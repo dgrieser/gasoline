@@ -511,6 +511,94 @@ function formatPrice(mixed $value): string
             line-height: 1;
         }
 
+        /* ── Cheapest card ─────────────────────────────────────── */
+        .cheapest-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            overflow: hidden;
+        }
+
+        .cheapest-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.9rem 1.25rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .cheapest-title {
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            font-weight: 700;
+            color: var(--muted);
+            font-family: var(--mono);
+        }
+
+        .cheapest-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1px;
+            background: var(--border);
+        }
+
+        .cheapest-grid.single   { grid-template-columns: 1fr; }
+        .cheapest-grid.two-col  { grid-template-columns: repeat(2, 1fr); }
+
+        .cheapest-cell {
+            background: var(--surface);
+            padding: 1.1rem 1.25rem;
+        }
+
+        .cheapest-fuel-label {
+            font-size: 0.68rem;
+            font-family: var(--mono);
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: var(--muted);
+            margin-bottom: 0.45rem;
+        }
+
+        .cheapest-price {
+            font-family: var(--mono);
+            font-size: 1.75rem;
+            font-weight: 500;
+            line-height: 1;
+            margin-bottom: 0.5rem;
+            letter-spacing: -0.02em;
+        }
+
+        .cheapest-station {
+            font-family: var(--mono);
+            font-size: 0.75rem;
+            color: var(--ink);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .cheapest-time {
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            color: var(--muted);
+            margin-top: 0.2rem;
+            opacity: 0.7;
+        }
+
+        .cheapest-empty {
+            padding: 2rem 1.25rem;
+            font-family: var(--mono);
+            font-size: 0.85rem;
+            color: var(--muted);
+            text-align: center;
+        }
+
+        @media (max-width: 560px) {
+            .cheapest-grid,
+            .cheapest-grid.two-col { grid-template-columns: 1fr; }
+        }
+
         /* ── Chart card ────────────────────────────────────────── */
         .chart-card {
             background: var(--surface);
@@ -939,6 +1027,9 @@ function formatPrice(mixed $value): string
                 </div>
             </div>
 
+            <!-- Cheapest now -->
+            <div class="cheapest-card" id="cheapest-card"></div>
+
             <!-- Chart -->
             <div class="chart-card">
                 <div class="chart-header">
@@ -1309,6 +1400,8 @@ const translations = {
         openNo: 'closed',
         noData: 'No data',
         noSnapshots: 'No snapshots match the current filters.',
+        cheapestNow: 'Cheapest — last snapshot',
+        cheapestNoData: 'No price data available.',
     },
     de: {
         title: 'Preisverlauf',
@@ -1343,6 +1436,8 @@ const translations = {
         openNo: 'geschlossen',
         noData: 'Keine Daten',
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
+        cheapestNow: 'Günstigster Preis — letzter Snapshot',
+        cheapestNoData: 'Keine Preisdaten vorhanden.',
     },
 };
 
@@ -1352,6 +1447,59 @@ currentLang = (() => {
     const browser = (navigator.language || 'en').slice(0, 2).toLowerCase();
     return translations[browser] ? browser : 'en';
 })();
+
+/* ── Cheapest-price box ────────────────────────────────────────── */
+const cheapestCard = document.getElementById('cheapest-card');
+
+function renderCheapest() {
+    if (!cheapestCard) return;
+    const t = translations[currentLang];
+
+    // Most recent snapshot per station
+    const latestByStation = new Map();
+    for (const row of chartData) {
+        const ts = Date.parse(row.recorded_at);
+        const prev = latestByStation.get(row.station_id);
+        if (!prev || ts > prev.ts) latestByStation.set(row.station_id, { ts, row });
+    }
+    const latestRows = [...latestByStation.values()].map((v) => v.row);
+
+    const fuels = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
+    const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
+
+    // Cheapest per fuel across all stations' latest snapshot
+    const cheapest = [];
+    for (const fuel of fuels) {
+        let best = null;
+        for (const row of latestRows) {
+            if (row[fuel] !== null && (best === null || row[fuel] < best.price)) {
+                best = { price: row[fuel], station: row.station_name, recorded_at: row.recorded_at };
+            }
+        }
+        if (best) cheapest.push({ fuel, ...best });
+    }
+
+    const colClass = cheapest.length === 1 ? 'single' : cheapest.length === 2 ? 'two-col' : '';
+
+    cheapestCard.innerHTML =
+        `<div class="cheapest-header">` +
+            `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 8 16 12"/><line x1="12" y1="16" x2="12" y2="8"/></svg>` +
+            `<span class="cheapest-title">${t.cheapestNow}</span>` +
+        `</div>` +
+        (cheapest.length === 0
+            ? `<div class="cheapest-empty">${t.cheapestNoData}</div>`
+            : `<div class="cheapest-grid${colClass ? ' ' + colClass : ''}">` +
+                cheapest.map(({ fuel, price, station, recorded_at }) =>
+                    `<div class="cheapest-cell">` +
+                        `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
+                        `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                        `<div class="cheapest-station">${station}</div>` +
+                        `<div class="cheapest-time">${formatDateTime(recorded_at)}</div>` +
+                    `</div>`
+                ).join('') +
+              `</div>`
+        );
+}
 
 function applyLang(lang) {
     currentLang = lang;
@@ -1368,6 +1516,7 @@ function applyLang(lang) {
     document.querySelectorAll('[data-recorded-at]').forEach((el) => {
         el.textContent = formatDateTime(el.dataset.recordedAt);
     });
+    renderCheapest();
     if (chartEl) renderChart();
 }
 
