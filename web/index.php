@@ -941,9 +941,7 @@ function formatPrice(mixed $value): string
                             <th data-i18n="brand">Brand</th>
                             <th data-i18n="street">Street</th>
                             <th data-i18n="place">Place</th>
-                            <th data-i18n="cityCol">City</th>
                             <th data-i18n="open">Open</th>
-                            <th data-i18n="dist">Dist</th>
                             <th>E5</th>
                             <th>E10</th>
                             <th>Diesel</th>
@@ -963,16 +961,14 @@ function formatPrice(mixed $value): string
                                 <td class="td-muted"><?= h((string) $row['brand']) ?></td>
                                 <td class="td-muted"><?= h($streetFull) ?></td>
                                 <td class="td-muted"><?= h((string) $row['place']) ?></td>
-                                <td class="td-muted"><?= h((string) $row['city_name']) ?></td>
                                 <td class="<?= !empty($row['is_open']) ? 'open-yes' : 'open-no' ?>" data-i18n="<?= !empty($row['is_open']) ? 'openYes' : 'openNo' ?>"><?= !empty($row['is_open']) ? 'open' : 'closed' ?></td>
-                                <td class="td-muted"><?= h(number_format((float) $row['dist_km'], 2)) ?> km</td>
                                 <td class="price-e5"><?= h(formatPrice($row['e5'])) ?></td>
                                 <td class="price-e10"><?= h(formatPrice($row['e10'])) ?></td>
                                 <td class="price-diesel"><?= h(formatPrice($row['diesel'])) ?></td>
                             </tr>
                         <?php endforeach; ?>
                         <?php if ($rows === []): ?>
-                            <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="noData">No data</td></tr>
+                            <tr><td colspan="9" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="noData">No data</td></tr>
                         <?php endif; ?>
                         </tbody>
                     </table>

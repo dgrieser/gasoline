@@ -223,7 +223,7 @@ func runUpdate(args []string) error {
 	}
 
 	recordedAt := time.Now().UTC()
-	if err := persistUpdate(ctx, db, location, stations, recordedAt); err != nil {
+	if err := persistUpdate(ctx, db, location, stations, recordedAt, *radius); err != nil {
 		return err
 	}
 
@@ -645,6 +645,7 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 		city_name TEXT NOT NULL,
 		recorded_at TEXT NOT NULL,
 		dist_km REAL NOT NULL,
+		search_radius_km REAL NOT NULL DEFAULT 5,
 		is_open INTEGER NOT NULL,
 		e5 REAL,
 		e10 REAL,
@@ -783,7 +784,7 @@ func fetchStations(ctx context.Context, cfg config, lat, lng, radius float64, fu
 	return payload.Stations, nil
 }
 
-func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []tankerStation, recordedAt time.Time) error {
+func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -811,9 +812,9 @@ func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []
 
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO price_snapshots (
-				station_id, city_name, recorded_at, dist_km, is_open, e5, e10, diesel
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, station.ID, city.Name, recordedAt.Format(time.RFC3339), station.Dist, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel)); err != nil {
+				station_id, city_name, recorded_at, dist_km, search_radius_km, is_open, e5, e10, diesel
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, station.ID, city.Name, recordedAt.Format(time.RFC3339), station.Dist, searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel)); err != nil {
 			return err
 		}
 	}

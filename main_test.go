@@ -108,7 +108,7 @@ func TestPersistUpdateAndQueryHistory(t *testing.T) {
 		},
 	}
 
-	if err := persistUpdate(ctx, db, city, stations, recordedAt); err != nil {
+	if err := persistUpdate(ctx, db, city, stations, recordedAt, 5); err != nil {
 		t.Fatalf("persistUpdate: %v", err)
 	}
 
@@ -365,7 +365,7 @@ func seedFixtureDB(t *testing.T) string {
 		HouseNumber: "1",
 		PostCode:    10115,
 	}}
-	if err := persistUpdate(ctx, db, city, stations, time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC)); err != nil {
+	if err := persistUpdate(ctx, db, city, stations, time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC), 5); err != nil {
 		t.Fatalf("persistUpdate: %v", err)
 	}
 
