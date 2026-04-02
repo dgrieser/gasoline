@@ -783,9 +783,41 @@ function formatPrice(mixed $value): string
 
         .theme-toggle:hover { color: var(--amber); border-color: var(--amber-glow); }
         .theme-toggle svg { width: 16px; height: 16px; pointer-events: none; }
+
+        /* ── Price tooltip ─────────────────────────────────────── */
+        #price-tooltip {
+            position: fixed;
+            z-index: 200;
+            background: var(--surface);
+            border: 1px solid var(--border-hi);
+            border-radius: 10px;
+            padding: 0.6rem 0.9rem;
+            font-family: var(--mono);
+            font-size: 0.8rem;
+            color: var(--ink);
+            pointer-events: none;
+            line-height: 1.55;
+            box-shadow: 0 6px 28px rgba(0,0,0,0.35), 0 1px 6px rgba(0,0,0,0.2);
+            display: none;
+            min-width: 130px;
+            max-width: 240px;
+        }
+
+        #price-tooltip .tt-price {
+            font-size: 1rem;
+            font-weight: 500;
+            letter-spacing: 0.03em;
+        }
+
+        #price-tooltip .tt-meta {
+            color: var(--muted);
+            font-size: 0.72rem;
+            margin-top: 2px;
+        }
     </style>
 </head>
 <body>
+<div id="price-tooltip" role="tooltip" aria-hidden="true"></div>
 <main class="page">
 
     <!-- Header -->
@@ -899,11 +931,11 @@ function formatPrice(mixed $value): string
                 </div>
                 <div class="stat">
                     <div class="stat-label" data-i18n="firstRecorded">First recorded</div>
-                    <div class="stat-value" style="font-size:1rem"><?= h($summary['first_recorded_at'] ? substr((string) $summary['first_recorded_at'], 0, 10) : '—') ?></div>
+                    <div class="stat-value" style="font-size:1rem" <?= $summary['first_recorded_at'] ? 'data-recorded-at="' . h((string) $summary['first_recorded_at']) . '"' : '' ?>><?= h($summary['first_recorded_at'] ? substr((string) $summary['first_recorded_at'], 0, 10) : '—') ?></div>
                 </div>
                 <div class="stat">
                     <div class="stat-label" data-i18n="lastRecorded">Last recorded</div>
-                    <div class="stat-value" style="font-size:1rem"><?= h($summary['last_recorded_at'] ? substr((string) $summary['last_recorded_at'], 0, 10) : '—') ?></div>
+                    <div class="stat-value" style="font-size:1rem" <?= $summary['last_recorded_at'] ? 'data-recorded-at="' . h((string) $summary['last_recorded_at']) . '"' : '' ?>><?= h($summary['last_recorded_at'] ? substr((string) $summary['last_recorded_at'], 0, 10) : '—') ?></div>
                 </div>
             </div>
 
@@ -956,7 +988,7 @@ function formatPrice(mixed $value): string
                             ])));
                             ?>
                             <tr>
-                                <td class="td-muted"><?= h((string) $row['recorded_at']) ?></td>
+                                <td class="td-muted" data-recorded-at="<?= h((string) $row['recorded_at']) ?>"><?= h((string) $row['recorded_at']) ?></td>
                                 <td><?= h((string) $row['station_name']) ?></td>
                                 <td class="td-muted"><?= h((string) $row['brand']) ?></td>
                                 <td class="td-muted"><?= h($streetFull) ?></td>
@@ -980,6 +1012,38 @@ function formatPrice(mixed $value): string
 </main>
 
 <script>
+/* ── Locale-aware date/time helpers ────────────────────────────── */
+// These reference `currentLang` which is set up below; safe to call after init.
+function _tz() { return currentLang === 'de' ? 'Europe/Berlin' : 'UTC'; }
+function _loc() { return currentLang === 'de' ? 'de-DE' : 'en-GB'; }
+
+function formatDateTime(isoString) {
+    const d = new Date(isoString);
+    return d.toLocaleString(_loc(), {
+        timeZone: _tz(),
+        day: '2-digit', month: '2-digit', year: '2-digit',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false,
+    });
+}
+
+function formatTickDate(isoString) {
+    const d = new Date(isoString);
+    return d.toLocaleDateString(_loc(), {
+        timeZone: _tz(),
+        day: '2-digit', month: '2-digit',
+    });
+}
+
+function formatTickTime(isoString) {
+    const d = new Date(isoString);
+    return d.toLocaleTimeString(_loc(), {
+        timeZone: _tz(),
+        hour: '2-digit', minute: '2-digit',
+        hour12: false,
+    });
+}
+
 const chartData = <?= json_encode($chartRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
 const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
 
@@ -992,6 +1056,35 @@ const fuelConfig = {
 const chartEl = document.getElementById('chart');
 const legendEl = document.getElementById('legend');
 const toggles = [...document.querySelectorAll('.fuel-toggle')];
+
+/* ── Tooltip helpers ───────────────────────────────────────────── */
+const tooltip = document.getElementById('price-tooltip');
+
+function positionTooltip(e) {
+    const x = e.clientX ?? 0;
+    const y = e.clientY ?? 0;
+    tooltip.style.left = (x + 14) + 'px';
+    tooltip.style.top  = (y - 14) + 'px';
+    // Clamp to viewport after paint
+    requestAnimationFrame(() => {
+        const r = tooltip.getBoundingClientRect();
+        if (r.right  > window.innerWidth  - 8) tooltip.style.left = (x - r.width  - 14) + 'px';
+        if (r.bottom > window.innerHeight - 8) tooltip.style.top  = (y - r.height - 14) + 'px';
+    });
+}
+
+function showTooltip(e, row, fuel, cfg) {
+    tooltip.innerHTML =
+        `<div class="tt-price" style="color:${cfg.color}">${cfg.label} &nbsp;${row[fuel].toFixed(3)} €</div>` +
+        `<div class="tt-meta">${row.station_name}</div>` +
+        `<div class="tt-meta">${formatDateTime(row.recorded_at)}</div>`;
+    tooltip.style.display = 'block';
+    positionTooltip(e);
+}
+
+function hideTooltip() { tooltip.style.display = 'none'; }
+
+document.addEventListener('touchend', hideTooltip);
 
 if (!chartEl) {
     // No chart in DOM (empty state)
@@ -1014,7 +1107,7 @@ if (!chartEl) {
         const visibleRows = chartData.filter((row) => [...activeFuels].some((f) => row[f] !== null));
         if (visibleRows.length === 0) return;
 
-        const margin = { top: 24, right: 24, bottom: 48, left: 68 };
+        const margin = { top: 24, right: 24, bottom: 60, left: 68 };
         const W = 960, H = 380;
         const iW = W - margin.left - margin.right;
         const iH = H - margin.top - margin.bottom;
@@ -1027,8 +1120,7 @@ if (!chartEl) {
             return el;
         };
 
-        // defs for gradients
-        const defs = mk('defs');
+        // no fill — line-only chart
 
         const timestamps = visibleRows.map((r) => Date.parse(r.recorded_at));
         const allVals = [];
@@ -1069,17 +1161,27 @@ if (!chartEl) {
             ).textContent = val.toFixed(3);
         }
 
-        // X ticks
+        // X ticks — two-line: date + time
         const tickCount = Math.min(7, visibleRows.length);
+        const tickColor = light ? 'rgba(0,0,0,0.4)' : 'rgba(255,255,255,0.38)';
         for (let i = 0; i < tickCount; i++) {
             const idx = tickCount === 1 ? 0 : Math.round((visibleRows.length - 1) * (i / (tickCount - 1)));
             const row = visibleRows[idx];
             const xp = px(Date.parse(row.recorded_at));
             mk('line', { x1: xp, y1: margin.top, x2: xp, y2: H - margin.bottom,
                 stroke: tickStroke, 'stroke-width': 1 });
-            mk('text', { x: xp, y: H - 16, 'text-anchor': 'middle',
-                'font-size': 10, 'font-family': "'DM Mono', monospace", fill: '#6b7280' },
-            ).textContent = row.recorded_at.slice(0, 10);
+            const txt = mk('text', { x: xp, y: H - margin.bottom + 14, 'text-anchor': 'middle',
+                'font-size': 10, 'font-family': "'DM Mono', monospace", fill: tickColor });
+            const tDate = document.createElementNS(ns, 'tspan');
+            tDate.setAttribute('x', xp);
+            tDate.setAttribute('dy', '0');
+            tDate.textContent = formatTickDate(row.recorded_at);
+            txt.appendChild(tDate);
+            const tTime = document.createElementNS(ns, 'tspan');
+            tTime.setAttribute('x', xp);
+            tTime.setAttribute('dy', '14');
+            tTime.textContent = formatTickTime(row.recorded_at);
+            txt.appendChild(tTime);
         }
 
         // Axes
@@ -1094,13 +1196,9 @@ if (!chartEl) {
             return [id, `hsl(${hue} 70% 62%)`];
         }));
 
-        // Area fill + line for each fuel/station combo
+        // Line only — no area fill
         for (const fuel of activeFuels) {
             const cfg = fuelConfig[fuel];
-            const gradId = `grad-${fuel}`;
-            const grad = mk('linearGradient', { id: gradId, x1: 0, y1: 0, x2: 0, y2: 1 }, defs);
-            mk('stop', { offset: '0%',   'stop-color': cfg.color, 'stop-opacity': 0.25 }, grad);
-            mk('stop', { offset: '100%', 'stop-color': cfg.color, 'stop-opacity': 0 }, grad);
 
             for (const stationId of stations) {
                 const series = visibleRows.filter((r) => r.station_id === stationId && r[fuel] !== null);
@@ -1108,16 +1206,13 @@ if (!chartEl) {
 
                 const pts = series.map((r) => [px(Date.parse(r.recorded_at)), py(r[fuel])]);
                 const linePath = pts.map(([x, y], j) => `${j === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
-                const bottomLeft = `L${pts.at(-1)[0].toFixed(2)},${(H - margin.bottom).toFixed(2)} L${pts[0][0].toFixed(2)},${(H - margin.bottom).toFixed(2)} Z`;
-                const areaPath = linePath + ' ' + bottomLeft;
 
-                mk('path', { d: areaPath, fill: `url(#${gradId})` });
                 mk('path', { d: linePath, fill: 'none', stroke: cfg.color,
                     'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round', opacity: 0.9 });
             }
         }
 
-        // Dots on top
+        // Dots on top — with hover/tap tooltip
         for (const fuel of activeFuels) {
             const cfg = fuelConfig[fuel];
             for (const stationId of stations) {
@@ -1126,10 +1221,18 @@ if (!chartEl) {
                     const xp = px(Date.parse(row.recorded_at));
                     const yp = py(row[fuel]);
                     const g = mk('g', { style: 'cursor:pointer' });
-                    mk('circle', { cx: xp, cy: yp, r: 5, fill: dotFill, stroke: cfg.color, 'stroke-width': 1.5 }, g);
-                    const t = document.createElementNS(ns, 'title');
-                    t.textContent = `${row.station_name} · ${cfg.label} ${row[fuel].toFixed(3)} € · ${row.recorded_at.slice(0, 16)}`;
-                    g.appendChild(t);
+                    // Larger invisible hit area for easier touch
+                    mk('circle', { cx: xp, cy: yp, r: 12, fill: 'transparent' }, g);
+                    mk('circle', { cx: xp, cy: yp, r: 4.5, fill: dotFill, stroke: cfg.color, 'stroke-width': 1.5 }, g);
+                    // Closure-safe capture of row/fuel/cfg
+                    const _row = row, _cfg = cfg, _fuel = fuel;
+                    g.addEventListener('mouseenter', (e) => showTooltip(e, _row, _fuel, _cfg));
+                    g.addEventListener('mousemove',  positionTooltip);
+                    g.addEventListener('mouseleave', hideTooltip);
+                    g.addEventListener('touchstart', (e) => {
+                        e.preventDefault();
+                        showTooltip(e.touches[0], _row, _fuel, _cfg);
+                    }, { passive: false });
                     chartEl.appendChild(g);
                 }
             }
@@ -1256,6 +1359,10 @@ function applyLang(lang) {
     });
     document.querySelectorAll('.lang-btn').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.lang === lang);
+    });
+    // Re-format all date/time cells
+    document.querySelectorAll('[data-recorded-at]').forEach((el) => {
+        el.textContent = formatDateTime(el.dataset.recordedAt);
     });
     if (chartEl) renderChart();
 }
