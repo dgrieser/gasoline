@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -196,6 +198,108 @@ func TestGetOrCreateCityUsesCache(t *testing.T) {
 	}
 }
 
+func TestRunCitiesSupportsJSONOutput(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+	output := captureStdout(t, func() error {
+		return run([]string{"cities", "--db", dbPath, "--output", "json"})
+	})
+
+	var cities []cityRow
+	if err := json.Unmarshal([]byte(output), &cities); err != nil {
+		t.Fatalf("unmarshal cities output: %v\noutput=%s", err, output)
+	}
+	if len(cities) != 1 {
+		t.Fatalf("len(cities) = %d, want 1", len(cities))
+	}
+	if cities[0].Name != "Berlin, Germany" {
+		t.Fatalf("city name = %q", cities[0].Name)
+	}
+}
+
+func TestRunStationsSupportsShortJSONFlag(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+	output := captureStdout(t, func() error {
+		return run([]string{"stations", "--db", dbPath, "-o", "json"})
+	})
+
+	var stations []stationRow
+	if err := json.Unmarshal([]byte(output), &stations); err != nil {
+		t.Fatalf("unmarshal stations output: %v\noutput=%s", err, output)
+	}
+	if len(stations) != 1 {
+		t.Fatalf("len(stations) = %d, want 1", len(stations))
+	}
+	if stations[0].ID != "station-1" {
+		t.Fatalf("station id = %q", stations[0].ID)
+	}
+	if stations[0].Diesel == nil || *stations[0].Diesel != 1.659 {
+		t.Fatalf("diesel = %v, want 1.659", stations[0].Diesel)
+	}
+}
+
+func TestRunHistorySupportsJSONOutput(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+	output := captureStdout(t, func() error {
+		return run([]string{"history", "--db", dbPath, "--station-id", "station-1", "--fuel", "diesel", "--output", "json"})
+	})
+
+	var history []historyRow
+	if err := json.Unmarshal([]byte(output), &history); err != nil {
+		t.Fatalf("unmarshal history output: %v\noutput=%s", err, output)
+	}
+	if len(history) != 1 {
+		t.Fatalf("len(history) = %d, want 1", len(history))
+	}
+	if history[0].Diesel == nil || *history[0].Diesel != 1.659 {
+		t.Fatalf("diesel = %v, want 1.659", history[0].Diesel)
+	}
+	if history[0].E5 != nil || history[0].E10 != nil {
+		t.Fatalf("expected only diesel field in filtered history row: %+v", history[0])
+	}
+}
+
+func TestRunUpdateSupportsJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "update.db")
+	t.Setenv(envAPIKeyName, "test-key")
+
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasPrefix(req.URL.String(), nominatimBaseURL):
+			body := `[{"display_name":"Berlin, Deutschland","lat":"52.517389","lon":"13.395131"}]`
+			return jsonResponse(http.StatusOK, body), nil
+		case strings.HasPrefix(req.URL.String(), tankerKoenigBase+"/list.php"):
+			body := `{"ok":true,"stations":[{"id":"station-1","name":"Test Station","brand":"ARAL","street":"Test Street","place":"Berlin","lat":52.5,"lng":13.4,"dist":1.25,"diesel":1.659,"e5":1.789,"e10":1.729,"isOpen":true,"houseNumber":"1","postCode":10115}]}`
+			return jsonResponse(http.StatusOK, body), nil
+		default:
+			return nil, fmt.Errorf("unexpected request URL: %s", req.URL.String())
+		}
+	})
+	defer restore()
+
+	output := captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin, Germany", "--output", "json"})
+	})
+
+	var result updateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal update output: %v\noutput=%s", err, output)
+	}
+	if result.City.Name != "Berlin, Germany" {
+		t.Fatalf("city name = %q", result.City.Name)
+	}
+	if result.StoredCount != 1 {
+		t.Fatalf("stored_count = %d, want 1", result.StoredCount)
+	}
+}
+
+func TestResolveOutputModeRejectsConflictingFlags(t *testing.T) {
+	err := run([]string{"cities", "--db", filepath.Join(t.TempDir(), "test.db"), "--output", "txt", "-o", "json"})
+	if err == nil || !strings.Contains(err.Error(), "--output and -o must match") {
+		t.Fatalf("err = %v, want conflicting output flag error", err)
+	}
+}
+
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 
@@ -211,6 +315,77 @@ func openTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("initSchema: %v", err)
 	}
 	return db
+}
+
+func seedFixtureDB(t *testing.T) string {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "fixture.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+
+	city := cachedCity{
+		Name:        "Berlin, Germany",
+		DisplayName: "Berlin, Deutschland",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	}
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO cities (name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, city.Name, city.DisplayName, city.Lat, city.Lng, "2026-04-02T09:00:00Z")
+	if err != nil {
+		t.Fatalf("insert city: %v", err)
+	}
+
+	diesel := 1.659
+	e5 := 1.789
+	e10 := 1.729
+	stations := []tankerStation{{
+		ID:          "station-1",
+		Name:        "Test Station",
+		Brand:       "ARAL",
+		Street:      "Test Street",
+		Place:       "Berlin",
+		Lat:         52.5,
+		Lng:         13.4,
+		Dist:        1.25,
+		Diesel:      &diesel,
+		E5:          &e5,
+		E10:         &e10,
+		IsOpen:      true,
+		HouseNumber: "1",
+		PostCode:    10115,
+	}}
+	if err := persistUpdate(ctx, db, city, stations, time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("persistUpdate: %v", err)
+	}
+
+	return dbPath
+}
+
+func captureStdout(t *testing.T, fn func() error) string {
+	t.Helper()
+
+	old := stdout
+	var buf bytes.Buffer
+	stdout = &buf
+	t.Cleanup(func() {
+		stdout = old
+	})
+
+	if err := fn(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	return buf.String()
 }
 
 func stubDefaultTransport(t *testing.T, fn func(*http.Request) (*http.Response, error)) func() {

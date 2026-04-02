@@ -70,6 +70,55 @@ type cachedCity struct {
 	Lng         float64
 }
 
+type outputMode string
+
+const (
+	outputText outputMode = "txt"
+	outputJSON outputMode = "json"
+)
+
+type updateResult struct {
+	City        cachedCity `json:"city"`
+	CacheStatus string     `json:"cache_status"`
+	StoredCount int        `json:"stored_count"`
+	RecordedAt  string     `json:"recorded_at"`
+	DBPath      string     `json:"db_path"`
+}
+
+type cityRow struct {
+	Name        string  `json:"name"`
+	DisplayName string  `json:"display_name"`
+	Lat         float64 `json:"lat"`
+	Lng         float64 `json:"lng"`
+	CreatedAt   string  `json:"created_at"`
+}
+
+type stationRow struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Brand      string   `json:"brand"`
+	Street     string   `json:"street"`
+	Place      string   `json:"place"`
+	RecordedAt string   `json:"recorded_at"`
+	DistKM     float64  `json:"dist_km"`
+	IsOpen     bool     `json:"is_open"`
+	E5         *float64 `json:"e5"`
+	E10        *float64 `json:"e10"`
+	Diesel     *float64 `json:"diesel"`
+}
+
+type historyRow struct {
+	CityName   string   `json:"city_name"`
+	RecordedAt string   `json:"recorded_at"`
+	DistKM     float64  `json:"dist_km"`
+	IsOpen     bool     `json:"is_open"`
+	E5         *float64 `json:"e5,omitempty"`
+	E10        *float64 `json:"e10,omitempty"`
+	Diesel     *float64 `json:"diesel,omitempty"`
+}
+
+var stdout io.Writer = os.Stdout
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -123,7 +172,12 @@ func runUpdate(args []string) error {
 	fuelType := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
 	sortBy := fs.String("sort", "dist", "Sort order: dist or price")
 	userAgent := fs.String("user-agent", defaultUserAgent, "User-Agent for Nominatim and API calls")
+	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(*city) == "" {
@@ -178,17 +232,32 @@ func runUpdate(args []string) error {
 		cacheStatus = "loaded from cache"
 	}
 
-	fmt.Printf("city: %s\n", location.Name)
-	fmt.Printf("display: %s\n", location.DisplayName)
-	fmt.Printf("coordinates: %.6f, %.6f (%s)\n", location.Lat, location.Lng, cacheStatus)
-	fmt.Printf("stored %d station snapshots at %s in %s\n", len(stations), recordedAt.Format(time.RFC3339), *dbPath)
+	if output == outputJSON {
+		return writeJSON(updateResult{
+			City:        location,
+			CacheStatus: cacheStatus,
+			StoredCount: len(stations),
+			RecordedAt:  recordedAt.Format(time.RFC3339),
+			DBPath:      *dbPath,
+		})
+	}
+
+	fmt.Fprintf(stdout, "city: %s\n", location.Name)
+	fmt.Fprintf(stdout, "display: %s\n", location.DisplayName)
+	fmt.Fprintf(stdout, "coordinates: %.6f, %.6f (%s)\n", location.Lat, location.Lng, cacheStatus)
+	fmt.Fprintf(stdout, "stored %d station snapshots at %s in %s\n", len(stations), recordedAt.Format(time.RFC3339), *dbPath)
 	return nil
 }
 
 func runCities(args []string) error {
 	fs := flag.NewFlagSet("cities", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
 		return err
 	}
 
@@ -213,15 +282,32 @@ func runCities(args []string) error {
 	}
 	defer rows.Close()
 
+	var results []cityRow
 	for rows.Next() {
 		var name, displayName, createdAt string
 		var lat, lng float64
 		if err := rows.Scan(&name, &displayName, &lat, &lng, &createdAt); err != nil {
 			return err
 		}
-		fmt.Printf("%s | %.6f, %.6f | cached_at=%s | %s\n", name, lat, lng, createdAt, displayName)
+		row := cityRow{
+			Name:        name,
+			DisplayName: displayName,
+			Lat:         lat,
+			Lng:         lng,
+			CreatedAt:   createdAt,
+		}
+		results = append(results, row)
+		if output == outputText {
+			fmt.Fprintf(stdout, "%s | %.6f, %.6f | cached_at=%s | %s\n", name, lat, lng, createdAt, displayName)
+		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if output == outputJSON {
+		return writeJSON(results)
+	}
+	return nil
 }
 
 func runStations(args []string) error {
@@ -229,7 +315,12 @@ func runStations(args []string) error {
 	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
 	city := fs.String("city", "", "Optional city filter from stored sync runs")
 	limit := fs.Int("limit", 50, "Max rows to print")
+	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
 		return err
 	}
 	if *limit <= 0 {
@@ -291,6 +382,7 @@ func runStations(args []string) error {
 	}
 	defer rows.Close()
 
+	var results []stationRow
 	for rows.Next() {
 		var (
 			id, name, brand, street, place, recordedAt string
@@ -301,21 +393,43 @@ func runStations(args []string) error {
 		if err := rows.Scan(&id, &name, &brand, &street, &place, &recordedAt, &dist, &isOpen, &e5, &e10, &diesel); err != nil {
 			return err
 		}
-		fmt.Printf("%s | %s | %s | %s %s | dist=%.2fkm | open=%t | e5=%s e10=%s diesel=%s | at=%s\n",
-			id,
-			name,
-			blankDash(brand),
-			strings.TrimSpace(street),
-			strings.TrimSpace(place),
-			dist,
-			isOpen,
-			formatNullFloat(e5),
-			formatNullFloat(e10),
-			formatNullFloat(diesel),
-			recordedAt,
-		)
+		row := stationRow{
+			ID:         id,
+			Name:       name,
+			Brand:      brand,
+			Street:     strings.TrimSpace(street),
+			Place:      strings.TrimSpace(place),
+			RecordedAt: recordedAt,
+			DistKM:     dist,
+			IsOpen:     isOpen,
+			E5:         nullFloatPtr(e5),
+			E10:        nullFloatPtr(e10),
+			Diesel:     nullFloatPtr(diesel),
+		}
+		results = append(results, row)
+		if output == outputText {
+			fmt.Fprintf(stdout, "%s | %s | %s | %s %s | dist=%.2fkm | open=%t | e5=%s e10=%s diesel=%s | at=%s\n",
+				id,
+				name,
+				blankDash(brand),
+				row.Street,
+				row.Place,
+				dist,
+				isOpen,
+				formatNullFloat(e5),
+				formatNullFloat(e10),
+				formatNullFloat(diesel),
+				recordedAt,
+			)
+		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if output == outputJSON {
+		return writeJSON(results)
+	}
+	return nil
 }
 
 func runHistory(args []string) error {
@@ -324,7 +438,12 @@ func runHistory(args []string) error {
 	stationID := fs.String("station-id", "", "Station UUID")
 	fuel := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
 	limit := fs.Int("limit", 100, "Max history rows")
+	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(*stationID) == "" {
@@ -361,6 +480,7 @@ func runHistory(args []string) error {
 	}
 	defer rows.Close()
 
+	var results []historyRow
 	for rows.Next() {
 		var (
 			cityName, recordedAt string
@@ -371,19 +491,82 @@ func runHistory(args []string) error {
 		if err := rows.Scan(&cityName, &recordedAt, &dist, &isOpen, &e5, &e10, &diesel); err != nil {
 			return err
 		}
+		row := historyRow{
+			CityName:   cityName,
+			RecordedAt: recordedAt,
+			DistKM:     dist,
+			IsOpen:     isOpen,
+		}
 		switch *fuel {
 		case "e5":
-			fmt.Printf("%s | city=%s | dist=%.2fkm | open=%t | e5=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(e5))
+			row.E5 = nullFloatPtr(e5)
+			if output == outputText {
+				fmt.Fprintf(stdout, "%s | city=%s | dist=%.2fkm | open=%t | e5=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(e5))
+			}
 		case "e10":
-			fmt.Printf("%s | city=%s | dist=%.2fkm | open=%t | e10=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(e10))
+			row.E10 = nullFloatPtr(e10)
+			if output == outputText {
+				fmt.Fprintf(stdout, "%s | city=%s | dist=%.2fkm | open=%t | e10=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(e10))
+			}
 		case "diesel":
-			fmt.Printf("%s | city=%s | dist=%.2fkm | open=%t | diesel=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(diesel))
+			row.Diesel = nullFloatPtr(diesel)
+			if output == outputText {
+				fmt.Fprintf(stdout, "%s | city=%s | dist=%.2fkm | open=%t | diesel=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(diesel))
+			}
 		default:
-			fmt.Printf("%s | city=%s | dist=%.2fkm | open=%t | e5=%s e10=%s diesel=%s\n",
-				recordedAt, cityName, dist, isOpen, formatNullFloat(e5), formatNullFloat(e10), formatNullFloat(diesel))
+			row.E5 = nullFloatPtr(e5)
+			row.E10 = nullFloatPtr(e10)
+			row.Diesel = nullFloatPtr(diesel)
+			if output == outputText {
+				fmt.Fprintf(stdout, "%s | city=%s | dist=%.2fkm | open=%t | e5=%s e10=%s diesel=%s\n",
+					recordedAt, cityName, dist, isOpen, formatNullFloat(e5), formatNullFloat(e10), formatNullFloat(diesel))
+			}
 		}
+		results = append(results, row)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if output == outputJSON {
+		return writeJSON(results)
+	}
+	return nil
+}
+
+func addOutputFlags(fs *flag.FlagSet) (*string, *string) {
+	return fs.String("output", "", "Output format: txt or json"), fs.String("o", "", "Output format: txt or json")
+}
+
+func resolveOutputMode(longValue, shortValue string) (outputMode, error) {
+	longValue = strings.TrimSpace(longValue)
+	shortValue = strings.TrimSpace(shortValue)
+	if longValue != "" && shortValue != "" && longValue != shortValue {
+		return "", errors.New("--output and -o must match when both are provided")
+	}
+	value := blankOr(longValue, shortValue)
+	if value == "" {
+		return outputText, nil
+	}
+	switch outputMode(value) {
+	case outputText, outputJSON:
+		return outputMode(value), nil
+	default:
+		return "", errors.New("--output must be one of: txt, json")
+	}
+}
+
+func writeJSON(v any) error {
+	enc := json.NewEncoder(stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+func nullFloatPtr(v sql.NullFloat64) *float64 {
+	if !v.Valid {
+		return nil
+	}
+	value := v.Float64
+	return &value
 }
 
 func loadConfig(userAgent string) (config, error) {
