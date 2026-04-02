@@ -170,21 +170,25 @@ function h(?string $value): string
 
 function stationLabel(array $station): string
 {
-    $parts = [$station['name']];
+    $parts = [trim($station['name'])];
+
     if (($station['brand'] ?? '') !== '' && $station['brand'] !== 'Unknown brand') {
-        $parts[] = $station['brand'];
+        $parts[] = trim($station['brand']);
     }
 
-    $address = trim(implode(' ', array_filter([
+    $street = trim(implode(' ', array_filter([
         $station['street'] ?? '',
         $station['house_number'] ?? '',
-        $station['place'] ?? '',
     ])));
-    if ($address !== '') {
-        $parts[] = $address;
+    if ($street !== '') {
+        $parts[] = $street;
     }
 
-    return implode(' | ', $parts);
+    if (trim($station['place'] ?? '') !== '') {
+        $parts[] = trim($station['place']);
+    }
+
+    return implode(', ', $parts);
 }
 
 function formatPrice(mixed $value): string
@@ -202,6 +206,13 @@ function formatPrice(mixed $value): string
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Gasoline — Price History</title>
+    <script>
+        (function () {
+            const t = localStorage.getItem('theme') ||
+                (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+            document.documentElement.setAttribute('data-theme', t);
+        })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -702,6 +713,80 @@ function formatPrice(mixed $value): string
         .page > *:nth-child(1) { animation-delay: 0s; }
         .page > *:nth-child(2) { animation-delay: 0.06s; }
         .page > *:nth-child(3) { animation-delay: 0.12s; }
+
+        /* ── Light mode overrides ──────────────────────────────── */
+        html[data-theme="light"] {
+            --bg:         #f4f2ed;
+            --surface:    #ffffff;
+            --surface-hi: #ece9e2;
+            --border:     rgba(0,0,0,0.08);
+            --border-hi:  rgba(0,0,0,0.15);
+            --ink:        #1c1c1e;
+            --muted:      #6e6e73;
+            --amber-dim:  rgba(194,120,10,0.08);
+            --amber-glow: rgba(194,120,10,0.2);
+        }
+
+        html[data-theme="light"] body {
+            background-image:
+                url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E"),
+                radial-gradient(ellipse 80% 50% at 10% -10%, rgba(245,166,35,0.06) 0%, transparent 60%),
+                radial-gradient(ellipse 60% 40% at 90% 110%, rgba(96,165,250,0.04) 0%, transparent 60%),
+                var(--bg);
+        }
+
+        /* ── Header controls ───────────────────────────────────── */
+        .header-controls {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+        }
+
+        .lang-picker {
+            display: flex;
+            border: 1px solid var(--border-hi);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .lang-btn {
+            background: transparent;
+            border: none;
+            border-right: 1px solid var(--border-hi);
+            padding: 0.38rem 0.65rem;
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            color: var(--muted);
+            cursor: pointer;
+            letter-spacing: 0.07em;
+            transition: background 0.15s, color 0.15s;
+        }
+
+        .lang-btn:last-child { border-right: none; }
+
+        .lang-btn.active {
+            background: var(--amber-dim);
+            color: var(--amber);
+        }
+
+        .lang-btn:hover:not(.active) { color: var(--ink); }
+
+        .theme-toggle {
+            width: 34px;
+            height: 34px;
+            border-radius: 8px;
+            border: 1px solid var(--border-hi);
+            background: transparent;
+            color: var(--muted);
+            cursor: pointer;
+            display: grid;
+            place-items: center;
+            transition: color 0.15s, border-color 0.15s;
+            flex-shrink: 0;
+        }
+
+        .theme-toggle:hover { color: var(--amber); border-color: var(--amber-glow); }
+        .theme-toggle svg { width: 16px; height: 16px; pointer-events: none; }
     </style>
 </head>
 <body>
@@ -719,9 +804,17 @@ function formatPrice(mixed $value): string
                 </svg>
             </div>
             <div>
-                <h1>Gasoline <em>/</em> Price History</h1>
-                <p class="tagline">Tankerkönig SQLite snapshot viewer</p>
+                <h1>Gasoline <em>/</em> <span data-i18n="title">Price History</span></h1>
             </div>
+        </div>
+        <div class="header-controls">
+            <div class="lang-picker">
+                <button class="lang-btn" data-lang="en">EN</button>
+                <button class="lang-btn" data-lang="de">DE</button>
+            </div>
+            <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">
+                <svg id="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+            </button>
         </div>
     </header>
 
@@ -732,14 +825,14 @@ function formatPrice(mixed $value): string
         <aside class="sidebar">
             <div class="sidebar-head">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--muted)"><line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="16" y2="12"/><line x1="11" y1="18" x2="13" y2="18"/></svg>
-                <h2>Filters</h2>
+                <h2 data-i18n="filters">Filters</h2>
             </div>
 
             <form method="get">
                 <div class="field">
-                    <label for="f-city">City</label>
+                    <label for="f-city" data-i18n="city">City</label>
                     <select name="city" id="f-city">
-                        <option value="">— all cities —</option>
+                        <option value="" data-i18n="allCities">— all cities —</option>
                         <?php foreach ($cities as $city): ?>
                             <option value="<?= h((string) $city) ?>" <?= $selectedCity === $city ? 'selected' : '' ?>>
                                 <?= h((string) $city) ?>
@@ -749,17 +842,17 @@ function formatPrice(mixed $value): string
                 </div>
 
                 <div class="field">
-                    <label for="f-from">From</label>
+                    <label for="f-from" data-i18n="from">From</label>
                     <input type="date" name="from" id="f-from" value="<?= h($fromDate) ?>">
                 </div>
 
                 <div class="field">
-                    <label for="f-to">To</label>
+                    <label for="f-to" data-i18n="to">To</label>
                     <input type="date" name="to" id="f-to" value="<?= h($toDate) ?>">
                 </div>
 
                 <div class="field">
-                    <label for="f-fuel">Fuel type</label>
+                    <label for="f-fuel" data-i18n="fuelType">Fuel type</label>
                     <select name="fuel" id="f-fuel">
                         <?php foreach ($validFuels as $fuel): ?>
                             <option value="<?= h($fuel) ?>" <?= $selectedFuel === $fuel ? 'selected' : '' ?>>
@@ -770,7 +863,7 @@ function formatPrice(mixed $value): string
                 </div>
 
                 <div class="field">
-                    <label>Stations <span style="color:var(--border-hi)">(hold Ctrl to multi-select)</span></label>
+                    <label><span data-i18n="stations">Stations</span> <span style="color:var(--border-hi)" data-i18n="stationsHint">(hold Ctrl to multi-select)</span></label>
                     <select name="station_ids[]" multiple>
                         <?php foreach ($stations as $station): ?>
                             <?php $stationId = (string) $station['id']; ?>
@@ -783,8 +876,8 @@ function formatPrice(mixed $value): string
             </form>
 
             <div class="sidebar-actions">
-                <button type="submit" form="" onclick="this.closest('aside').querySelector('form').submit()" class="btn-primary">Apply filters</button>
-                <a class="btn-reset" href="<?= h(strtok($_SERVER['REQUEST_URI'] ?? '/web/index.php', '?') ?: '/web/index.php') ?>">Reset</a>
+                <button type="submit" form="" onclick="this.closest('aside').querySelector('form').submit()" class="btn-primary" data-i18n="applyFilters">Apply filters</button>
+                <a class="btn-reset" href="<?= h(strtok($_SERVER['REQUEST_URI'] ?? '/web/index.php', '?') ?: '/web/index.php') ?>" data-i18n="reset">Reset</a>
             </div>
         </aside>
 
@@ -798,19 +891,19 @@ function formatPrice(mixed $value): string
             <!-- Stats -->
             <div class="stats">
                 <div class="stat">
-                    <div class="stat-label">Snapshots</div>
+                    <div class="stat-label" data-i18n="snapshots">Snapshots</div>
                     <div class="stat-value"><?= h((string) $summary['points']) ?></div>
                 </div>
                 <div class="stat">
-                    <div class="stat-label">Stations</div>
+                    <div class="stat-label" data-i18n="stationsCount">Stations</div>
                     <div class="stat-value"><?= h((string) $summary['stations']) ?></div>
                 </div>
                 <div class="stat">
-                    <div class="stat-label">First recorded</div>
+                    <div class="stat-label" data-i18n="firstRecorded">First recorded</div>
                     <div class="stat-value" style="font-size:1rem"><?= h($summary['first_recorded_at'] ? substr((string) $summary['first_recorded_at'], 0, 10) : '—') ?></div>
                 </div>
                 <div class="stat">
-                    <div class="stat-label">Last recorded</div>
+                    <div class="stat-label" data-i18n="lastRecorded">Last recorded</div>
                     <div class="stat-value" style="font-size:1rem"><?= h($summary['last_recorded_at'] ? substr((string) $summary['last_recorded_at'], 0, 10) : '—') ?></div>
                 </div>
             </div>
@@ -818,7 +911,7 @@ function formatPrice(mixed $value): string
             <!-- Chart -->
             <div class="chart-card">
                 <div class="chart-header">
-                    <span class="chart-title">Price timeline</span>
+                    <span class="chart-title" data-i18n="priceTimeline">Price timeline</span>
                     <div class="fuel-toggles">
                         <button type="button" class="fuel-toggle active" data-fuel="e5">E5</button>
                         <button type="button" class="fuel-toggle active" data-fuel="e10">E10</button>
@@ -831,24 +924,24 @@ function formatPrice(mixed $value): string
                     </div>
                     <div class="chart-legend" id="legend"></div>
                 <?php else: ?>
-                    <div class="chart-empty">No snapshots match the current filters.</div>
+                    <div class="chart-empty" data-i18n="noSnapshots">No snapshots match the current filters.</div>
                 <?php endif; ?>
             </div>
 
             <!-- Table -->
             <div class="table-card">
                 <div class="table-card-header">
-                    <span class="table-card-title">Raw snapshots</span>
+                    <span class="table-card-title" data-i18n="rawSnapshots">Raw snapshots</span>
                 </div>
                 <div class="table-wrap">
                     <table>
                         <thead>
                         <tr>
-                            <th>Recorded at</th>
-                            <th>Station</th>
-                            <th>City</th>
-                            <th>Open</th>
-                            <th>Dist</th>
+                            <th data-i18n="recordedAt">Recorded at</th>
+                            <th data-i18n="station">Station</th>
+                            <th data-i18n="cityCol">City</th>
+                            <th data-i18n="open">Open</th>
+                            <th data-i18n="dist">Dist</th>
                             <th>E5</th>
                             <th>E10</th>
                             <th>Diesel</th>
@@ -860,7 +953,7 @@ function formatPrice(mixed $value): string
                                 <td class="td-muted"><?= h((string) $row['recorded_at']) ?></td>
                                 <td><?= h((string) $row['station_name']) ?></td>
                                 <td class="td-muted"><?= h((string) $row['city_name']) ?></td>
-                                <td class="<?= !empty($row['is_open']) ? 'open-yes' : 'open-no' ?>"><?= !empty($row['is_open']) ? 'open' : 'closed' ?></td>
+                                <td class="<?= !empty($row['is_open']) ? 'open-yes' : 'open-no' ?>" data-i18n="<?= !empty($row['is_open']) ? 'openYes' : 'openNo' ?>"><?= !empty($row['is_open']) ? 'open' : 'closed' ?></td>
                                 <td class="td-muted"><?= h(number_format((float) $row['dist_km'], 2)) ?> km</td>
                                 <td class="price-e5"><?= h(formatPrice($row['e5'])) ?></td>
                                 <td class="price-e10"><?= h(formatPrice($row['e10'])) ?></td>
@@ -868,7 +961,7 @@ function formatPrice(mixed $value): string
                             </tr>
                         <?php endforeach; ?>
                         <?php if ($rows === []): ?>
-                            <tr><td colspan="8" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem">No data</td></tr>
+                            <tr><td colspan="8" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="noData">No data</td></tr>
                         <?php endif; ?>
                         </tbody>
                     </table>
@@ -948,15 +1041,22 @@ if (!chartEl) {
         const px = (v) => margin.left + ((v - minX) / (maxX - minX)) * iW;
         const py = (v) => margin.top + iH - ((v - minY) / (maxY - minY)) * iH;
 
+        const light = document.documentElement.getAttribute('data-theme') === 'light';
+        const chartBg    = light ? '#ffffff' : '#13151a';
+        const gridStroke = light ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.05)';
+        const tickStroke = light ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.04)';
+        const axisStroke = light ? 'rgba(0,0,0,0.15)' : 'rgba(255,255,255,0.12)';
+        const dotFill    = chartBg;
+
         // Background
-        mk('rect', { x: 0, y: 0, width: W, height: H, fill: '#13151a' });
+        mk('rect', { x: 0, y: 0, width: W, height: H, fill: chartBg });
 
         // Grid lines
         for (let i = 0; i <= 5; i++) {
             const val = minY + ((maxY - minY) / 5) * i;
             const yp = py(val);
             mk('line', { x1: margin.left, y1: yp, x2: W - margin.right, y2: yp,
-                stroke: 'rgba(255,255,255,0.05)', 'stroke-width': 1 });
+                stroke: gridStroke, 'stroke-width': 1 });
             mk('text', { x: margin.left - 10, y: yp + 4, 'text-anchor': 'end',
                 'font-size': 11, 'font-family': "'DM Mono', monospace", fill: '#6b7280' },
             ).textContent = val.toFixed(3);
@@ -969,7 +1069,7 @@ if (!chartEl) {
             const row = visibleRows[idx];
             const xp = px(Date.parse(row.recorded_at));
             mk('line', { x1: xp, y1: margin.top, x2: xp, y2: H - margin.bottom,
-                stroke: 'rgba(255,255,255,0.04)', 'stroke-width': 1 });
+                stroke: tickStroke, 'stroke-width': 1 });
             mk('text', { x: xp, y: H - 16, 'text-anchor': 'middle',
                 'font-size': 10, 'font-family': "'DM Mono', monospace", fill: '#6b7280' },
             ).textContent = row.recorded_at.slice(0, 10);
@@ -977,9 +1077,9 @@ if (!chartEl) {
 
         // Axes
         mk('line', { x1: margin.left, y1: H - margin.bottom, x2: W - margin.right, y2: H - margin.bottom,
-            stroke: 'rgba(255,255,255,0.12)', 'stroke-width': 1 });
+            stroke: axisStroke, 'stroke-width': 1 });
         mk('line', { x1: margin.left, y1: margin.top, x2: margin.left, y2: H - margin.bottom,
-            stroke: 'rgba(255,255,255,0.12)', 'stroke-width': 1 });
+            stroke: axisStroke, 'stroke-width': 1 });
 
         const stations = [...new Set(visibleRows.map((r) => r.station_id))];
         const stationColors = new Map(stations.map((id, i) => {
@@ -1019,7 +1119,7 @@ if (!chartEl) {
                     const xp = px(Date.parse(row.recorded_at));
                     const yp = py(row[fuel]);
                     const g = mk('g', { style: 'cursor:pointer' });
-                    mk('circle', { cx: xp, cy: yp, r: 5, fill: '#13151a', stroke: cfg.color, 'stroke-width': 1.5 }, g);
+                    mk('circle', { cx: xp, cy: yp, r: 5, fill: dotFill, stroke: cfg.color, 'stroke-width': 1.5 }, g);
                     const t = document.createElementNS(ns, 'title');
                     t.textContent = `${row.station_name} · ${cfg.label} ${row[fuel].toFixed(3)} € · ${row.recorded_at.slice(0, 16)}`;
                     g.appendChild(t);
@@ -1059,6 +1159,114 @@ if (!chartEl) {
 
     renderChart();
 }
+
+/* ── i18n ──────────────────────────────────────────────────────── */
+const translations = {
+    en: {
+        title: 'Price History',
+        filters: 'Filters',
+        city: 'City',
+        allCities: '— all cities —',
+        from: 'From',
+        to: 'To',
+        fuelType: 'Fuel type',
+        stations: 'Stations',
+        stationsHint: '(hold Ctrl to multi-select)',
+        applyFilters: 'Apply filters',
+        reset: 'Reset',
+        snapshots: 'Snapshots',
+        stationsCount: 'Stations',
+        firstRecorded: 'First recorded',
+        lastRecorded: 'Last recorded',
+        priceTimeline: 'Price timeline',
+        rawSnapshots: 'Raw snapshots',
+        recordedAt: 'Recorded at',
+        station: 'Station',
+        cityCol: 'City',
+        open: 'Open',
+        dist: 'Dist',
+        openYes: 'open',
+        openNo: 'closed',
+        noData: 'No data',
+        noSnapshots: 'No snapshots match the current filters.',
+    },
+    de: {
+        title: 'Preisverlauf',
+        filters: 'Filter',
+        city: 'Stadt',
+        allCities: '— alle Städte —',
+        from: 'Von',
+        to: 'Bis',
+        fuelType: 'Kraftstoffart',
+        stations: 'Tankstellen',
+        stationsHint: '(Strg für Mehrfachauswahl)',
+        applyFilters: 'Filter anwenden',
+        reset: 'Zurücksetzen',
+        snapshots: 'Einträge',
+        stationsCount: 'Tankstellen',
+        firstRecorded: 'Erste Aufzeichnung',
+        lastRecorded: 'Letzte Aufzeichnung',
+        priceTimeline: 'Preisverlauf',
+        rawSnapshots: 'Alle Einträge',
+        recordedAt: 'Aufgezeichnet um',
+        station: 'Tankstelle',
+        cityCol: 'Stadt',
+        open: 'Geöffnet',
+        dist: 'Entf.',
+        openYes: 'offen',
+        openNo: 'geschlossen',
+        noData: 'Keine Daten',
+        noSnapshots: 'Keine Einträge für die aktuellen Filter.',
+    },
+};
+
+let currentLang = (() => {
+    const stored = localStorage.getItem('lang');
+    if (stored && translations[stored]) return stored;
+    const browser = (navigator.language || 'en').slice(0, 2).toLowerCase();
+    return translations[browser] ? browser : 'en';
+})();
+
+function applyLang(lang) {
+    currentLang = lang;
+    localStorage.setItem('lang', lang);
+    const t = translations[lang];
+    document.querySelectorAll('[data-i18n]').forEach((el) => {
+        const key = el.dataset.i18n;
+        if (t[key] !== undefined) el.textContent = t[key];
+    });
+    document.querySelectorAll('.lang-btn').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.lang === lang);
+    });
+    if (chartEl) renderChart();
+}
+
+document.querySelectorAll('.lang-btn').forEach((btn) => {
+    btn.addEventListener('click', () => applyLang(btn.dataset.lang));
+});
+
+applyLang(currentLang);
+
+/* ── Theme toggle ──────────────────────────────────────────────── */
+const moonIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>';
+const sunIcon  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>';
+
+const themeToggle = document.getElementById('theme-toggle');
+
+function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('theme', theme);
+    themeToggle.innerHTML = theme === 'light' ? moonIcon : sunIcon;
+    if (chartEl) renderChart();
+}
+
+themeToggle.addEventListener('click', () => {
+    const current = document.documentElement.getAttribute('data-theme') || 'dark';
+    applyTheme(current === 'dark' ? 'light' : 'dark');
+});
+
+// Sync icon to current theme (set by head script)
+applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
 </script>
 </body>
 </html>
