@@ -44,6 +44,18 @@ Show historical prices for a station:
 go run . history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel
 ```
 
+## PHP Viewer
+
+There is also a small PHP viewer at `web/index.php` that reads `gasoline.db`, shows historical prices as a graph, and supports filtering by date range, city, fuel, and selected stations.
+
+Serve it locally from the repo root with PHP's built-in server:
+
+```bash
+php -S 127.0.0.1:8080 -t web
+```
+
+Then open `http://127.0.0.1:8080/`.
+
 Build release binaries for Linux `amd64`, `arm64`, and `armv7`:
 
 ```bash
