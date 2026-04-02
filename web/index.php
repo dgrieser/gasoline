@@ -1086,6 +1086,10 @@ function hideTooltip() { tooltip.style.display = 'none'; }
 
 document.addEventListener('touchend', hideTooltip);
 
+// Declared early so renderChart() (called below) can access it via _tz()/_loc().
+// Properly initialised later once `translations` is available.
+let currentLang = 'en';
+
 if (!chartEl) {
     // No chart in DOM (empty state)
 } else {
@@ -1342,7 +1346,7 @@ const translations = {
     },
 };
 
-let currentLang = (() => {
+currentLang = (() => {
     const stored = localStorage.getItem('lang');
     if (stored && translations[stored]) return stored;
     const browser = (navigator.language || 'en').slice(0, 2).toLowerCase();
