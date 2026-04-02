@@ -1,1 +1,45 @@
 # gasoline
+
+Small Go CLI that stores Tankerkönig gas station prices historically in SQLite.
+
+## Setup
+
+The CLI reads the Tankerkönig API key from the `TANKER_KOENIG_API_KEY` environment variable or from the local `.env` file.
+
+Install dependencies:
+
+```bash
+go mod tidy
+```
+
+## Commands
+
+Persist a new snapshot for a place:
+
+```bash
+go run . update --city "Berlin, Germany" --radius 5
+```
+
+List cached city geocodes:
+
+```bash
+go run . cities
+```
+
+List known stations and their latest stored prices:
+
+```bash
+go run . stations --city "Berlin, Germany"
+```
+
+Show historical prices for a station:
+
+```bash
+go run . history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel
+```
+
+## Notes
+
+- City geocoding is cached in SQLite, so Nominatim is only queried once per city unless you delete the cache row.
+- Each `update` appends new rows to `price_snapshots`, preserving full history for cron-based collection.
+- Default SQLite file is `gasoline.db`. Override it with `--db`.

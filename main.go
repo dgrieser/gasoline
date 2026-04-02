@@ -1,0 +1,698 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+const (
+	defaultDBPath     = "gasoline.db"
+	tankerKoenigBase  = "https://creativecommons.tankerkoenig.de/json"
+	nominatimBaseURL  = "https://nominatim.openstreetmap.org/search"
+	defaultUserAgent  = "gasoline-cli/1.0 (local utility)"
+	envAPIKeyName     = "TANKER_KOENIG_API_KEY"
+	sqliteBusyTimeout = 5000
+)
+
+type config struct {
+	APIKey    string
+	UserAgent string
+}
+
+type tankerListResponse struct {
+	OK       bool            `json:"ok"`
+	Message  string          `json:"message"`
+	Status   string          `json:"status"`
+	Stations []tankerStation `json:"stations"`
+}
+
+type tankerStation struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Brand       string   `json:"brand"`
+	Street      string   `json:"street"`
+	Place       string   `json:"place"`
+	Lat         float64  `json:"lat"`
+	Lng         float64  `json:"lng"`
+	Dist        float64  `json:"dist"`
+	Diesel      *float64 `json:"diesel"`
+	E5          *float64 `json:"e5"`
+	E10         *float64 `json:"e10"`
+	IsOpen      bool     `json:"isOpen"`
+	HouseNumber string   `json:"houseNumber"`
+	PostCode    int      `json:"postCode"`
+}
+
+type nominatimResult struct {
+	DisplayName string `json:"display_name"`
+	Lat         string `json:"lat"`
+	Lon         string `json:"lon"`
+}
+
+type cachedCity struct {
+	Name        string
+	DisplayName string
+	Lat         float64
+	Lng         float64
+}
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	if len(args) == 0 {
+		printUsage()
+		return nil
+	}
+
+	switch args[0] {
+	case "update":
+		return runUpdate(args[1:])
+	case "cities":
+		return runCities(args[1:])
+	case "stations":
+		return runStations(args[1:])
+	case "history":
+		return runHistory(args[1:])
+	case "help", "-h", "--help":
+		printUsage()
+		return nil
+	default:
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func printUsage() {
+	fmt.Println(`gasoline: persist Tankerkönig station prices into SQLite
+
+Commands:
+  update   geocode a city if needed, query Tankerkönig, store station snapshots
+  cities   list cached city geocodes
+  stations list known stations with latest stored snapshot
+  history  show historical prices for one station
+
+Examples:
+  go run . update --city "Berlin, Germany" --radius 5
+  go run . stations --city "Berlin, Germany"
+  go run . history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel`)
+}
+
+func runUpdate(args []string) error {
+	fs := flag.NewFlagSet("update", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	city := fs.String("city", "", "City or place to geocode and query")
+	radius := fs.Float64("radius", 5, "Search radius in km (max 25)")
+	fuelType := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
+	sortBy := fs.String("sort", "dist", "Sort order: dist or price")
+	userAgent := fs.String("user-agent", defaultUserAgent, "User-Agent for Nominatim and API calls")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*city) == "" {
+		return errors.New("update requires --city")
+	}
+	if *radius <= 0 || *radius > 25 {
+		return errors.New("--radius must be > 0 and <= 25")
+	}
+	if !isValidFuelType(*fuelType) {
+		return errors.New("--fuel must be one of: all, diesel, e5, e10")
+	}
+	if !isValidSort(*sortBy) {
+		return errors.New("--sort must be one of: dist, price")
+	}
+	if *fuelType == "all" {
+		*sortBy = "dist"
+	}
+
+	cfg, err := loadConfig(*userAgent)
+	if err != nil {
+		return err
+	}
+
+	db, err := openDB(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	location, cached, err := getOrCreateCity(ctx, db, strings.TrimSpace(*city), cfg.UserAgent)
+	if err != nil {
+		return err
+	}
+
+	stations, err := fetchStations(ctx, cfg, location.Lat, location.Lng, *radius, *fuelType, *sortBy)
+	if err != nil {
+		return err
+	}
+
+	recordedAt := time.Now().UTC()
+	if err := persistUpdate(ctx, db, location, stations, recordedAt); err != nil {
+		return err
+	}
+
+	cacheStatus := "resolved via geocoder"
+	if cached {
+		cacheStatus = "loaded from cache"
+	}
+
+	fmt.Printf("city: %s\n", location.Name)
+	fmt.Printf("display: %s\n", location.DisplayName)
+	fmt.Printf("coordinates: %.6f, %.6f (%s)\n", location.Lat, location.Lng, cacheStatus)
+	fmt.Printf("stored %d station snapshots at %s in %s\n", len(stations), recordedAt.Format(time.RFC3339), *dbPath)
+	return nil
+}
+
+func runCities(args []string) error {
+	fs := flag.NewFlagSet("cities", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	db, err := openDB(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT name, display_name, lat, lng, created_at
+		FROM cities
+		ORDER BY name ASC
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name, displayName, createdAt string
+		var lat, lng float64
+		if err := rows.Scan(&name, &displayName, &lat, &lng, &createdAt); err != nil {
+			return err
+		}
+		fmt.Printf("%s | %.6f, %.6f | cached_at=%s | %s\n", name, lat, lng, createdAt, displayName)
+	}
+	return rows.Err()
+}
+
+func runStations(args []string) error {
+	fs := flag.NewFlagSet("stations", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	city := fs.String("city", "", "Optional city filter from stored sync runs")
+	limit := fs.Int("limit", 50, "Max rows to print")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *limit <= 0 {
+		return errors.New("--limit must be > 0")
+	}
+
+	db, err := openDB(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	var (
+		rows *sql.Rows
+	)
+	if strings.TrimSpace(*city) == "" {
+		rows, err = db.QueryContext(ctx, `
+			SELECT
+				s.id, s.name, COALESCE(s.brand, ''), COALESCE(s.street, ''), COALESCE(s.place, ''),
+				ps.recorded_at, ps.dist_km, ps.is_open, ps.e5, ps.e10, ps.diesel
+			FROM stations s
+			JOIN (
+				SELECT station_id, MAX(recorded_at) AS latest_recorded_at
+				FROM price_snapshots
+				GROUP BY station_id
+			) latest ON latest.station_id = s.id
+			JOIN price_snapshots ps
+				ON ps.station_id = latest.station_id
+				AND ps.recorded_at = latest.latest_recorded_at
+			ORDER BY s.name ASC
+			LIMIT ?
+		`, *limit)
+	} else {
+		rows, err = db.QueryContext(ctx, `
+			SELECT
+				s.id, s.name, COALESCE(s.brand, ''), COALESCE(s.street, ''), COALESCE(s.place, ''),
+				ps.recorded_at, ps.dist_km, ps.is_open, ps.e5, ps.e10, ps.diesel
+			FROM stations s
+			JOIN (
+				SELECT station_id, MAX(recorded_at) AS latest_recorded_at
+				FROM price_snapshots
+				WHERE city_name = ?
+				GROUP BY station_id
+			) latest ON latest.station_id = s.id
+			JOIN price_snapshots ps
+				ON ps.station_id = latest.station_id
+				AND ps.recorded_at = latest.latest_recorded_at
+			ORDER BY s.name ASC
+			LIMIT ?
+		`, strings.TrimSpace(*city), *limit)
+	}
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			id, name, brand, street, place, recordedAt string
+			dist                                       float64
+			isOpen                                     bool
+			e5, e10, diesel                            sql.NullFloat64
+		)
+		if err := rows.Scan(&id, &name, &brand, &street, &place, &recordedAt, &dist, &isOpen, &e5, &e10, &diesel); err != nil {
+			return err
+		}
+		fmt.Printf("%s | %s | %s | %s %s | dist=%.2fkm | open=%t | e5=%s e10=%s diesel=%s | at=%s\n",
+			id,
+			name,
+			blankDash(brand),
+			strings.TrimSpace(street),
+			strings.TrimSpace(place),
+			dist,
+			isOpen,
+			formatNullFloat(e5),
+			formatNullFloat(e10),
+			formatNullFloat(diesel),
+			recordedAt,
+		)
+	}
+	return rows.Err()
+}
+
+func runHistory(args []string) error {
+	fs := flag.NewFlagSet("history", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	stationID := fs.String("station-id", "", "Station UUID")
+	fuel := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
+	limit := fs.Int("limit", 100, "Max history rows")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*stationID) == "" {
+		return errors.New("history requires --station-id")
+	}
+	if !isValidFuelType(*fuel) {
+		return errors.New("--fuel must be one of: all, diesel, e5, e10")
+	}
+	if *limit <= 0 {
+		return errors.New("--limit must be > 0")
+	}
+
+	db, err := openDB(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	query := `
+		SELECT city_name, recorded_at, dist_km, is_open, e5, e10, diesel
+		FROM price_snapshots
+		WHERE station_id = ?
+		ORDER BY recorded_at DESC
+		LIMIT ?
+	`
+	rows, err := db.QueryContext(ctx, query, strings.TrimSpace(*stationID), *limit)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cityName, recordedAt string
+			dist                 float64
+			isOpen               bool
+			e5, e10, diesel      sql.NullFloat64
+		)
+		if err := rows.Scan(&cityName, &recordedAt, &dist, &isOpen, &e5, &e10, &diesel); err != nil {
+			return err
+		}
+		switch *fuel {
+		case "e5":
+			fmt.Printf("%s | city=%s | dist=%.2fkm | open=%t | e5=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(e5))
+		case "e10":
+			fmt.Printf("%s | city=%s | dist=%.2fkm | open=%t | e10=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(e10))
+		case "diesel":
+			fmt.Printf("%s | city=%s | dist=%.2fkm | open=%t | diesel=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(diesel))
+		default:
+			fmt.Printf("%s | city=%s | dist=%.2fkm | open=%t | e5=%s e10=%s diesel=%s\n",
+				recordedAt, cityName, dist, isOpen, formatNullFloat(e5), formatNullFloat(e10), formatNullFloat(diesel))
+		}
+	}
+	return rows.Err()
+}
+
+func loadConfig(userAgent string) (config, error) {
+	apiKey := strings.TrimSpace(os.Getenv(envAPIKeyName))
+	if apiKey == "" {
+		values, err := loadDotEnv(".env")
+		if err != nil {
+			return config{}, err
+		}
+		apiKey = strings.TrimSpace(values[envAPIKeyName])
+	}
+	if apiKey == "" {
+		return config{}, fmt.Errorf("%s is not set in environment or .env", envAPIKeyName)
+	}
+	return config{
+		APIKey:    apiKey,
+		UserAgent: strings.TrimSpace(userAgent),
+	}, nil
+}
+
+func loadDotEnv(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	values := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		values[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), `"'`)
+	}
+	return values, nil
+}
+
+func openDB(path string) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
+		return nil, err
+	}
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)", path, sqliteBusyTimeout)
+	return sql.Open("sqlite", dsn)
+}
+
+func initSchema(ctx context.Context, db *sql.DB) error {
+	schema := `
+	CREATE TABLE IF NOT EXISTS cities (
+		name TEXT PRIMARY KEY,
+		display_name TEXT NOT NULL,
+		lat REAL NOT NULL,
+		lng REAL NOT NULL,
+		created_at TEXT NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS stations (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		brand TEXT,
+		street TEXT,
+		house_number TEXT,
+		post_code INTEGER,
+		place TEXT,
+		lat REAL NOT NULL,
+		lng REAL NOT NULL,
+		first_seen_at TEXT NOT NULL,
+		last_seen_at TEXT NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS price_snapshots (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		station_id TEXT NOT NULL,
+		city_name TEXT NOT NULL,
+		recorded_at TEXT NOT NULL,
+		dist_km REAL NOT NULL,
+		is_open INTEGER NOT NULL,
+		e5 REAL,
+		e10 REAL,
+		diesel REAL,
+		FOREIGN KEY (station_id) REFERENCES stations(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_price_snapshots_station_recorded
+		ON price_snapshots(station_id, recorded_at DESC);
+
+	CREATE INDEX IF NOT EXISTS idx_price_snapshots_city_recorded
+		ON price_snapshots(city_name, recorded_at DESC);
+	`
+	_, err := db.ExecContext(ctx, schema)
+	return err
+}
+
+func getOrCreateCity(ctx context.Context, db *sql.DB, cityName, userAgent string) (cachedCity, bool, error) {
+	var city cachedCity
+	row := db.QueryRowContext(ctx, `
+		SELECT name, display_name, lat, lng
+		FROM cities
+		WHERE name = ?
+	`, cityName)
+	if err := row.Scan(&city.Name, &city.DisplayName, &city.Lat, &city.Lng); err == nil {
+		return city, true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return cachedCity{}, false, err
+	}
+
+	geo, err := geocodeCity(ctx, cityName, userAgent)
+	if err != nil {
+		return cachedCity{}, false, err
+	}
+	city = cachedCity{
+		Name:        cityName,
+		DisplayName: geo.DisplayName,
+		Lat:         geo.Lat,
+		Lng:         geo.Lng,
+	}
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO cities (name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, city.Name, city.DisplayName, city.Lat, city.Lng, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return cachedCity{}, false, err
+	}
+	return city, false, nil
+}
+
+func geocodeCity(ctx context.Context, city string, userAgent string) (cachedCity, error) {
+	values := url.Values{}
+	values.Set("q", city)
+	values.Set("format", "json")
+	values.Set("limit", "1")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nominatimBaseURL+"?"+values.Encode(), nil)
+	if err != nil {
+		return cachedCity{}, err
+	}
+	req.Header.Set("User-Agent", blankOr(userAgent, defaultUserAgent))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return cachedCity{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return cachedCity{}, fmt.Errorf("nominatim request failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var results []nominatimResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return cachedCity{}, err
+	}
+	if len(results) == 0 {
+		return cachedCity{}, fmt.Errorf("no geocoding result for %q", city)
+	}
+
+	lat, err := strconv.ParseFloat(results[0].Lat, 64)
+	if err != nil {
+		return cachedCity{}, err
+	}
+	lng, err := strconv.ParseFloat(results[0].Lon, 64)
+	if err != nil {
+		return cachedCity{}, err
+	}
+
+	return cachedCity{
+		Name:        city,
+		DisplayName: results[0].DisplayName,
+		Lat:         lat,
+		Lng:         lng,
+	}, nil
+}
+
+func fetchStations(ctx context.Context, cfg config, lat, lng, radius float64, fuelType, sortBy string) ([]tankerStation, error) {
+	values := url.Values{}
+	values.Set("lat", strconv.FormatFloat(lat, 'f', 6, 64))
+	values.Set("lng", strconv.FormatFloat(lng, 'f', 6, 64))
+	values.Set("rad", strconv.FormatFloat(radius, 'f', 2, 64))
+	values.Set("type", fuelType)
+	values.Set("apikey", cfg.APIKey)
+	if fuelType != "all" {
+		values.Set("sort", sortBy)
+	} else {
+		values.Set("sort", "dist")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tankerKoenigBase+"/list.php?"+values.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", blankOr(cfg.UserAgent, defaultUserAgent))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("tankerkönig request failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var payload tankerListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if !payload.OK {
+		return nil, fmt.Errorf("tankerkönig API error: %s", blankOr(payload.Message, payload.Status))
+	}
+	return payload.Stations, nil
+}
+
+func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []tankerStation, recordedAt time.Time) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, station := range stations {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO stations (
+				id, name, brand, street, house_number, post_code, place, lat, lng, first_seen_at, last_seen_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				name = excluded.name,
+				brand = excluded.brand,
+				street = excluded.street,
+				house_number = excluded.house_number,
+				post_code = excluded.post_code,
+				place = excluded.place,
+				lat = excluded.lat,
+				lng = excluded.lng,
+				last_seen_at = excluded.last_seen_at
+		`, station.ID, station.Name, station.Brand, station.Street, station.HouseNumber, station.PostCode, station.Place, station.Lat, station.Lng, recordedAt.Format(time.RFC3339), recordedAt.Format(time.RFC3339)); err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO price_snapshots (
+				station_id, city_name, recorded_at, dist_km, is_open, e5, e10, diesel
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, station.ID, city.Name, recordedAt.Format(time.RFC3339), station.Dist, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel)); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO cities (name, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?)`,
+		city.Name, city.DisplayName, city.Lat, city.Lng, recordedAt.Format(time.RFC3339),
+	); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func nullableFloat(v *float64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func isValidFuelType(value string) bool {
+	switch value {
+	case "all", "diesel", "e5", "e10":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidSort(value string) bool {
+	switch value {
+	case "dist", "price":
+		return true
+	default:
+		return false
+	}
+}
+
+func blankOr(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func blankDash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value
+}
+
+func formatNullFloat(v sql.NullFloat64) string {
+	if !v.Valid {
+		return "-"
+	}
+	return fmt.Sprintf("%.3f", v.Float64)
+}
