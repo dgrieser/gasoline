@@ -172,10 +172,6 @@ function stationLabel(array $station): string
 {
     $parts = [trim($station['name'])];
 
-    if (($station['brand'] ?? '') !== '' && $station['brand'] !== 'Unknown brand') {
-        $parts[] = trim($station['brand']);
-    }
-
     $street = trim(implode(' ', array_filter([
         $station['street'] ?? '',
         $station['house_number'] ?? '',
@@ -831,7 +827,7 @@ function formatPrice(mixed $value): string
             <form method="get">
                 <div class="field">
                     <label for="f-city" data-i18n="city">City</label>
-                    <select name="city" id="f-city">
+                    <select name="city" id="f-city" onchange="this.form.submit()">
                         <option value="" data-i18n="allCities">— all cities —</option>
                         <?php foreach ($cities as $city): ?>
                             <option value="<?= h((string) $city) ?>" <?= $selectedCity === $city ? 'selected' : '' ?>>
@@ -843,20 +839,24 @@ function formatPrice(mixed $value): string
 
                 <div class="field">
                     <label for="f-from" data-i18n="from">From</label>
-                    <input type="date" name="from" id="f-from" value="<?= h($fromDate) ?>">
+                    <input type="date" name="from" id="f-from" value="<?= h($fromDate) ?>" onchange="this.form.submit()">
                 </div>
 
                 <div class="field">
                     <label for="f-to" data-i18n="to">To</label>
-                    <input type="date" name="to" id="f-to" value="<?= h($toDate) ?>">
+                    <input type="date" name="to" id="f-to" value="<?= h($toDate) ?>" onchange="this.form.submit()">
                 </div>
 
+                <?php
+                $fuelI18nKeys = ['all' => 'fuelAll', 'diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10'];
+                $fuelLabels   = ['all' => 'All', 'diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10'];
+                ?>
                 <div class="field">
                     <label for="f-fuel" data-i18n="fuelType">Fuel type</label>
-                    <select name="fuel" id="f-fuel">
+                    <select name="fuel" id="f-fuel" onchange="this.form.submit()">
                         <?php foreach ($validFuels as $fuel): ?>
-                            <option value="<?= h($fuel) ?>" <?= $selectedFuel === $fuel ? 'selected' : '' ?>>
-                                <?= h(strtoupper($fuel)) ?>
+                            <option value="<?= h($fuel) ?>" data-i18n="<?= h($fuelI18nKeys[$fuel]) ?>" <?= $selectedFuel === $fuel ? 'selected' : '' ?>>
+                                <?= h($fuelLabels[$fuel]) ?>
                             </option>
                         <?php endforeach; ?>
                     </select>
@@ -864,7 +864,7 @@ function formatPrice(mixed $value): string
 
                 <div class="field">
                     <label><span data-i18n="stations">Stations</span> <span style="color:var(--border-hi)" data-i18n="stationsHint">(hold Ctrl to multi-select)</span></label>
-                    <select name="station_ids[]" multiple>
+                    <select name="station_ids[]" multiple onchange="this.form.submit()">
                         <?php foreach ($stations as $station): ?>
                             <?php $stationId = (string) $station['id']; ?>
                             <option value="<?= h($stationId) ?>" <?= in_array($stationId, $selectedStationIds, true) ? 'selected' : '' ?>>
@@ -876,7 +876,6 @@ function formatPrice(mixed $value): string
             </form>
 
             <div class="sidebar-actions">
-                <button type="submit" form="" onclick="this.closest('aside').querySelector('form').submit()" class="btn-primary" data-i18n="applyFilters">Apply filters</button>
                 <a class="btn-reset" href="<?= h(strtok($_SERVER['REQUEST_URI'] ?? '/web/index.php', '?') ?: '/web/index.php') ?>" data-i18n="reset">Reset</a>
             </div>
         </aside>
@@ -939,6 +938,9 @@ function formatPrice(mixed $value): string
                         <tr>
                             <th data-i18n="recordedAt">Recorded at</th>
                             <th data-i18n="station">Station</th>
+                            <th data-i18n="brand">Brand</th>
+                            <th data-i18n="street">Street</th>
+                            <th data-i18n="place">Place</th>
                             <th data-i18n="cityCol">City</th>
                             <th data-i18n="open">Open</th>
                             <th data-i18n="dist">Dist</th>
@@ -949,9 +951,18 @@ function formatPrice(mixed $value): string
                         </thead>
                         <tbody>
                         <?php foreach (array_reverse($rows) as $row): ?>
+                            <?php
+                            $streetFull = trim(implode(' ', array_filter([
+                                (string) $row['street'],
+                                (string) $row['house_number'],
+                            ])));
+                            ?>
                             <tr>
                                 <td class="td-muted"><?= h((string) $row['recorded_at']) ?></td>
                                 <td><?= h((string) $row['station_name']) ?></td>
+                                <td class="td-muted"><?= h((string) $row['brand']) ?></td>
+                                <td class="td-muted"><?= h($streetFull) ?></td>
+                                <td class="td-muted"><?= h((string) $row['place']) ?></td>
                                 <td class="td-muted"><?= h((string) $row['city_name']) ?></td>
                                 <td class="<?= !empty($row['is_open']) ? 'open-yes' : 'open-no' ?>" data-i18n="<?= !empty($row['is_open']) ? 'openYes' : 'openNo' ?>"><?= !empty($row['is_open']) ? 'open' : 'closed' ?></td>
                                 <td class="td-muted"><?= h(number_format((float) $row['dist_km'], 2)) ?> km</td>
@@ -961,7 +972,7 @@ function formatPrice(mixed $value): string
                             </tr>
                         <?php endforeach; ?>
                         <?php if ($rows === []): ?>
-                            <tr><td colspan="8" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="noData">No data</td></tr>
+                            <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="noData">No data</td></tr>
                         <?php endif; ?>
                         </tbody>
                     </table>
@@ -1170,9 +1181,12 @@ const translations = {
         from: 'From',
         to: 'To',
         fuelType: 'Fuel type',
+        fuelAll: 'All',
+        fuelDiesel: 'Diesel',
+        fuelE5: 'E5',
+        fuelE10: 'E10',
         stations: 'Stations',
         stationsHint: '(hold Ctrl to multi-select)',
-        applyFilters: 'Apply filters',
         reset: 'Reset',
         snapshots: 'Snapshots',
         stationsCount: 'Stations',
@@ -1182,6 +1196,9 @@ const translations = {
         rawSnapshots: 'Raw snapshots',
         recordedAt: 'Recorded at',
         station: 'Station',
+        brand: 'Brand',
+        street: 'Street',
+        place: 'Place',
         cityCol: 'City',
         open: 'Open',
         dist: 'Dist',
@@ -1198,9 +1215,12 @@ const translations = {
         from: 'Von',
         to: 'Bis',
         fuelType: 'Kraftstoffart',
+        fuelAll: 'Alle',
+        fuelDiesel: 'Diesel',
+        fuelE5: 'E5',
+        fuelE10: 'E10',
         stations: 'Tankstellen',
         stationsHint: '(Strg für Mehrfachauswahl)',
-        applyFilters: 'Filter anwenden',
         reset: 'Zurücksetzen',
         snapshots: 'Einträge',
         stationsCount: 'Tankstellen',
@@ -1210,6 +1230,9 @@ const translations = {
         rawSnapshots: 'Alle Einträge',
         recordedAt: 'Aufgezeichnet um',
         station: 'Tankstelle',
+        brand: 'Marke',
+        street: 'Straße',
+        place: 'Ort',
         cityCol: 'Stadt',
         open: 'Geöffnet',
         dist: 'Entf.',
