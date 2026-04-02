@@ -153,6 +153,8 @@ $chartRows = array_map(static function (array $row): array {
         'station_id' => $row['station_id'],
         'station_name' => $row['station_name'],
         'brand' => $row['brand'],
+        'street' => trim(implode(' ', array_filter([(string) $row['street'], (string) $row['house_number']]))),
+        'place' => trim((string) $row['place']),
         'city_name' => $row['city_name'],
         'recorded_at' => $row['recorded_at'],
         'dist_km' => (float) $row['dist_km'],
@@ -1473,11 +1475,12 @@ function renderCheapest() {
         let best = null;
         for (const row of latestRows) {
             if (row[fuel] !== null && (best === null || row[fuel] < best.price)) {
-                best = { price: row[fuel], station: row.station_name, recorded_at: row.recorded_at };
+                best = { price: row[fuel], station: row.station_name, street: row.street, place: row.place, recorded_at: row.recorded_at };
             }
         }
         if (best) cheapest.push({ fuel, ...best });
     }
+
 
     const colClass = cheapest.length === 1 ? 'single' : cheapest.length === 2 ? 'two-col' : '';
 
@@ -1489,14 +1492,17 @@ function renderCheapest() {
         (cheapest.length === 0
             ? `<div class="cheapest-empty">${t.cheapestNoData}</div>`
             : `<div class="cheapest-grid${colClass ? ' ' + colClass : ''}">` +
-                cheapest.map(({ fuel, price, station, recorded_at }) =>
-                    `<div class="cheapest-cell">` +
+                cheapest.map(({ fuel, price, station, street, place, recorded_at }) => {
+                    const addressParts = [street, place].filter(Boolean);
+                    const address = addressParts.length ? addressParts.join(', ') : '';
+                    return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
                         `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
                         `<div class="cheapest-station">${station}</div>` +
+                        (address ? `<div class="cheapest-station" style="opacity:0.6">${address}</div>` : '') +
                         `<div class="cheapest-time">${formatDateTime(recorded_at)}</div>` +
-                    `</div>`
-                ).join('') +
+                    `</div>`;
+                }).join('') +
               `</div>`
         );
 }
