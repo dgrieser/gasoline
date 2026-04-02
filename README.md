@@ -12,6 +12,12 @@ Install dependencies:
 go mod tidy
 ```
 
+Run tests:
+
+```bash
+make test
+```
+
 ## Commands
 
 Persist a new snapshot for a place:
@@ -37,6 +43,14 @@ Show historical prices for a station:
 ```bash
 go run . history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel
 ```
+
+Build release binaries for Linux `amd64`, `arm64`, and `armv7`:
+
+```bash
+make release
+```
+
+Push a version tag like `v1.2.3` to trigger a GitHub Release named after the tag, with auto-generated release notes and those binaries attached.
 
 ## Notes
 

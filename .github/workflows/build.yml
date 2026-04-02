@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            artifact: gasoline-linux-amd64
+          - arch: arm64
+            artifact: gasoline-linux-arm64
+          - arch: arm
+            goarm: "7"
+            artifact: gasoline-linux-armv7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: make test
+
+      - name: Build Linux binary
+        run: GOOS=linux GOARCH=${{ matrix.arch }} GOARM=${{ matrix.goarm }} go build -o dist/${{ matrix.artifact }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}

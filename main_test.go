@@ -1,0 +1,242 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestLoadDotEnv(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	content := strings.Join([]string{
+		`# comment`,
+		`TANKER_KOENIG_API_KEY="test-key"`,
+		`USER_AGENT='gasoline-test/1.0'`,
+		`EMPTY=`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write env: %v", err)
+	}
+
+	values, err := loadDotEnv(path)
+	if err != nil {
+		t.Fatalf("loadDotEnv: %v", err)
+	}
+
+	if got := values[envAPIKeyName]; got != "test-key" {
+		t.Fatalf("api key = %q, want %q", got, "test-key")
+	}
+	if got := values["USER_AGENT"]; got != "gasoline-test/1.0" {
+		t.Fatalf("user agent = %q, want %q", got, "gasoline-test/1.0")
+	}
+	if got := values["EMPTY"]; got != "" {
+		t.Fatalf("empty = %q, want empty string", got)
+	}
+}
+
+func TestValidationHelpers(t *testing.T) {
+	t.Parallel()
+
+	validFuels := []string{"all", "diesel", "e5", "e10"}
+	for _, fuel := range validFuels {
+		if !isValidFuelType(fuel) {
+			t.Fatalf("expected valid fuel type %q", fuel)
+		}
+	}
+	if isValidFuelType("premium") {
+		t.Fatal("unexpected valid fuel type")
+	}
+
+	validSorts := []string{"dist", "price"}
+	for _, sort := range validSorts {
+		if !isValidSort(sort) {
+			t.Fatalf("expected valid sort %q", sort)
+		}
+	}
+	if isValidSort("name") {
+		t.Fatal("unexpected valid sort")
+	}
+}
+
+func TestPersistUpdateAndQueryHistory(t *testing.T) {
+	t.Parallel()
+
+	db := openTestDB(t)
+	ctx := context.Background()
+	recordedAt := time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC)
+
+	priceE5 := 1.789
+	priceE10 := 1.729
+	priceDiesel := 1.659
+
+	city := cachedCity{
+		Name:        "Berlin, Germany",
+		DisplayName: "Berlin, Deutschland",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	}
+	stations := []tankerStation{
+		{
+			ID:          "station-1",
+			Name:        "Test Station",
+			Brand:       "ARAL",
+			Street:      "Test Street",
+			Place:       "Berlin",
+			Lat:         52.5,
+			Lng:         13.4,
+			Dist:        1.25,
+			Diesel:      &priceDiesel,
+			E5:          &priceE5,
+			E10:         &priceE10,
+			IsOpen:      true,
+			HouseNumber: "1",
+			PostCode:    10115,
+		},
+	}
+
+	if err := persistUpdate(ctx, db, city, stations, recordedAt); err != nil {
+		t.Fatalf("persistUpdate: %v", err)
+	}
+
+	var stationCount, snapshotCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM stations`).Scan(&stationCount); err != nil {
+		t.Fatalf("count stations: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM price_snapshots`).Scan(&snapshotCount); err != nil {
+		t.Fatalf("count snapshots: %v", err)
+	}
+	if stationCount != 1 {
+		t.Fatalf("station count = %d, want 1", stationCount)
+	}
+	if snapshotCount != 1 {
+		t.Fatalf("snapshot count = %d, want 1", snapshotCount)
+	}
+
+	var (
+		name       string
+		lastSeenAt string
+		cityName   string
+		dist       float64
+		isOpen     bool
+		diesel     sql.NullFloat64
+	)
+	if err := db.QueryRowContext(ctx, `
+		SELECT s.name, s.last_seen_at, ps.city_name, ps.dist_km, ps.is_open, ps.diesel
+		FROM stations s
+		JOIN price_snapshots ps ON ps.station_id = s.id
+		WHERE s.id = ?
+	`, "station-1").Scan(&name, &lastSeenAt, &cityName, &dist, &isOpen, &diesel); err != nil {
+		t.Fatalf("query stored rows: %v", err)
+	}
+
+	if name != "Test Station" {
+		t.Fatalf("name = %q, want %q", name, "Test Station")
+	}
+	if lastSeenAt != recordedAt.Format(time.RFC3339) {
+		t.Fatalf("lastSeenAt = %q, want %q", lastSeenAt, recordedAt.Format(time.RFC3339))
+	}
+	if cityName != city.Name {
+		t.Fatalf("cityName = %q, want %q", cityName, city.Name)
+	}
+	if dist != 1.25 {
+		t.Fatalf("dist = %v, want 1.25", dist)
+	}
+	if !isOpen {
+		t.Fatal("expected station to be open")
+	}
+	if !diesel.Valid || diesel.Float64 != priceDiesel {
+		t.Fatalf("diesel = %+v, want %v", diesel, priceDiesel)
+	}
+}
+
+func TestGetOrCreateCityUsesCache(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	var requests atomic.Int32
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		body := `[{"display_name":"Berlin, Deutschland","lat":"52.517389","lon":"13.395131"}]`
+		return jsonResponse(http.StatusOK, body), nil
+	})
+	defer restore()
+
+	city, cached, err := getOrCreateCity(ctx, db, "Berlin, Germany", "gasoline-test/1.0")
+	if err != nil {
+		t.Fatalf("first getOrCreateCity: %v", err)
+	}
+	if cached {
+		t.Fatal("first lookup should not come from cache")
+	}
+	if city.DisplayName != "Berlin, Deutschland" {
+		t.Fatalf("display name = %q", city.DisplayName)
+	}
+
+	city, cached, err = getOrCreateCity(ctx, db, "Berlin, Germany", "gasoline-test/1.0")
+	if err != nil {
+		t.Fatalf("second getOrCreateCity: %v", err)
+	}
+	if !cached {
+		t.Fatal("second lookup should come from cache")
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("geocoder requests = %d, want 1", got)
+	}
+}
+
+func openTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := initSchema(context.Background(), db); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	return db
+}
+
+func stubDefaultTransport(t *testing.T, fn func(*http.Request) (*http.Response, error)) func() {
+	t.Helper()
+
+	original := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(fn)
+	http.DefaultClient.Transport = http.DefaultTransport
+
+	return func() {
+		http.DefaultTransport = original
+		http.DefaultClient.Transport = original
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func jsonResponse(statusCode int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: statusCode,
+		Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
