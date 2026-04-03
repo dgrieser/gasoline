@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -297,6 +298,34 @@ func TestResolveOutputModeRejectsConflictingFlags(t *testing.T) {
 	err := run([]string{"cities", "--db", filepath.Join(t.TempDir(), "test.db"), "--output", "txt", "-o", "json"})
 	if err == nil || !strings.Contains(err.Error(), "--output and -o must match") {
 		t.Fatalf("err = %v, want conflicting output flag error", err)
+	}
+}
+
+func TestResolveDBPathUsesEnvVarWhenFlagUnset(t *testing.T) {
+	t.Setenv(envDBPathName, "/tmp/from-env.db")
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	if got := resolveDBPath(fs, *dbPath); got != "/tmp/from-env.db" {
+		t.Fatalf("resolveDBPath = %q, want %q", got, "/tmp/from-env.db")
+	}
+}
+
+func TestResolveDBPathPrefersFlagOverEnvVar(t *testing.T) {
+	t.Setenv(envDBPathName, "/tmp/from-env.db")
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	if err := fs.Parse([]string{"--db", "/tmp/from-flag.db"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+
+	if got := resolveDBPath(fs, *dbPath); got != "/tmp/from-flag.db" {
+		t.Fatalf("resolveDBPath = %q, want %q", got, "/tmp/from-flag.db")
 	}
 }
 

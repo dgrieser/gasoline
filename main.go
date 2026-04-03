@@ -25,6 +25,7 @@ const (
 	nominatimBaseURL  = "https://nominatim.openstreetmap.org/search"
 	defaultUserAgent  = "gasoline-cli/1.0 (local utility)"
 	envAPIKeyName     = "TANKER_KOENIG_API_KEY"
+	envDBPathName     = "GASOLINE_DB_PATH"
 	sqliteBusyTimeout = 5000
 )
 
@@ -176,6 +177,7 @@ func runUpdate(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
@@ -201,7 +203,7 @@ func runUpdate(args []string) error {
 		return err
 	}
 
-	db, err := openDB(*dbPath)
+	db, err := openDB(resolvedDBPath)
 	if err != nil {
 		return err
 	}
@@ -238,14 +240,14 @@ func runUpdate(args []string) error {
 			CacheStatus: cacheStatus,
 			StoredCount: len(stations),
 			RecordedAt:  recordedAt.Format(time.RFC3339),
-			DBPath:      *dbPath,
+			DBPath:      resolvedDBPath,
 		})
 	}
 
 	fmt.Fprintf(stdout, "city: %s\n", location.Name)
 	fmt.Fprintf(stdout, "display: %s\n", location.DisplayName)
 	fmt.Fprintf(stdout, "coordinates: %.6f, %.6f (%s)\n", location.Lat, location.Lng, cacheStatus)
-	fmt.Fprintf(stdout, "stored %d station snapshots at %s in %s\n", len(stations), recordedAt.Format(time.RFC3339), *dbPath)
+	fmt.Fprintf(stdout, "stored %d station snapshots at %s in %s\n", len(stations), recordedAt.Format(time.RFC3339), resolvedDBPath)
 	return nil
 }
 
@@ -256,12 +258,13 @@ func runCities(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
 	}
 
-	db, err := openDB(*dbPath)
+	db, err := openDB(resolvedDBPath)
 	if err != nil {
 		return err
 	}
@@ -319,6 +322,7 @@ func runStations(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
@@ -327,7 +331,7 @@ func runStations(args []string) error {
 		return errors.New("--limit must be > 0")
 	}
 
-	db, err := openDB(*dbPath)
+	db, err := openDB(resolvedDBPath)
 	if err != nil {
 		return err
 	}
@@ -442,6 +446,7 @@ func runHistory(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
@@ -456,7 +461,7 @@ func runHistory(args []string) error {
 		return errors.New("--limit must be > 0")
 	}
 
-	db, err := openDB(*dbPath)
+	db, err := openDB(resolvedDBPath)
 	if err != nil {
 		return err
 	}
@@ -613,6 +618,26 @@ func openDB(path string) (*sql.DB, error) {
 	}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)", path, sqliteBusyTimeout)
 	return sql.Open("sqlite", dsn)
+}
+
+func resolveDBPath(fs *flag.FlagSet, flagValue string) string {
+	if flagWasSet(fs, "db") {
+		return flagValue
+	}
+	if envValue := strings.TrimSpace(os.Getenv(envDBPathName)); envValue != "" {
+		return envValue
+	}
+	return flagValue
+}
+
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	var found bool
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func initSchema(ctx context.Context, db *sql.DB) error {

@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
-$dbPath = realpath(__DIR__ . '/../gasoline.db') ?: (__DIR__ . '/../gasoline.db');
+$envDBPath = trim((string) getenv('GASOLINE_DB_PATH'));
+$defaultDBPath = realpath(__DIR__ . '/../gasoline.db') ?: (__DIR__ . '/../gasoline.db');
+$dbPath = $envDBPath !== '' ? $envDBPath : $defaultDBPath;
 $errors = [];
 $stations = [];
 $rows = [];
