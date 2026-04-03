@@ -205,7 +205,7 @@ function stationLabel(array $station): string
     return $suffix !== '' ? "{$name}, {$suffix}" : $name;
 }
 
-function formatPrice(mixed $value): string
+function formatPrice($value): string
 {
     if ($value === null || $value === '') {
         return '-';
