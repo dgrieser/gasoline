@@ -1137,6 +1137,30 @@ function formatTickTime(isoString) {
     });
 }
 
+/* ── Station colour helpers ────────────────────────────────────── */
+// DJB2-style hash → hue 0-359, stable per station name
+function nameToHue(name) {
+    let h = 5381;
+    for (let i = 0; i < name.length; i++) {
+        h = ((h << 5) + h) ^ name.charCodeAt(i);
+        h = h >>> 0;
+    }
+    return h % 360;
+}
+
+// Three tints of the station hue, one per fuel type
+const FUEL_TINTS = {
+    e5:     { s: 82, l: 70 },   // bright
+    e10:    { s: 68, l: 55 },   // mid
+    diesel: { s: 52, l: 42 },   // deep
+};
+
+function stationFuelColor(stationName, fuel) {
+    const hue = nameToHue(stationName);
+    const { s, l } = FUEL_TINTS[fuel];
+    return `hsl(${hue},${s}%,${l}%)`;
+}
+
 const chartData = <?= json_encode($chartRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
 const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
 
@@ -1167,8 +1191,9 @@ function positionTooltip(e) {
 }
 
 function showTooltip(e, row, fuel, cfg) {
+    const color = stationFuelColor(row.station_name, fuel);
     tooltip.innerHTML =
-        `<div class="tt-price" style="color:${cfg.color}">${cfg.label} &nbsp;${row[fuel].toFixed(3)} €</div>` +
+        `<div class="tt-price" style="color:${color}">${cfg.label} &nbsp;${row[fuel].toFixed(3)} €</div>` +
         `<div class="tt-meta">${row.station_name}</div>` +
         `<div class="tt-meta">${formatDateTime(row.recorded_at)}</div>`;
     tooltip.style.display = 'block';
@@ -1288,28 +1313,23 @@ if (!chartEl) {
             stroke: axisStroke, 'stroke-width': 1 });
 
         const stations = [...new Set(visibleRows.map((r) => r.station_id))];
-        const stationColors = new Map(stations.map((id, i) => {
-            const hue = (i * 97 + 30) % 360;
-            return [id, `hsl(${hue} 70% 62%)`];
-        }));
 
-        // Line only — no area fill
+        // Line only — per-station colour, per-fuel tint
         for (const fuel of activeFuels) {
-            const cfg = fuelConfig[fuel];
-
             for (const stationId of stations) {
                 const series = visibleRows.filter((r) => r.station_id === stationId && r[fuel] !== null);
                 if (series.length < 2) continue;
 
+                const color = stationFuelColor(series[0].station_name, fuel);
                 const pts = series.map((r) => [px(Date.parse(r.recorded_at)), py(r[fuel])]);
                 const linePath = pts.map(([x, y], j) => `${j === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
 
-                mk('path', { d: linePath, fill: 'none', stroke: cfg.color,
+                mk('path', { d: linePath, fill: 'none', stroke: color,
                     'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round', opacity: 0.9 });
             }
         }
 
-        // Dots on top — with hover/tap tooltip
+        // Dots on top — per-station colour, per-fuel tint
         for (const fuel of activeFuels) {
             const cfg = fuelConfig[fuel];
             for (const stationId of stations) {
@@ -1317,11 +1337,11 @@ if (!chartEl) {
                 for (const row of series) {
                     const xp = px(Date.parse(row.recorded_at));
                     const yp = py(row[fuel]);
+                    const color = stationFuelColor(row.station_name, fuel);
                     const g = mk('g', { style: 'cursor:pointer' });
                     // Larger invisible hit area for easier touch
                     mk('circle', { cx: xp, cy: yp, r: 12, fill: 'transparent' }, g);
-                    mk('circle', { cx: xp, cy: yp, r: 4.5, fill: dotFill, stroke: cfg.color, 'stroke-width': 1.5 }, g);
-                    // Closure-safe capture of row/fuel/cfg
+                    mk('circle', { cx: xp, cy: yp, r: 4.5, fill: dotFill, stroke: color, 'stroke-width': 1.5 }, g);
                     const _row = row, _cfg = cfg, _fuel = fuel;
                     g.addEventListener('mouseenter', (e) => showTooltip(e, _row, _fuel, _cfg));
                     g.addEventListener('mousemove',  positionTooltip);
@@ -1335,19 +1355,17 @@ if (!chartEl) {
             }
         }
 
-        // Legend
-        for (const fuel of activeFuels) {
-            const cfg = fuelConfig[fuel];
-            const item = document.createElement('div');
-            item.className = 'legend-item';
-            item.innerHTML = `<span class="legend-dot" style="background:${cfg.color}"></span>${cfg.label}`;
-            legendEl.appendChild(item);
-        }
+        // Legend — one entry per station; dots show each active fuel tint
         for (const stationId of stations) {
             const sample = visibleRows.find((r) => r.station_id === stationId);
             const item = document.createElement('div');
             item.className = 'legend-item';
-            item.innerHTML = `<span class="legend-dot" style="background:${stationColors.get(stationId)}"></span>${sample.station_name}`;
+            const swatches = [...activeFuels].map((fuel) => {
+                const color = stationFuelColor(sample.station_name, fuel);
+                const label = fuelConfig[fuel].label;
+                return `<span class="legend-dot" title="${label}" style="background:${color}"></span>`;
+            }).join('');
+            item.innerHTML = `${swatches}${sample.station_name}`;
             legendEl.appendChild(item);
         }
     }
