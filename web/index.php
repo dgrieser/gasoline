@@ -922,7 +922,7 @@ function formatPrice(mixed $value): string
                 </svg>
             </div>
             <div>
-                <h1>Gasoline <em>/</em> <span data-i18n="title">Price History</span></h1>
+                <h1>Gas<em>o</em>line</h1>
             </div>
         </div>
         <div class="header-controls">
@@ -1200,7 +1200,11 @@ function showTooltip(e, row, fuel, cfg) {
     positionTooltip(e);
 }
 
-function hideTooltip() { tooltip.style.display = 'none'; }
+let _activeDot = null;
+function hideTooltip() {
+    tooltip.style.display = 'none';
+    if (_activeDot) { _activeDot.setAttribute('opacity', 0); _activeDot = null; }
+}
 
 document.addEventListener('touchend', hideTooltip);
 
@@ -1339,15 +1343,24 @@ if (!chartEl) {
                     const yp = py(row[fuel]);
                     const color = stationFuelColor(row.station_name, fuel);
                     const g = mk('g', { style: 'cursor:pointer' });
-                    // Larger invisible hit area for easier touch
+                    // Hit area (invisible, generous for touch)
                     mk('circle', { cx: xp, cy: yp, r: 12, fill: 'transparent' }, g);
-                    mk('circle', { cx: xp, cy: yp, r: 4.5, fill: dotFill, stroke: color, 'stroke-width': 1.5 }, g);
+                    // Visible dot — hidden until hover/tap
+                    const dot = mk('circle', { cx: xp, cy: yp, r: 4.5, fill: dotFill, stroke: color, 'stroke-width': 1.5, opacity: 0 }, g);
                     const _row = row, _cfg = cfg, _fuel = fuel;
-                    g.addEventListener('mouseenter', (e) => showTooltip(e, _row, _fuel, _cfg));
+                    g.addEventListener('mouseenter', (e) => {
+                        if (_activeDot) _activeDot.setAttribute('opacity', 0);
+                        _activeDot = dot;
+                        dot.setAttribute('opacity', 1);
+                        showTooltip(e, _row, _fuel, _cfg);
+                    });
                     g.addEventListener('mousemove',  positionTooltip);
                     g.addEventListener('mouseleave', hideTooltip);
                     g.addEventListener('touchstart', (e) => {
                         e.preventDefault();
+                        if (_activeDot) _activeDot.setAttribute('opacity', 0);
+                        _activeDot = dot;
+                        dot.setAttribute('opacity', 1);
                         showTooltip(e.touches[0], _row, _fuel, _cfg);
                     }, { passive: false });
                     chartEl.appendChild(g);
