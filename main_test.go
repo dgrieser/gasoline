@@ -49,6 +49,32 @@ func TestLoadDotEnv(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAllowsMissingDotEnv(t *testing.T) {
+	t.Parallel()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("chdir temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(wd); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	})
+
+	_, err = loadConfig("gasoline-test/1.0")
+	if err == nil {
+		t.Fatal("expected missing API key error")
+	}
+	if !strings.Contains(err.Error(), "not set in environment or .env") {
+		t.Fatalf("err = %v, want missing api key error", err)
+	}
+}
+
 func TestValidationHelpers(t *testing.T) {
 	t.Parallel()
 

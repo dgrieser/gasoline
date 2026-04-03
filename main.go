@@ -578,7 +578,7 @@ func loadConfig(userAgent string) (config, error) {
 	apiKey := strings.TrimSpace(os.Getenv(envAPIKeyName))
 	if apiKey == "" {
 		values, err := loadDotEnv(".env")
-		if err != nil {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return config{}, err
 		}
 		apiKey = strings.TrimSpace(values[envAPIKeyName])
