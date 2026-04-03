@@ -51,19 +51,36 @@ if ($errors === []) {
                 TRIM(COALESCE(s.street, '')) AS street,
                 TRIM(COALESCE(s.house_number, '')) AS house_number,
                 TRIM(COALESCE(s.place, '')) AS place,
-                s.last_seen_at
+                s.last_seen_at,
+                (
+                    SELECT ps.dist_km
+                    FROM price_snapshots ps
+                    WHERE ps.station_id = s.id
+                    ORDER BY ps.recorded_at DESC
+                    LIMIT 1
+                ) AS dist_km
             FROM stations s
-            ORDER BY s.name ASC, s.id ASC
+            ORDER BY dist_km ASC, s.name ASC, s.id ASC
             SQL
         )->fetchAll();
 
         $cities = $pdo->query(
             <<<'SQL'
-            SELECT DISTINCT city_name
+            SELECT
+                city_name,
+                MIN(dist_km) AS dist_km,
+                (
+                    SELECT ps2.search_radius_km
+                    FROM price_snapshots ps2
+                    WHERE ps2.city_name = price_snapshots.city_name
+                    ORDER BY ps2.recorded_at DESC
+                    LIMIT 1
+                ) AS search_radius_km
             FROM price_snapshots
-            ORDER BY city_name ASC
+            GROUP BY city_name
+            ORDER BY dist_km ASC, city_name ASC
             SQL
-        )->fetchAll(PDO::FETCH_COLUMN);
+        )->fetchAll();
 
         $where = [];
         $params = [];
@@ -172,21 +189,18 @@ function h(?string $value): string
 
 function stationLabel(array $station): string
 {
-    $parts = [trim($station['name'])];
+    $name = trim($station['name']);
 
-    $street = trim(implode(' ', array_filter([
-        $station['street'] ?? '',
-        $station['house_number'] ?? '',
-    ])));
-    if ($street !== '') {
-        $parts[] = $street;
+    $place = trim($station['place'] ?? '');
+
+    $dist = '';
+    if ($station['dist_km'] !== null) {
+        $dist = number_format((float) $station['dist_km'], 1) . ' km';
     }
 
-    if (trim($station['place'] ?? '') !== '') {
-        $parts[] = trim($station['place']);
-    }
+    $suffix = implode(' ', array_filter([$place, $dist !== '' ? "({$dist})" : '']));
 
-    return implode(', ', $parts);
+    return $suffix !== '' ? "{$name}, {$suffix}" : $name;
 }
 
 function formatPrice(mixed $value): string
@@ -952,8 +966,14 @@ function formatPrice(mixed $value): string
                     <select name="city" id="f-city" onchange="this.form.submit()">
                         <option value="" data-i18n="allCities">— all cities —</option>
                         <?php foreach ($cities as $city): ?>
-                            <option value="<?= h((string) $city) ?>" <?= $selectedCity === $city ? 'selected' : '' ?>>
-                                <?= h((string) $city) ?>
+                            <?php
+                            $cityName   = (string) $city['city_name'];
+                            $cityRadius = $city['search_radius_km'] !== null
+                                ? ' (' . number_format((float) $city['search_radius_km'], 0) . ' km)'
+                                : '';
+                            ?>
+                            <option value="<?= h($cityName) ?>" <?= $selectedCity === $cityName ? 'selected' : '' ?>>
+                                <?= h($cityName . $cityRadius) ?>
                             </option>
                         <?php endforeach; ?>
                     </select>
