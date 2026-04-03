@@ -111,7 +111,8 @@ func TestPersistUpdateAndQueryHistory(t *testing.T) {
 	priceDiesel := 1.659
 
 	city := cachedCity{
-		Name:        "Berlin, Germany",
+		QueryName:   "Berlin, Germany",
+		Name:        "Berlin",
 		DisplayName: "Berlin, Deutschland",
 		Lat:         52.517389,
 		Lng:         13.395131,
@@ -197,7 +198,7 @@ func TestGetOrCreateCityUsesCache(t *testing.T) {
 	var requests atomic.Int32
 	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
 		requests.Add(1)
-		body := `[{"display_name":"Berlin, Deutschland","lat":"52.517389","lon":"13.395131"}]`
+		body := `[{"name":"Berlin","display_name":"Berlin, Deutschland","lat":"52.517389","lon":"13.395131"}]`
 		return jsonResponse(http.StatusOK, body), nil
 	})
 	defer restore()
@@ -212,6 +213,9 @@ func TestGetOrCreateCityUsesCache(t *testing.T) {
 	if city.DisplayName != "Berlin, Deutschland" {
 		t.Fatalf("display name = %q", city.DisplayName)
 	}
+	if city.Name != "Berlin" {
+		t.Fatalf("normalized name = %q", city.Name)
+	}
 
 	city, cached, err = getOrCreateCity(ctx, db, "Berlin, Germany", "gasoline-test/1.0")
 	if err != nil {
@@ -222,6 +226,9 @@ func TestGetOrCreateCityUsesCache(t *testing.T) {
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("geocoder requests = %d, want 1", got)
+	}
+	if city.Name != "Berlin" {
+		t.Fatalf("cached normalized name = %q", city.Name)
 	}
 }
 
@@ -238,7 +245,7 @@ func TestRunCitiesSupportsJSONOutput(t *testing.T) {
 	if len(cities) != 1 {
 		t.Fatalf("len(cities) = %d, want 1", len(cities))
 	}
-	if cities[0].Name != "Berlin, Germany" {
+	if cities[0].Name != "Berlin" {
 		t.Fatalf("city name = %q", cities[0].Name)
 	}
 }
@@ -293,7 +300,7 @@ func TestRunUpdateSupportsJSONOutput(t *testing.T) {
 	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
 		switch {
 		case strings.HasPrefix(req.URL.String(), nominatimBaseURL):
-			body := `[{"display_name":"Berlin, Deutschland","lat":"52.517389","lon":"13.395131"}]`
+			body := `[{"name":"Berlin","display_name":"Berlin, Deutschland","lat":"52.517389","lon":"13.395131"}]`
 			return jsonResponse(http.StatusOK, body), nil
 		case strings.HasPrefix(req.URL.String(), tankerKoenigBase+"/list.php"):
 			body := `{"ok":true,"stations":[{"id":"station-1","name":"Test Station","brand":"ARAL","street":"Test Street","place":"Berlin","lat":52.5,"lng":13.4,"dist":1.25,"diesel":1.659,"e5":1.789,"e10":1.729,"isOpen":true,"houseNumber":"1","postCode":10115}]}`
@@ -312,7 +319,7 @@ func TestRunUpdateSupportsJSONOutput(t *testing.T) {
 	if err := json.Unmarshal([]byte(output), &result); err != nil {
 		t.Fatalf("unmarshal update output: %v\noutput=%s", err, output)
 	}
-	if result.City.Name != "Berlin, Germany" {
+	if result.City.Name != "Berlin" {
 		t.Fatalf("city name = %q", result.City.Name)
 	}
 	if result.StoredCount != 1 {
@@ -388,15 +395,16 @@ func seedFixtureDB(t *testing.T) string {
 	}
 
 	city := cachedCity{
-		Name:        "Berlin, Germany",
+		QueryName:   "Berlin, Germany",
+		Name:        "Berlin",
 		DisplayName: "Berlin, Deutschland",
 		Lat:         52.517389,
 		Lng:         13.395131,
 	}
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO cities (name, display_name, lat, lng, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, city.Name, city.DisplayName, city.Lat, city.Lng, "2026-04-02T09:00:00Z")
+		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, city.QueryName, city.Name, city.DisplayName, city.Lat, city.Lng, "2026-04-02T09:00:00Z")
 	if err != nil {
 		t.Fatalf("insert city: %v", err)
 	}

@@ -59,12 +59,14 @@ type tankerStation struct {
 }
 
 type nominatimResult struct {
+	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
 	Lat         string `json:"lat"`
 	Lon         string `json:"lon"`
 }
 
 type cachedCity struct {
+	QueryName   string `json:"-"`
 	Name        string
 	DisplayName string
 	Lat         float64
@@ -276,9 +278,9 @@ func runCities(args []string) error {
 	}
 
 	rows, err := db.QueryContext(ctx, `
-		SELECT name, display_name, lat, lng, created_at
+		SELECT normalized_name, display_name, lat, lng, created_at
 		FROM cities
-		ORDER BY name ASC
+		ORDER BY normalized_name ASC
 	`)
 	if err != nil {
 		return err
@@ -644,6 +646,7 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS cities (
 		name TEXT PRIMARY KEY,
+		normalized_name TEXT NOT NULL,
 		display_name TEXT NOT NULL,
 		lat REAL NOT NULL,
 		lng REAL NOT NULL,
@@ -685,17 +688,37 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 		ON price_snapshots(city_name, recorded_at DESC);
 	`
 	_, err := db.ExecContext(ctx, schema)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.ExecContext(ctx, `
+		ALTER TABLE cities
+		ADD COLUMN normalized_name TEXT NOT NULL DEFAULT ''
+	`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+
+	_, err = db.ExecContext(ctx, `
+		UPDATE cities
+		SET normalized_name = CASE
+			WHEN TRIM(normalized_name) <> '' THEN normalized_name
+			WHEN TRIM(display_name) <> '' THEN display_name
+			ELSE name
+		END
+	`)
 	return err
 }
 
 func getOrCreateCity(ctx context.Context, db *sql.DB, cityName, userAgent string) (cachedCity, bool, error) {
 	var city cachedCity
 	row := db.QueryRowContext(ctx, `
-		SELECT name, display_name, lat, lng
+		SELECT name, normalized_name, display_name, lat, lng
 		FROM cities
 		WHERE name = ?
 	`, cityName)
-	if err := row.Scan(&city.Name, &city.DisplayName, &city.Lat, &city.Lng); err == nil {
+	if err := row.Scan(&city.QueryName, &city.Name, &city.DisplayName, &city.Lat, &city.Lng); err == nil {
 		return city, true, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return cachedCity{}, false, err
@@ -706,15 +729,15 @@ func getOrCreateCity(ctx context.Context, db *sql.DB, cityName, userAgent string
 		return cachedCity{}, false, err
 	}
 	city = cachedCity{
-		Name:        cityName,
+		Name:        geo.Name,
 		DisplayName: geo.DisplayName,
 		Lat:         geo.Lat,
 		Lng:         geo.Lng,
 	}
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO cities (name, display_name, lat, lng, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, city.Name, city.DisplayName, city.Lat, city.Lng, time.Now().UTC().Format(time.RFC3339))
+		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, cityName, city.Name, city.DisplayName, city.Lat, city.Lng, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return cachedCity{}, false, err
 	}
@@ -762,7 +785,8 @@ func geocodeCity(ctx context.Context, city string, userAgent string) (cachedCity
 	}
 
 	return cachedCity{
-		Name:        city,
+		QueryName:   city,
+		Name:        blankOr(results[0].Name, results[0].DisplayName),
 		DisplayName: results[0].DisplayName,
 		Lat:         lat,
 		Lng:         lng,
@@ -844,8 +868,8 @@ func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO cities (name, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?)`,
-		city.Name, city.DisplayName, city.Lat, city.Lng, recordedAt.Format(time.RFC3339),
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO cities (name, normalized_name, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		city.QueryName, city.Name, city.DisplayName, city.Lat, city.Lng, recordedAt.Format(time.RFC3339),
 	); err != nil {
 		return err
 	}
