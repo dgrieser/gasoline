@@ -232,6 +232,49 @@ func TestGetOrCreateCityUsesCache(t *testing.T) {
 	}
 }
 
+func TestGetOrCreateCityRefreshesLegacyNormalizedName(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, "Luebbecke, Germany", "Luebbecke, Kreis Minden-Luebbecke, Nordrhein-Westfalen, 32312, Deutschland", "Luebbecke, Kreis Minden-Luebbecke, Nordrhein-Westfalen, 32312, Deutschland", 52.3027209, 8.6183054, "2026-04-03T20:00:00Z")
+	if err != nil {
+		t.Fatalf("insert legacy city: %v", err)
+	}
+
+	var requests atomic.Int32
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		body := `[{"name":"Lübbecke","display_name":"Lübbecke, Kreis Minden-Lübbecke, Nordrhein-Westfalen, 32312, Deutschland","lat":"52.3027209","lon":"8.6183054"}]`
+		return jsonResponse(http.StatusOK, body), nil
+	})
+	defer restore()
+
+	city, cached, err := getOrCreateCity(ctx, db, "Luebbecke, Germany", "gasoline-test/1.0")
+	if err != nil {
+		t.Fatalf("getOrCreateCity: %v", err)
+	}
+	if cached {
+		t.Fatal("legacy normalized_name row should be refreshed via geocoder")
+	}
+	if city.Name != "Lübbecke" {
+		t.Fatalf("normalized name = %q", city.Name)
+	}
+
+	var normalizedName string
+	if err := db.QueryRowContext(ctx, `SELECT normalized_name FROM cities WHERE name = ?`, "Luebbecke, Germany").Scan(&normalizedName); err != nil {
+		t.Fatalf("query normalized_name: %v", err)
+	}
+	if normalizedName != "Lübbecke" {
+		t.Fatalf("stored normalized_name = %q", normalizedName)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("geocoder requests = %d, want 1", got)
+	}
+}
+
 func TestRunCitiesSupportsJSONOutput(t *testing.T) {
 	dbPath := seedFixtureDB(t)
 	output := captureStdout(t, func() error {

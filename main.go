@@ -719,6 +719,28 @@ func getOrCreateCity(ctx context.Context, db *sql.DB, cityName, userAgent string
 		WHERE name = ?
 	`, cityName)
 	if err := row.Scan(&city.QueryName, &city.Name, &city.DisplayName, &city.Lat, &city.Lng); err == nil {
+		if needsNormalizedNameRefresh(city) {
+			geo, err := geocodeCity(ctx, cityName, userAgent)
+			if err != nil {
+				return cachedCity{}, false, err
+			}
+			city = cachedCity{
+				QueryName:   cityName,
+				Name:        geo.Name,
+				DisplayName: geo.DisplayName,
+				Lat:         geo.Lat,
+				Lng:         geo.Lng,
+			}
+			_, err = db.ExecContext(ctx, `
+				UPDATE cities
+				SET normalized_name = ?, display_name = ?, lat = ?, lng = ?
+				WHERE name = ?
+			`, city.Name, city.DisplayName, city.Lat, city.Lng, city.QueryName)
+			if err != nil {
+				return cachedCity{}, false, err
+			}
+			return city, false, nil
+		}
 		return city, true, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return cachedCity{}, false, err
@@ -791,6 +813,10 @@ func geocodeCity(ctx context.Context, city string, userAgent string) (cachedCity
 		Lat:         lat,
 		Lng:         lng,
 	}, nil
+}
+
+func needsNormalizedNameRefresh(city cachedCity) bool {
+	return strings.TrimSpace(city.Name) == "" || city.Name == city.DisplayName
 }
 
 func fetchStations(ctx context.Context, cfg config, lat, lng, radius float64, fuelType, sortBy string) ([]tankerStation, error) {
