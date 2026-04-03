@@ -47,7 +47,7 @@ if ($errors === []) {
             SELECT
                 s.id,
                 s.name,
-                COALESCE(NULLIF(TRIM(s.brand), ''), 'Unknown brand') AS brand,
+                COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
                 TRIM(COALESCE(s.street, '')) AS street,
                 TRIM(COALESCE(s.house_number, '')) AS house_number,
                 TRIM(COALESCE(s.place, '')) AS place,
@@ -107,7 +107,7 @@ if ($errors === []) {
             SELECT
                 ps.station_id,
                 s.name AS station_name,
-                COALESCE(NULLIF(TRIM(s.brand), ''), 'Unknown brand') AS brand,
+                COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
                 TRIM(COALESCE(s.street, '')) AS street,
                 TRIM(COALESCE(s.house_number, '')) AS house_number,
                 TRIM(COALESCE(s.place, '')) AS place,
