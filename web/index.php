@@ -1296,19 +1296,20 @@ function getRangeFilteredData() {
         cutoffTs = Date.now() - days * 24 * 60 * 60 * 1000;
     }
 
-    const rangeRows = chartData.filter((r) => r._ts >= cutoffTs);
-
-    // For each station, find the last known data point before the cutoff and
-    // inject synthetic rows so lines extend from the range start.
+    // Single pass: split into before-cutoff (track last per station) and in-range rows.
+    // chartData is sorted by recorded_at ASC, so iterating forward naturally keeps
+    // the last assignment as the most recent pre-cutoff row for each station.
+    const rangeRows = [];
     const lastBeforeByStation = new Map();
+    const stationsInRange = new Set();
     for (const row of chartData) {
-        if (row._ts >= cutoffTs) continue;
-        const prev = lastBeforeByStation.get(row.station_id);
-        if (!prev || row._ts > prev._ts) lastBeforeByStation.set(row.station_id, row);
+        if (row._ts < cutoffTs) {
+            lastBeforeByStation.set(row.station_id, row);
+        } else {
+            rangeRows.push(row);
+            stationsInRange.add(row.station_id);
+        }
     }
-
-    // Stations that have at least one real data point in the range
-    const stationsInRange = new Set(rangeRows.map((r) => r.station_id));
 
     const nowTs = Date.now();
     const synthetic = [];
