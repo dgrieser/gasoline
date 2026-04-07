@@ -1285,15 +1285,55 @@ let chartRange = 'all';
 
 function getRangeFilteredData() {
     if (chartRange === 'all') return chartData;
+
+    let cutoffTs;
     if (chartRange === 'today') {
         const startOfToday = new Date();
         startOfToday.setHours(0, 0, 0, 0);
-        return chartData.filter((r) => r._ts >= startOfToday.getTime());
+        cutoffTs = startOfToday.getTime();
+    } else {
+        const days = chartRange === '30d' ? 30 : chartRange === '14d' ? 14 : 7;
+        cutoffTs = Date.now() - days * 24 * 60 * 60 * 1000;
     }
-    const now = Date.now();
-    const days = chartRange === '30d' ? 30 : chartRange === '14d' ? 14 : 7;
-    const cutoff = now - days * 24 * 60 * 60 * 1000;
-    return chartData.filter((r) => r._ts >= cutoff);
+
+    // Single pass: split into before-cutoff (track last per station) and in-range rows.
+    // chartData is sorted by recorded_at ASC, so iterating forward naturally keeps
+    // the last assignment as the most recent pre-cutoff row for each station.
+    const rangeRows = [];
+    const lastBeforeByStation = new Map();
+    const stationsInRange = new Set();
+    for (const row of chartData) {
+        if (row._ts < cutoffTs) {
+            lastBeforeByStation.set(row.station_id, row);
+        } else {
+            rangeRows.push(row);
+            stationsInRange.add(row.station_id);
+        }
+    }
+
+    const nowTs = Date.now();
+    const synthetic = [];
+    for (const [stationId, lastRow] of lastBeforeByStation) {
+        // Synthetic point at the start of the range (left edge of chart)
+        synthetic.push({
+            ...lastRow,
+            _ts: cutoffTs,
+            recorded_at: new Date(cutoffTs).toISOString(),
+            _synthetic: true,
+        });
+        // If there are no real data points for this station within the range,
+        // also add a synthetic point at "now" to draw a flat line across the range.
+        if (!stationsInRange.has(stationId)) {
+            synthetic.push({
+                ...lastRow,
+                _ts: nowTs,
+                recorded_at: new Date(nowTs).toISOString(),
+                _synthetic: true,
+            });
+        }
+    }
+
+    return [...synthetic, ...rangeRows].sort((a, b) => a._ts - b._ts);
 }
 
 if (!chartEl) {
@@ -1436,6 +1476,7 @@ if (!chartEl) {
             for (const stationId of stations) {
                 const series = visibleRows.filter((r) => r.station_id === stationId && r[fuel] !== null);
                 for (const row of series) {
+                    if (row._synthetic) continue;
                     const xp = px(row._ts);
                     const yp = py(row[fuel]);
                     const color = stationFuelColor(row.station_name, fuel);
