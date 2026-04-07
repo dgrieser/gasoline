@@ -1218,7 +1218,7 @@ function stationFuelColor(stationName, fuel) {
 }
 
 const chartData = <?= json_encode($chartRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
-chartData.forEach((r) => { r._ts = r._ts; });
+chartData.forEach((r) => { r._ts = Date.parse(r.recorded_at); });
 const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
 
 const fuelConfig = {
