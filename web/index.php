@@ -1218,6 +1218,7 @@ function stationFuelColor(stationName, fuel) {
 }
 
 const chartData = <?= json_encode($chartRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
+chartData.forEach((r) => { r._ts = r._ts; });
 const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
 
 const fuelConfig = {
@@ -1275,12 +1276,12 @@ function getRangeFilteredData() {
     if (chartRange === 'today') {
         const startOfToday = new Date();
         startOfToday.setHours(0, 0, 0, 0);
-        return chartData.filter((r) => Date.parse(r.recorded_at) >= startOfToday.getTime());
+        return chartData.filter((r) => r._ts >= startOfToday.getTime());
     }
     const now = Date.now();
     const days = chartRange === '30d' ? 30 : chartRange === '14d' ? 14 : 7;
     const cutoff = now - days * 24 * 60 * 60 * 1000;
-    return chartData.filter((r) => Date.parse(r.recorded_at) >= cutoff);
+    return chartData.filter((r) => r._ts >= cutoff);
 }
 
 if (!chartEl) {
@@ -1331,7 +1332,7 @@ if (!chartEl) {
 
         // no fill — line-only chart
 
-        const timestamps = visibleRows.map((r) => Date.parse(r.recorded_at));
+        const timestamps = visibleRows.map((r) => r._ts);
         const allVals = [];
         for (const f of activeFuels)
             for (const r of visibleRows)
@@ -1376,7 +1377,7 @@ if (!chartEl) {
         for (let i = 0; i < tickCount; i++) {
             const idx = tickCount === 1 ? 0 : Math.round((visibleRows.length - 1) * (i / (tickCount - 1)));
             const row = visibleRows[idx];
-            const xp = px(Date.parse(row.recorded_at));
+            const xp = px(row._ts);
             mk('line', { x1: xp, y1: margin.top, x2: xp, y2: H - margin.bottom,
                 stroke: tickStroke, 'stroke-width': 1 });
             const txt = mk('text', { x: xp, y: H - margin.bottom + 14, 'text-anchor': 'middle',
@@ -1408,7 +1409,7 @@ if (!chartEl) {
                 if (series.length < 2) continue;
 
                 const color = stationFuelColor(series[0].station_name, fuel);
-                const pts = series.map((r) => [px(Date.parse(r.recorded_at)), py(r[fuel])]);
+                const pts = series.map((r) => [px(r._ts), py(r[fuel])]);
                 const linePath = pts.map(([x, y], j) => `${j === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
 
                 mk('path', { d: linePath, fill: 'none', stroke: color,
@@ -1422,7 +1423,7 @@ if (!chartEl) {
             for (const stationId of stations) {
                 const series = visibleRows.filter((r) => r.station_id === stationId && r[fuel] !== null);
                 for (const row of series) {
-                    const xp = px(Date.parse(row.recorded_at));
+                    const xp = px(row._ts);
                     const yp = py(row[fuel]);
                     const color = stationFuelColor(row.station_name, fuel);
                     const g = mk('g', { style: 'cursor:pointer' });
@@ -1588,7 +1589,7 @@ function renderCheapest() {
     // Most recent snapshot per station
     const latestByStation = new Map();
     for (const row of chartData) {
-        const ts = Date.parse(row.recorded_at);
+        const ts = row._ts;
         const prev = latestByStation.get(row.station_id);
         if (!prev || ts > prev.ts) latestByStation.set(row.station_id, { ts, row });
     }
