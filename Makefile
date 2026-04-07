@@ -1,7 +1,9 @@
 APP := gasoline
 DIST_DIR := dist
+BINDIR ?= /usr/local/bin
+WEB_INSTALL_DIR ?= /var/www/html/$(APP)
 
-.PHONY: build test tidy fmt clean release
+.PHONY: build test tidy fmt clean install release
 
 build:
 	go build -o $(APP) .
@@ -17,6 +19,12 @@ fmt:
 
 clean:
 	rm -rf $(APP) $(DIST_DIR)
+
+install: build
+	install -d $(BINDIR)
+	install -m 0755 $(APP) $(BINDIR)/$(APP)
+	install -d $(WEB_INSTALL_DIR)
+	cp -R web/. $(WEB_INSTALL_DIR)/
 
 release:
 	mkdir -p $(DIST_DIR)

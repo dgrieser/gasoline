@@ -19,6 +19,12 @@ Run tests:
 make test
 ```
 
+Install the binary to `/usr/local/bin/gasoline` and copy the PHP viewer into `/var/www/html/gasoline`:
+
+```bash
+sudo make install
+```
+
 ## Commands
 
 Persist a new snapshot for a place:
