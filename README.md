@@ -33,6 +33,12 @@ Persist a new snapshot for a place:
 gasoline update --city "Berlin, Germany" --radius 5
 ```
 
+Compact existing snapshots in-place without fetching new data:
+
+```bash
+gasoline compact
+```
+
 List cached city geocodes:
 
 ```bash
@@ -74,5 +80,5 @@ Push a version tag like `v1.2.3` to trigger a GitHub Release named after the tag
 ## Notes
 
 - City geocoding is cached in SQLite, so Nominatim is only queried once per city unless you delete the cache row.
-- Each `update` appends new rows to `price_snapshots`, preserving full history for cron-based collection.
+- `update` stores only changed snapshots and the adjacent unchanged snapshots needed for price graphs. Run `compact` once to apply the same compaction to older databases.
 - Default SQLite file is `gasoline.db`. Override it with `GASOLINE_DB_PATH` or `--db`.

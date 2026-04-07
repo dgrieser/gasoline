@@ -88,6 +88,15 @@ type updateResult struct {
 	DBPath      string     `json:"db_path"`
 }
 
+type compactResult struct {
+	StationsProcessed int    `json:"stations_processed"`
+	BeforeCount       int    `json:"before_count"`
+	AfterCount        int    `json:"after_count"`
+	DeletedCount      int    `json:"deleted_count"`
+	UpdatedCount      int    `json:"updated_count"`
+	DBPath            string `json:"db_path"`
+}
+
 type cityRow struct {
 	Name        string  `json:"name"`
 	DisplayName string  `json:"display_name"`
@@ -138,6 +147,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "update":
 		return runUpdate(args[1:])
+	case "compact":
+		return runCompact(args[1:])
 	case "cities":
 		return runCities(args[1:])
 	case "stations":
@@ -157,12 +168,14 @@ func printUsage() {
 
 Commands:
   update   geocode a city if needed, query Tankerkönig, store station snapshots
+  compact  compact existing price snapshots in-place
   cities   list cached city geocodes
   stations list known stations with latest stored snapshot
   history  show historical prices for one station
 
 Examples:
   gasoline update --city "Berlin, Germany" --radius 5
+  gasoline compact
   gasoline stations --city "Berlin, Germany"
   gasoline history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel`)
 }
@@ -250,6 +263,45 @@ func runUpdate(args []string) error {
 	fmt.Fprintf(stdout, "display: %s\n", location.DisplayName)
 	fmt.Fprintf(stdout, "coordinates: %.6f, %.6f (%s)\n", location.Lat, location.Lng, cacheStatus)
 	fmt.Fprintf(stdout, "stored %d station snapshots at %s in %s\n", len(stations), recordedAt.Format(time.RFC3339), resolvedDBPath)
+	return nil
+}
+
+func runCompact(args []string) error {
+	fs := flag.NewFlagSet("compact", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	outputLong, outputShort := addOutputFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
+		return err
+	}
+
+	db, err := openDB(resolvedDBPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	result, err := compactPriceSnapshots(ctx, db)
+	if err != nil {
+		return err
+	}
+	result.DBPath = resolvedDBPath
+
+	if output == outputJSON {
+		return writeJSON(result)
+	}
+
+	fmt.Fprintf(stdout, "compacted %d stations in %s\n", result.StationsProcessed, resolvedDBPath)
+	fmt.Fprintf(stdout, "snapshots: %d -> %d (deleted=%d, updated=%d)\n", result.BeforeCount, result.AfterCount, result.DeletedCount, result.UpdatedCount)
 	return nil
 }
 
@@ -885,11 +937,7 @@ func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []
 			return err
 		}
 
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO price_snapshots (
-				station_id, city_name, recorded_at, dist_km, search_radius_km, is_open, e5, e10, diesel
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, station.ID, city.Name, recordedAt.Format(time.RFC3339), station.Dist, searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel)); err != nil {
+		if err := persistPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm); err != nil {
 			return err
 		}
 	}
@@ -901,6 +949,263 @@ func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []
 	}
 
 	return tx.Commit()
+}
+
+type priceSnapshotValues struct {
+	ID     int64
+	IsOpen bool
+	E5     sql.NullFloat64
+	E10    sql.NullFloat64
+	Diesel sql.NullFloat64
+}
+
+type compactSnapshotRow struct {
+	priceSnapshotValues
+	CityName       string
+	RecordedAt     string
+	DistKM         float64
+	SearchRadiusKM float64
+	Updated        bool
+}
+
+func compactPriceSnapshots(ctx context.Context, db *sql.DB) (compactResult, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return compactResult{}, err
+	}
+	defer tx.Rollback()
+
+	var result compactResult
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM price_snapshots`).Scan(&result.BeforeCount); err != nil {
+		return compactResult{}, err
+	}
+
+	stationRows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT station_id
+		FROM price_snapshots
+		ORDER BY station_id
+	`)
+	if err != nil {
+		return compactResult{}, err
+	}
+	var stationIDs []string
+	for stationRows.Next() {
+		var stationID string
+		if err := stationRows.Scan(&stationID); err != nil {
+			stationRows.Close()
+			return compactResult{}, err
+		}
+		stationIDs = append(stationIDs, stationID)
+	}
+	if err := stationRows.Err(); err != nil {
+		stationRows.Close()
+		return compactResult{}, err
+	}
+	if err := stationRows.Close(); err != nil {
+		return compactResult{}, err
+	}
+
+	for _, stationID := range stationIDs {
+		snapshots, err := loadCompactSnapshots(ctx, tx, stationID)
+		if err != nil {
+			return compactResult{}, err
+		}
+		kept, deleteIDs := compactSnapshotRows(snapshots)
+		result.StationsProcessed++
+
+		for _, snapshot := range kept {
+			if !snapshot.Updated {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE price_snapshots
+				SET city_name = ?, recorded_at = ?, dist_km = ?, search_radius_km = ?, is_open = ?, e5 = ?, e10 = ?, diesel = ?
+				WHERE id = ?
+			`, snapshot.CityName, snapshot.RecordedAt, snapshot.DistKM, snapshot.SearchRadiusKM, boolToInt(snapshot.IsOpen), nullFloatValue(snapshot.E5), nullFloatValue(snapshot.E10), nullFloatValue(snapshot.Diesel), snapshot.ID); err != nil {
+				return compactResult{}, err
+			}
+			result.UpdatedCount++
+		}
+		for _, id := range deleteIDs {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM price_snapshots WHERE id = ?`, id); err != nil {
+				return compactResult{}, err
+			}
+			result.DeletedCount++
+		}
+	}
+
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM price_snapshots`).Scan(&result.AfterCount); err != nil {
+		return compactResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return compactResult{}, err
+	}
+	return result, nil
+}
+
+func loadCompactSnapshots(ctx context.Context, tx *sql.Tx, stationID string) ([]compactSnapshotRow, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, city_name, recorded_at, dist_km, search_radius_km, is_open, e5, e10, diesel
+		FROM price_snapshots
+		WHERE station_id = ?
+		ORDER BY recorded_at ASC, id ASC
+	`, stationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var snapshots []compactSnapshotRow
+	for rows.Next() {
+		var snapshot compactSnapshotRow
+		if err := rows.Scan(
+			&snapshot.ID,
+			&snapshot.CityName,
+			&snapshot.RecordedAt,
+			&snapshot.DistKM,
+			&snapshot.SearchRadiusKM,
+			&snapshot.IsOpen,
+			&snapshot.E5,
+			&snapshot.E10,
+			&snapshot.Diesel,
+		); err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return snapshots, nil
+}
+
+func compactSnapshotRows(snapshots []compactSnapshotRow) ([]compactSnapshotRow, []int64) {
+	var kept []compactSnapshotRow
+	var deleteIDs []int64
+
+	for _, snapshot := range snapshots {
+		if len(kept) == 0 {
+			kept = append(kept, snapshot)
+			continue
+		}
+
+		latest := kept[len(kept)-1]
+		switch {
+		case !priceSnapshotValuesEqual(latest.priceSnapshotValues, snapshot.priceSnapshotValues):
+			kept = append(kept, snapshot)
+		case len(kept) >= 2 && !priceSnapshotValuesEqual(latest.priceSnapshotValues, kept[len(kept)-2].priceSnapshotValues):
+			kept = append(kept, snapshot)
+		default:
+			deleteID := snapshot.ID
+			snapshot.ID = latest.ID
+			snapshot.Updated = true
+			kept[len(kept)-1] = snapshot
+			deleteIDs = append(deleteIDs, deleteID)
+		}
+	}
+
+	return kept, deleteIDs
+}
+
+func persistPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
+	latest, previous, err := latestPriceSnapshots(ctx, tx, station.ID)
+	if err != nil {
+		return err
+	}
+
+	current := priceSnapshotValues{
+		IsOpen: station.IsOpen,
+		E5:     floatPtrToNull(station.E5),
+		E10:    floatPtrToNull(station.E10),
+		Diesel: floatPtrToNull(station.Diesel),
+	}
+
+	switch {
+	case latest == nil:
+		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
+	case !priceSnapshotValuesEqual(*latest, current):
+		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
+	case previous != nil && !priceSnapshotValuesEqual(*latest, *previous):
+		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
+	default:
+		_, err := tx.ExecContext(ctx, `
+			UPDATE price_snapshots
+			SET city_name = ?, recorded_at = ?, dist_km = ?, search_radius_km = ?, is_open = ?, e5 = ?, e10 = ?, diesel = ?
+			WHERE id = ?
+		`, city.Name, recordedAt.Format(time.RFC3339), station.Dist, searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel), latest.ID)
+		return err
+	}
+}
+
+func latestPriceSnapshots(ctx context.Context, tx *sql.Tx, stationID string) (*priceSnapshotValues, *priceSnapshotValues, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, is_open, e5, e10, diesel
+		FROM price_snapshots
+		WHERE station_id = ?
+		ORDER BY recorded_at DESC, id DESC
+		LIMIT 2
+	`, stationID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	var snapshots []*priceSnapshotValues
+	for rows.Next() {
+		snapshot := priceSnapshotValues{}
+		if err := rows.Scan(&snapshot.ID, &snapshot.IsOpen, &snapshot.E5, &snapshot.E10, &snapshot.Diesel); err != nil {
+			return nil, nil, err
+		}
+		snapshots = append(snapshots, &snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	if len(snapshots) == 0 {
+		return nil, nil, nil
+	}
+	if len(snapshots) == 1 {
+		return snapshots[0], nil, nil
+	}
+	return snapshots[0], snapshots[1], nil
+}
+
+func insertPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO price_snapshots (
+			station_id, city_name, recorded_at, dist_km, search_radius_km, is_open, e5, e10, diesel
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, station.ID, city.Name, recordedAt.Format(time.RFC3339), station.Dist, searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel))
+	return err
+}
+
+func priceSnapshotValuesEqual(a, b priceSnapshotValues) bool {
+	return a.IsOpen == b.IsOpen &&
+		nullFloatEqual(a.E5, b.E5) &&
+		nullFloatEqual(a.E10, b.E10) &&
+		nullFloatEqual(a.Diesel, b.Diesel)
+}
+
+func nullFloatEqual(a, b sql.NullFloat64) bool {
+	if a.Valid != b.Valid {
+		return false
+	}
+	return !a.Valid || a.Float64 == b.Float64
+}
+
+func floatPtrToNull(v *float64) sql.NullFloat64 {
+	if v == nil {
+		return sql.NullFloat64{}
+	}
+	return sql.NullFloat64{Float64: *v, Valid: true}
+}
+
+func nullFloatValue(v sql.NullFloat64) any {
+	if !v.Valid {
+		return nil
+	}
+	return v.Float64
 }
 
 func nullableFloat(v *float64) any {

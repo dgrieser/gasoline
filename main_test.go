@@ -191,6 +191,177 @@ func TestPersistUpdateAndQueryHistory(t *testing.T) {
 	}
 }
 
+func TestPersistUpdateCompactsUnchangedSnapshots(t *testing.T) {
+	t.Parallel()
+
+	db := openTestDB(t)
+	ctx := context.Background()
+	city := cachedCity{
+		QueryName:   "Luebbecke, Germany",
+		Name:        "Lübbecke",
+		DisplayName: "Lübbecke, Deutschland",
+		Lat:         52.3027209,
+		Lng:         8.6183054,
+	}
+
+	e5 := 2.189
+	e10 := 2.149
+	diesel := 2.349
+	station := tankerStation{
+		ID:          "station-1",
+		Name:        "Test Station",
+		Brand:       "ARAL",
+		Street:      "Test Street",
+		Place:       "Lübbecke",
+		Lat:         52.3,
+		Lng:         8.6,
+		Dist:        4.60,
+		Diesel:      &diesel,
+		E5:          &e5,
+		E10:         &e10,
+		IsOpen:      true,
+		HouseNumber: "1",
+		PostCode:    32312,
+	}
+
+	times := []time.Time{
+		time.Date(2026, 4, 7, 10, 20, 2, 0, time.UTC),
+		time.Date(2026, 4, 7, 10, 25, 2, 0, time.UTC),
+		time.Date(2026, 4, 7, 10, 30, 8, 0, time.UTC),
+		time.Date(2026, 4, 7, 10, 35, 8, 0, time.UTC),
+		time.Date(2026, 4, 7, 10, 40, 8, 0, time.UTC),
+	}
+
+	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[0], 5); err != nil {
+		t.Fatalf("persist initial update: %v", err)
+	}
+	assertSnapshotCount(t, db, 1)
+	assertLatestSnapshot(t, db, times[0].Format(time.RFC3339), 2.349)
+
+	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[1], 5); err != nil {
+		t.Fatalf("persist unchanged update: %v", err)
+	}
+	assertSnapshotCount(t, db, 1)
+	assertLatestSnapshot(t, db, times[1].Format(time.RFC3339), 2.349)
+
+	diesel = 2.389
+	station.Diesel = &diesel
+	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[2], 5); err != nil {
+		t.Fatalf("persist changed update: %v", err)
+	}
+	assertSnapshotCount(t, db, 2)
+	assertLatestSnapshot(t, db, times[2].Format(time.RFC3339), 2.389)
+
+	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[3], 5); err != nil {
+		t.Fatalf("persist first unchanged update after change: %v", err)
+	}
+	assertSnapshotCount(t, db, 3)
+	assertLatestSnapshot(t, db, times[3].Format(time.RFC3339), 2.389)
+
+	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[4], 5); err != nil {
+		t.Fatalf("persist later unchanged update after change: %v", err)
+	}
+	assertSnapshotCount(t, db, 3)
+	assertLatestSnapshot(t, db, times[4].Format(time.RFC3339), 2.389)
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT recorded_at, diesel
+		FROM price_snapshots
+		WHERE station_id = ?
+		ORDER BY recorded_at
+	`, station.ID)
+	if err != nil {
+		t.Fatalf("query snapshots: %v", err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var (
+			recordedAt string
+			diesel     float64
+		)
+		if err := rows.Scan(&recordedAt, &diesel); err != nil {
+			t.Fatalf("scan snapshot: %v", err)
+		}
+		got = append(got, fmt.Sprintf("%s %.3f", recordedAt, diesel))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate snapshots: %v", err)
+	}
+
+	want := []string{
+		"2026-04-07T10:25:02Z 2.349",
+		"2026-04-07T10:30:08Z 2.389",
+		"2026-04-07T10:40:08Z 2.389",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("snapshots =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestPersistUpdateIgnoresDistanceChangeButTracksOpenChange(t *testing.T) {
+	t.Parallel()
+
+	db := openTestDB(t)
+	ctx := context.Background()
+	city := cachedCity{
+		QueryName:   "Berlin, Germany",
+		Name:        "Berlin",
+		DisplayName: "Berlin, Deutschland",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	}
+
+	e5 := 1.789
+	e10 := 1.729
+	diesel := 1.659
+	station := tankerStation{
+		ID:          "station-1",
+		Name:        "Test Station",
+		Brand:       "ARAL",
+		Street:      "Test Street",
+		Place:       "Berlin",
+		Lat:         52.5,
+		Lng:         13.4,
+		Dist:        1.25,
+		Diesel:      &diesel,
+		E5:          &e5,
+		E10:         &e10,
+		IsOpen:      true,
+		HouseNumber: "1",
+		PostCode:    10115,
+	}
+
+	first := time.Date(2026, 4, 7, 11, 0, 0, 0, time.UTC)
+	second := time.Date(2026, 4, 7, 11, 5, 0, 0, time.UTC)
+	third := time.Date(2026, 4, 7, 11, 10, 0, 0, time.UTC)
+
+	if err := persistUpdate(ctx, db, city, []tankerStation{station}, first, 5); err != nil {
+		t.Fatalf("persist first update: %v", err)
+	}
+
+	station.Dist = 9.99
+	if err := persistUpdate(ctx, db, city, []tankerStation{station}, second, 5); err != nil {
+		t.Fatalf("persist distance-only update: %v", err)
+	}
+	assertSnapshotCount(t, db, 1)
+
+	var dist float64
+	if err := db.QueryRowContext(ctx, `SELECT dist_km FROM price_snapshots WHERE station_id = ?`, station.ID).Scan(&dist); err != nil {
+		t.Fatalf("query dist: %v", err)
+	}
+	if dist != 9.99 {
+		t.Fatalf("dist = %v, want 9.99", dist)
+	}
+
+	station.IsOpen = false
+	if err := persistUpdate(ctx, db, city, []tankerStation{station}, third, 5); err != nil {
+		t.Fatalf("persist open change update: %v", err)
+	}
+	assertSnapshotCount(t, db, 2)
+}
+
 func TestGetOrCreateCityUsesCache(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -370,6 +541,78 @@ func TestRunUpdateSupportsJSONOutput(t *testing.T) {
 	}
 }
 
+func TestRunCompactCompactsExistingSnapshots(t *testing.T) {
+	dbPath := seedUncompactedFixtureDB(t)
+
+	output := captureStdout(t, func() error {
+		return run([]string{"compact", "--db", dbPath, "--output", "json"})
+	})
+
+	var result compactResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal compact output: %v\noutput=%s", err, output)
+	}
+	if result.StationsProcessed != 1 {
+		t.Fatalf("stations_processed = %d, want 1", result.StationsProcessed)
+	}
+	if result.BeforeCount != 8 {
+		t.Fatalf("before_count = %d, want 8", result.BeforeCount)
+	}
+	if result.AfterCount != 5 {
+		t.Fatalf("after_count = %d, want 5", result.AfterCount)
+	}
+	if result.DeletedCount != 3 {
+		t.Fatalf("deleted_count = %d, want 3", result.DeletedCount)
+	}
+	if result.UpdatedCount != 3 {
+		t.Fatalf("updated_count = %d, want 3", result.UpdatedCount)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open compacted db: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT recorded_at, is_open, diesel
+		FROM price_snapshots
+		WHERE station_id = ?
+		ORDER BY recorded_at ASC, id ASC
+	`, "station-1")
+	if err != nil {
+		t.Fatalf("query compacted snapshots: %v", err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var (
+			recordedAt string
+			isOpen     bool
+			diesel     float64
+		)
+		if err := rows.Scan(&recordedAt, &isOpen, &diesel); err != nil {
+			t.Fatalf("scan compacted snapshot: %v", err)
+		}
+		got = append(got, fmt.Sprintf("%s open=%t diesel=%.3f", recordedAt, isOpen, diesel))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate compacted snapshots: %v", err)
+	}
+
+	want := []string{
+		"2026-04-07T10:25:02Z open=true diesel=2.349",
+		"2026-04-07T10:30:08Z open=true diesel=2.389",
+		"2026-04-07T10:40:08Z open=true diesel=2.389",
+		"2026-04-07T16:00:02Z open=true diesel=2.349",
+		"2026-04-07T16:10:02Z open=true diesel=2.349",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("compacted snapshots =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
 func TestResolveOutputModeRejectsConflictingFlags(t *testing.T) {
 	err := run([]string{"cities", "--db", filepath.Join(t.TempDir(), "test.db"), "--output", "txt", "-o", "json"})
 	if err == nil || !strings.Contains(err.Error(), "--output and -o must match") {
@@ -420,6 +663,41 @@ func openTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("initSchema: %v", err)
 	}
 	return db
+}
+
+func assertSnapshotCount(t *testing.T, db *sql.DB, want int) {
+	t.Helper()
+
+	var got int
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM price_snapshots`).Scan(&got); err != nil {
+		t.Fatalf("count snapshots: %v", err)
+	}
+	if got != want {
+		t.Fatalf("snapshot count = %d, want %d", got, want)
+	}
+}
+
+func assertLatestSnapshot(t *testing.T, db *sql.DB, wantRecordedAt string, wantDiesel float64) {
+	t.Helper()
+
+	var (
+		recordedAt string
+		diesel     float64
+	)
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT recorded_at, diesel
+		FROM price_snapshots
+		ORDER BY recorded_at DESC, id DESC
+		LIMIT 1
+	`).Scan(&recordedAt, &diesel); err != nil {
+		t.Fatalf("query latest snapshot: %v", err)
+	}
+	if recordedAt != wantRecordedAt {
+		t.Fatalf("latest recorded_at = %q, want %q", recordedAt, wantRecordedAt)
+	}
+	if diesel != wantDiesel {
+		t.Fatalf("latest diesel = %v, want %v", diesel, wantDiesel)
+	}
 }
 
 func seedFixtureDB(t *testing.T) string {
@@ -473,6 +751,58 @@ func seedFixtureDB(t *testing.T) string {
 	}}
 	if err := persistUpdate(ctx, db, city, stations, time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC), 5); err != nil {
 		t.Fatalf("persistUpdate: %v", err)
+	}
+
+	return dbPath
+}
+
+func seedUncompactedFixtureDB(t *testing.T) string {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "uncompacted.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO stations (
+			id, name, brand, street, house_number, post_code, place, lat, lng, first_seen_at, last_seen_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "station-1", "Test Station", "ARAL", "Test Street", "1", 32312, "Lübbecke", 52.3, 8.6, "2026-04-07T10:20:02Z", "2026-04-07T16:10:02Z")
+	if err != nil {
+		t.Fatalf("insert station: %v", err)
+	}
+
+	e5 := 2.189
+	e10 := 2.149
+	for _, snapshot := range []struct {
+		recordedAt string
+		diesel     float64
+	}{
+		{"2026-04-07T10:20:02Z", 2.349},
+		{"2026-04-07T10:25:02Z", 2.349},
+		{"2026-04-07T10:30:08Z", 2.389},
+		{"2026-04-07T10:35:08Z", 2.389},
+		{"2026-04-07T10:40:08Z", 2.389},
+		{"2026-04-07T16:00:02Z", 2.349},
+		{"2026-04-07T16:05:02Z", 2.349},
+		{"2026-04-07T16:10:02Z", 2.349},
+	} {
+		_, err := db.ExecContext(ctx, `
+			INSERT INTO price_snapshots (
+				station_id, city_name, recorded_at, dist_km, search_radius_km, is_open, e5, e10, diesel
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, "station-1", "Lübbecke", snapshot.recordedAt, 4.60, 5, 1, e5, e10, snapshot.diesel)
+		if err != nil {
+			t.Fatalf("insert snapshot %s: %v", snapshot.recordedAt, err)
+		}
 	}
 
 	return dbPath
