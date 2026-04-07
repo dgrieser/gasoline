@@ -666,6 +666,30 @@ function formatPrice($value): string
         .fuel-toggle[data-fuel="e10"].active  { border-color: var(--e10);   color: var(--e10);    background: rgba(52,211,153,0.1); }
         .fuel-toggle[data-fuel="diesel"].active { border-color: var(--diesel); color: var(--diesel); background: rgba(96,165,250,0.1); }
 
+        .range-toggles {
+            display: flex;
+            gap: 0.35rem;
+        }
+
+        .range-toggle {
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            padding: 0.3rem 0.6rem;
+            border-radius: 6px;
+            border: 1px solid var(--border-hi);
+            background: transparent;
+            color: var(--muted);
+            cursor: pointer;
+            transition: all 0.15s;
+            letter-spacing: 0.04em;
+        }
+
+        .range-toggle.active {
+            border-color: var(--amber);
+            color: var(--amber);
+            background: rgba(245,166,35,0.1);
+        }
+
         .chart-body {
             padding: 1rem 1.25rem;
         }
@@ -1054,10 +1078,20 @@ function formatPrice($value): string
             <!-- Cheapest now -->
             <div class="cheapest-card" id="cheapest-card"></div>
 
+            <!-- Highest last 7 days -->
+            <div class="cheapest-card" id="highest-card"></div>
+
             <!-- Chart -->
             <div class="chart-card">
                 <div class="chart-header">
                     <span class="chart-title" data-i18n="priceTimeline">Price timeline</span>
+                    <div class="range-toggles">
+                        <button type="button" class="range-toggle active" data-range="all"   data-i18n="rangeAll">All</button>
+                        <button type="button" class="range-toggle"        data-range="30d"   data-i18n="range30d">30d</button>
+                        <button type="button" class="range-toggle"        data-range="14d"   data-i18n="range14d">14d</button>
+                        <button type="button" class="range-toggle"        data-range="7d"    data-i18n="range7d">7d</button>
+                        <button type="button" class="range-toggle"        data-range="today" data-i18n="rangeToday">Today</button>
+                    </div>
                     <div class="fuel-toggles">
                         <button type="button" class="fuel-toggle active" data-fuel="e5">E5</button>
                         <button type="button" class="fuel-toggle active" data-fuel="e10">E10</button>
@@ -1239,6 +1273,21 @@ if (!chartEl) {
 } else {
     const activeFuels = new Set(selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel]);
 
+    let chartRange = 'all';
+    const rangeToggleEls = [...document.querySelectorAll('.range-toggle')];
+
+    function getRangeFilteredData() {
+        if (chartRange === 'all') return chartData;
+        const now = Date.now();
+        if (chartRange === 'today') {
+            const todayStr = new Date().toLocaleDateString('sv'); // YYYY-MM-DD in local tz
+            return chartData.filter((r) => r.recorded_at.startsWith(todayStr));
+        }
+        const days = chartRange === '30d' ? 30 : chartRange === '14d' ? 14 : 7;
+        const cutoff = now - days * 24 * 60 * 60 * 1000;
+        return chartData.filter((r) => Date.parse(r.recorded_at) >= cutoff);
+    }
+
     toggles.forEach((toggle) => {
         const fuel = toggle.dataset.fuel;
         toggle.classList.toggle('active', activeFuels.has(fuel));
@@ -1246,13 +1295,22 @@ if (!chartEl) {
         if (toggle.disabled) toggle.classList.remove('active');
     });
 
+    rangeToggleEls.forEach((btn) => {
+        btn.addEventListener('click', () => {
+            chartRange = btn.dataset.range;
+            rangeToggleEls.forEach((b) => b.classList.toggle('active', b.dataset.range === chartRange));
+            renderChart();
+        });
+    });
+
     function renderChart() {
         chartEl.innerHTML = '';
         legendEl.innerHTML = '';
 
-        if (chartData.length === 0) return;
+        const rangeData = getRangeFilteredData();
+        if (rangeData.length === 0) return;
 
-        const visibleRows = chartData.filter((row) => [...activeFuels].some((f) => row[f] !== null));
+        const visibleRows = rangeData.filter((row) => [...activeFuels].some((f) => row[f] !== null));
         if (visibleRows.length === 0) return;
 
         const margin = { top: 24, right: 24, bottom: 60, left: 68 };
@@ -1457,6 +1515,13 @@ const translations = {
         noSnapshots: 'No snapshots match the current filters.',
         cheapestNow: 'Cheapest — last snapshot',
         cheapestNoData: 'No price data available.',
+        highestNow: 'Highest — last 7 days',
+        highestNoData: 'No price data available.',
+        rangeAll: 'All',
+        range30d: '30d',
+        range14d: '14d',
+        range7d: '7d',
+        rangeToday: 'Today',
     },
     de: {
         title: 'Preisverlauf',
@@ -1493,6 +1558,13 @@ const translations = {
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
         cheapestNow: 'Günstigster Preis — letzter Snapshot',
         cheapestNoData: 'Keine Preisdaten vorhanden.',
+        highestNow: 'Höchster Preis — letzte 7 Tage',
+        highestNoData: 'Keine Preisdaten vorhanden.',
+        rangeAll: 'Alle',
+        range30d: '30d',
+        range14d: '14d',
+        range7d: '7d',
+        rangeToday: 'Heute',
     },
 };
 
@@ -1551,7 +1623,56 @@ function renderCheapest() {
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
                         `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                        `<div class="cheapest-station">${station}</div>` +
+                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${station}</div>` +
+                        (address ? `<div class="cheapest-station" style="opacity:0.6">${address}</div>` : '') +
+                        `<div class="cheapest-time">${formatDateTime(recorded_at)}</div>` +
+                    `</div>`;
+                }).join('') +
+              `</div>`
+        );
+}
+
+/* ── Highest-price box (last 7 days) ───────────────────────────── */
+const highestCard = document.getElementById('highest-card');
+
+function renderHighest() {
+    if (!highestCard) return;
+    const t = translations[currentLang];
+
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const recentRows = chartData.filter((row) => Date.parse(row.recorded_at) >= cutoff);
+
+    const fuels = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
+    const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
+
+    const highest = [];
+    for (const fuel of fuels) {
+        let best = null;
+        for (const row of recentRows) {
+            if (row[fuel] !== null && (best === null || row[fuel] > best.price)) {
+                best = { price: row[fuel], station: row.station_name, street: row.street, place: row.place, recorded_at: row.recorded_at };
+            }
+        }
+        if (best) highest.push({ fuel, ...best });
+    }
+
+    const colClass = highest.length === 1 ? 'single' : highest.length === 2 ? 'two-col' : '';
+
+    highestCard.innerHTML =
+        `<div class="cheapest-header">` +
+            `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--muted);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 16 16 12"/><line x1="12" y1="8" x2="12" y2="16"/></svg>` +
+            `<span class="cheapest-title">${t.highestNow}</span>` +
+        `</div>` +
+        (highest.length === 0
+            ? `<div class="cheapest-empty">${t.highestNoData}</div>`
+            : `<div class="cheapest-grid${colClass ? ' ' + colClass : ''}">` +
+                highest.map(({ fuel, price, station, street, place, recorded_at }) => {
+                    const addressParts = [street, place].filter(Boolean);
+                    const address = addressParts.length ? addressParts.join(', ') : '';
+                    return `<div class="cheapest-cell">` +
+                        `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
+                        `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${station}</div>` +
                         (address ? `<div class="cheapest-station" style="opacity:0.6">${address}</div>` : '') +
                         `<div class="cheapest-time">${formatDateTime(recorded_at)}</div>` +
                     `</div>`;
@@ -1576,6 +1697,7 @@ function applyLang(lang) {
         el.textContent = formatDateTime(el.dataset.recordedAt);
     });
     renderCheapest();
+    renderHighest();
     if (chartEl) renderChart();
 }
 
