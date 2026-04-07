@@ -1078,7 +1078,10 @@ function formatPrice($value): string
             <!-- Cheapest now -->
             <div class="cheapest-card" id="cheapest-card"></div>
 
-            <!-- Highest last 7 days -->
+            <!-- Cheapest in selected range -->
+            <div class="cheapest-card" id="cheapest-range-card"></div>
+
+            <!-- Highest in selected range -->
             <div class="cheapest-card" id="highest-card"></div>
 
             <!-- Chart -->
@@ -1303,6 +1306,7 @@ if (!chartEl) {
             chartRange = btn.dataset.range;
             rangeToggleEls.forEach((b) => b.classList.toggle('active', b.dataset.range === chartRange));
             renderChart();
+            renderCheapestRange();
             renderHighest();
         });
     });
@@ -1519,6 +1523,8 @@ const translations = {
         noSnapshots: 'No snapshots match the current filters.',
         cheapestNow: 'Cheapest — last snapshot',
         cheapestNoData: 'No price data available.',
+        cheapestPrefix: 'Cheapest',
+        cheapestRangeNoData: 'No price data available.',
         highestPrefix: 'Highest',
         highestNoData: 'No price data available.',
         rangeAll: 'All',
@@ -1562,6 +1568,8 @@ const translations = {
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
         cheapestNow: 'Günstigster Preis — letzter Snapshot',
         cheapestNoData: 'Keine Preisdaten vorhanden.',
+        cheapestPrefix: 'Günstigster Preis',
+        cheapestRangeNoData: 'Keine Preisdaten vorhanden.',
         highestPrefix: 'Höchster Preis',
         highestNoData: 'Keine Preisdaten vorhanden.',
         rangeAll: 'Alle',
@@ -1620,6 +1628,56 @@ function renderCheapest() {
         `</div>` +
         (cheapest.length === 0
             ? `<div class="cheapest-empty">${t.cheapestNoData}</div>`
+            : `<div class="cheapest-grid${colClass ? ' ' + colClass : ''}">` +
+                cheapest.map(({ fuel, price, station, street, place, recorded_at }) => {
+                    const addressParts = [street, place].filter(Boolean);
+                    const address = addressParts.length ? addressParts.join(', ') : '';
+                    return `<div class="cheapest-cell">` +
+                        `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
+                        `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${station}</div>` +
+                        (address ? `<div class="cheapest-station" style="opacity:0.6">${address}</div>` : '') +
+                        `<div class="cheapest-time">${formatDateTime(recorded_at)}</div>` +
+                    `</div>`;
+                }).join('') +
+              `</div>`
+        );
+}
+
+/* ── Cheapest-price box (range) ────────────────────────────────── */
+const cheapestRangeCard = document.getElementById('cheapest-range-card');
+
+function renderCheapestRange() {
+    if (!cheapestRangeCard) return;
+    const t = translations[currentLang];
+
+    const rangeRows = getRangeFilteredData();
+    const rangeKey = 'range' + chartRange.charAt(0).toUpperCase() + chartRange.slice(1);
+    const title = `${t.cheapestPrefix} — ${t[rangeKey]}`;
+
+    const fuels = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
+    const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
+
+    const cheapest = [];
+    for (const fuel of fuels) {
+        let best = null;
+        for (const row of rangeRows) {
+            if (row[fuel] !== null && (best === null || row[fuel] < best.price)) {
+                best = { price: row[fuel], station: row.station_name, street: row.street, place: row.place, recorded_at: row.recorded_at };
+            }
+        }
+        if (best) cheapest.push({ fuel, ...best });
+    }
+
+    const colClass = cheapest.length === 1 ? 'single' : cheapest.length === 2 ? 'two-col' : '';
+
+    cheapestRangeCard.innerHTML =
+        `<div class="cheapest-header">` +
+            `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 16 16 12"/><line x1="12" y1="8" x2="12" y2="16"/></svg>` +
+            `<span class="cheapest-title">${title}</span>` +
+        `</div>` +
+        (cheapest.length === 0
+            ? `<div class="cheapest-empty">${t.cheapestRangeNoData}</div>`
             : `<div class="cheapest-grid${colClass ? ' ' + colClass : ''}">` +
                 cheapest.map(({ fuel, price, station, street, place, recorded_at }) => {
                     const addressParts = [street, place].filter(Boolean);
@@ -1702,6 +1760,7 @@ function applyLang(lang) {
         el.textContent = formatDateTime(el.dataset.recordedAt);
     });
     renderCheapest();
+    renderCheapestRange();
     renderHighest();
     if (chartEl) renderChart();
 }
