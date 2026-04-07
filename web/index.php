@@ -1268,25 +1268,26 @@ document.addEventListener('touchend', hideTooltip);
 // Properly initialised later once `translations` is available.
 let currentLang = 'en';
 
+let chartRange = 'all';
+
+function getRangeFilteredData() {
+    if (chartRange === 'all') return chartData;
+    const now = Date.now();
+    if (chartRange === 'today') {
+        const todayStr = new Date().toLocaleDateString('sv'); // YYYY-MM-DD in local tz
+        return chartData.filter((r) => r.recorded_at.startsWith(todayStr));
+    }
+    const days = chartRange === '30d' ? 30 : chartRange === '14d' ? 14 : 7;
+    const cutoff = now - days * 24 * 60 * 60 * 1000;
+    return chartData.filter((r) => Date.parse(r.recorded_at) >= cutoff);
+}
+
 if (!chartEl) {
     // No chart in DOM (empty state)
 } else {
     const activeFuels = new Set(selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel]);
 
-    let chartRange = 'all';
     const rangeToggleEls = [...document.querySelectorAll('.range-toggle')];
-
-    function getRangeFilteredData() {
-        if (chartRange === 'all') return chartData;
-        const now = Date.now();
-        if (chartRange === 'today') {
-            const todayStr = new Date().toLocaleDateString('sv'); // YYYY-MM-DD in local tz
-            return chartData.filter((r) => r.recorded_at.startsWith(todayStr));
-        }
-        const days = chartRange === '30d' ? 30 : chartRange === '14d' ? 14 : 7;
-        const cutoff = now - days * 24 * 60 * 60 * 1000;
-        return chartData.filter((r) => Date.parse(r.recorded_at) >= cutoff);
-    }
 
     toggles.forEach((toggle) => {
         const fuel = toggle.dataset.fuel;
@@ -1300,6 +1301,7 @@ if (!chartEl) {
             chartRange = btn.dataset.range;
             rangeToggleEls.forEach((b) => b.classList.toggle('active', b.dataset.range === chartRange));
             renderChart();
+            renderHighest();
         });
     });
 
@@ -1515,7 +1517,7 @@ const translations = {
         noSnapshots: 'No snapshots match the current filters.',
         cheapestNow: 'Cheapest — last snapshot',
         cheapestNoData: 'No price data available.',
-        highestNow: 'Highest — last 7 days',
+        highestPrefix: 'Highest',
         highestNoData: 'No price data available.',
         rangeAll: 'All',
         range30d: '30d',
@@ -1558,7 +1560,7 @@ const translations = {
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
         cheapestNow: 'Günstigster Preis — letzter Snapshot',
         cheapestNoData: 'Keine Preisdaten vorhanden.',
-        highestNow: 'Höchster Preis — letzte 7 Tage',
+        highestPrefix: 'Höchster Preis',
         highestNoData: 'Keine Preisdaten vorhanden.',
         rangeAll: 'Alle',
         range30d: '30d',
@@ -1632,15 +1634,16 @@ function renderCheapest() {
         );
 }
 
-/* ── Highest-price box (last 7 days) ───────────────────────────── */
+/* ── Highest-price box ─────────────────────────────────────────── */
 const highestCard = document.getElementById('highest-card');
 
 function renderHighest() {
     if (!highestCard) return;
     const t = translations[currentLang];
 
-    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-    const recentRows = chartData.filter((row) => Date.parse(row.recorded_at) >= cutoff);
+    const rangeRows = getRangeFilteredData();
+    const rangeKey = 'range' + chartRange.charAt(0).toUpperCase() + chartRange.slice(1);
+    const title = `${t.highestPrefix} — ${t[rangeKey]}`;
 
     const fuels = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
     const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
@@ -1648,7 +1651,7 @@ function renderHighest() {
     const highest = [];
     for (const fuel of fuels) {
         let best = null;
-        for (const row of recentRows) {
+        for (const row of rangeRows) {
             if (row[fuel] !== null && (best === null || row[fuel] > best.price)) {
                 best = { price: row[fuel], station: row.station_name, street: row.street, place: row.place, recorded_at: row.recorded_at };
             }
@@ -1661,7 +1664,7 @@ function renderHighest() {
     highestCard.innerHTML =
         `<div class="cheapest-header">` +
             `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--muted);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 16 16 12"/><line x1="12" y1="8" x2="12" y2="16"/></svg>` +
-            `<span class="cheapest-title">${t.highestNow}</span>` +
+            `<span class="cheapest-title">${title}</span>` +
         `</div>` +
         (highest.length === 0
             ? `<div class="cheapest-empty">${t.highestNoData}</div>`
