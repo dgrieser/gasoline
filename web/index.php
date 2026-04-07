@@ -1272,11 +1272,12 @@ let chartRange = 'all';
 
 function getRangeFilteredData() {
     if (chartRange === 'all') return chartData;
-    const now = Date.now();
     if (chartRange === 'today') {
-        const todayStr = new Date().toLocaleDateString('sv'); // YYYY-MM-DD in local tz
-        return chartData.filter((r) => r.recorded_at.startsWith(todayStr));
+        const startOfToday = new Date();
+        startOfToday.setHours(0, 0, 0, 0);
+        return chartData.filter((r) => Date.parse(r.recorded_at) >= startOfToday.getTime());
     }
+    const now = Date.now();
     const days = chartRange === '30d' ? 30 : chartRange === '14d' ? 14 : 7;
     const cutoff = now - days * 24 * 60 * 60 * 1000;
     return chartData.filter((r) => Date.parse(r.recorded_at) >= cutoff);
