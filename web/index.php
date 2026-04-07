@@ -1220,6 +1220,15 @@ function stationFuelColor(stationName, fuel) {
     return `hsl(${hue},${s}%,${l}%)`;
 }
 
+function h(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 const chartData = <?= json_encode($chartRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
 chartData.forEach((r) => { r._ts = Date.parse(r.recorded_at); });
 const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
@@ -1254,8 +1263,8 @@ function showTooltip(e, row, fuel, cfg) {
     const color = stationFuelColor(row.station_name, fuel);
     tooltip.innerHTML =
         `<div class="tt-price" style="color:${color}">${cfg.label} &nbsp;${row[fuel].toFixed(3)} €</div>` +
-        `<div class="tt-meta">${row.station_name}</div>` +
-        `<div class="tt-meta">${formatDateTime(row.recorded_at)}</div>`;
+        `<div class="tt-meta">${h(row.station_name)}</div>` +
+        `<div class="tt-meta">${h(formatDateTime(row.recorded_at))}</div>`;
     tooltip.style.display = 'block';
     positionTooltip(e);
 }
@@ -1466,7 +1475,7 @@ if (!chartEl) {
                 const label = fuelConfig[fuel].label;
                 return `<span class="legend-dot" title="${label}" style="background:${color}"></span>`;
             }).join('');
-            item.innerHTML = `${swatches}${sample.station_name}`;
+            item.innerHTML = `${swatches}${h(sample.station_name)}`;
             legendEl.appendChild(item);
         }
     }
@@ -1635,9 +1644,9 @@ function renderCheapest() {
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
                         `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${station}</div>` +
-                        (address ? `<div class="cheapest-station" style="opacity:0.6">${address}</div>` : '') +
-                        `<div class="cheapest-time">${formatDateTime(recorded_at)}</div>` +
+                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(station)}</div>` +
+                        (address ? `<div class="cheapest-station" style="opacity:0.6">${h(address)}</div>` : '') +
+                        `<div class="cheapest-time">${h(formatDateTime(recorded_at))}</div>` +
                     `</div>`;
                 }).join('') +
               `</div>`
@@ -1685,9 +1694,9 @@ function renderCheapestRange() {
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
                         `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${station}</div>` +
-                        (address ? `<div class="cheapest-station" style="opacity:0.6">${address}</div>` : '') +
-                        `<div class="cheapest-time">${formatDateTime(recorded_at)}</div>` +
+                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(station)}</div>` +
+                        (address ? `<div class="cheapest-station" style="opacity:0.6">${h(address)}</div>` : '') +
+                        `<div class="cheapest-time">${h(formatDateTime(recorded_at))}</div>` +
                     `</div>`;
                 }).join('') +
               `</div>`
@@ -1735,9 +1744,9 @@ function renderHighest() {
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
                         `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${station}</div>` +
-                        (address ? `<div class="cheapest-station" style="opacity:0.6">${address}</div>` : '') +
-                        `<div class="cheapest-time">${formatDateTime(recorded_at)}</div>` +
+                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(station)}</div>` +
+                        (address ? `<div class="cheapest-station" style="opacity:0.6">${h(address)}</div>` : '') +
+                        `<div class="cheapest-time">${h(formatDateTime(recorded_at))}</div>` +
                     `</div>`;
                 }).join('') +
               `</div>`
