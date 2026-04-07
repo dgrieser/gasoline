@@ -1214,12 +1214,6 @@ const FUEL_TINTS = {
     diesel: { s: 52, l: 42 },   // deep
 };
 
-function stationFuelColor(stationName, fuel) {
-    const hue = _stationHues?.[stationName] ?? nameToHue(stationName);
-    const { s, l } = FUEL_TINTS[fuel];
-    return `hsl(${hue},${s}%,${l}%)`;
-}
-
 function h(str) {
     return String(str)
         .replace(/&/g, '&amp;')
@@ -1239,6 +1233,13 @@ const _stationHues = (() => {
     const names = [...new Set(chartData.map((r) => r.station_name))].sort();
     return Object.fromEntries(names.map((name, i) => [name, (i * GOLDEN_ANGLE) % 360]));
 })();
+
+function stationFuelColor(stationName, fuel) {
+    const hue = _stationHues[stationName] ?? nameToHue(stationName);
+    const { s, l } = FUEL_TINTS[fuel];
+    return `hsl(${hue},${s}%,${l}%)`;
+}
+
 const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
 
 const fuelConfig = {
