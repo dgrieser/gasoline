@@ -162,9 +162,9 @@ Commands:
   history  show historical prices for one station
 
 Examples:
-  go run . update --city "Berlin, Germany" --radius 5
-  go run . stations --city "Berlin, Germany"
-  go run . history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel`)
+  gasoline update --city "Berlin, Germany" --radius 5
+  gasoline stations --city "Berlin, Germany"
+  gasoline history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel`)
 }
 
 func runUpdate(args []string) error {

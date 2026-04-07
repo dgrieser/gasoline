@@ -24,25 +24,25 @@ make test
 Persist a new snapshot for a place:
 
 ```bash
-go run . update --city "Berlin, Germany" --radius 5
+gasoline update --city "Berlin, Germany" --radius 5
 ```
 
 List cached city geocodes:
 
 ```bash
-go run . cities
+gasoline cities
 ```
 
 List known stations and their latest stored prices:
 
 ```bash
-go run . stations --city "Berlin, Germany"
+gasoline stations --city "Berlin, Germany"
 ```
 
 Show historical prices for a station:
 
 ```bash
-go run . history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel
+gasoline history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel
 ```
 
 ## PHP Viewer
