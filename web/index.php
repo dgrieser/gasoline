@@ -1215,7 +1215,7 @@ const FUEL_TINTS = {
 };
 
 function stationFuelColor(stationName, fuel) {
-    const hue = nameToHue(stationName);
+    const hue = _stationHues?.[stationName] ?? nameToHue(stationName);
     const { s, l } = FUEL_TINTS[fuel];
     return `hsl(${hue},${s}%,${l}%)`;
 }
@@ -1231,6 +1231,14 @@ function h(str) {
 
 const chartData = <?= json_encode($chartRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
 chartData.forEach((r) => { r._ts = Date.parse(r.recorded_at); });
+
+// Evenly-spread hues for all stations in this view using golden-angle spacing.
+// Stations sorted alphabetically → deterministic within a place.
+const _stationHues = (() => {
+    const GOLDEN_ANGLE = 137.508;
+    const names = [...new Set(chartData.map((r) => r.station_name))].sort();
+    return Object.fromEntries(names.map((name, i) => [name, (i * GOLDEN_ANGLE) % 360]));
+})();
 const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
 
 const fuelConfig = {
