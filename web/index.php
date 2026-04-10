@@ -1204,7 +1204,8 @@ function formatPrice($value): string
                             type="text"
                             id="f-city"
                             class="city-ac-input"
-                            placeholder="Type 3+ chars…"
+                            data-i18n-placeholder="enterCity"
+                            placeholder="Enter city..."
                             autocomplete="off"
                             spellcheck="false"
                             value="<?= h($selectedCityRow ? (string) $selectedCityRow['display_name'] : '') ?>"
@@ -1784,6 +1785,7 @@ const translations = {
         title: 'Price History',
         filters: 'Filters',
         city: 'City',
+        enterCity: 'Enter city...',
         allCities: '— all cities —',
         radius: 'Radius',
         from: 'From',
@@ -1830,6 +1832,7 @@ const translations = {
         title: 'Preisverlauf',
         filters: 'Filter',
         city: 'Stadt',
+        enterCity: 'Stadt eingeben...',
         allCities: '— alle Städte —',
         radius: 'Radius',
         from: 'Von',
@@ -1975,6 +1978,10 @@ function applyLang(lang) {
     document.querySelectorAll('[data-i18n]').forEach((el) => {
         const key = el.dataset.i18n;
         if (t[key] !== undefined) el.textContent = t[key];
+    });
+    document.querySelectorAll('[data-i18n-placeholder]').forEach((el) => {
+        const key = el.dataset.i18nPlaceholder;
+        if (t[key] !== undefined) el.setAttribute('placeholder', t[key]);
     });
     document.querySelectorAll('.lang-btn').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.lang === lang);
