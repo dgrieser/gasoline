@@ -67,7 +67,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
         $searchStmt->bindValue(':prefix', strtolower($q) . '%');
         $searchStmt->execute();
         echo json_encode($searchStmt->fetchAll(), JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
-    } catch (Throwable) {
+    } catch (Throwable $e) {
         echo '[]';
     }
     exit;
