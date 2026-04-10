@@ -995,6 +995,9 @@ func migrateSchema(ctx context.Context, db *sql.DB) (migrateResult, error) {
 	if err := migrateCitiesNormalizedName(ctx, tx, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateCitiesDisplayName(ctx, tx, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migrateCitiesDeduplicate(ctx, tx, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -1077,7 +1080,7 @@ func migrateCitiesDeduplicate(ctx context.Context, tx *sql.Tx, result *migrateRe
 			continue
 		}
 
-		if shouldPromoteCityDisplay(keeper.DisplayName, row.DisplayName) {
+		if shouldPromoteCityDisplay(keeper.Name, keeper.DisplayName, row.DisplayName) {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE cities
 				SET display_name = ?, lat = ?, lng = ?
@@ -1101,6 +1104,26 @@ func migrateCitiesDeduplicate(ctx context.Context, tx *sql.Tx, result *migrateRe
 
 	if deduped {
 		result.Applied = append(result.Applied, "cities.deduplicate_normalized_name")
+	}
+	return nil
+}
+
+func migrateCitiesDisplayName(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE cities
+		SET display_name = normalized_name
+		WHERE TRIM(normalized_name) <> ''
+			AND display_name <> normalized_name
+	`)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected > 0 {
+		result.Applied = append(result.Applied, "cities.display_name")
 	}
 	return nil
 }
@@ -1437,7 +1460,8 @@ func updateCachedCity(ctx context.Context, db *sql.DB, queryName string, city ca
 	return err
 }
 
-func shouldPromoteCityDisplay(current, candidate string) bool {
+func shouldPromoteCityDisplay(normalizedName, current, candidate string) bool {
+	normalizedName = strings.TrimSpace(normalizedName)
 	current = strings.TrimSpace(current)
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
@@ -1449,7 +1473,13 @@ func shouldPromoteCityDisplay(current, candidate string) bool {
 	if current == candidate {
 		return false
 	}
-	return len(candidate) > len(current)
+	if current == normalizedName {
+		return false
+	}
+	if candidate == normalizedName {
+		return true
+	}
+	return len(candidate) < len(current)
 }
 
 func geocodeCity(ctx context.Context, city string, userAgent string) (cachedCity, error) {
@@ -1495,14 +1525,15 @@ func geocodeCity(ctx context.Context, city string, userAgent string) (cachedCity
 	return cachedCity{
 		QueryName:   city,
 		Name:        blankOr(results[0].Name, results[0].DisplayName),
-		DisplayName: results[0].DisplayName,
+		DisplayName: blankOr(results[0].Name, results[0].DisplayName),
 		Lat:         lat,
 		Lng:         lng,
 	}, nil
 }
 
 func needsNormalizedNameRefresh(city cachedCity) bool {
-	return strings.TrimSpace(city.Name) == "" || city.Name == city.DisplayName
+	return strings.TrimSpace(city.Name) == "" ||
+		(strings.TrimSpace(city.Name) == strings.TrimSpace(city.DisplayName) && strings.Contains(city.Name, ","))
 }
 
 func fetchStations(ctx context.Context, cfg config, lat, lng, radius float64, fuelType, sortBy string) ([]tankerStation, error) {

@@ -114,7 +114,7 @@ func TestPersistUpdateAndQueryHistory(t *testing.T) {
 	city := cachedCity{
 		QueryName:   "Berlin, Germany",
 		Name:        "Berlin",
-		DisplayName: "Berlin, Deutschland",
+		DisplayName: "Berlin",
 		Lat:         52.517389,
 		Lng:         13.395131,
 	}
@@ -305,7 +305,7 @@ func TestPersistUpdateIgnoresDistanceChangeButTracksOpenChange(t *testing.T) {
 	city := cachedCity{
 		QueryName:   "Berlin, Germany",
 		Name:        "Berlin",
-		DisplayName: "Berlin, Deutschland",
+		DisplayName: "Berlin",
 		Lat:         52.517389,
 		Lng:         13.395131,
 	}
@@ -370,7 +370,7 @@ func TestGetOrCreateCityUsesCache(t *testing.T) {
 	if cached {
 		t.Fatal("first lookup should not come from cache")
 	}
-	if city.DisplayName != "Berlin, Deutschland" {
+	if city.DisplayName != "Berlin" {
 		t.Fatalf("display name = %q", city.DisplayName)
 	}
 	if city.Name != "Berlin" {
@@ -422,6 +422,9 @@ func TestGetOrCreateCityRefreshesLegacyNormalizedName(t *testing.T) {
 	if city.Name != "Lübbecke" {
 		t.Fatalf("normalized name = %q", city.Name)
 	}
+	if city.DisplayName != "Lübbecke" {
+		t.Fatalf("display name = %q", city.DisplayName)
+	}
 
 	var normalizedName string
 	if err := db.QueryRowContext(ctx, `SELECT normalized_name FROM cities WHERE name = ?`, "Luebbecke, Germany").Scan(&normalizedName); err != nil {
@@ -468,7 +471,7 @@ func TestGetOrCreateCityReusesCanonicalCityForAliasQuery(t *testing.T) {
 	if city.Name != "Lübbecke" {
 		t.Fatalf("normalized name = %q", city.Name)
 	}
-	if city.DisplayName != "Lübbecke, Kreis Minden-Lübbecke, Nordrhein-Westfalen, 32312, Deutschland" {
+	if city.DisplayName != "Lübbecke" {
 		t.Fatalf("display name = %q", city.DisplayName)
 	}
 	if got := requests.Load(); got != 1 {
@@ -920,6 +923,9 @@ func TestRunMigrateDeduplicatesCitiesByNormalizedName(t *testing.T) {
 	if !containsString(result.Applied, "cities.deduplicate_normalized_name") {
 		t.Fatalf("applied migrations = %v, want cities.deduplicate_normalized_name", result.Applied)
 	}
+	if !containsString(result.Applied, "cities.display_name") {
+		t.Fatalf("applied migrations = %v, want cities.display_name", result.Applied)
+	}
 
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -949,7 +955,7 @@ func TestRunMigrateDeduplicatesCitiesByNormalizedName(t *testing.T) {
 	if name != "Lübbecke" {
 		t.Fatalf("kept city name = %q, want %q", name, "Lübbecke")
 	}
-	if displayName != "Lübbecke, Kreis Minden-Lübbecke, Nordrhein-Westfalen, 32312, Deutschland" {
+	if displayName != "Lübbecke" {
 		t.Fatalf("display_name = %q", displayName)
 	}
 }
@@ -1059,7 +1065,7 @@ func seedFixtureDB(t *testing.T) string {
 	city := cachedCity{
 		QueryName:   "Berlin, Germany",
 		Name:        "Berlin",
-		DisplayName: "Berlin, Deutschland",
+		DisplayName: "Berlin",
 		Lat:         52.517389,
 		Lng:         13.395131,
 	}
