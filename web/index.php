@@ -17,10 +17,14 @@ $summary = [
 
 $selectedStationIds = array_values(array_filter(
     array_map(
-        static fn ($value): string => trim((string) $value),
+        static function ($value): string {
+            return trim((string) $value);
+        },
         (array) ($_GET['station_ids'] ?? [])
     ),
-    static fn (string $value): bool => $value !== ''
+    static function (string $value): bool {
+        return $value !== '';
+    }
 ));
 
 $fromDate = trim((string) ($_GET['from'] ?? ''));
