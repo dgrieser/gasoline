@@ -41,7 +41,34 @@ if (!file_exists($dbPath)) {
     $errors[] = sprintf('SQLite database not found at %s', $dbPath);
 }
 
-$cities = [];
+// ── AJAX: city prefix search ──────────────────────────────────────────────────
+if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
+    header('Content-Type: application/json; charset=utf-8');
+    $q = trim((string) ($_GET['q'] ?? ''));
+    if (strlen($q) < 3 || !file_exists($dbPath)) {
+        echo '[]';
+        exit;
+    }
+    try {
+        $searchPdo = new PDO('sqlite:' . $dbPath);
+        $searchPdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $searchPdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        $searchStmt = $searchPdo->prepare(
+            "SELECT normalized_name AS city_key, display_name
+             FROM cities
+             WHERE LOWER(normalized_name) LIKE :prefix
+             ORDER BY normalized_name ASC
+             LIMIT 20"
+        );
+        $searchStmt->bindValue(':prefix', strtolower($q) . '%');
+        $searchStmt->execute();
+        echo json_encode($searchStmt->fetchAll(), JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+    } catch (Throwable) {
+        echo '[]';
+    }
+    exit;
+}
+
 $selectedCityRow = null;
 $selectedCityDistances = [];
 
@@ -75,19 +102,6 @@ if ($errors === []) {
         $pdo = new PDO('sqlite:' . $dbPath);
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-
-        $cities = $pdo->query(
-            <<<'SQL'
-            SELECT
-                normalized_name AS city_key,
-                normalized_name AS city_name,
-                display_name,
-                lat,
-                lng
-            FROM cities
-            ORDER BY normalized_name ASC
-            SQL
-        )->fetchAll();
 
         if ($selectedCity !== '') {
             $cityStatement = $pdo->prepare(
@@ -561,6 +575,75 @@ function formatPrice($value): string
         .field select[multiple] option:checked {
             background: var(--amber-dim);
             color: var(--amber);
+        }
+
+        /* ── City autocomplete ─────────────────────────────────────── */
+        .city-ac { position: relative; }
+
+        .city-ac-input {
+            width: 100%;
+            background: var(--surface-hi);
+            border: 1px solid var(--border-hi);
+            border-radius: 8px;
+            padding: 0.65rem 0.8rem;
+            font-family: var(--mono);
+            font-size: 0.85rem;
+            color: var(--ink);
+            appearance: none;
+            transition: border-color 0.15s;
+            outline: none;
+        }
+
+        .city-ac-input:focus {
+            border-color: var(--amber);
+            box-shadow: 0 0 0 3px var(--amber-dim);
+        }
+
+        .city-ac-list {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            right: 0;
+            background: var(--surface);
+            border: 1px solid var(--border-hi);
+            border-radius: 8px;
+            list-style: none;
+            padding: 0.3rem;
+            margin: 0;
+            z-index: 200;
+            max-height: 14rem;
+            overflow-y: auto;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+            scrollbar-width: thin;
+        }
+
+        .city-ac-list[hidden] { display: none; }
+
+        .city-ac-item {
+            padding: 0.48rem 0.6rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            color: var(--ink);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            transition: background 0.1s, color 0.1s;
+        }
+
+        .city-ac-item:hover,
+        .city-ac-item[aria-selected="true"] {
+            background: var(--amber-dim);
+            color: var(--amber);
+        }
+
+        .city-ac-empty {
+            padding: 0.48rem 0.6rem;
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            color: var(--muted);
+            text-align: center;
         }
 
         .sidebar-actions {
@@ -1112,15 +1195,22 @@ function formatPrice($value): string
             <form method="get">
                 <div class="field">
                     <label for="f-city" data-i18n="city">City</label>
-                    <select name="city" id="f-city" onchange="this.form.submit()">
-                        <option value="" data-i18n="allCities">— all cities —</option>
-                        <?php foreach ($cities as $city): ?>
-                            <?php $cityKey = (string) $city['city_key']; ?>
-                            <option value="<?= h($cityKey) ?>" <?= $selectedCity === $cityKey ? 'selected' : '' ?>>
-                                <?= h((string) $city['city_name']) ?>
-                            </option>
-                        <?php endforeach; ?>
-                    </select>
+                    <div class="city-ac" id="city-ac">
+                        <input
+                            type="text"
+                            id="f-city"
+                            class="city-ac-input"
+                            placeholder="Type 3+ chars…"
+                            autocomplete="off"
+                            spellcheck="false"
+                            value="<?= h($selectedCityRow ? (string) $selectedCityRow['display_name'] : '') ?>"
+                            aria-autocomplete="list"
+                            aria-controls="city-ac-list"
+                            aria-expanded="false"
+                        >
+                        <input type="hidden" name="city" id="f-city-value" value="<?= h($selectedCity) ?>">
+                        <ul class="city-ac-list" id="city-ac-list" role="listbox" hidden></ul>
+                    </div>
                 </div>
 
                 <div class="field">
@@ -1921,6 +2011,126 @@ themeToggle.addEventListener('click', () => {
 
 // Sync icon to current theme (set by head script)
 applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+
+/* ── City autocomplete ─────────────────────────────────────────── */
+(function () {
+    const wrap   = document.getElementById('city-ac');
+    const input  = document.getElementById('f-city');
+    const hidden = document.getElementById('f-city-value');
+    const list   = document.getElementById('city-ac-list');
+    const form   = input?.closest('form');
+    const radius = document.getElementById('f-radius');
+
+    if (!wrap || !input || !hidden || !list || !form) return;
+
+    let controller = null;
+    let activeIdx  = -1;
+
+    function showList() {
+        list.hidden = false;
+        input.setAttribute('aria-expanded', 'true');
+    }
+
+    function hideList() {
+        list.hidden = true;
+        input.setAttribute('aria-expanded', 'false');
+        activeIdx = -1;
+    }
+
+    function setActive(idx) {
+        const items = list.querySelectorAll('.city-ac-item');
+        items.forEach((el, i) => el.setAttribute('aria-selected', String(i === idx)));
+        activeIdx = idx;
+    }
+
+    function selectCity(cityKey, displayName) {
+        input.value  = displayName;
+        hidden.value = cityKey;
+        hideList();
+        if (radius) radius.disabled = (cityKey === '');
+        form.submit();
+    }
+
+    async function fetchMatches(q) {
+        if (controller) controller.abort();
+        controller = new AbortController();
+        try {
+            const url = new URL(location.href);
+            url.search = '';
+            url.searchParams.set('action', 'city_search');
+            url.searchParams.set('q', q);
+            const res = await fetch(url.toString(), { signal: controller.signal });
+            return await res.json();
+        } catch {
+            return null;
+        }
+    }
+
+    let debounceTimer = null;
+
+    input.addEventListener('input', () => {
+        const q = input.value.trim();
+        hidden.value = '';
+        if (radius) radius.disabled = true;
+        clearTimeout(debounceTimer);
+        if (q.length < 3) { hideList(); return; }
+
+        debounceTimer = setTimeout(async () => {
+            const results = await fetchMatches(q);
+            if (results === null) return;
+
+            list.innerHTML = '';
+            if (results.length === 0) {
+                const empty = document.createElement('li');
+                empty.className = 'city-ac-empty';
+                empty.textContent = '— no matches —';
+                list.appendChild(empty);
+            } else {
+                results.forEach(({ city_key, display_name }) => {
+                    const li = document.createElement('li');
+                    li.className    = 'city-ac-item';
+                    li.role         = 'option';
+                    li.setAttribute('aria-selected', 'false');
+                    li.textContent  = display_name || city_key;
+                    li.addEventListener('mousedown', (e) => {
+                        e.preventDefault();
+                        selectCity(city_key, display_name || city_key);
+                    });
+                    list.appendChild(li);
+                });
+            }
+            showList();
+            activeIdx = -1;
+        }, 200);
+    });
+
+    input.addEventListener('keydown', (e) => {
+        const items = [...list.querySelectorAll('.city-ac-item')];
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setActive(Math.min(activeIdx + 1, items.length - 1));
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setActive(Math.max(activeIdx - 1, 0));
+        } else if (e.key === 'Enter' && !list.hidden && activeIdx >= 0 && items[activeIdx]) {
+            e.preventDefault();
+            items[activeIdx].dispatchEvent(new MouseEvent('mousedown'));
+        } else if (e.key === 'Escape') {
+            hideList();
+        }
+    });
+
+    input.addEventListener('blur', () => setTimeout(hideList, 150));
+
+    // Submit with empty city when user clears the field and blurs
+    input.addEventListener('change', () => {
+        if (input.value.trim() === '' && hidden.value === '') form.submit();
+    });
+
+    document.addEventListener('click', (e) => {
+        if (!wrap.contains(e.target)) hideList();
+    });
+})();
 </script>
 </body>
 </html>
