@@ -1,8 +1,11 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -97,6 +101,19 @@ type compactResult struct {
 	DBPath            string `json:"db_path"`
 }
 
+type importCitiesResult struct {
+	CountryCode   string `json:"country_code"`
+	SourceURL     string `json:"source_url"`
+	ParsedCount   int    `json:"parsed_count"`
+	ImportedCount int    `json:"imported_count"`
+	DBPath        string `json:"db_path"`
+}
+
+type clearCitiesResult struct {
+	ClearedCount int    `json:"cleared_count"`
+	DBPath       string `json:"db_path"`
+}
+
 type cityRow struct {
 	Name        string  `json:"name"`
 	DisplayName string  `json:"display_name"`
@@ -130,6 +147,8 @@ type historyRow struct {
 }
 
 var stdout io.Writer = os.Stdout
+var countryCodePattern = regexp.MustCompile(`^[A-Za-z]{2}$`)
+var geoNamesFeatureCodePattern = regexp.MustCompile(`^(PPL|PPLC|PPLA[1-9]*)$`)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -149,8 +168,16 @@ func run(args []string) error {
 		return runUpdate(args[1:])
 	case "compact":
 		return runCompact(args[1:])
+	case "list":
+		return runList(args[1:])
+	case "import":
+		return runImport(args[1:])
+	case "clear":
+		return runClear(args[1:])
 	case "cities":
 		return runCities(args[1:])
+	case "import-cities":
+		return runImportCities(args[1:])
 	case "stations":
 		return runStations(args[1:])
 	case "history":
@@ -169,15 +196,63 @@ func printUsage() {
 Commands:
   update   geocode a city if needed, query Tankerkönig, store station snapshots
   compact  compact existing price snapshots in-place
-  cities   list cached city geocodes
-  stations list known stations with latest stored snapshot
-  history  show historical prices for one station
+  list cities   list cached city geocodes
+  list stations list known stations with latest stored snapshot
+  list history  show historical prices for one station
+  import cities import GeoNames populated places for a 2-letter country code
+  clear cities  clear all cached cities
 
 Examples:
   gasoline update --city "Berlin, Germany" --radius 5
   gasoline compact
-  gasoline stations --city "Berlin, Germany"
-  gasoline history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel`)
+  gasoline list cities
+  gasoline list stations --city "Berlin, Germany"
+  gasoline list history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel
+  gasoline import cities DE
+  gasoline clear cities`)
+}
+
+func runList(args []string) error {
+	if len(args) == 0 {
+		return errors.New("list requires a subcommand: cities, stations, history")
+	}
+
+	switch args[0] {
+	case "cities":
+		return runCities(args[1:])
+	case "stations":
+		return runStations(args[1:])
+	case "history":
+		return runHistory(args[1:])
+	default:
+		return fmt.Errorf("unknown list subcommand %q", args[0])
+	}
+}
+
+func runImport(args []string) error {
+	if len(args) == 0 {
+		return errors.New("import requires a subcommand: cities")
+	}
+
+	switch args[0] {
+	case "cities":
+		return runImportCities(args[1:])
+	default:
+		return fmt.Errorf("unknown import subcommand %q", args[0])
+	}
+}
+
+func runClear(args []string) error {
+	if len(args) == 0 {
+		return errors.New("clear requires a subcommand: cities")
+	}
+
+	switch args[0] {
+	case "cities":
+		return runClearCities(args[1:])
+	default:
+		return fmt.Errorf("unknown clear subcommand %q", args[0])
+	}
 }
 
 func runUpdate(args []string) error {
@@ -364,6 +439,112 @@ func runCities(args []string) error {
 	if output == outputJSON {
 		return writeJSON(results)
 	}
+	return nil
+}
+
+func runImportCities(args []string) error {
+	fs := flag.NewFlagSet("import-cities", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	outputLong, outputShort := addOutputFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("import-cities requires a 2-letter country code argument")
+	}
+
+	countryCode := strings.ToUpper(strings.TrimSpace(fs.Arg(0)))
+	if !countryCodePattern.MatchString(countryCode) {
+		return errors.New("import-cities requires a 2-letter country code argument")
+	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
+
+	db, err := openDB(resolvedDBPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	sourceURL := fmt.Sprintf("https://download.geonames.org/export/dump/%s.zip", countryCode)
+	cities, err := downloadGeoNamesCities(ctx, sourceURL, countryCode, defaultUserAgent)
+	if err != nil {
+		return err
+	}
+
+	importedCount, err := importCities(ctx, db, cities)
+	if err != nil {
+		return err
+	}
+
+	result := importCitiesResult{
+		CountryCode:   countryCode,
+		SourceURL:     sourceURL,
+		ParsedCount:   len(cities),
+		ImportedCount: importedCount,
+		DBPath:        resolvedDBPath,
+	}
+	if output == outputJSON {
+		return writeJSON(result)
+	}
+
+	fmt.Fprintf(stdout, "source: %s\n", sourceURL)
+	fmt.Fprintf(stdout, "country: %s\n", countryCode)
+	fmt.Fprintf(stdout, "parsed %d cities\n", result.ParsedCount)
+	fmt.Fprintf(stdout, "imported %d cities into %s\n", result.ImportedCount, resolvedDBPath)
+	return nil
+}
+
+func runClearCities(args []string) error {
+	fs := flag.NewFlagSet("clear cities", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	outputLong, outputShort := addOutputFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
+		return err
+	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
+
+	db, err := openDB(resolvedDBPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	resultExec, err := db.ExecContext(ctx, `DELETE FROM cities`)
+	if err != nil {
+		return err
+	}
+	clearedCount, err := resultExec.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	result := clearCitiesResult{
+		ClearedCount: int(clearedCount),
+		DBPath:       resolvedDBPath,
+	}
+	if output == outputJSON {
+		return writeJSON(result)
+	}
+
+	fmt.Fprintf(stdout, "cleared %d cities from %s\n", result.ClearedCount, resolvedDBPath)
 	return nil
 }
 
@@ -761,6 +942,140 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 		END
 	`)
 	return err
+}
+
+func downloadGeoNamesCities(ctx context.Context, sourceURL, countryCode, userAgent string) ([]cachedCity, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", blankOr(userAgent, defaultUserAgent))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("geonames download failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return parseGeoNamesZip(body, countryCode)
+}
+
+func parseGeoNamesZip(body []byte, countryCode string) ([]cachedCity, error) {
+	readerAt := bytes.NewReader(body)
+	archive, err := zip.NewReader(readerAt, int64(len(body)))
+	if err != nil {
+		return nil, err
+	}
+
+	targetName := countryCode + ".txt"
+	for _, file := range archive.File {
+		if filepath.Base(file.Name) != targetName {
+			continue
+		}
+
+		rc, err := file.Open()
+		if err != nil {
+			return nil, err
+		}
+
+		cities, parseErr := parseGeoNamesCities(rc, countryCode)
+		closeErr := rc.Close()
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		return cities, nil
+	}
+
+	return nil, fmt.Errorf("zip archive does not contain %s", targetName)
+}
+
+func parseGeoNamesCities(r io.Reader, countryCode string) ([]cachedCity, error) {
+	reader := csv.NewReader(r)
+	reader.Comma = '\t'
+	reader.FieldsPerRecord = -1
+	reader.LazyQuotes = true
+	reader.ReuseRecord = true
+
+	var cities []cachedCity
+	for {
+		record, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			return cities, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(record) < 9 || record[6] != "P" || !geoNamesFeatureCodePattern.MatchString(record[7]) || record[8] != countryCode {
+			continue
+		}
+
+		lat, err := strconv.ParseFloat(record[4], 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid latitude for %q: %w", record[1], err)
+		}
+		lng, err := strconv.ParseFloat(record[5], 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid longitude for %q: %w", record[1], err)
+		}
+
+		name := strings.TrimSpace(record[1])
+		if name == "" {
+			continue
+		}
+
+		cities = append(cities, cachedCity{
+			Name:        name,
+			DisplayName: name,
+			Lat:         lat,
+			Lng:         lng,
+		})
+	}
+}
+
+func importCities(ctx context.Context, db *sql.DB, cities []cachedCity) (int, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			normalized_name = excluded.normalized_name,
+			display_name = excluded.display_name,
+			lat = excluded.lat,
+			lng = excluded.lng
+	`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	createdAt := time.Now().UTC().Format(time.RFC3339)
+	for _, city := range cities {
+		if _, err := stmt.ExecContext(ctx, city.Name, city.Name, city.DisplayName, city.Lat, city.Lng, createdAt); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(cities), nil
 }
 
 func getOrCreateCity(ctx context.Context, db *sql.DB, cityName, userAgent string) (cachedCity, bool, error) {

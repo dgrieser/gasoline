@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"database/sql"
@@ -446,10 +447,10 @@ func TestGetOrCreateCityRefreshesLegacyNormalizedName(t *testing.T) {
 	}
 }
 
-func TestRunCitiesSupportsJSONOutput(t *testing.T) {
+func TestRunListCitiesSupportsJSONOutput(t *testing.T) {
 	dbPath := seedFixtureDB(t)
 	output := captureStdout(t, func() error {
-		return run([]string{"cities", "--db", dbPath, "--output", "json"})
+		return run([]string{"list", "cities", "--db", dbPath, "--output", "json"})
 	})
 
 	var cities []cityRow
@@ -464,10 +465,10 @@ func TestRunCitiesSupportsJSONOutput(t *testing.T) {
 	}
 }
 
-func TestRunStationsSupportsShortJSONFlag(t *testing.T) {
+func TestRunListStationsSupportsShortJSONFlag(t *testing.T) {
 	dbPath := seedFixtureDB(t)
 	output := captureStdout(t, func() error {
-		return run([]string{"stations", "--db", dbPath, "-o", "json"})
+		return run([]string{"list", "stations", "--db", dbPath, "-o", "json"})
 	})
 
 	var stations []stationRow
@@ -485,10 +486,10 @@ func TestRunStationsSupportsShortJSONFlag(t *testing.T) {
 	}
 }
 
-func TestRunHistorySupportsJSONOutput(t *testing.T) {
+func TestRunListHistorySupportsJSONOutput(t *testing.T) {
 	dbPath := seedFixtureDB(t)
 	output := captureStdout(t, func() error {
-		return run([]string{"history", "--db", dbPath, "--station-id", "station-1", "--fuel", "diesel", "--output", "json"})
+		return run([]string{"list", "history", "--db", dbPath, "--station-id", "station-1", "--fuel", "diesel", "--output", "json"})
 	})
 
 	var history []historyRow
@@ -538,6 +539,156 @@ func TestRunUpdateSupportsJSONOutput(t *testing.T) {
 	}
 	if result.StoredCount != 1 {
 		t.Fatalf("stored_count = %d, want 1", result.StoredCount)
+	}
+}
+
+func TestRunImportCitiesSupportsJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "cities.db")
+
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != "https://download.geonames.org/export/dump/DE.zip" {
+			return nil, fmt.Errorf("unexpected request URL: %s", req.URL.String())
+		}
+		return zipResponse(t, map[string]string{
+			"DE.txt": strings.Join([]string{
+				"1\tBerlin\tBerlin\tBerlin\t52.5200\t13.4050\tP\tPPL\tDE",
+				"2\tHamburg\tHamburg\tHamburg\t53.5511\t9.9937\tP\tPPLA2\tDE",
+				"3\tVillage\tVillage\tVillage\t50.0000\t8.0000\tP\tPPLL\tDE",
+				"4\tAdmin\tAdmin\tAdmin\t51.0000\t9.0000\tA\tPPL\tDE",
+				"5\tParis\tParis\tParis\t48.8566\t2.3522\tP\tPPL\tFR",
+			}, "\n"),
+		}), nil
+	})
+	defer restore()
+
+	output := captureStdout(t, func() error {
+		return run([]string{"import", "cities", "--db", dbPath, "--output", "json", "de"})
+	})
+
+	var result importCitiesResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal import-cities output: %v\noutput=%s", err, output)
+	}
+	if result.CountryCode != "DE" {
+		t.Fatalf("country_code = %q, want %q", result.CountryCode, "DE")
+	}
+	if result.ParsedCount != 2 || result.ImportedCount != 2 {
+		t.Fatalf("counts = parsed:%d imported:%d, want 2/2", result.ParsedCount, result.ImportedCount)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	var count int
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM cities`).Scan(&count); err != nil {
+		t.Fatalf("count cities: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("city count = %d, want 2", count)
+	}
+}
+
+func TestRunImportCitiesRequiresCountryCode(t *testing.T) {
+	err := run([]string{"import", "cities"})
+	if err == nil || !strings.Contains(err.Error(), "2-letter country code") {
+		t.Fatalf("err = %v, want country code validation error", err)
+	}
+}
+
+func TestRunImportCitiesRejectsInvalidCountryCode(t *testing.T) {
+	err := run([]string{"import", "cities", "DEU"})
+	if err == nil || !strings.Contains(err.Error(), "2-letter country code") {
+		t.Fatalf("err = %v, want country code validation error", err)
+	}
+}
+
+func TestRunClearCitiesSupportsJSONOutput(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+
+	output := captureStdout(t, func() error {
+		return run([]string{"clear", "cities", "--db", dbPath, "--output", "json"})
+	})
+
+	var result clearCitiesResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal clear cities output: %v\noutput=%s", err, output)
+	}
+	if result.ClearedCount != 1 {
+		t.Fatalf("cleared_count = %d, want 1", result.ClearedCount)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	var count int
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM cities`).Scan(&count); err != nil {
+		t.Fatalf("count cities: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("city count = %d, want 0", count)
+	}
+}
+
+func TestRunImportCitiesUpsertsExistingRows(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, "Berlin", "Berlin", "Berlin", 1.0, 2.0, "2026-04-01T00:00:00Z")
+	if err != nil {
+		t.Fatalf("insert seed city: %v", err)
+	}
+
+	imported, err := importCities(ctx, db, []cachedCity{{
+		Name:        "Berlin",
+		DisplayName: "Berlin",
+		Lat:         52.5200,
+		Lng:         13.4050,
+	}})
+	if err != nil {
+		t.Fatalf("importCities: %v", err)
+	}
+	if imported != 1 {
+		t.Fatalf("imported = %d, want 1", imported)
+	}
+
+	var (
+		lat       float64
+		lng       float64
+		createdAt string
+		count     int
+	)
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), lat, lng, created_at FROM cities WHERE name = ?`, "Berlin").Scan(&count, &lat, &lng, &createdAt); err != nil {
+		t.Fatalf("query city: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+	if lat != 52.5200 || lng != 13.4050 {
+		t.Fatalf("coordinates = %.4f, %.4f, want 52.5200, 13.4050", lat, lng)
+	}
+	if createdAt != "2026-04-01T00:00:00Z" {
+		t.Fatalf("created_at = %q, want seed timestamp", createdAt)
+	}
+}
+
+func TestParseGeoNamesZipRequiresCountryFile(t *testing.T) {
+	body := buildZipBytes(t, map[string]string{
+		"FR.txt": "1\tParis\tParis\tParis\t48.8566\t2.3522\tP\tPPL\tFR\n",
+	})
+
+	_, err := parseGeoNamesZip(body, "DE")
+	if err == nil || !strings.Contains(err.Error(), "DE.txt") {
+		t.Fatalf("err = %v, want missing file error", err)
 	}
 }
 
@@ -614,7 +765,7 @@ func TestRunCompactCompactsExistingSnapshots(t *testing.T) {
 }
 
 func TestResolveOutputModeRejectsConflictingFlags(t *testing.T) {
-	err := run([]string{"cities", "--db", filepath.Join(t.TempDir(), "test.db"), "--output", "txt", "-o", "json"})
+	err := run([]string{"list", "cities", "--db", filepath.Join(t.TempDir(), "test.db"), "--output", "txt", "-o", "json"})
 	if err == nil || !strings.Contains(err.Error(), "--output and -o must match") {
 		t.Fatalf("err = %v, want conflicting output flag error", err)
 	}
@@ -850,4 +1001,35 @@ func jsonResponse(statusCode int, body string) *http.Response {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
+}
+
+func zipResponse(t *testing.T, files map[string]string) *http.Response {
+	t.Helper()
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     fmt.Sprintf("%d %s", http.StatusOK, http.StatusText(http.StatusOK)),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(buildZipBytes(t, files))),
+	}
+}
+
+func buildZipBytes(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("create zip entry %s: %v", name, err)
+		}
+		if _, err := io.WriteString(w, content); err != nil {
+			t.Fatalf("write zip entry %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	return buf.Bytes()
 }
