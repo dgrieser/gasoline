@@ -159,16 +159,15 @@ func TestPersistUpdateAndQueryHistory(t *testing.T) {
 		name       string
 		lastSeenAt string
 		cityName   string
-		dist       float64
 		isOpen     bool
 		diesel     sql.NullFloat64
 	)
 	if err := db.QueryRowContext(ctx, `
-		SELECT s.name, s.last_seen_at, ps.city_name, ps.dist_km, ps.is_open, ps.diesel
+		SELECT s.name, s.last_seen_at, ps.city_name, ps.is_open, ps.diesel
 		FROM stations s
 		JOIN price_snapshots ps ON ps.station_id = s.id
 		WHERE s.id = ?
-	`, "station-1").Scan(&name, &lastSeenAt, &cityName, &dist, &isOpen, &diesel); err != nil {
+	`, "station-1").Scan(&name, &lastSeenAt, &cityName, &isOpen, &diesel); err != nil {
 		t.Fatalf("query stored rows: %v", err)
 	}
 
@@ -180,9 +179,6 @@ func TestPersistUpdateAndQueryHistory(t *testing.T) {
 	}
 	if cityName != city.Name {
 		t.Fatalf("cityName = %q, want %q", cityName, city.Name)
-	}
-	if dist != 1.25 {
-		t.Fatalf("dist = %v, want 1.25", dist)
 	}
 	if !isOpen {
 		t.Fatal("expected station to be open")
@@ -347,14 +343,6 @@ func TestPersistUpdateIgnoresDistanceChangeButTracksOpenChange(t *testing.T) {
 		t.Fatalf("persist distance-only update: %v", err)
 	}
 	assertSnapshotCount(t, db, 1)
-
-	var dist float64
-	if err := db.QueryRowContext(ctx, `SELECT dist_km FROM price_snapshots WHERE station_id = ?`, station.ID).Scan(&dist); err != nil {
-		t.Fatalf("query dist: %v", err)
-	}
-	if dist != 9.99 {
-		t.Fatalf("dist = %v, want 9.99", dist)
-	}
 
 	station.IsOpen = false
 	if err := persistUpdate(ctx, db, city, []tankerStation{station}, third, 5); err != nil {
@@ -764,6 +752,103 @@ func TestRunCompactCompactsExistingSnapshots(t *testing.T) {
 	}
 }
 
+func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
+	dbPath := seedLegacyFixtureDB(t)
+
+	output := captureStdout(t, func() error {
+		return run([]string{"migrate", "--db", dbPath, "--output", "json"})
+	})
+
+	var result migrateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal migrate output: %v\noutput=%s", err, output)
+	}
+	if !containsString(result.Applied, "cities.normalized_name") {
+		t.Fatalf("applied migrations = %v, want cities.normalized_name", result.Applied)
+	}
+	if !containsString(result.Applied, "price_snapshots.dist_km") {
+		t.Fatalf("applied migrations = %v, want price_snapshots.dist_km", result.Applied)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open migrated db: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	hasNormalizedName, err := tableHasColumn(ctx, db, "cities", "normalized_name")
+	if err != nil {
+		t.Fatalf("tableHasColumn cities.normalized_name: %v", err)
+	}
+	if !hasNormalizedName {
+		t.Fatal("expected cities.normalized_name after migration")
+	}
+
+	hasDistKM, err := tableHasColumn(ctx, db, "price_snapshots", "dist_km")
+	if err != nil {
+		t.Fatalf("tableHasColumn price_snapshots.dist_km: %v", err)
+	}
+	if hasDistKM {
+		t.Fatal("expected price_snapshots.dist_km to be removed")
+	}
+
+	var normalizedName string
+	if err := db.QueryRowContext(ctx, `SELECT normalized_name FROM cities WHERE name = ?`, "Berlin, Germany").Scan(&normalizedName); err != nil {
+		t.Fatalf("query normalized_name: %v", err)
+	}
+	if normalizedName != "Berlin, Deutschland" {
+		t.Fatalf("normalized_name = %q, want %q", normalizedName, "Berlin, Deutschland")
+	}
+
+	var (
+		cityName       string
+		recordedAt     string
+		searchRadiusKM float64
+		isOpen         bool
+		diesel         float64
+	)
+	if err := db.QueryRowContext(ctx, `
+		SELECT city_name, recorded_at, search_radius_km, is_open, diesel
+		FROM price_snapshots
+		WHERE station_id = ?
+	`, "station-1").Scan(&cityName, &recordedAt, &searchRadiusKM, &isOpen, &diesel); err != nil {
+		t.Fatalf("query migrated snapshot: %v", err)
+	}
+	if cityName != "Berlin" {
+		t.Fatalf("city_name = %q, want %q", cityName, "Berlin")
+	}
+	if recordedAt != "2026-04-02T09:15:00Z" {
+		t.Fatalf("recorded_at = %q, want %q", recordedAt, "2026-04-02T09:15:00Z")
+	}
+	if searchRadiusKM != 5 {
+		t.Fatalf("search_radius_km = %v, want 5", searchRadiusKM)
+	}
+	if !isOpen {
+		t.Fatal("expected migrated snapshot to stay open")
+	}
+	if diesel != 1.659 {
+		t.Fatalf("diesel = %v, want 1.659", diesel)
+	}
+}
+
+func TestRunMigrateReportsNoChangesForCurrentSchema(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+
+	output := captureStdout(t, func() error {
+		return run([]string{"migrate", "--db", dbPath, "--output", "json"})
+	})
+
+	var result migrateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal migrate output: %v\noutput=%s", err, output)
+	}
+	if len(result.Applied) != 0 {
+		t.Fatalf("applied migrations = %v, want none", result.Applied)
+	}
+}
+
 func TestResolveOutputModeRejectsConflictingFlags(t *testing.T) {
 	err := run([]string{"list", "cities", "--db", filepath.Join(t.TempDir(), "test.db"), "--output", "txt", "-o", "json"})
 	if err == nil || !strings.Contains(err.Error(), "--output and -o must match") {
@@ -948,12 +1033,90 @@ func seedUncompactedFixtureDB(t *testing.T) string {
 	} {
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO price_snapshots (
-				station_id, city_name, recorded_at, dist_km, search_radius_km, is_open, e5, e10, diesel
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, "station-1", "Lübbecke", snapshot.recordedAt, 4.60, 5, 1, e5, e10, snapshot.diesel)
+				station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, "station-1", "Lübbecke", snapshot.recordedAt, 5, 1, e5, e10, snapshot.diesel)
 		if err != nil {
 			t.Fatalf("insert snapshot %s: %v", snapshot.recordedAt, err)
 		}
+	}
+
+	return dbPath
+}
+
+func seedLegacyFixtureDB(t *testing.T) string {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	legacySchema := `
+	CREATE TABLE cities (
+		name TEXT PRIMARY KEY,
+		display_name TEXT NOT NULL,
+		lat REAL NOT NULL,
+		lng REAL NOT NULL,
+		created_at TEXT NOT NULL
+	);
+
+	CREATE TABLE stations (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		brand TEXT,
+		street TEXT,
+		house_number TEXT,
+		post_code INTEGER,
+		place TEXT,
+		lat REAL NOT NULL,
+		lng REAL NOT NULL,
+		first_seen_at TEXT NOT NULL,
+		last_seen_at TEXT NOT NULL
+	);
+
+	CREATE TABLE price_snapshots (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		station_id TEXT NOT NULL,
+		city_name TEXT NOT NULL,
+		recorded_at TEXT NOT NULL,
+		dist_km REAL NOT NULL,
+		search_radius_km REAL NOT NULL DEFAULT 5,
+		is_open INTEGER NOT NULL,
+		e5 REAL,
+		e10 REAL,
+		diesel REAL,
+		FOREIGN KEY (station_id) REFERENCES stations(id)
+	);
+	`
+	if _, err := db.ExecContext(ctx, legacySchema); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO cities (name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, "Berlin, Germany", "Berlin, Deutschland", 52.517389, 13.395131, "2026-04-02T09:00:00Z"); err != nil {
+		t.Fatalf("insert legacy city: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO stations (
+			id, name, brand, street, house_number, post_code, place, lat, lng, first_seen_at, last_seen_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "station-1", "Test Station", "ARAL", "Test Street", "1", 10115, "Berlin", 52.5, 13.4, "2026-04-02T09:15:00Z", "2026-04-02T09:15:00Z"); err != nil {
+		t.Fatalf("insert legacy station: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO price_snapshots (
+			station_id, city_name, recorded_at, dist_km, search_radius_km, is_open, e5, e10, diesel
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "station-1", "Berlin", "2026-04-02T09:15:00Z", 1.25, 5, 1, 1.789, 1.729, 1.659); err != nil {
+		t.Fatalf("insert legacy snapshot: %v", err)
 	}
 
 	return dbPath
@@ -973,6 +1136,15 @@ func captureStdout(t *testing.T, fn func() error) string {
 		t.Fatalf("run: %v", err)
 	}
 	return buf.String()
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func stubDefaultTransport(t *testing.T, fn func(*http.Request) (*http.Response, error)) func() {

@@ -109,6 +109,11 @@ type importCitiesResult struct {
 	DBPath        string `json:"db_path"`
 }
 
+type migrateResult struct {
+	Applied []string `json:"applied"`
+	DBPath  string   `json:"db_path"`
+}
+
 type clearCitiesResult struct {
 	ClearedCount int    `json:"cleared_count"`
 	DBPath       string `json:"db_path"`
@@ -129,7 +134,6 @@ type stationRow struct {
 	Street     string   `json:"street"`
 	Place      string   `json:"place"`
 	RecordedAt string   `json:"recorded_at"`
-	DistKM     float64  `json:"dist_km"`
 	IsOpen     bool     `json:"is_open"`
 	E5         *float64 `json:"e5"`
 	E10        *float64 `json:"e10"`
@@ -139,7 +143,6 @@ type stationRow struct {
 type historyRow struct {
 	CityName   string   `json:"city_name"`
 	RecordedAt string   `json:"recorded_at"`
-	DistKM     float64  `json:"dist_km"`
 	IsOpen     bool     `json:"is_open"`
 	E5         *float64 `json:"e5,omitempty"`
 	E10        *float64 `json:"e10,omitempty"`
@@ -149,6 +152,10 @@ type historyRow struct {
 var stdout io.Writer = os.Stdout
 var countryCodePattern = regexp.MustCompile(`^[A-Za-z]{2}$`)
 var geoNamesFeatureCodePattern = regexp.MustCompile(`^(PPL|PPLC|PPLA[1-9]*)$`)
+
+type queryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -168,6 +175,8 @@ func run(args []string) error {
 		return runUpdate(args[1:])
 	case "compact":
 		return runCompact(args[1:])
+	case "migrate":
+		return runMigrate(args[1:])
 	case "list":
 		return runList(args[1:])
 	case "import":
@@ -196,6 +205,7 @@ func printUsage() {
 Commands:
   update   geocode a city if needed, query Tankerkönig, store station snapshots
   compact  compact existing price snapshots in-place
+  migrate  apply schema migrations to an existing database
   list cities   list cached city geocodes
   list stations list known stations with latest stored snapshot
   list history  show historical prices for one station
@@ -205,6 +215,7 @@ Commands:
 Examples:
   gasoline update --city "Berlin, Germany" --radius 5
   gasoline compact
+  gasoline migrate
   gasoline list cities
   gasoline list stations --city "Berlin, Germany"
   gasoline list history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel
@@ -377,6 +388,50 @@ func runCompact(args []string) error {
 
 	fmt.Fprintf(stdout, "compacted %d stations in %s\n", result.StationsProcessed, resolvedDBPath)
 	fmt.Fprintf(stdout, "snapshots: %d -> %d (deleted=%d, updated=%d)\n", result.BeforeCount, result.AfterCount, result.DeletedCount, result.UpdatedCount)
+	return nil
+}
+
+func runMigrate(args []string) error {
+	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	outputLong, outputShort := addOutputFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
+		return err
+	}
+
+	db, err := openDB(resolvedDBPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := ensureSchema(ctx, db); err != nil {
+		return err
+	}
+
+	result, err := migrateSchema(ctx, db)
+	if err != nil {
+		return err
+	}
+	result.DBPath = resolvedDBPath
+
+	if output == outputJSON {
+		return writeJSON(result)
+	}
+	if len(result.Applied) == 0 {
+		fmt.Fprintf(stdout, "no migrations needed for %s\n", resolvedDBPath)
+		return nil
+	}
+	fmt.Fprintf(stdout, "applied %d migrations to %s\n", len(result.Applied), resolvedDBPath)
+	for _, migration := range result.Applied {
+		fmt.Fprintf(stdout, "- %s\n", migration)
+	}
 	return nil
 }
 
@@ -584,7 +639,7 @@ func runStations(args []string) error {
 		rows, err = db.QueryContext(ctx, `
 			SELECT
 				s.id, s.name, COALESCE(s.brand, ''), COALESCE(s.street, ''), COALESCE(s.place, ''),
-				ps.recorded_at, ps.dist_km, ps.is_open, ps.e5, ps.e10, ps.diesel
+				ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
 			FROM stations s
 			JOIN (
 				SELECT station_id, MAX(recorded_at) AS latest_recorded_at
@@ -601,7 +656,7 @@ func runStations(args []string) error {
 		rows, err = db.QueryContext(ctx, `
 			SELECT
 				s.id, s.name, COALESCE(s.brand, ''), COALESCE(s.street, ''), COALESCE(s.place, ''),
-				ps.recorded_at, ps.dist_km, ps.is_open, ps.e5, ps.e10, ps.diesel
+				ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
 			FROM stations s
 			JOIN (
 				SELECT station_id, MAX(recorded_at) AS latest_recorded_at
@@ -625,11 +680,10 @@ func runStations(args []string) error {
 	for rows.Next() {
 		var (
 			id, name, brand, street, place, recordedAt string
-			dist                                       float64
 			isOpen                                     bool
 			e5, e10, diesel                            sql.NullFloat64
 		)
-		if err := rows.Scan(&id, &name, &brand, &street, &place, &recordedAt, &dist, &isOpen, &e5, &e10, &diesel); err != nil {
+		if err := rows.Scan(&id, &name, &brand, &street, &place, &recordedAt, &isOpen, &e5, &e10, &diesel); err != nil {
 			return err
 		}
 		row := stationRow{
@@ -639,7 +693,6 @@ func runStations(args []string) error {
 			Street:     strings.TrimSpace(street),
 			Place:      strings.TrimSpace(place),
 			RecordedAt: recordedAt,
-			DistKM:     dist,
 			IsOpen:     isOpen,
 			E5:         nullFloatPtr(e5),
 			E10:        nullFloatPtr(e10),
@@ -647,13 +700,12 @@ func runStations(args []string) error {
 		}
 		results = append(results, row)
 		if output == outputText {
-			fmt.Fprintf(stdout, "%s | %s | %s | %s %s | dist=%.2fkm | open=%t | e5=%s e10=%s diesel=%s | at=%s\n",
+			fmt.Fprintf(stdout, "%s | %s | %s | %s %s | open=%t | e5=%s e10=%s diesel=%s | at=%s\n",
 				id,
 				name,
 				blankDash(brand),
 				row.Street,
 				row.Place,
-				dist,
 				isOpen,
 				formatNullFloat(e5),
 				formatNullFloat(e10),
@@ -708,7 +760,7 @@ func runHistory(args []string) error {
 	}
 
 	query := `
-		SELECT city_name, recorded_at, dist_km, is_open, e5, e10, diesel
+		SELECT city_name, recorded_at, is_open, e5, e10, diesel
 		FROM price_snapshots
 		WHERE station_id = ?
 		ORDER BY recorded_at DESC
@@ -724,42 +776,40 @@ func runHistory(args []string) error {
 	for rows.Next() {
 		var (
 			cityName, recordedAt string
-			dist                 float64
 			isOpen               bool
 			e5, e10, diesel      sql.NullFloat64
 		)
-		if err := rows.Scan(&cityName, &recordedAt, &dist, &isOpen, &e5, &e10, &diesel); err != nil {
+		if err := rows.Scan(&cityName, &recordedAt, &isOpen, &e5, &e10, &diesel); err != nil {
 			return err
 		}
 		row := historyRow{
 			CityName:   cityName,
 			RecordedAt: recordedAt,
-			DistKM:     dist,
 			IsOpen:     isOpen,
 		}
 		switch *fuel {
 		case "e5":
 			row.E5 = nullFloatPtr(e5)
 			if output == outputText {
-				fmt.Fprintf(stdout, "%s | city=%s | dist=%.2fkm | open=%t | e5=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(e5))
+				fmt.Fprintf(stdout, "%s | city=%s | open=%t | e5=%s\n", recordedAt, cityName, isOpen, formatNullFloat(e5))
 			}
 		case "e10":
 			row.E10 = nullFloatPtr(e10)
 			if output == outputText {
-				fmt.Fprintf(stdout, "%s | city=%s | dist=%.2fkm | open=%t | e10=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(e10))
+				fmt.Fprintf(stdout, "%s | city=%s | open=%t | e10=%s\n", recordedAt, cityName, isOpen, formatNullFloat(e10))
 			}
 		case "diesel":
 			row.Diesel = nullFloatPtr(diesel)
 			if output == outputText {
-				fmt.Fprintf(stdout, "%s | city=%s | dist=%.2fkm | open=%t | diesel=%s\n", recordedAt, cityName, dist, isOpen, formatNullFloat(diesel))
+				fmt.Fprintf(stdout, "%s | city=%s | open=%t | diesel=%s\n", recordedAt, cityName, isOpen, formatNullFloat(diesel))
 			}
 		default:
 			row.E5 = nullFloatPtr(e5)
 			row.E10 = nullFloatPtr(e10)
 			row.Diesel = nullFloatPtr(diesel)
 			if output == outputText {
-				fmt.Fprintf(stdout, "%s | city=%s | dist=%.2fkm | open=%t | e5=%s e10=%s diesel=%s\n",
-					recordedAt, cityName, dist, isOpen, formatNullFloat(e5), formatNullFloat(e10), formatNullFloat(diesel))
+				fmt.Fprintf(stdout, "%s | city=%s | open=%t | e5=%s e10=%s diesel=%s\n",
+					recordedAt, cityName, isOpen, formatNullFloat(e5), formatNullFloat(e10), formatNullFloat(diesel))
 			}
 		}
 		results = append(results, row)
@@ -876,6 +926,14 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func initSchema(ctx context.Context, db *sql.DB) error {
+	if err := ensureSchema(ctx, db); err != nil {
+		return err
+	}
+	_, err := migrateSchema(ctx, db)
+	return err
+}
+
+func ensureSchema(ctx context.Context, db *sql.DB) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS cities (
 		name TEXT PRIMARY KEY,
@@ -905,7 +963,6 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 		station_id TEXT NOT NULL,
 		city_name TEXT NOT NULL,
 		recorded_at TEXT NOT NULL,
-		dist_km REAL NOT NULL,
 		search_radius_km REAL NOT NULL DEFAULT 5,
 		is_open INTEGER NOT NULL,
 		e5 REAL,
@@ -924,19 +981,46 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 		ON stations(lat, lng);
 	`
 	_, err := db.ExecContext(ctx, schema)
+	return err
+}
+
+func migrateSchema(ctx context.Context, db *sql.DB) (migrateResult, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return migrateResult{}, err
+	}
+	defer tx.Rollback()
+
+	var result migrateResult
+	if err := migrateCitiesNormalizedName(ctx, tx, &result); err != nil {
+		return migrateResult{}, err
+	}
+	if err := migratePriceSnapshotsDropDistKM(ctx, tx, &result); err != nil {
+		return migrateResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return migrateResult{}, err
+	}
+	return result, nil
+}
+
+func migrateCitiesNormalizedName(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, "cities", "normalized_name")
 	if err != nil {
 		return err
 	}
-
-	_, err = db.ExecContext(ctx, `
-		ALTER TABLE cities
-		ADD COLUMN normalized_name TEXT NOT NULL DEFAULT ''
-	`)
-	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-		return err
+	if !hasColumn {
+		if _, err := tx.ExecContext(ctx, `
+			ALTER TABLE cities
+			ADD COLUMN normalized_name TEXT NOT NULL DEFAULT ''
+		`); err != nil {
+			return err
+		}
+		result.Applied = append(result.Applied, "cities.normalized_name")
 	}
 
-	_, err = db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		UPDATE cities
 		SET normalized_name = CASE
 			WHEN TRIM(normalized_name) <> '' THEN normalized_name
@@ -945,6 +1029,94 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 		END
 	`)
 	return err
+}
+
+func migratePriceSnapshotsDropDistKM(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, "price_snapshots", "dist_km")
+	if err != nil {
+		return err
+	}
+	if !hasColumn {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE price_snapshots_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			station_id TEXT NOT NULL,
+			city_name TEXT NOT NULL,
+			recorded_at TEXT NOT NULL,
+			search_radius_km REAL NOT NULL DEFAULT 5,
+			is_open INTEGER NOT NULL,
+			e5 REAL,
+			e10 REAL,
+			diesel REAL,
+			FOREIGN KEY (station_id) REFERENCES stations(id)
+		)
+	`); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO price_snapshots_new (
+			id, station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
+		)
+		SELECT id, station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
+		FROM price_snapshots
+	`); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `DROP TABLE price_snapshots`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE price_snapshots_new RENAME TO price_snapshots`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_price_snapshots_station_recorded
+			ON price_snapshots(station_id, recorded_at DESC)
+	`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_price_snapshots_city_recorded
+			ON price_snapshots(city_name, recorded_at DESC)
+	`); err != nil {
+		return err
+	}
+
+	result.Applied = append(result.Applied, "price_snapshots.dist_km")
+	return nil
+}
+
+func tableHasColumn(ctx context.Context, q queryer, tableName, columnName string) (bool, error) {
+	rows, err := q.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &pk); err != nil {
+			return false, err
+		}
+		if name == columnName {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func downloadGeoNamesCities(ctx context.Context, sourceURL, countryCode, userAgent string) ([]cachedCity, error) {
@@ -1281,7 +1453,6 @@ type compactSnapshotRow struct {
 	priceSnapshotValues
 	CityName       string
 	RecordedAt     string
-	DistKM         float64
 	SearchRadiusKM float64
 	Updated        bool
 }
@@ -1337,9 +1508,9 @@ func compactPriceSnapshots(ctx context.Context, db *sql.DB) (compactResult, erro
 			}
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE price_snapshots
-				SET city_name = ?, recorded_at = ?, dist_km = ?, search_radius_km = ?, is_open = ?, e5 = ?, e10 = ?, diesel = ?
+				SET city_name = ?, recorded_at = ?, search_radius_km = ?, is_open = ?, e5 = ?, e10 = ?, diesel = ?
 				WHERE id = ?
-			`, snapshot.CityName, snapshot.RecordedAt, snapshot.DistKM, snapshot.SearchRadiusKM, boolToInt(snapshot.IsOpen), nullFloatValue(snapshot.E5), nullFloatValue(snapshot.E10), nullFloatValue(snapshot.Diesel), snapshot.ID); err != nil {
+			`, snapshot.CityName, snapshot.RecordedAt, snapshot.SearchRadiusKM, boolToInt(snapshot.IsOpen), nullFloatValue(snapshot.E5), nullFloatValue(snapshot.E10), nullFloatValue(snapshot.Diesel), snapshot.ID); err != nil {
 				return compactResult{}, err
 			}
 			result.UpdatedCount++
@@ -1363,7 +1534,7 @@ func compactPriceSnapshots(ctx context.Context, db *sql.DB) (compactResult, erro
 
 func loadCompactSnapshots(ctx context.Context, tx *sql.Tx, stationID string) ([]compactSnapshotRow, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, city_name, recorded_at, dist_km, search_radius_km, is_open, e5, e10, diesel
+		SELECT id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
 		FROM price_snapshots
 		WHERE station_id = ?
 		ORDER BY recorded_at ASC, id ASC
@@ -1380,7 +1551,6 @@ func loadCompactSnapshots(ctx context.Context, tx *sql.Tx, stationID string) ([]
 			&snapshot.ID,
 			&snapshot.CityName,
 			&snapshot.RecordedAt,
-			&snapshot.DistKM,
 			&snapshot.SearchRadiusKM,
 			&snapshot.IsOpen,
 			&snapshot.E5,
@@ -1448,9 +1618,9 @@ func persistPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, stat
 	default:
 		_, err := tx.ExecContext(ctx, `
 			UPDATE price_snapshots
-			SET city_name = ?, recorded_at = ?, dist_km = ?, search_radius_km = ?, is_open = ?, e5 = ?, e10 = ?, diesel = ?
+			SET city_name = ?, recorded_at = ?, search_radius_km = ?, is_open = ?, e5 = ?, e10 = ?, diesel = ?
 			WHERE id = ?
-		`, city.Name, recordedAt.Format(time.RFC3339), station.Dist, searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel), latest.ID)
+		`, city.Name, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel), latest.ID)
 		return err
 	}
 }
@@ -1492,9 +1662,9 @@ func latestPriceSnapshots(ctx context.Context, tx *sql.Tx, stationID string) (*p
 func insertPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO price_snapshots (
-			station_id, city_name, recorded_at, dist_km, search_radius_km, is_open, e5, e10, diesel
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, station.ID, city.Name, recordedAt.Format(time.RFC3339), station.Dist, searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel))
+			station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, station.ID, city.Name, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel))
 	return err
 }
 
