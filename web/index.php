@@ -27,16 +27,48 @@ $fromDate = trim((string) ($_GET['from'] ?? ''));
 $toDate = trim((string) ($_GET['to'] ?? ''));
 $selectedFuel = trim((string) ($_GET['fuel'] ?? 'all'));
 $selectedCity = trim((string) ($_GET['city'] ?? ''));
+$selectedRadiusKmRaw = trim((string) ($_GET['radius_km'] ?? ''));
 $validFuels = ['all', 'diesel', 'e5', 'e10'];
+$validRadiusOptions = [5, 10, 20];
 if (!in_array($selectedFuel, $validFuels, true)) {
     $selectedFuel = 'all';
 }
+$selectedRadiusKm = in_array((int) $selectedRadiusKmRaw, $validRadiusOptions, true)
+    ? (int) $selectedRadiusKmRaw
+    : ($selectedCity !== '' ? 5 : $validRadiusOptions[0]);
 
 if (!file_exists($dbPath)) {
     $errors[] = sprintf('SQLite database not found at %s', $dbPath);
 }
 
 $cities = [];
+$selectedCityRow = null;
+$selectedCityDistances = [];
+
+function boundingBox(float $lat, float $lng, int $radiusKm): array
+{
+    $latDelta = $radiusKm / 111.32;
+    $lngDivisor = 111.32 * max(cos(deg2rad($lat)), 0.01);
+    $lngDelta = $radiusKm / $lngDivisor;
+
+    return [
+        'min_lat' => $lat - $latDelta,
+        'max_lat' => $lat + $latDelta,
+        'min_lng' => $lng - $lngDelta,
+        'max_lng' => $lng + $lngDelta,
+    ];
+}
+
+function haversineKm(float $lat1, float $lng1, float $lat2, float $lng2): float
+{
+    $earthRadiusKm = 6371.0;
+    $latDelta = deg2rad($lat2 - $lat1);
+    $lngDelta = deg2rad($lng2 - $lng1);
+    $a = sin($latDelta / 2) ** 2
+        + cos(deg2rad($lat1)) * cos(deg2rad($lat2)) * sin($lngDelta / 2) ** 2;
+
+    return $earthRadiusKm * 2 * asin(min(1.0, sqrt($a)));
+}
 
 if ($errors === []) {
     try {
@@ -44,48 +76,110 @@ if ($errors === []) {
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 
-        $stations = $pdo->query(
-            <<<'SQL'
-            SELECT
-                s.id,
-                s.name,
-                COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
-                TRIM(COALESCE(s.street, '')) AS street,
-                TRIM(COALESCE(s.house_number, '')) AS house_number,
-                TRIM(COALESCE(s.place, '')) AS place,
-                s.last_seen_at,
-                (
-                    SELECT ps.dist_km
-                    FROM price_snapshots ps
-                    WHERE ps.station_id = s.id
-                    ORDER BY ps.recorded_at DESC
-                    LIMIT 1
-                ) AS dist_km
-            FROM stations s
-            ORDER BY dist_km ASC, s.name ASC, s.id ASC
-            SQL
-        )->fetchAll();
-
         $cities = $pdo->query(
             <<<'SQL'
             SELECT
-                city_name,
-                MIN(dist_km) AS dist_km,
-                (
-                    SELECT ps2.search_radius_km
-                    FROM price_snapshots ps2
-                    WHERE ps2.city_name = price_snapshots.city_name
-                    ORDER BY ps2.recorded_at DESC
-                    LIMIT 1
-                ) AS search_radius_km
-            FROM price_snapshots
-            GROUP BY city_name
-            ORDER BY dist_km ASC, city_name ASC
+                normalized_name AS city_key,
+                normalized_name AS city_name,
+                display_name,
+                lat,
+                lng
+            FROM cities
+            ORDER BY normalized_name ASC
             SQL
         )->fetchAll();
 
+        if ($selectedCity !== '') {
+            $cityStatement = $pdo->prepare(
+                <<<'SQL'
+                SELECT normalized_name AS city_key, normalized_name AS city_name, display_name, lat, lng
+                FROM cities
+                WHERE normalized_name = :city_key
+                LIMIT 1
+                SQL
+            );
+            $cityStatement->bindValue(':city_key', $selectedCity);
+            $cityStatement->execute();
+            $selectedCityRow = $cityStatement->fetch() ?: null;
+
+            if ($selectedCityRow === null) {
+                $errors[] = 'Selected city not found.';
+            } else {
+                $bbox = boundingBox(
+                    (float) $selectedCityRow['lat'],
+                    (float) $selectedCityRow['lng'],
+                    $selectedRadiusKm
+                );
+                $stationStatement = $pdo->prepare(
+                    <<<'SQL'
+                    SELECT
+                        s.id,
+                        s.name,
+                        COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
+                        TRIM(COALESCE(s.street, '')) AS street,
+                        TRIM(COALESCE(s.house_number, '')) AS house_number,
+                        TRIM(COALESCE(s.place, '')) AS place,
+                        s.last_seen_at,
+                        s.lat,
+                        s.lng
+                    FROM stations s
+                    WHERE s.lat BETWEEN :min_lat AND :max_lat
+                      AND s.lng BETWEEN :min_lng AND :max_lng
+                    SQL
+                );
+                foreach ($bbox as $key => $value) {
+                    $stationStatement->bindValue(':' . $key, $value);
+                }
+                $stationStatement->execute();
+                $candidateStations = $stationStatement->fetchAll();
+
+                foreach ($candidateStations as $station) {
+                    $selectedDistKm = haversineKm(
+                        (float) $selectedCityRow['lat'],
+                        (float) $selectedCityRow['lng'],
+                        (float) $station['lat'],
+                        (float) $station['lng']
+                    );
+                    if ($selectedDistKm > $selectedRadiusKm) {
+                        continue;
+                    }
+                    $station['selected_dist_km'] = $selectedDistKm;
+                    $stations[] = $station;
+                    $selectedCityDistances[(string) $station['id']] = $selectedDistKm;
+                }
+
+                usort($stations, static function (array $left, array $right): int {
+                    $distCompare = ($left['selected_dist_km'] ?? INF) <=> ($right['selected_dist_km'] ?? INF);
+                    if ($distCompare !== 0) {
+                        return $distCompare;
+                    }
+                    $nameCompare = strcmp((string) $left['name'], (string) $right['name']);
+                    if ($nameCompare !== 0) {
+                        return $nameCompare;
+                    }
+                    return strcmp((string) $left['id'], (string) $right['id']);
+                });
+            }
+        } else {
+            $stations = $pdo->query(
+                <<<'SQL'
+                SELECT
+                    s.id,
+                    s.name,
+                    COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
+                    TRIM(COALESCE(s.street, '')) AS street,
+                    TRIM(COALESCE(s.house_number, '')) AS house_number,
+                    TRIM(COALESCE(s.place, '')) AS place,
+                    s.last_seen_at
+                FROM stations s
+                ORDER BY s.name ASC, s.id ASC
+                SQL
+            )->fetchAll();
+        }
+
         $where = [];
         $params = [];
+        $shouldRunRowQuery = true;
 
         if ($fromDate !== '') {
             $from = DateTimeImmutable::createFromFormat('Y-m-d', $fromDate, new DateTimeZone('UTC'));
@@ -107,12 +201,27 @@ if ($errors === []) {
             }
         }
 
-        if ($selectedCity !== '') {
-            $where[] = 'ps.city_name = :city_name';
-            $params[':city_name'] = $selectedCity;
+        if ($selectedCityRow !== null) {
+            $effectiveStationIds = array_column($stations, 'id');
+            if ($selectedStationIds !== []) {
+                $effectiveStationIds = array_values(array_intersect($effectiveStationIds, $selectedStationIds));
+            }
+
+            if ($effectiveStationIds === []) {
+                $shouldRunRowQuery = false;
+                $rows = [];
+            } else {
+                $placeholders = [];
+                foreach ($effectiveStationIds as $index => $stationId) {
+                    $placeholder = ':station_scope_id_' . $index;
+                    $placeholders[] = $placeholder;
+                    $params[$placeholder] = $stationId;
+                }
+                $where[] = 'ps.station_id IN (' . implode(', ', $placeholders) . ')';
+            }
         }
 
-        if ($selectedStationIds !== []) {
+        if ($selectedCityRow === null && $selectedStationIds !== []) {
             $placeholders = [];
             foreach ($selectedStationIds as $index => $stationId) {
                 $placeholder = ':station_id_' . $index;
@@ -132,7 +241,6 @@ if ($errors === []) {
                 TRIM(COALESCE(s.place, '')) AS place,
                 ps.city_name,
                 ps.recorded_at,
-                ps.dist_km,
                 ps.is_open,
                 ps.e5,
                 ps.e10,
@@ -147,13 +255,28 @@ if ($errors === []) {
 
         $sql .= "\nORDER BY ps.recorded_at ASC, s.name ASC";
 
-        if ($errors === []) {
+        if ($errors === [] && $shouldRunRowQuery) {
             $statement = $pdo->prepare($sql);
             foreach ($params as $key => $value) {
                 $statement->bindValue($key, $value);
             }
             $statement->execute();
             $rows = $statement->fetchAll();
+
+            if ($selectedCityRow !== null) {
+                usort($rows, static function (array $left, array $right) use ($selectedCityDistances): int {
+                    $timeCompare = strcmp((string) $left['recorded_at'], (string) $right['recorded_at']);
+                    if ($timeCompare !== 0) {
+                        return $timeCompare;
+                    }
+                    $distCompare = (($selectedCityDistances[(string) $left['station_id']] ?? INF)
+                        <=> ($selectedCityDistances[(string) $right['station_id']] ?? INF));
+                    if ($distCompare !== 0) {
+                        return $distCompare;
+                    }
+                    return strcmp((string) $left['station_name'], (string) $right['station_name']);
+                });
+            }
         }
 
         if ($rows !== []) {
@@ -176,7 +299,6 @@ $chartRows = array_map(static function (array $row): array {
         'place' => trim((string) $row['place']),
         'city_name' => $row['city_name'],
         'recorded_at' => $row['recorded_at'],
-        'dist_km' => (float) $row['dist_km'],
         'is_open' => (bool) $row['is_open'],
         'e5' => $row['e5'] !== null ? (float) $row['e5'] : null,
         'e10' => $row['e10'] !== null ? (float) $row['e10'] : null,
@@ -196,8 +318,9 @@ function stationLabel(array $station): string
     $place = trim($station['place'] ?? '');
 
     $dist = '';
-    if ($station['dist_km'] !== null) {
-        $dist = number_format((float) $station['dist_km'], 1) . ' km';
+    $selectedDistKm = $station['selected_dist_km'] ?? null;
+    if ($selectedDistKm !== null) {
+        $dist = number_format((float) $selectedDistKm, 1) . ' km';
     }
 
     $suffix = implode(' ', array_filter([$place, $dist !== '' ? "({$dist})" : '']));
@@ -992,14 +1115,25 @@ function formatPrice($value): string
                     <select name="city" id="f-city" onchange="this.form.submit()">
                         <option value="" data-i18n="allCities">— all cities —</option>
                         <?php foreach ($cities as $city): ?>
-                            <?php
-                            $cityName   = (string) $city['city_name'];
-                            $cityRadius = $city['search_radius_km'] !== null
-                                ? ' (' . number_format((float) $city['search_radius_km'], 0) . ' km)'
-                                : '';
-                            ?>
-                            <option value="<?= h($cityName) ?>" <?= $selectedCity === $cityName ? 'selected' : '' ?>>
-                                <?= h($cityName . $cityRadius) ?>
+                            <?php $cityKey = (string) $city['city_key']; ?>
+                            <option value="<?= h($cityKey) ?>" <?= $selectedCity === $cityKey ? 'selected' : '' ?>>
+                                <?= h((string) $city['city_name']) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="f-radius" data-i18n="radius">Radius</label>
+                    <select
+                        name="radius_km"
+                        id="f-radius"
+                        onchange="this.form.submit()"
+                        <?= $selectedCity === '' ? 'disabled' : '' ?>
+                    >
+                        <?php foreach ($validRadiusOptions as $radiusOption): ?>
+                            <option value="<?= h((string) $radiusOption) ?>" <?= $selectedRadiusKm === $radiusOption ? 'selected' : '' ?>>
+                                <?= h((string) $radiusOption . ' km') ?>
                             </option>
                         <?php endforeach; ?>
                     </select>
@@ -1138,10 +1272,14 @@ function formatPrice($value): string
                                 (string) $row['street'],
                                 (string) $row['house_number'],
                             ])));
+                            $rowStationDistance = $selectedCityDistances[(string) $row['station_id']] ?? null;
+                            $stationDistance = $rowStationDistance !== null
+                                ? ' (' . number_format((float) $rowStationDistance, 1) . ' km)'
+                                : '';
                             ?>
                             <tr>
                                 <td class="td-muted" data-recorded-at="<?= h((string) $row['recorded_at']) ?>"><?= h((string) $row['recorded_at']) ?></td>
-                                <td><?= h((string) $row['station_name']) ?></td>
+                                <td><?= h((string) $row['station_name'] . $stationDistance) ?></td>
                                 <td class="td-muted"><?= h((string) $row['brand']) ?></td>
                                 <td class="td-muted"><?= h($streetFull) ?></td>
                                 <td class="td-muted"><?= h((string) $row['place']) ?></td>
@@ -1224,6 +1362,7 @@ function h(str) {
 }
 
 const chartData = <?= json_encode($chartRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
+const stationDistancesById = <?= json_encode($selectedCityDistances, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
 chartData.forEach((r) => { r._ts = Date.parse(r.recorded_at); });
 
 // Evenly-spread hues for all stations in this view using golden-angle spacing.
@@ -1552,6 +1691,7 @@ const translations = {
         filters: 'Filters',
         city: 'City',
         allCities: '— all cities —',
+        radius: 'Radius',
         from: 'From',
         to: 'To',
         fuelType: 'Fuel type',
@@ -1597,6 +1737,7 @@ const translations = {
         filters: 'Filter',
         city: 'Stadt',
         allCities: '— alle Städte —',
+        radius: 'Radius',
         from: 'Von',
         to: 'Bis',
         fuelType: 'Kraftstoffart',
@@ -1664,7 +1805,14 @@ function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
         let best = null;
         for (const row of rows) {
             if (row[fuel] !== null && (best === null || better(row[fuel], best.price))) {
-                best = { price: row[fuel], station: row.station_name, street: row.street, place: row.place, recorded_at: row.recorded_at };
+                best = {
+                    price: row[fuel],
+                    station_id: row.station_id,
+                    station: row.station_name,
+                    street: row.street,
+                    place: row.place,
+                    recorded_at: row.recorded_at,
+                };
             }
         }
         if (best) results.push({ fuel, ...best });
@@ -1677,8 +1825,12 @@ function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
         (results.length === 0
             ? `<div class="cheapest-empty">${emptyMsg}</div>`
             : `<div class="cheapest-grid${colClass ? ' ' + colClass : ''}">` +
-                results.map(({ fuel, price, station, street, place, recorded_at }) => {
+                results.map(({ fuel, price, station_id, station, street, place, recorded_at }) => {
                     const addressParts = [street, place].filter(Boolean);
+                    const selectedDistKm = stationDistancesById[station_id] ?? null;
+                    if (selectedDistKm !== null) {
+                        addressParts.push(`${selectedDistKm.toFixed(1)} km`);
+                    }
                     const address = addressParts.length ? addressParts.join(', ') : '';
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +

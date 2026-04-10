@@ -919,6 +919,9 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 
 	CREATE INDEX IF NOT EXISTS idx_price_snapshots_city_recorded
 		ON price_snapshots(city_name, recorded_at DESC);
+
+	CREATE INDEX IF NOT EXISTS idx_stations_lat_lng
+		ON stations(lat, lng);
 	`
 	_, err := db.ExecContext(ctx, schema)
 	if err != nil {
