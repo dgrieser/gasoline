@@ -995,6 +995,9 @@ func migrateSchema(ctx context.Context, db *sql.DB) (migrateResult, error) {
 	if err := migrateCitiesNormalizedName(ctx, tx, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateCitiesDeduplicate(ctx, tx, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migratePriceSnapshotsDropDistKM(ctx, tx, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -1029,6 +1032,77 @@ func migrateCitiesNormalizedName(ctx context.Context, tx *sql.Tx, result *migrat
 		END
 	`)
 	return err
+}
+
+func migrateCitiesDeduplicate(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT name, normalized_name, display_name, lat, lng
+		FROM cities
+		WHERE TRIM(normalized_name) <> ''
+		ORDER BY normalized_name ASC,
+			CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC,
+			created_at ASC,
+			name ASC
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type cityCacheRow struct {
+		QueryName   string
+		Name        string
+		DisplayName string
+		Lat         float64
+		Lng         float64
+	}
+
+	var (
+		lastNormalized string
+		keeper         cityCacheRow
+		haveKeeper     bool
+		deduped        bool
+	)
+
+	for rows.Next() {
+		var row cityCacheRow
+		if err := rows.Scan(&row.QueryName, &row.Name, &row.DisplayName, &row.Lat, &row.Lng); err != nil {
+			return err
+		}
+
+		if !haveKeeper || row.Name != lastNormalized {
+			keeper = row
+			lastNormalized = row.Name
+			haveKeeper = true
+			continue
+		}
+
+		if shouldPromoteCityDisplay(keeper.DisplayName, row.DisplayName) {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE cities
+				SET display_name = ?, lat = ?, lng = ?
+				WHERE name = ?
+			`, row.DisplayName, row.Lat, row.Lng, keeper.QueryName); err != nil {
+				return err
+			}
+			keeper.DisplayName = row.DisplayName
+			keeper.Lat = row.Lat
+			keeper.Lng = row.Lng
+		}
+
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cities WHERE name = ?`, row.QueryName); err != nil {
+			return err
+		}
+		deduped = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if deduped {
+		result.Applied = append(result.Applied, "cities.deduplicate_normalized_name")
+	}
+	return nil
 }
 
 func migratePriceSnapshotsDropDistKM(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
@@ -1266,22 +1340,36 @@ func getOrCreateCity(ctx context.Context, db *sql.DB, cityName, userAgent string
 			if err != nil {
 				return cachedCity{}, false, err
 			}
-			city = cachedCity{
-				QueryName:   cityName,
+			geocoded := cachedCity{
+				QueryName:   city.QueryName,
 				Name:        geo.Name,
 				DisplayName: geo.DisplayName,
 				Lat:         geo.Lat,
 				Lng:         geo.Lng,
 			}
+			canonical, found, err := findCanonicalCity(ctx, db, geocoded.Name, geocoded.DisplayName)
+			if err != nil {
+				return cachedCity{}, false, err
+			}
+			if found && canonical.QueryName != city.QueryName {
+				if err := updateCachedCity(ctx, db, canonical.QueryName, geocoded); err != nil {
+					return cachedCity{}, false, err
+				}
+				if _, err := db.ExecContext(ctx, `DELETE FROM cities WHERE name = ?`, city.QueryName); err != nil {
+					return cachedCity{}, false, err
+				}
+				geocoded.QueryName = canonical.QueryName
+				return geocoded, false, nil
+			}
 			_, err = db.ExecContext(ctx, `
 				UPDATE cities
 				SET normalized_name = ?, display_name = ?, lat = ?, lng = ?
 				WHERE name = ?
-			`, city.Name, city.DisplayName, city.Lat, city.Lng, city.QueryName)
+			`, geocoded.Name, geocoded.DisplayName, geocoded.Lat, geocoded.Lng, city.QueryName)
 			if err != nil {
 				return cachedCity{}, false, err
 			}
-			return city, false, nil
+			return geocoded, false, nil
 		}
 		return city, true, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -1293,19 +1381,75 @@ func getOrCreateCity(ctx context.Context, db *sql.DB, cityName, userAgent string
 		return cachedCity{}, false, err
 	}
 	city = cachedCity{
+		QueryName:   cityName,
 		Name:        geo.Name,
 		DisplayName: geo.DisplayName,
 		Lat:         geo.Lat,
 		Lng:         geo.Lng,
 	}
+	canonical, found, err := findCanonicalCity(ctx, db, city.Name, city.DisplayName)
+	if err != nil {
+		return cachedCity{}, false, err
+	}
+	if found {
+		if err := updateCachedCity(ctx, db, canonical.QueryName, city); err != nil {
+			return cachedCity{}, false, err
+		}
+		city.QueryName = canonical.QueryName
+		return city, false, nil
+	}
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, cityName, city.Name, city.DisplayName, city.Lat, city.Lng, time.Now().UTC().Format(time.RFC3339))
+	`, city.QueryName, city.Name, city.DisplayName, city.Lat, city.Lng, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return cachedCity{}, false, err
 	}
 	return city, false, nil
+}
+
+func findCanonicalCity(ctx context.Context, db *sql.DB, normalizedName, displayName string) (cachedCity, bool, error) {
+	var city cachedCity
+	row := db.QueryRowContext(ctx, `
+		SELECT name, normalized_name, display_name, lat, lng
+		FROM cities
+		WHERE normalized_name = ?
+			OR name = ?
+			OR display_name = ?
+		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
+		LIMIT 1
+	`, normalizedName, normalizedName, displayName)
+	if err := row.Scan(&city.QueryName, &city.Name, &city.DisplayName, &city.Lat, &city.Lng); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return cachedCity{}, false, nil
+		}
+		return cachedCity{}, false, err
+	}
+	return city, true, nil
+}
+
+func updateCachedCity(ctx context.Context, db *sql.DB, queryName string, city cachedCity) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE cities
+		SET normalized_name = ?, display_name = ?, lat = ?, lng = ?
+		WHERE name = ?
+	`, city.Name, city.DisplayName, city.Lat, city.Lng, queryName)
+	return err
+}
+
+func shouldPromoteCityDisplay(current, candidate string) bool {
+	current = strings.TrimSpace(current)
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return false
+	}
+	if current == "" {
+		return true
+	}
+	if current == candidate {
+		return false
+	}
+	return len(candidate) > len(current)
 }
 
 func geocodeCity(ctx context.Context, city string, userAgent string) (cachedCity, error) {

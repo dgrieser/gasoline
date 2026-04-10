@@ -435,6 +435,63 @@ func TestGetOrCreateCityRefreshesLegacyNormalizedName(t *testing.T) {
 	}
 }
 
+func TestGetOrCreateCityReusesCanonicalCityForAliasQuery(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, "Lübbecke", "Lübbecke", "Lübbecke", 52.306990, 8.614230, "2026-04-10T13:48:51Z")
+	if err != nil {
+		t.Fatalf("insert canonical city: %v", err)
+	}
+
+	var requests atomic.Int32
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		body := `[{"name":"Lübbecke","display_name":"Lübbecke, Kreis Minden-Lübbecke, Nordrhein-Westfalen, 32312, Deutschland","lat":"52.3027209","lon":"8.6183054"}]`
+		return jsonResponse(http.StatusOK, body), nil
+	})
+	defer restore()
+
+	city, cached, err := getOrCreateCity(ctx, db, "Luebbecke", "gasoline-test/1.0")
+	if err != nil {
+		t.Fatalf("getOrCreateCity: %v", err)
+	}
+	if cached {
+		t.Fatal("alias lookup should geocode once and refresh canonical cache row")
+	}
+	if city.QueryName != "Lübbecke" {
+		t.Fatalf("query name = %q, want canonical row key", city.QueryName)
+	}
+	if city.Name != "Lübbecke" {
+		t.Fatalf("normalized name = %q", city.Name)
+	}
+	if city.DisplayName != "Lübbecke, Kreis Minden-Lübbecke, Nordrhein-Westfalen, 32312, Deutschland" {
+		t.Fatalf("display name = %q", city.DisplayName)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("geocoder requests = %d, want 1", got)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cities`).Scan(&count); err != nil {
+		t.Fatalf("count cities: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("city count = %d, want 1", count)
+	}
+
+	var displayName string
+	if err := db.QueryRowContext(ctx, `SELECT display_name FROM cities WHERE name = ?`, "Lübbecke").Scan(&displayName); err != nil {
+		t.Fatalf("query canonical display_name: %v", err)
+	}
+	if displayName != city.DisplayName {
+		t.Fatalf("stored display_name = %q, want %q", displayName, city.DisplayName)
+	}
+}
+
 func TestRunListCitiesSupportsJSONOutput(t *testing.T) {
 	dbPath := seedFixtureDB(t)
 	output := captureStdout(t, func() error {
@@ -849,6 +906,54 @@ func TestRunMigrateReportsNoChangesForCurrentSchema(t *testing.T) {
 	}
 }
 
+func TestRunMigrateDeduplicatesCitiesByNormalizedName(t *testing.T) {
+	dbPath := seedDuplicateCitiesFixtureDB(t)
+
+	output := captureStdout(t, func() error {
+		return run([]string{"migrate", "--db", dbPath, "--output", "json"})
+	})
+
+	var result migrateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal migrate output: %v\noutput=%s", err, output)
+	}
+	if !containsString(result.Applied, "cities.deduplicate_normalized_name") {
+		t.Fatalf("applied migrations = %v, want cities.deduplicate_normalized_name", result.Applied)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open migrated db: %v", err)
+	}
+	defer db.Close()
+
+	var count int
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM cities WHERE normalized_name = ?`, "Lübbecke").Scan(&count); err != nil {
+		t.Fatalf("count deduplicated cities: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("deduplicated city count = %d, want 1", count)
+	}
+
+	var (
+		name        string
+		displayName string
+	)
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT name, display_name
+		FROM cities
+		WHERE normalized_name = ?
+	`, "Lübbecke").Scan(&name, &displayName); err != nil {
+		t.Fatalf("query deduplicated city: %v", err)
+	}
+	if name != "Lübbecke" {
+		t.Fatalf("kept city name = %q, want %q", name, "Lübbecke")
+	}
+	if displayName != "Lübbecke, Kreis Minden-Lübbecke, Nordrhein-Westfalen, 32312, Deutschland" {
+		t.Fatalf("display_name = %q", displayName)
+	}
+}
+
 func TestResolveOutputModeRejectsConflictingFlags(t *testing.T) {
 	err := run([]string{"list", "cities", "--db", filepath.Join(t.TempDir(), "test.db"), "--output", "txt", "-o", "json"})
 	if err == nil || !strings.Contains(err.Error(), "--output and -o must match") {
@@ -1117,6 +1222,44 @@ func seedLegacyFixtureDB(t *testing.T) string {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, "station-1", "Berlin", "2026-04-02T09:15:00Z", 1.25, 5, 1, 1.789, 1.729, 1.659); err != nil {
 		t.Fatalf("insert legacy snapshot: %v", err)
+	}
+
+	return dbPath
+}
+
+func seedDuplicateCitiesFixtureDB(t *testing.T) string {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "duplicate-cities.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+
+	rows := []struct {
+		name        string
+		displayName string
+		lat         float64
+		lng         float64
+		createdAt   string
+	}{
+		{"Lübbecke", "Lübbecke", 52.306990, 8.614230, "2026-04-10T13:48:51Z"},
+		{"Luebbecke", "Lübbecke, Kreis Minden-Lübbecke, Nordrhein-Westfalen, 32312, Deutschland", 52.3027209, 8.6183054, "2026-04-10T13:51:57Z"},
+		{"", "Lübbecke, Kreis Minden-Lübbecke, Nordrhein-Westfalen, 32312, Deutschland", 52.3027209, 8.6183054, "2026-04-10T13:51:57Z"},
+	}
+	for _, row := range rows {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, row.name, "Lübbecke", row.displayName, row.lat, row.lng, row.createdAt); err != nil {
+			t.Fatalf("insert duplicate city %q: %v", row.name, err)
+		}
 	}
 
 	return dbPath
