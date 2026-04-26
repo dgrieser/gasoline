@@ -1384,34 +1384,7 @@ function formatPrice($value): string
                             <th data-i18n="fuelDiesel">Diesel</th>
                         </tr>
                         </thead>
-                        <tbody>
-                        <?php foreach (array_reverse($rows) as $row): ?>
-                            <?php
-                            $streetFull = trim(implode(' ', array_filter([
-                                (string) $row['street'],
-                                (string) $row['house_number'],
-                            ])));
-                            $rowStationDistance = $selectedCityDistances[(string) $row['station_id']] ?? null;
-                            $stationDistance = $rowStationDistance !== null
-                                ? ' (' . number_format((float) $rowStationDistance, 1) . ' km)'
-                                : '';
-                            ?>
-                            <tr>
-                                <td class="td-muted" data-recorded-at="<?= h((string) $row['recorded_at']) ?>"><?= h((string) $row['recorded_at']) ?></td>
-                                <td><?= h((string) $row['station_name'] . $stationDistance) ?></td>
-                                <td class="td-muted"><?= h((string) $row['brand']) ?></td>
-                                <td class="td-muted"><?= h($streetFull) ?></td>
-                                <td class="td-muted"><?= h((string) $row['place']) ?></td>
-                                <td class="<?= !empty($row['is_open']) ? 'open-yes' : 'open-no' ?>" data-i18n="<?= !empty($row['is_open']) ? 'openYes' : 'openNo' ?>"><?= !empty($row['is_open']) ? 'open' : 'closed' ?></td>
-                                <td class="price-e5"><?= h(formatPrice($row['e5'])) ?></td>
-                                <td class="price-e10"><?= h(formatPrice($row['e10'])) ?></td>
-                                <td class="price-diesel"><?= h(formatPrice($row['diesel'])) ?></td>
-                            </tr>
-                        <?php endforeach; ?>
-                        <?php if ($rows === []): ?>
-                            <tr><td colspan="9" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="noData">No data</td></tr>
-                        <?php endif; ?>
-                        </tbody>
+                        <tbody id="table-body"></tbody>
                     </table>
                 </div>
             </div>
@@ -1624,6 +1597,7 @@ if (!chartEl) {
             renderChart();
             renderCheapestRange();
             renderHighest();
+            renderTable();
         });
     });
 
@@ -1995,6 +1969,34 @@ function renderHighest() {
     renderPriceCard(highestCard, getRangeFilteredData(), rangeTitle(t.highestPrefix), (a, b) => a > b, ICON_UP, t.highestNoData);
 }
 
+function renderTable() {
+    const tbody = document.getElementById('table-body');
+    if (!tbody) return;
+    const t = translations[currentLang];
+    const rows = getRangeFilteredData().filter((r) => !r._synthetic).reverse();
+    if (rows.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem">${h(t.noData)}</td></tr>`;
+        return;
+    }
+    tbody.innerHTML = rows.map((row) => {
+        const distKm = stationDistancesById[row.station_id] ?? null;
+        const distStr = distKm !== null ? ` (${distKm.toFixed(1)} km)` : '';
+        const openClass = row.is_open ? 'open-yes' : 'open-no';
+        const openText  = row.is_open ? h(t.openYes) : h(t.openNo);
+        return `<tr>` +
+            `<td class="td-muted" data-recorded-at="${h(row.recorded_at)}">${h(formatDateTime(row.recorded_at))}</td>` +
+            `<td>${h(row.station_name + distStr)}</td>` +
+            `<td class="td-muted">${h(row.brand)}</td>` +
+            `<td class="td-muted">${h(row.street)}</td>` +
+            `<td class="td-muted">${h(row.place)}</td>` +
+            `<td class="${openClass}">${openText}</td>` +
+            `<td class="price-e5">${row.e5 !== null ? row.e5.toFixed(3) : '-'}</td>` +
+            `<td class="price-e10">${row.e10 !== null ? row.e10.toFixed(3) : '-'}</td>` +
+            `<td class="price-diesel">${row.diesel !== null ? row.diesel.toFixed(3) : '-'}</td>` +
+        `</tr>`;
+    }).join('');
+}
+
 function applyLang(lang) {
     currentLang = lang;
     localStorage.setItem('lang', lang);
@@ -2017,6 +2019,7 @@ function applyLang(lang) {
     renderCheapest();
     renderCheapestRange();
     renderHighest();
+    renderTable();
     if (chartEl) renderChart();
 }
 

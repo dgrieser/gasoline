@@ -141,12 +141,14 @@ type stationRow struct {
 }
 
 type historyRow struct {
-	CityName   string   `json:"city_name"`
-	RecordedAt string   `json:"recorded_at"`
-	IsOpen     bool     `json:"is_open"`
-	E5         *float64 `json:"e5,omitempty"`
-	E10        *float64 `json:"e10,omitempty"`
-	Diesel     *float64 `json:"diesel,omitempty"`
+	StationID   string   `json:"station_id"`
+	StationName string   `json:"station_name"`
+	CityName    string   `json:"city_name"`
+	RecordedAt  string   `json:"recorded_at"`
+	IsOpen      bool     `json:"is_open"`
+	E5          *float64 `json:"e5,omitempty"`
+	E10         *float64 `json:"e10,omitempty"`
+	Diesel      *float64 `json:"diesel,omitempty"`
 }
 
 var stdout io.Writer = os.Stdout
@@ -208,7 +210,7 @@ Commands:
   migrate  apply schema migrations to an existing database
   list cities   list cached city geocodes
   list stations list known stations with latest stored snapshot
-  list history  show historical prices for one station
+  list history  show historical prices
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
 
@@ -218,7 +220,7 @@ Examples:
   gasoline migrate
   gasoline list cities
   gasoline list stations --city "Berlin, Germany"
-  gasoline list history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel
+  gasoline list history --fuel diesel
   gasoline import cities DE
   gasoline clear cities`)
 }
@@ -738,9 +740,6 @@ func runHistory(args []string) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(*stationID) == "" {
-		return errors.New("history requires --station-id")
-	}
 	if !isValidFuelType(*fuel) {
 		return errors.New("--fuel must be one of: all, diesel, e5, e10")
 	}
@@ -759,14 +758,26 @@ func runHistory(args []string) error {
 		return err
 	}
 
-	query := `
-		SELECT city_name, recorded_at, is_open, e5, e10, diesel
-		FROM price_snapshots
-		WHERE station_id = ?
-		ORDER BY recorded_at DESC
-		LIMIT ?
-	`
-	rows, err := db.QueryContext(ctx, query, strings.TrimSpace(*stationID), *limit)
+	stationFilter := strings.TrimSpace(*stationID)
+	var rows *sql.Rows
+	if stationFilter == "" {
+		rows, err = db.QueryContext(ctx, `
+			SELECT ps.station_id, s.name, ps.city_name, ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
+			FROM price_snapshots ps
+			JOIN stations s ON s.id = ps.station_id
+			ORDER BY ps.recorded_at DESC
+			LIMIT ?
+		`, *limit)
+	} else {
+		rows, err = db.QueryContext(ctx, `
+			SELECT ps.station_id, s.name, ps.city_name, ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
+			FROM price_snapshots ps
+			JOIN stations s ON s.id = ps.station_id
+			WHERE ps.station_id = ?
+			ORDER BY ps.recorded_at DESC
+			LIMIT ?
+		`, stationFilter, *limit)
+	}
 	if err != nil {
 		return err
 	}
@@ -775,41 +786,43 @@ func runHistory(args []string) error {
 	var results []historyRow
 	for rows.Next() {
 		var (
-			cityName, recordedAt string
-			isOpen               bool
-			e5, e10, diesel      sql.NullFloat64
+			stationID, stationName, cityName, recordedAt string
+			isOpen                                       bool
+			e5, e10, diesel                              sql.NullFloat64
 		)
-		if err := rows.Scan(&cityName, &recordedAt, &isOpen, &e5, &e10, &diesel); err != nil {
+		if err := rows.Scan(&stationID, &stationName, &cityName, &recordedAt, &isOpen, &e5, &e10, &diesel); err != nil {
 			return err
 		}
 		row := historyRow{
-			CityName:   cityName,
-			RecordedAt: recordedAt,
-			IsOpen:     isOpen,
+			StationID:   stationID,
+			StationName: stationName,
+			CityName:    cityName,
+			RecordedAt:  recordedAt,
+			IsOpen:      isOpen,
 		}
 		switch *fuel {
 		case "e5":
 			row.E5 = nullFloatPtr(e5)
 			if output == outputText {
-				fmt.Fprintf(stdout, "%s | city=%s | open=%t | e5=%s\n", recordedAt, cityName, isOpen, formatNullFloat(e5))
+				printHistoryText(stationFilter, stationID, stationName, recordedAt, cityName, isOpen, "e5="+formatNullFloat(e5))
 			}
 		case "e10":
 			row.E10 = nullFloatPtr(e10)
 			if output == outputText {
-				fmt.Fprintf(stdout, "%s | city=%s | open=%t | e10=%s\n", recordedAt, cityName, isOpen, formatNullFloat(e10))
+				printHistoryText(stationFilter, stationID, stationName, recordedAt, cityName, isOpen, "e10="+formatNullFloat(e10))
 			}
 		case "diesel":
 			row.Diesel = nullFloatPtr(diesel)
 			if output == outputText {
-				fmt.Fprintf(stdout, "%s | city=%s | open=%t | diesel=%s\n", recordedAt, cityName, isOpen, formatNullFloat(diesel))
+				printHistoryText(stationFilter, stationID, stationName, recordedAt, cityName, isOpen, "diesel="+formatNullFloat(diesel))
 			}
 		default:
 			row.E5 = nullFloatPtr(e5)
 			row.E10 = nullFloatPtr(e10)
 			row.Diesel = nullFloatPtr(diesel)
 			if output == outputText {
-				fmt.Fprintf(stdout, "%s | city=%s | open=%t | e5=%s e10=%s diesel=%s\n",
-					recordedAt, cityName, isOpen, formatNullFloat(e5), formatNullFloat(e10), formatNullFloat(diesel))
+				printHistoryText(stationFilter, stationID, stationName, recordedAt, cityName, isOpen,
+					fmt.Sprintf("e5=%s e10=%s diesel=%s", formatNullFloat(e5), formatNullFloat(e10), formatNullFloat(diesel)))
 			}
 		}
 		results = append(results, row)
@@ -821,6 +834,15 @@ func runHistory(args []string) error {
 		return writeJSON(results)
 	}
 	return nil
+}
+
+func printHistoryText(stationFilter, stationID, stationName, recordedAt, cityName string, isOpen bool, prices string) {
+	if stationFilter == "" {
+		fmt.Fprintf(stdout, "%s | %s | %s | city=%s | open=%t | %s\n",
+			recordedAt, stationID, stationName, cityName, isOpen, prices)
+		return
+	}
+	fmt.Fprintf(stdout, "%s | city=%s | open=%t | %s\n", recordedAt, cityName, isOpen, prices)
 }
 
 func addOutputFlags(fs *flag.FlagSet) (*string, *string) {

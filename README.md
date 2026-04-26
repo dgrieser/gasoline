@@ -96,9 +96,10 @@ List known stations and their latest stored prices:
 gasoline list stations --city "Berlin" --limit 20
 ```
 
-Show historical prices for one station:
+Show historical prices, optionally filtered to one station:
 
 ```bash
+gasoline list history --fuel diesel --limit 100
 gasoline list history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel --limit 100
 ```
 

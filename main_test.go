@@ -555,6 +555,49 @@ func TestRunListHistorySupportsJSONOutput(t *testing.T) {
 	}
 }
 
+func TestRunListHistoryAllowsMissingStationID(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO stations (
+			id, name, brand, street, house_number, post_code, place, lat, lng, first_seen_at, last_seen_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "station-2", "Other Station", "ESSO", "Other Street", "2", 10115, "Berlin", 52.6, 13.5, "2026-04-02T10:15:00Z", "2026-04-02T10:15:00Z"); err != nil {
+		t.Fatalf("insert station: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO price_snapshots (
+			station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, "station-2", "Berlin", "2026-04-02T10:15:00Z", 5, 1, 1.809, 1.749, 1.679); err != nil {
+		t.Fatalf("insert snapshot: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"list", "history", "--db", dbPath, "--output", "json"})
+	})
+
+	var history []historyRow
+	if err := json.Unmarshal([]byte(output), &history); err != nil {
+		t.Fatalf("unmarshal history output: %v\noutput=%s", err, output)
+	}
+	if len(history) != 2 {
+		t.Fatalf("len(history) = %d, want 2", len(history))
+	}
+	if history[0].StationID != "station-2" || history[0].StationName != "Other Station" {
+		t.Fatalf("latest station = %q/%q, want station-2/Other Station", history[0].StationID, history[0].StationName)
+	}
+	if history[1].StationID != "station-1" || history[1].StationName != "Test Station" {
+		t.Fatalf("older station = %q/%q, want station-1/Test Station", history[1].StationID, history[1].StationName)
+	}
+}
+
 func TestRunUpdateSupportsJSONOutput(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "update.db")

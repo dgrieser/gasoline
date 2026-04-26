@@ -2,3 +2,4 @@
 gasoline
 *.db
 dist/
+.codex
