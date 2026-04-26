@@ -27,8 +27,23 @@ $selectedStationIds = array_values(array_filter(
     }
 ));
 
+$selectedRange = trim((string) ($_GET['range'] ?? ''));
+$validRanges = ['7d', '14d', '30d'];
+if (!in_array($selectedRange, $validRanges, true)) {
+    $selectedRange = '';
+}
+
 $fromDate = trim((string) ($_GET['from'] ?? ''));
 $toDate = trim((string) ($_GET['to'] ?? ''));
+
+if ($selectedRange !== '') {
+    $rangeDays = ['7d' => 7, '14d' => 14, '30d' => 30];
+    $fromDate = (new DateTimeImmutable('now', new DateTimeZone('UTC')))
+        ->modify('-' . $rangeDays[$selectedRange] . ' days')
+        ->format('Y-m-d');
+    $toDate = '';
+}
+
 $selectedFuel = trim((string) ($_GET['fuel'] ?? 'all'));
 $selectedCity = trim((string) ($_GET['city'] ?? ''));
 $selectedRadiusKmRaw = trim((string) ($_GET['radius_km'] ?? ''));
@@ -1283,22 +1298,23 @@ function formatPrice($value): string
                 </div>
 
                 <div class="field">
+                    <label data-i18n="quickRange">Quick range</label>
+                    <div class="quick-ranges">
+                        <button type="button" class="quick-range-btn" data-range="7d"  data-i18n="range7d">7d</button>
+                        <button type="button" class="quick-range-btn" data-range="14d" data-i18n="range14d">14d</button>
+                        <button type="button" class="quick-range-btn" data-range="30d" data-i18n="range30d">30d</button>
+                    </div>
+                    <input type="hidden" name="range" id="f-range" value="<?= h($selectedRange) ?>">
+                </div>
+
+                <div class="field">
                     <label for="f-from" data-i18n="from">From</label>
-                    <input type="date" name="from" id="f-from" value="<?= h($fromDate) ?>" onchange="this.form.submit()">
+                    <input type="date" name="from" id="f-from" value="<?= $selectedRange === '' ? h($fromDate) : '' ?>" onchange="onDateChange(this)">
                 </div>
 
                 <div class="field">
                     <label for="f-to" data-i18n="to">To</label>
-                    <input type="date" name="to" id="f-to" value="<?= h($toDate) ?>" onchange="this.form.submit()">
-                </div>
-
-                <div class="field">
-                    <label data-i18n="quickRange">Quick range</label>
-                    <div class="quick-ranges">
-                        <button type="button" class="quick-range-btn" data-days="7"  data-i18n="range7d">7d</button>
-                        <button type="button" class="quick-range-btn" data-days="14" data-i18n="range14d">14d</button>
-                        <button type="button" class="quick-range-btn" data-days="30" data-i18n="range30d">30d</button>
-                    </div>
+                    <input type="date" name="to" id="f-to" value="<?= $selectedRange === '' ? h($toDate) : '' ?>" onchange="onDateChange(this)">
                 </div>
 
                 <?php
@@ -2087,49 +2103,36 @@ themeToggle.addEventListener('click', () => {
 applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
 
 /* ── Quick date-range buttons ──────────────────────────────────── */
+function onDateChange(el) {
+    document.getElementById('f-range').value = '';
+    el.form.submit();
+}
+
 (function () {
-    const fromInput = document.getElementById('f-from');
-    const toInput   = document.getElementById('f-to');
-    const form      = fromInput?.closest('form');
-    if (!fromInput || !toInput || !form) return;
-
-    function toYMD(date) {
-        return date.toISOString().slice(0, 10);
-    }
-
-    function detectActiveDays() {
-        if (toInput.value) return null;
-        if (!fromInput.value) return null;
-        const from = new Date(fromInput.value + 'T00:00:00');
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const diffDays = Math.round((today - from) / 86_400_000);
-        return [7, 14, 30].includes(diffDays) ? diffDays : null;
-    }
+    const rangeInput = document.getElementById('f-range');
+    const fromInput  = document.getElementById('f-from');
+    const toInput    = document.getElementById('f-to');
+    const form       = rangeInput?.closest('form');
+    if (!rangeInput || !fromInput || !toInput || !form) return;
 
     function updateActiveStates() {
-        const active = detectActiveDays();
+        const active = rangeInput.value;
         document.querySelectorAll('.quick-range-btn').forEach((btn) => {
-            btn.classList.toggle('active', Number(btn.dataset.days) === active);
+            btn.classList.toggle('active', btn.dataset.range === active);
         });
     }
 
     document.querySelectorAll('.quick-range-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
-            const days = Number(btn.dataset.days);
-            const from = new Date();
-            from.setDate(from.getDate() - days);
-            fromInput.value = toYMD(from);
-            toInput.value   = '';
+            rangeInput.value = btn.dataset.range;
+            fromInput.value  = '';
+            toInput.value    = '';
             updateActiveStates();
             form.submit();
         });
     });
 
     updateActiveStates();
-
-    fromInput.addEventListener('change', updateActiveStates);
-    toInput.addEventListener('change', updateActiveStates);
 })();
 
 /* ── City autocomplete ─────────────────────────────────────────── */
