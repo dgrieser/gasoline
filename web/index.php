@@ -42,7 +42,11 @@ $selectedRadiusKm = in_array((int) $selectedRadiusKmRaw, $validRadiusOptions, tr
     : ($selectedCity !== '' ? 5 : $validRadiusOptions[0]);
 
 if (!file_exists($dbPath)) {
-    $errors[] = sprintf('SQLite database not found at %s', $dbPath);
+    $errors[] = [
+        'key' => 'dbNotFound',
+        'params' => ['path' => $dbPath],
+        'message' => sprintf('SQLite database not found at %s', $dbPath),
+    ];
 }
 
 // ── AJAX: city prefix search ──────────────────────────────────────────────────
@@ -121,7 +125,11 @@ if ($errors === []) {
             $selectedCityRow = $cityStatement->fetch() ?: null;
 
             if ($selectedCityRow === null) {
-                $errors[] = 'Selected city not found.';
+                $errors[] = [
+                    'key' => 'cityNotFound',
+                    'params' => [],
+                    'message' => 'Selected city not found.',
+                ];
             } else {
                 $bbox = boundingBox(
                     (float) $selectedCityRow['lat'],
@@ -202,7 +210,11 @@ if ($errors === []) {
         if ($fromDate !== '') {
             $from = DateTimeImmutable::createFromFormat('Y-m-d', $fromDate, new DateTimeZone('UTC'));
             if ($from === false) {
-                $errors[] = 'Invalid from date.';
+                $errors[] = [
+                    'key' => 'invalidFromDate',
+                    'params' => [],
+                    'message' => 'Invalid from date.',
+                ];
             } else {
                 $where[] = 'ps.recorded_at >= :from_recorded_at';
                 $params[':from_recorded_at'] = $from->setTime(0, 0, 0)->format(DateTimeInterface::RFC3339);
@@ -212,7 +224,11 @@ if ($errors === []) {
         if ($toDate !== '') {
             $to = DateTimeImmutable::createFromFormat('Y-m-d', $toDate, new DateTimeZone('UTC'));
             if ($to === false) {
-                $errors[] = 'Invalid to date.';
+                $errors[] = [
+                    'key' => 'invalidToDate',
+                    'params' => [],
+                    'message' => 'Invalid to date.',
+                ];
             } else {
                 $where[] = 'ps.recorded_at <= :to_recorded_at';
                 $params[':to_recorded_at'] = $to->setTime(23, 59, 59)->format(DateTimeInterface::RFC3339);
@@ -304,7 +320,11 @@ if ($errors === []) {
             $summary['last_recorded_at'] = $rows[count($rows) - 1]['recorded_at'];
         }
     } catch (Throwable $e) {
-        $errors[] = $e->getMessage();
+        $errors[] = [
+            'key' => null,
+            'params' => [],
+            'message' => $e->getMessage(),
+        ];
     }
 }
 
@@ -1180,7 +1200,7 @@ function formatPrice($value): string
                 <button class="lang-btn" data-lang="en">EN</button>
                 <button class="lang-btn" data-lang="de">DE</button>
             </div>
-            <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">
+            <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" data-i18n-aria-label="toggleTheme">
                 <svg id="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
             </button>
         </div>
@@ -1281,7 +1301,11 @@ function formatPrice($value): string
         <div class="content">
 
             <?php foreach ($errors as $error): ?>
-                <div class="error-box"><?= h($error) ?></div>
+                <div
+                    class="error-box"
+                    <?= !empty($error['key']) ? 'data-error-key="' . h((string) $error['key']) . '"' : '' ?>
+                    <?= !empty($error['params']['path']) ? 'data-error-path="' . h((string) $error['params']['path']) . '"' : '' ?>
+                ><?= h((string) $error['message']) ?></div>
             <?php endforeach; ?>
 
             <!-- Stats -->
@@ -1327,12 +1351,12 @@ function formatPrice($value): string
                     <div class="fuel-toggles">
                         <button type="button" class="fuel-toggle active" data-fuel="e5">E5</button>
                         <button type="button" class="fuel-toggle active" data-fuel="e10">E10</button>
-                        <button type="button" class="fuel-toggle active" data-fuel="diesel">Diesel</button>
+                        <button type="button" class="fuel-toggle active" data-fuel="diesel" data-i18n="fuelDiesel">Diesel</button>
                     </div>
                 </div>
                 <?php if ($rows !== [] || $errors !== []): ?>
                     <div class="chart-body">
-                        <svg id="chart" viewBox="0 0 960 380" preserveAspectRatio="none" aria-label="Fuel price history chart"></svg>
+                        <svg id="chart" viewBox="0 0 960 380" preserveAspectRatio="none" aria-label="Fuel price history chart" data-i18n-aria-label="chartAriaLabel"></svg>
                     </div>
                     <div class="chart-legend" id="legend"></div>
                 <?php else: ?>
@@ -1357,7 +1381,7 @@ function formatPrice($value): string
                             <th data-i18n="open">Open</th>
                             <th>E5</th>
                             <th>E10</th>
-                            <th>Diesel</th>
+                            <th data-i18n="fuelDiesel">Diesel</th>
                         </tr>
                         </thead>
                         <tbody>
