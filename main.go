@@ -11,11 +11,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -151,6 +153,85 @@ type historyRow struct {
 	Diesel      *float64 `json:"diesel,omitempty"`
 }
 
+type suggestionRow struct {
+	Date           string  `json:"date"`
+	Weekday        string  `json:"weekday"`
+	StartTime      string  `json:"start_time"`
+	EndTime        string  `json:"end_time"`
+	StationID      string  `json:"station_id"`
+	StationName    string  `json:"station_name"`
+	DistanceKM     float64 `json:"distance_km"`
+	Fuel           string  `json:"fuel"`
+	PredictedPrice float64 `json:"predicted_price"`
+	Confidence     string  `json:"confidence"`
+	SampleCount    int     `json:"sample_count"`
+}
+
+type suggestOptions struct {
+	City        string
+	RangeKM     float64
+	Fuel        string
+	HistoryDays int
+	PredictDays int
+	LimitPerDay int
+	Now         time.Time
+	Location    *time.Location
+}
+
+type suggestSnapshot struct {
+	StationID   string
+	StationName string
+	DistanceKM  float64
+	RecordedAt  time.Time
+	IsOpen      bool
+	Price       sql.NullFloat64
+}
+
+type priceInterval struct {
+	StationID   string
+	StationName string
+	DistanceKM  float64
+	Start       time.Time
+	End         time.Time
+	Price       float64
+}
+
+type forecastStation struct {
+	ID         string
+	Name       string
+	DistanceKM float64
+}
+
+type priceSample struct {
+	Price  float64
+	Weight float64
+	Date   string
+}
+
+type stationWeekdayHourKey struct {
+	StationID string
+	Weekday   time.Weekday
+	Hour      int
+}
+
+type stationHourKey struct {
+	StationID string
+	Hour      int
+}
+
+type forecastModel struct {
+	Stations    map[string]forecastStation
+	WeekdayHour map[stationWeekdayHourKey][]priceSample
+	Hour        map[stationHourKey][]priceSample
+	Recent      map[string][]priceSample
+}
+
+type forecastScore struct {
+	PredictedPrice float64
+	Confidence     string
+	SampleCount    int
+}
+
 var stdout io.Writer = os.Stdout
 var countryCodePattern = regexp.MustCompile(`^[A-Za-z]{2}$`)
 var geoNamesFeatureCodePattern = regexp.MustCompile(`^(PPL|PPLC|PPLA[1-9]*)$`)
@@ -193,6 +274,8 @@ func run(args []string) error {
 		return runStations(args[1:])
 	case "history":
 		return runHistory(args[1:])
+	case "suggest":
+		return runSuggest(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -211,6 +294,7 @@ Commands:
   list cities   list cached city geocodes
   list stations list known stations with latest stored snapshot
   list history  show historical prices
+  suggest       predict cheap fueling windows by day and time
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
 
@@ -221,6 +305,7 @@ Examples:
   gasoline list cities
   gasoline list stations --city "Berlin, Germany"
   gasoline list history --fuel diesel
+  gasoline suggest --city "Berlin" --range-km 10 --fuel diesel
   gasoline import cities DE
   gasoline clear cities`)
 }
@@ -834,6 +919,454 @@ func runHistory(args []string) error {
 		return writeJSON(results)
 	}
 	return nil
+}
+
+func runSuggest(args []string) error {
+	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	city := fs.String("city", "", "Cached city to use as the range center")
+	rangeKM := fs.Float64("range-km", 5, "Maximum station distance from the city center in km")
+	fuel := fs.String("fuel", "diesel", "Fuel type: diesel, e5, e10")
+	historyDays := fs.Int("history-days", 21, "Historical days to use for prediction")
+	predictDays := fs.Int("predict-days", 3, "Calendar days to suggest, including today when future hours remain")
+	limitPerDay := fs.Int("limit-per-day", 3, "Maximum suggestions per day")
+	outputLong, outputShort := addOutputFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
+		return err
+	}
+
+	opts := suggestOptions{
+		City:        strings.TrimSpace(*city),
+		RangeKM:     *rangeKM,
+		Fuel:        strings.TrimSpace(*fuel),
+		HistoryDays: *historyDays,
+		PredictDays: *predictDays,
+		LimitPerDay: *limitPerDay,
+		Now:         time.Now().UTC(),
+		Location:    time.Local,
+	}
+	if err := validateSuggestOptions(opts); err != nil {
+		return err
+	}
+
+	db, err := openDB(resolvedDBPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	suggestions, err := suggestGas(ctx, db, opts)
+	if err != nil {
+		return err
+	}
+	if output == outputJSON {
+		return writeJSON(suggestions)
+	}
+
+	printSuggestionsText(suggestions)
+	return nil
+}
+
+func validateSuggestOptions(opts suggestOptions) error {
+	if strings.TrimSpace(opts.City) == "" {
+		return errors.New("suggest requires --city")
+	}
+	if opts.RangeKM <= 0 {
+		return errors.New("--range-km must be > 0")
+	}
+	if !isSuggestFuelType(opts.Fuel) {
+		return errors.New("--fuel must be one of: diesel, e5, e10")
+	}
+	if opts.HistoryDays <= 0 {
+		return errors.New("--history-days must be > 0")
+	}
+	if opts.PredictDays <= 0 {
+		return errors.New("--predict-days must be > 0")
+	}
+	if opts.LimitPerDay <= 0 {
+		return errors.New("--limit-per-day must be > 0")
+	}
+	return nil
+}
+
+func suggestGas(ctx context.Context, db *sql.DB, opts suggestOptions) ([]suggestionRow, error) {
+	if err := validateSuggestOptions(opts); err != nil {
+		return nil, err
+	}
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	location := opts.Location
+	if location == nil {
+		location = time.Local
+	}
+
+	city, err := loadCachedCity(ctx, db, opts.City)
+	if err != nil {
+		return nil, err
+	}
+
+	historyStart := now.AddDate(0, 0, -opts.HistoryDays)
+	snapshots, err := loadSuggestSnapshots(ctx, db, city, opts.Fuel, opts.RangeKM, historyStart, now)
+	if err != nil {
+		return nil, err
+	}
+	intervals := reconstructPriceIntervals(snapshots, historyStart, now)
+	if len(intervals) == 0 {
+		return nil, errors.New("not enough historical open-price data for suggestions")
+	}
+
+	model := buildForecastModel(intervals, now, location)
+	suggestions := generateSuggestions(model, opts.Fuel, now, location, opts.PredictDays, opts.LimitPerDay)
+	if len(suggestions) == 0 {
+		return nil, errors.New("not enough historical price patterns for suggestions")
+	}
+	return suggestions, nil
+}
+
+func loadCachedCity(ctx context.Context, db *sql.DB, cityName string) (cachedCity, error) {
+	cityName = strings.TrimSpace(cityName)
+	var city cachedCity
+	row := db.QueryRowContext(ctx, `
+		SELECT name, normalized_name, display_name, lat, lng
+		FROM cities
+		WHERE name = ?
+			OR normalized_name = ?
+			OR display_name = ?
+		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
+		LIMIT 1
+	`, cityName, cityName, cityName)
+	if err := row.Scan(&city.QueryName, &city.Name, &city.DisplayName, &city.Lat, &city.Lng); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return cachedCity{}, fmt.Errorf("city %q is not cached; run gasoline update --city %q first", cityName, cityName)
+		}
+		return cachedCity{}, err
+	}
+	return city, nil
+}
+
+func loadSuggestSnapshots(ctx context.Context, db *sql.DB, city cachedCity, fuel string, rangeKM float64, historyStart, now time.Time) ([]suggestSnapshot, error) {
+	column, err := suggestFuelColumn(fuel)
+	if err != nil {
+		return nil, err
+	}
+	query := fmt.Sprintf(`
+		SELECT s.id, s.name, s.lat, s.lng, ps.recorded_at, ps.is_open, ps.%s
+		FROM stations s
+		JOIN price_snapshots ps ON ps.station_id = s.id
+		WHERE ps.recorded_at >= ?
+			OR ps.recorded_at = (
+				SELECT MAX(prior.recorded_at)
+				FROM price_snapshots prior
+				WHERE prior.station_id = s.id
+					AND prior.recorded_at < ?
+			)
+		ORDER BY s.id ASC, ps.recorded_at ASC, ps.id ASC
+	`, column)
+	rows, err := db.QueryContext(ctx, query, historyStart.Format(time.RFC3339), historyStart.Format(time.RFC3339))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var snapshots []suggestSnapshot
+	for rows.Next() {
+		var (
+			stationID, stationName, recordedAtText string
+			lat, lng                               float64
+			isOpen                                 bool
+			price                                  sql.NullFloat64
+		)
+		if err := rows.Scan(&stationID, &stationName, &lat, &lng, &recordedAtText, &isOpen, &price); err != nil {
+			return nil, err
+		}
+		recordedAt, err := time.Parse(time.RFC3339, recordedAtText)
+		if err != nil {
+			return nil, fmt.Errorf("parse recorded_at %q: %w", recordedAtText, err)
+		}
+		if recordedAt.After(now) {
+			continue
+		}
+		distanceKM := haversineKM(city.Lat, city.Lng, lat, lng)
+		if distanceKM > rangeKM {
+			continue
+		}
+		snapshots = append(snapshots, suggestSnapshot{
+			StationID:   stationID,
+			StationName: stationName,
+			DistanceKM:  distanceKM,
+			RecordedAt:  recordedAt,
+			IsOpen:      isOpen,
+			Price:       price,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return snapshots, nil
+}
+
+func reconstructPriceIntervals(snapshots []suggestSnapshot, historyStart, now time.Time) []priceInterval {
+	var intervals []priceInterval
+	for i, snapshot := range snapshots {
+		end := now
+		if i+1 < len(snapshots) && snapshots[i+1].StationID == snapshot.StationID {
+			end = snapshots[i+1].RecordedAt
+		}
+		start := snapshot.RecordedAt
+		if start.Before(historyStart) {
+			start = historyStart
+		}
+		if end.After(now) {
+			end = now
+		}
+		if !end.After(start) || !snapshot.IsOpen || !snapshot.Price.Valid {
+			continue
+		}
+		intervals = append(intervals, priceInterval{
+			StationID:   snapshot.StationID,
+			StationName: snapshot.StationName,
+			DistanceKM:  snapshot.DistanceKM,
+			Start:       start,
+			End:         end,
+			Price:       snapshot.Price.Float64,
+		})
+	}
+	return intervals
+}
+
+func buildForecastModel(intervals []priceInterval, now time.Time, location *time.Location) forecastModel {
+	model := forecastModel{
+		Stations:    make(map[string]forecastStation),
+		WeekdayHour: make(map[stationWeekdayHourKey][]priceSample),
+		Hour:        make(map[stationHourKey][]priceSample),
+		Recent:      make(map[string][]priceSample),
+	}
+	nowLocal := now.In(location)
+	for _, interval := range intervals {
+		model.Stations[interval.StationID] = forecastStation{
+			ID:         interval.StationID,
+			Name:       interval.StationName,
+			DistanceKM: interval.DistanceKM,
+		}
+
+		localStart := interval.Start.In(location)
+		localEnd := interval.End.In(location)
+		for bucketStart := localHourStart(localStart); bucketStart.Before(localEnd); bucketStart = bucketStart.Add(time.Hour) {
+			bucketEnd := bucketStart.Add(time.Hour)
+			overlapStart := maxTime(localStart, bucketStart)
+			overlapEnd := minTime(localEnd, bucketEnd)
+			if !overlapEnd.After(overlapStart) {
+				continue
+			}
+
+			minutes := overlapEnd.Sub(overlapStart).Minutes()
+			midpoint := overlapStart.Add(overlapEnd.Sub(overlapStart) / 2)
+			ageDays := nowLocal.Sub(midpoint).Hours() / 24
+			if ageDays < 0 {
+				ageDays = 0
+			}
+			sample := priceSample{
+				Price:  interval.Price,
+				Weight: minutes * math.Exp(-ageDays/10),
+				Date:   bucketStart.Format("2006-01-02"),
+			}
+			model.WeekdayHour[stationWeekdayHourKey{
+				StationID: interval.StationID,
+				Weekday:   bucketStart.Weekday(),
+				Hour:      bucketStart.Hour(),
+			}] = append(model.WeekdayHour[stationWeekdayHourKey{
+				StationID: interval.StationID,
+				Weekday:   bucketStart.Weekday(),
+				Hour:      bucketStart.Hour(),
+			}], sample)
+			model.Hour[stationHourKey{
+				StationID: interval.StationID,
+				Hour:      bucketStart.Hour(),
+			}] = append(model.Hour[stationHourKey{
+				StationID: interval.StationID,
+				Hour:      bucketStart.Hour(),
+			}], sample)
+			model.Recent[interval.StationID] = append(model.Recent[interval.StationID], sample)
+		}
+	}
+	return model
+}
+
+func generateSuggestions(model forecastModel, fuel string, now time.Time, location *time.Location, predictDays, limitPerDay int) []suggestionRow {
+	nowLocal := now.In(location)
+	start := nextLocalHour(nowLocal)
+	firstDay := localDayStart(start)
+	end := firstDay.AddDate(0, 0, predictDays)
+
+	stationIDs := make([]string, 0, len(model.Stations))
+	for stationID := range model.Stations {
+		stationIDs = append(stationIDs, stationID)
+	}
+	sort.Strings(stationIDs)
+
+	byDate := make(map[string][]suggestionCandidate)
+	for candidateStart := start; candidateStart.Before(end); candidateStart = candidateStart.Add(time.Hour) {
+		for _, stationID := range stationIDs {
+			station := model.Stations[stationID]
+			score, ok := scoreForecast(model, stationID, candidateStart.Weekday(), candidateStart.Hour())
+			if !ok {
+				continue
+			}
+			candidateEnd := candidateStart.Add(time.Hour)
+			date := candidateStart.Format("2006-01-02")
+			byDate[date] = append(byDate[date], suggestionCandidate{
+				suggestionRow: suggestionRow{
+					Date:           date,
+					Weekday:        candidateStart.Weekday().String(),
+					StartTime:      candidateStart.Format("15:04"),
+					EndTime:        candidateEnd.Format("15:04"),
+					StationID:      station.ID,
+					StationName:    station.Name,
+					DistanceKM:     roundTo(station.DistanceKM, 1),
+					Fuel:           fuel,
+					PredictedPrice: roundTo(score.PredictedPrice, 3),
+					Confidence:     score.Confidence,
+					SampleCount:    score.SampleCount,
+				},
+				start: candidateStart,
+			})
+		}
+	}
+
+	var suggestions []suggestionRow
+	for dayStart := firstDay; dayStart.Before(end); dayStart = dayStart.AddDate(0, 0, 1) {
+		date := dayStart.Format("2006-01-02")
+		candidates := byDate[date]
+		sort.SliceStable(candidates, func(i, j int) bool {
+			return suggestionCandidateLess(candidates[i], candidates[j])
+		})
+
+		var selected []suggestionCandidate
+		for _, candidate := range candidates {
+			if duplicatesNearbyStationWindow(candidate, selected) {
+				continue
+			}
+			selected = append(selected, candidate)
+			suggestions = append(suggestions, candidate.suggestionRow)
+			if len(selected) == limitPerDay {
+				break
+			}
+		}
+	}
+	return suggestions
+}
+
+type suggestionCandidate struct {
+	suggestionRow
+	start time.Time
+}
+
+func scoreForecast(model forecastModel, stationID string, weekday time.Weekday, hour int) (forecastScore, bool) {
+	sameWeekday := model.WeekdayHour[stationWeekdayHourKey{StationID: stationID, Weekday: weekday, Hour: hour}]
+	sameHour := model.Hour[stationHourKey{StationID: stationID, Hour: hour}]
+	recent := model.Recent[stationID]
+	sameHourScore, ok := weightedMedianPrice(sameHour)
+	if !ok {
+		return forecastScore{}, false
+	}
+	recentScore, ok := weightedMedianPrice(recent)
+	if !ok {
+		return forecastScore{}, false
+	}
+
+	var (
+		predicted   float64
+		confidence  string
+		sampleCount int
+	)
+	if len(sameWeekday) >= 3 {
+		sameWeekdayScore, ok := weightedMedianPrice(sameWeekday)
+		if !ok {
+			return forecastScore{}, false
+		}
+		predicted = 0.60*sameWeekdayScore + 0.30*sameHourScore + 0.10*recentScore
+		sampleCount = len(sameWeekday)
+		switch {
+		case len(sameWeekday) >= 8 && distinctSampleDays(sameWeekday) >= 5:
+			confidence = "high"
+		case len(sameHour) >= 5:
+			confidence = "medium"
+		default:
+			confidence = "low"
+		}
+	} else {
+		predicted = 0.75*sameHourScore + 0.25*recentScore
+		sampleCount = len(sameHour)
+		confidence = "low"
+	}
+
+	return forecastScore{
+		PredictedPrice: predicted,
+		Confidence:     confidence,
+		SampleCount:    sampleCount,
+	}, true
+}
+
+func weightedMedianPrice(samples []priceSample) (float64, bool) {
+	if len(samples) == 0 {
+		return 0, false
+	}
+	ordered := append([]priceSample(nil), samples...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].Price < ordered[j].Price
+	})
+
+	var totalWeight float64
+	for _, sample := range ordered {
+		totalWeight += sample.Weight
+	}
+	if totalWeight <= 0 {
+		return 0, false
+	}
+
+	var cumulative float64
+	for _, sample := range ordered {
+		cumulative += sample.Weight
+		if cumulative >= totalWeight/2 {
+			return sample.Price, true
+		}
+	}
+	return ordered[len(ordered)-1].Price, true
+}
+
+func printSuggestionsText(suggestions []suggestionRow) {
+	currentDate := ""
+	for _, suggestion := range suggestions {
+		if suggestion.Date != currentDate {
+			if currentDate != "" {
+				fmt.Fprintln(stdout)
+			}
+			fmt.Fprintf(stdout, "%s %s\n", suggestion.Weekday, suggestion.Date)
+			currentDate = suggestion.Date
+		}
+		fmt.Fprintf(stdout, "  %s-%s  %-24s %5.1f km  %s  predicted %.3f  confidence %s  samples=%d\n",
+			suggestion.StartTime,
+			suggestion.EndTime,
+			suggestion.StationName,
+			suggestion.DistanceKM,
+			suggestion.Fuel,
+			suggestion.PredictedPrice,
+			suggestion.Confidence,
+			suggestion.SampleCount,
+		)
+	}
 }
 
 func printHistoryText(stationFilter, stationID, stationName, recordedAt, cityName string, isOpen bool, prices string) {
@@ -1907,6 +2440,112 @@ func nullableFloat(v *float64) any {
 	return *v
 }
 
+func suggestFuelColumn(fuel string) (string, error) {
+	if !isSuggestFuelType(fuel) {
+		return "", errors.New("--fuel must be one of: diesel, e5, e10")
+	}
+	return fuel, nil
+}
+
+func haversineKM(lat1, lng1, lat2, lng2 float64) float64 {
+	const earthRadiusKM = 6371.0088
+	lat1Rad := degreesToRadians(lat1)
+	lat2Rad := degreesToRadians(lat2)
+	deltaLat := degreesToRadians(lat2 - lat1)
+	deltaLng := degreesToRadians(lng2 - lng1)
+
+	a := math.Sin(deltaLat/2)*math.Sin(deltaLat/2) +
+		math.Cos(lat1Rad)*math.Cos(lat2Rad)*math.Sin(deltaLng/2)*math.Sin(deltaLng/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	return earthRadiusKM * c
+}
+
+func degreesToRadians(degrees float64) float64 {
+	return degrees * math.Pi / 180
+}
+
+func localHourStart(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
+}
+
+func nextLocalHour(t time.Time) time.Time {
+	start := localHourStart(t)
+	if t.Equal(start) {
+		return start
+	}
+	return start.Add(time.Hour)
+}
+
+func localDayStart(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+func roundTo(value float64, decimals int) float64 {
+	factor := math.Pow10(decimals)
+	return math.Round(value*factor) / factor
+}
+
+func distinctSampleDays(samples []priceSample) int {
+	days := make(map[string]struct{})
+	for _, sample := range samples {
+		days[sample.Date] = struct{}{}
+	}
+	return len(days)
+}
+
+func suggestionCandidateLess(a, b suggestionCandidate) bool {
+	if a.PredictedPrice != b.PredictedPrice {
+		return a.PredictedPrice < b.PredictedPrice
+	}
+	if confidenceRank(a.Confidence) != confidenceRank(b.Confidence) {
+		return confidenceRank(a.Confidence) > confidenceRank(b.Confidence)
+	}
+	if a.DistanceKM != b.DistanceKM {
+		return a.DistanceKM < b.DistanceKM
+	}
+	if !a.start.Equal(b.start) {
+		return a.start.Before(b.start)
+	}
+	return a.StationName < b.StationName
+}
+
+func confidenceRank(confidence string) int {
+	switch confidence {
+	case "high":
+		return 3
+	case "medium":
+		return 2
+	default:
+		return 1
+	}
+}
+
+func duplicatesNearbyStationWindow(candidate suggestionCandidate, selected []suggestionCandidate) bool {
+	for _, existing := range selected {
+		if existing.StationID != candidate.StationID {
+			continue
+		}
+		if math.Abs(candidate.start.Sub(existing.start).Hours()) < 2 {
+			return true
+		}
+	}
+	return false
+}
+
 func boolToInt(v bool) int {
 	if v {
 		return 1
@@ -1917,6 +2556,15 @@ func boolToInt(v bool) int {
 func isValidFuelType(value string) bool {
 	switch value {
 	case "all", "diesel", "e5", "e10":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSuggestFuelType(value string) bool {
+	switch value {
+	case "diesel", "e5", "e10":
 		return true
 	default:
 		return false

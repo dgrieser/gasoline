@@ -103,6 +103,23 @@ gasoline list history --fuel diesel --limit 0
 gasoline list history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel --limit 100
 ```
 
+Suggest cheap fueling windows for the coming days:
+
+```bash
+gasoline suggest --city "Berlin" --range-km 10 --fuel diesel --history-days 21 --predict-days 3 --limit-per-day 3
+```
+
+The suggestion algorithm uses open historical prices within the range, reconstructs compacted price intervals, buckets them by local weekday and hour, and ranks future day/time windows with a recency-weighted median forecast.
+
+Useful `suggest` flags:
+
+- `--range-km` maximum station distance from the cached city coordinates
+- `--fuel diesel|e5|e10`
+- `--history-days` amount of historic data to use
+- `--predict-days` amount of calendar days to suggest, including today when future hours remain
+- `--limit-per-day` maximum suggestions per day
+- `--output json` or `-o json`
+
 Use `--limit 0` with `list stations` or `list history` to return all matching rows.
 
 The grouped commands above are the canonical interface shown by `gasoline help`. The older top-level forms `cities`, `stations`, `history`, and `import-cities` are still accepted as aliases.

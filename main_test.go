@@ -595,6 +595,155 @@ func TestRunListHistoryAllowsMissingStationID(t *testing.T) {
 	}
 }
 
+func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	city := cachedCity{
+		QueryName:   "Berlin",
+		Name:        "Berlin",
+		DisplayName: "Berlin",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	}
+	insertSuggestCity(t, db, city)
+	insertSuggestStation(t, db, "near-station", "Near Station", 52.517389, 13.395131)
+	insertSuggestStation(t, db, "far-station", "Far Station", 53.500000, 13.395131)
+
+	for day := 20; day <= 25; day++ {
+		insertSuggestSnapshot(t, db, "near-station", "Berlin", time.Date(2026, 4, day, 17, 0, 0, 0, time.UTC), 2.200, true)
+		insertSuggestSnapshot(t, db, "near-station", "Berlin", time.Date(2026, 4, day, 18, 0, 0, 0, time.UTC), 2.000, true)
+		insertSuggestSnapshot(t, db, "near-station", "Berlin", time.Date(2026, 4, day, 19, 0, 0, 0, time.UTC), 2.200, true)
+		insertSuggestSnapshot(t, db, "far-station", "Berlin", time.Date(2026, 4, day, 18, 0, 0, 0, time.UTC), 1.500, true)
+	}
+
+	suggestions, err := suggestGas(ctx, db, suggestOptions{
+		City:        "Berlin",
+		RangeKM:     5,
+		Fuel:        "diesel",
+		HistoryDays: 10,
+		PredictDays: 2,
+		LimitPerDay: 1,
+		Now:         time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC),
+		Location:    time.UTC,
+	})
+	if err != nil {
+		t.Fatalf("suggestGas: %v", err)
+	}
+	if len(suggestions) != 2 {
+		t.Fatalf("len(suggestions) = %d, want 2: %+v", len(suggestions), suggestions)
+	}
+	for _, suggestion := range suggestions {
+		if suggestion.StationID != "near-station" {
+			t.Fatalf("station id = %q, want near-station", suggestion.StationID)
+		}
+		if suggestion.StartTime != "18:00" || suggestion.EndTime != "19:00" {
+			t.Fatalf("time window = %s-%s, want 18:00-19:00", suggestion.StartTime, suggestion.EndTime)
+		}
+		if suggestion.DistanceKM > 0.1 {
+			t.Fatalf("distance = %.1f, want near station distance", suggestion.DistanceKM)
+		}
+		if suggestion.PredictedPrice >= 2.200 {
+			t.Fatalf("predicted price = %.3f, want lower than 2.200", suggestion.PredictedPrice)
+		}
+	}
+	if suggestions[0].Date != "2026-04-26" || suggestions[0].Weekday != "Sunday" {
+		t.Fatalf("first suggestion date = %s/%s, want 2026-04-26/Sunday", suggestions[0].Date, suggestions[0].Weekday)
+	}
+	if suggestions[1].Date != "2026-04-27" || suggestions[1].Weekday != "Monday" {
+		t.Fatalf("second suggestion date = %s/%s, want 2026-04-27/Monday", suggestions[1].Date, suggestions[1].Weekday)
+	}
+}
+
+func TestReconstructPriceIntervalsClipsAndSkipsUnavailablePrices(t *testing.T) {
+	historyStart := time.Date(2026, 4, 11, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 4, 13, 0, 0, 0, 0, time.UTC)
+	snapshots := []suggestSnapshot{
+		{
+			StationID:   "station-1",
+			StationName: "Station 1",
+			DistanceKM:  1,
+			RecordedAt:  time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC),
+			IsOpen:      true,
+			Price:       sql.NullFloat64{Float64: 2.000, Valid: true},
+		},
+		{
+			StationID:   "station-1",
+			StationName: "Station 1",
+			DistanceKM:  1,
+			RecordedAt:  time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC),
+			IsOpen:      false,
+			Price:       sql.NullFloat64{Float64: 2.100, Valid: true},
+		},
+		{
+			StationID:   "station-1",
+			StationName: "Station 1",
+			DistanceKM:  1,
+			RecordedAt:  time.Date(2026, 4, 11, 18, 0, 0, 0, time.UTC),
+			IsOpen:      true,
+			Price:       sql.NullFloat64{},
+		},
+		{
+			StationID:   "station-1",
+			StationName: "Station 1",
+			DistanceKM:  1,
+			RecordedAt:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+			IsOpen:      true,
+			Price:       sql.NullFloat64{Float64: 2.200, Valid: true},
+		},
+	}
+
+	intervals := reconstructPriceIntervals(snapshots, historyStart, now)
+	if len(intervals) != 2 {
+		t.Fatalf("len(intervals) = %d, want 2: %+v", len(intervals), intervals)
+	}
+	if !intervals[0].Start.Equal(historyStart) || !intervals[0].End.Equal(time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("first interval = %s-%s, want clipped history start to closed snapshot", intervals[0].Start, intervals[0].End)
+	}
+	if intervals[0].Price != 2.000 {
+		t.Fatalf("first interval price = %.3f, want 2.000", intervals[0].Price)
+	}
+	if !intervals[1].Start.Equal(time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)) || !intervals[1].End.Equal(now) {
+		t.Fatalf("second interval = %s-%s, want 2026-04-12 to now", intervals[1].Start, intervals[1].End)
+	}
+}
+
+func TestWeightedMedianPriceUsesSampleWeights(t *testing.T) {
+	got, ok := weightedMedianPrice([]priceSample{
+		{Price: 1.900, Weight: 1},
+		{Price: 2.000, Weight: 1},
+		{Price: 2.100, Weight: 10},
+	})
+	if !ok {
+		t.Fatal("weightedMedianPrice returned !ok")
+	}
+	if got != 2.100 {
+		t.Fatalf("weighted median = %.3f, want 2.100", got)
+	}
+}
+
+func TestGenerateSuggestionsStartsTomorrowWhenTodayHasNoFutureHours(t *testing.T) {
+	model := forecastModel{
+		Stations: map[string]forecastStation{
+			"station-1": {ID: "station-1", Name: "Station 1", DistanceKM: 1.2},
+		},
+		WeekdayHour: make(map[stationWeekdayHourKey][]priceSample),
+		Hour: map[stationHourKey][]priceSample{
+			{StationID: "station-1", Hour: 0}: {{Price: 2.000, Weight: 1, Date: "2026-04-20"}},
+		},
+		Recent: map[string][]priceSample{
+			"station-1": {{Price: 2.000, Weight: 1, Date: "2026-04-20"}},
+		},
+	}
+
+	suggestions := generateSuggestions(model, "diesel", time.Date(2026, 4, 26, 23, 30, 0, 0, time.UTC), time.UTC, 1, 1)
+	if len(suggestions) != 1 {
+		t.Fatalf("len(suggestions) = %d, want 1", len(suggestions))
+	}
+	if suggestions[0].Date != "2026-04-27" || suggestions[0].StartTime != "00:00" {
+		t.Fatalf("suggestion = %s %s, want 2026-04-27 00:00", suggestions[0].Date, suggestions[0].StartTime)
+	}
+}
+
 func insertSecondFixtureStation(t *testing.T, dbPath string) {
 	t.Helper()
 
@@ -618,6 +767,46 @@ func insertSecondFixtureStation(t *testing.T, dbPath string) {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, "station-2", "Berlin", "2026-04-02T10:15:00Z", 5, 1, 1.809, 1.749, 1.679); err != nil {
 		t.Fatalf("insert snapshot: %v", err)
+	}
+}
+
+func insertSuggestCity(t *testing.T, db *sql.DB, city cachedCity) {
+	t.Helper()
+
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, city.QueryName, city.Name, city.DisplayName, city.Lat, city.Lng, "2026-04-20T00:00:00Z")
+	if err != nil {
+		t.Fatalf("insert city: %v", err)
+	}
+}
+
+func insertSuggestStation(t *testing.T, db *sql.DB, id, name string, lat, lng float64) {
+	t.Helper()
+
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO stations (
+			id, name, brand, street, house_number, post_code, place, lat, lng, first_seen_at, last_seen_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, name, "TEST", "Test Street", "1", 10115, "Berlin", lat, lng, "2026-04-20T00:00:00Z", "2026-04-25T19:00:00Z")
+	if err != nil {
+		t.Fatalf("insert station %q: %v", id, err)
+	}
+}
+
+func insertSuggestSnapshot(t *testing.T, db *sql.DB, stationID, cityName string, recordedAt time.Time, diesel float64, isOpen bool) {
+	t.Helper()
+
+	e5 := diesel + 0.080
+	e10 := diesel + 0.020
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO price_snapshots (
+			station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, stationID, cityName, recordedAt.Format(time.RFC3339), 5, boolToInt(isOpen), e5, e10, diesel)
+	if err != nil {
+		t.Fatalf("insert snapshot %q at %s: %v", stationID, recordedAt.Format(time.RFC3339), err)
 	}
 }
 
