@@ -609,7 +609,7 @@ func runStations(args []string) error {
 	fs := flag.NewFlagSet("stations", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
 	city := fs.String("city", "", "Optional city filter from stored sync runs")
-	limit := fs.Int("limit", 50, "Max rows to print")
+	limit := fs.Int("limit", 50, "Max rows to print; 0 for no limit")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -619,8 +619,8 @@ func runStations(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *limit <= 0 {
-		return errors.New("--limit must be > 0")
+	if *limit < 0 {
+		return errors.New("--limit must be >= 0")
 	}
 
 	db, err := openDB(resolvedDBPath)
@@ -653,7 +653,7 @@ func runStations(args []string) error {
 				AND ps.recorded_at = latest.latest_recorded_at
 			ORDER BY s.name ASC
 			LIMIT ?
-		`, *limit)
+		`, sqliteLimit(*limit))
 	} else {
 		rows, err = db.QueryContext(ctx, `
 			SELECT
@@ -671,7 +671,7 @@ func runStations(args []string) error {
 				AND ps.recorded_at = latest.latest_recorded_at
 			ORDER BY s.name ASC
 			LIMIT ?
-		`, strings.TrimSpace(*city), *limit)
+		`, strings.TrimSpace(*city), sqliteLimit(*limit))
 	}
 	if err != nil {
 		return err
@@ -730,7 +730,7 @@ func runHistory(args []string) error {
 	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
 	stationID := fs.String("station-id", "", "Station UUID")
 	fuel := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
-	limit := fs.Int("limit", 100, "Max history rows")
+	limit := fs.Int("limit", 100, "Max history rows; 0 for no limit")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -743,8 +743,8 @@ func runHistory(args []string) error {
 	if !isValidFuelType(*fuel) {
 		return errors.New("--fuel must be one of: all, diesel, e5, e10")
 	}
-	if *limit <= 0 {
-		return errors.New("--limit must be > 0")
+	if *limit < 0 {
+		return errors.New("--limit must be >= 0")
 	}
 
 	db, err := openDB(resolvedDBPath)
@@ -767,7 +767,7 @@ func runHistory(args []string) error {
 			JOIN stations s ON s.id = ps.station_id
 			ORDER BY ps.recorded_at DESC
 			LIMIT ?
-		`, *limit)
+		`, sqliteLimit(*limit))
 	} else {
 		rows, err = db.QueryContext(ctx, `
 			SELECT ps.station_id, s.name, ps.city_name, ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
@@ -776,7 +776,7 @@ func runHistory(args []string) error {
 			WHERE ps.station_id = ?
 			ORDER BY ps.recorded_at DESC
 			LIMIT ?
-		`, stationFilter, *limit)
+		`, stationFilter, sqliteLimit(*limit))
 	}
 	if err != nil {
 		return err
@@ -843,6 +843,13 @@ func printHistoryText(stationFilter, stationID, stationName, recordedAt, cityNam
 		return
 	}
 	fmt.Fprintf(stdout, "%s | city=%s | open=%t | %s\n", recordedAt, cityName, isOpen, prices)
+}
+
+func sqliteLimit(limit int) int {
+	if limit == 0 {
+		return -1
+	}
+	return limit
 }
 
 func addOutputFlags(fs *flag.FlagSet) (*string, *string) {

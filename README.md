@@ -99,9 +99,11 @@ gasoline list stations --city "Berlin" --limit 20
 Show historical prices, optionally filtered to one station:
 
 ```bash
-gasoline list history --fuel diesel --limit 100
+gasoline list history --fuel diesel --limit 0
 gasoline list history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel diesel --limit 100
 ```
+
+Use `--limit 0` with `list stations` or `list history` to return all matching rows.
 
 The grouped commands above are the canonical interface shown by `gasoline help`. The older top-level forms `cities`, `stations`, `history`, and `import-cities` are still accepted as aliases.
 

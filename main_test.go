@@ -534,6 +534,23 @@ func TestRunListStationsSupportsShortJSONFlag(t *testing.T) {
 	}
 }
 
+func TestRunListStationsLimitZeroIsUnlimited(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+	insertSecondFixtureStation(t, dbPath)
+
+	output := captureStdout(t, func() error {
+		return run([]string{"list", "stations", "--db", dbPath, "--limit", "0", "--output", "json"})
+	})
+
+	var stations []stationRow
+	if err := json.Unmarshal([]byte(output), &stations); err != nil {
+		t.Fatalf("unmarshal stations output: %v\noutput=%s", err, output)
+	}
+	if len(stations) != 2 {
+		t.Fatalf("len(stations) = %d, want 2", len(stations))
+	}
+}
+
 func TestRunListHistorySupportsJSONOutput(t *testing.T) {
 	dbPath := seedFixtureDB(t)
 	output := captureStdout(t, func() error {
@@ -557,6 +574,30 @@ func TestRunListHistorySupportsJSONOutput(t *testing.T) {
 
 func TestRunListHistoryAllowsMissingStationID(t *testing.T) {
 	dbPath := seedFixtureDB(t)
+	insertSecondFixtureStation(t, dbPath)
+
+	output := captureStdout(t, func() error {
+		return run([]string{"list", "history", "--db", dbPath, "--limit", "0", "--output", "json"})
+	})
+
+	var history []historyRow
+	if err := json.Unmarshal([]byte(output), &history); err != nil {
+		t.Fatalf("unmarshal history output: %v\noutput=%s", err, output)
+	}
+	if len(history) != 2 {
+		t.Fatalf("len(history) = %d, want 2", len(history))
+	}
+	if history[0].StationID != "station-2" || history[0].StationName != "Other Station" {
+		t.Fatalf("latest station = %q/%q, want station-2/Other Station", history[0].StationID, history[0].StationName)
+	}
+	if history[1].StationID != "station-1" || history[1].StationName != "Test Station" {
+		t.Fatalf("older station = %q/%q, want station-1/Test Station", history[1].StationID, history[1].StationName)
+	}
+}
+
+func insertSecondFixtureStation(t *testing.T, dbPath string) {
+	t.Helper()
+
 	db, err := openDB(dbPath)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
@@ -577,24 +618,6 @@ func TestRunListHistoryAllowsMissingStationID(t *testing.T) {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, "station-2", "Berlin", "2026-04-02T10:15:00Z", 5, 1, 1.809, 1.749, 1.679); err != nil {
 		t.Fatalf("insert snapshot: %v", err)
-	}
-
-	output := captureStdout(t, func() error {
-		return run([]string{"list", "history", "--db", dbPath, "--output", "json"})
-	})
-
-	var history []historyRow
-	if err := json.Unmarshal([]byte(output), &history); err != nil {
-		t.Fatalf("unmarshal history output: %v\noutput=%s", err, output)
-	}
-	if len(history) != 2 {
-		t.Fatalf("len(history) = %d, want 2", len(history))
-	}
-	if history[0].StationID != "station-2" || history[0].StationName != "Other Station" {
-		t.Fatalf("latest station = %q/%q, want station-2/Other Station", history[0].StationID, history[0].StationName)
-	}
-	if history[1].StationID != "station-1" || history[1].StationName != "Test Station" {
-		t.Fatalf("older station = %q/%q, want station-1/Test Station", history[1].StationID, history[1].StationName)
 	}
 }
 
