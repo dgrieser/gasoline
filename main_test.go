@@ -642,6 +642,12 @@ func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 		if suggestion.DistanceKM > 0.1 {
 			t.Fatalf("distance = %.1f, want near station distance", suggestion.DistanceKM)
 		}
+		if suggestion.Station.Address != "Test Street 1, 10115 Berlin" {
+			t.Fatalf("station address = %q, want formatted address", suggestion.Station.Address)
+		}
+		if suggestion.Station.Brand != "TEST" || suggestion.Station.Street != "Test Street" || suggestion.Station.HouseNumber != "1" || suggestion.Station.PostCode != 10115 || suggestion.Station.Place != "Berlin" {
+			t.Fatalf("station metadata = %+v, want persisted station details", suggestion.Station)
+		}
 		if suggestion.PredictedPrice >= 2.200 {
 			t.Fatalf("predicted price = %.3f, want lower than 2.200", suggestion.PredictedPrice)
 		}
@@ -724,7 +730,7 @@ func TestWeightedMedianPriceUsesSampleWeights(t *testing.T) {
 func TestGenerateSuggestionsStartsTomorrowWhenTodayHasNoFutureHours(t *testing.T) {
 	model := forecastModel{
 		Stations: map[string]forecastStation{
-			"station-1": {ID: "station-1", Name: "Station 1", DistanceKM: 1.2},
+			"station-1": {Station: suggestionStationRow{ID: "station-1", Name: "Station 1", DistanceKM: 1.2}},
 		},
 		WeekdayHour: make(map[stationWeekdayHourKey][]priceSample),
 		Hour: map[stationHourKey][]priceSample{

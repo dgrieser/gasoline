@@ -154,17 +154,34 @@ type historyRow struct {
 }
 
 type suggestionRow struct {
-	Date           string  `json:"date"`
-	Weekday        string  `json:"weekday"`
-	StartTime      string  `json:"start_time"`
-	EndTime        string  `json:"end_time"`
-	StationID      string  `json:"station_id"`
-	StationName    string  `json:"station_name"`
-	DistanceKM     float64 `json:"distance_km"`
-	Fuel           string  `json:"fuel"`
-	PredictedPrice float64 `json:"predicted_price"`
-	Confidence     string  `json:"confidence"`
-	SampleCount    int     `json:"sample_count"`
+	Date           string               `json:"date"`
+	Weekday        string               `json:"weekday"`
+	StartTime      string               `json:"start_time"`
+	EndTime        string               `json:"end_time"`
+	StationID      string               `json:"station_id"`
+	StationName    string               `json:"station_name"`
+	DistanceKM     float64              `json:"distance_km"`
+	Station        suggestionStationRow `json:"station"`
+	Fuel           string               `json:"fuel"`
+	PredictedPrice float64              `json:"predicted_price"`
+	Confidence     string               `json:"confidence"`
+	SampleCount    int                  `json:"sample_count"`
+}
+
+type suggestionStationRow struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Brand       string  `json:"brand"`
+	Street      string  `json:"street"`
+	HouseNumber string  `json:"house_number"`
+	PostCode    int     `json:"post_code"`
+	Place       string  `json:"place"`
+	Lat         float64 `json:"lat"`
+	Lng         float64 `json:"lng"`
+	FirstSeenAt string  `json:"first_seen_at"`
+	LastSeenAt  string  `json:"last_seen_at"`
+	Address     string  `json:"address"`
+	DistanceKM  float64 `json:"distance_km"`
 }
 
 type suggestOptions struct {
@@ -182,6 +199,7 @@ type suggestSnapshot struct {
 	StationID   string
 	StationName string
 	DistanceKM  float64
+	Station     suggestionStationRow
 	RecordedAt  time.Time
 	IsOpen      bool
 	Price       sql.NullFloat64
@@ -191,15 +209,14 @@ type priceInterval struct {
 	StationID   string
 	StationName string
 	DistanceKM  float64
+	Station     suggestionStationRow
 	Start       time.Time
 	End         time.Time
 	Price       float64
 }
 
 type forecastStation struct {
-	ID         string
-	Name       string
-	DistanceKM float64
+	Station suggestionStationRow
 }
 
 type priceSample struct {
@@ -1062,7 +1079,21 @@ func loadSuggestSnapshots(ctx context.Context, db *sql.DB, city cachedCity, fuel
 		return nil, err
 	}
 	query := fmt.Sprintf(`
-		SELECT s.id, s.name, s.lat, s.lng, ps.recorded_at, ps.is_open, ps.%s
+		SELECT
+			s.id,
+			s.name,
+			COALESCE(s.brand, ''),
+			COALESCE(s.street, ''),
+			COALESCE(s.house_number, ''),
+			COALESCE(s.post_code, 0),
+			COALESCE(s.place, ''),
+			s.lat,
+			s.lng,
+			s.first_seen_at,
+			s.last_seen_at,
+			ps.recorded_at,
+			ps.is_open,
+			ps.%s
 		FROM stations s
 		JOIN price_snapshots ps ON ps.station_id = s.id
 		WHERE ps.recorded_at >= ?
@@ -1083,12 +1114,28 @@ func loadSuggestSnapshots(ctx context.Context, db *sql.DB, city cachedCity, fuel
 	var snapshots []suggestSnapshot
 	for rows.Next() {
 		var (
-			stationID, stationName, recordedAtText string
-			lat, lng                               float64
-			isOpen                                 bool
-			price                                  sql.NullFloat64
+			stationID, stationName, brand, street, houseNumber, place, firstSeenAt, lastSeenAt, recordedAtText string
+			postCode                                                                                           int
+			lat, lng                                                                                           float64
+			isOpen                                                                                             bool
+			price                                                                                              sql.NullFloat64
 		)
-		if err := rows.Scan(&stationID, &stationName, &lat, &lng, &recordedAtText, &isOpen, &price); err != nil {
+		if err := rows.Scan(
+			&stationID,
+			&stationName,
+			&brand,
+			&street,
+			&houseNumber,
+			&postCode,
+			&place,
+			&lat,
+			&lng,
+			&firstSeenAt,
+			&lastSeenAt,
+			&recordedAtText,
+			&isOpen,
+			&price,
+		); err != nil {
 			return nil, err
 		}
 		recordedAt, err := time.Parse(time.RFC3339, recordedAtText)
@@ -1102,10 +1149,26 @@ func loadSuggestSnapshots(ctx context.Context, db *sql.DB, city cachedCity, fuel
 		if distanceKM > rangeKM {
 			continue
 		}
+		station := suggestionStationRow{
+			ID:          stationID,
+			Name:        stationName,
+			Brand:       brand,
+			Street:      street,
+			HouseNumber: houseNumber,
+			PostCode:    postCode,
+			Place:       place,
+			Lat:         lat,
+			Lng:         lng,
+			FirstSeenAt: firstSeenAt,
+			LastSeenAt:  lastSeenAt,
+			Address:     formatStationAddress(street, houseNumber, postCode, place),
+			DistanceKM:  distanceKM,
+		}
 		snapshots = append(snapshots, suggestSnapshot{
 			StationID:   stationID,
 			StationName: stationName,
 			DistanceKM:  distanceKM,
+			Station:     station,
 			RecordedAt:  recordedAt,
 			IsOpen:      isOpen,
 			Price:       price,
@@ -1138,6 +1201,7 @@ func reconstructPriceIntervals(snapshots []suggestSnapshot, historyStart, now ti
 			StationID:   snapshot.StationID,
 			StationName: snapshot.StationName,
 			DistanceKM:  snapshot.DistanceKM,
+			Station:     snapshot.Station,
 			Start:       start,
 			End:         end,
 			Price:       snapshot.Price.Float64,
@@ -1156,9 +1220,7 @@ func buildForecastModel(intervals []priceInterval, now time.Time, location *time
 	nowLocal := now.In(location)
 	for _, interval := range intervals {
 		model.Stations[interval.StationID] = forecastStation{
-			ID:         interval.StationID,
-			Name:       interval.StationName,
-			DistanceKM: interval.DistanceKM,
+			Station: interval.Station,
 		}
 
 		localStart := interval.Start.In(location)
@@ -1219,13 +1281,15 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 	byDate := make(map[string][]suggestionCandidate)
 	for candidateStart := start; candidateStart.Before(end); candidateStart = candidateStart.Add(time.Hour) {
 		for _, stationID := range stationIDs {
-			station := model.Stations[stationID]
+			station := model.Stations[stationID].Station
 			score, ok := scoreForecast(model, stationID, candidateStart.Weekday(), candidateStart.Hour())
 			if !ok {
 				continue
 			}
 			candidateEnd := candidateStart.Add(time.Hour)
 			date := candidateStart.Format("2006-01-02")
+			stationOutput := station
+			stationOutput.DistanceKM = roundTo(station.DistanceKM, 1)
 			byDate[date] = append(byDate[date], suggestionCandidate{
 				suggestionRow: suggestionRow{
 					Date:           date,
@@ -1234,7 +1298,8 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 					EndTime:        candidateEnd.Format("15:04"),
 					StationID:      station.ID,
 					StationName:    station.Name,
-					DistanceKM:     roundTo(station.DistanceKM, 1),
+					DistanceKM:     stationOutput.DistanceKM,
+					Station:        stationOutput,
 					Fuel:           fuel,
 					PredictedPrice: roundTo(score.PredictedPrice, 3),
 					Confidence:     score.Confidence,
@@ -1356,10 +1421,17 @@ func printSuggestionsText(suggestions []suggestionRow) {
 			fmt.Fprintf(stdout, "%s %s\n", suggestion.Weekday, suggestion.Date)
 			currentDate = suggestion.Date
 		}
-		fmt.Fprintf(stdout, "  %s-%s  %-24s %5.1f km  %s  predicted %.3f  confidence %s  samples=%d\n",
+		stationLabel := suggestion.StationName
+		if suggestion.Station.Brand != "" {
+			stationLabel = fmt.Sprintf("%s [%s]", stationLabel, suggestion.Station.Brand)
+		}
+		if suggestion.Station.Address != "" {
+			stationLabel = fmt.Sprintf("%s | %s", stationLabel, suggestion.Station.Address)
+		}
+		fmt.Fprintf(stdout, "  %s-%s  %s  %.1f km  %s  predicted %.3f  confidence %s  samples=%d\n",
 			suggestion.StartTime,
 			suggestion.EndTime,
-			suggestion.StationName,
+			stationLabel,
 			suggestion.DistanceKM,
 			suggestion.Fuel,
 			suggestion.PredictedPrice,
@@ -2505,6 +2577,35 @@ func distinctSampleDays(samples []priceSample) int {
 		days[sample.Date] = struct{}{}
 	}
 	return len(days)
+}
+
+func formatStationAddress(street, houseNumber string, postCode int, place string) string {
+	street = strings.TrimSpace(street)
+	houseNumber = strings.TrimSpace(houseNumber)
+	place = strings.TrimSpace(place)
+
+	streetLine := strings.TrimSpace(strings.Join(nonEmptyStrings(street, houseNumber), " "))
+	var cityLine string
+	if postCode > 0 && place != "" {
+		cityLine = fmt.Sprintf("%d %s", postCode, place)
+	} else if postCode > 0 {
+		cityLine = strconv.Itoa(postCode)
+	} else {
+		cityLine = place
+	}
+
+	return strings.Join(nonEmptyStrings(streetLine, cityLine), ", ")
+}
+
+func nonEmptyStrings(values ...string) []string {
+	var result []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func suggestionCandidateLess(a, b suggestionCandidate) bool {
