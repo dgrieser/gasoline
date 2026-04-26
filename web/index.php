@@ -720,6 +720,34 @@ function formatPrice($value): string
             color: var(--ink);
         }
 
+        .quick-ranges {
+            display: flex;
+            gap: 0.35rem;
+        }
+
+        .quick-range-btn {
+            flex: 1;
+            padding: 0.45rem 0.4rem;
+            border-radius: 6px;
+            border: 1px solid var(--border-hi);
+            background: transparent;
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.15s;
+            letter-spacing: 0.04em;
+            text-align: center;
+        }
+
+        .quick-range-btn.active {
+            border-color: var(--amber);
+            color: var(--amber);
+            background: var(--amber-dim);
+        }
+
+        .quick-range-btn:hover:not(.active) { color: var(--ink); }
+
         /* ── Main content ──────────────────────────────────────── */
         .content {
             display: grid;
@@ -1262,6 +1290,15 @@ function formatPrice($value): string
                 <div class="field">
                     <label for="f-to" data-i18n="to">To</label>
                     <input type="date" name="to" id="f-to" value="<?= h($toDate) ?>" onchange="this.form.submit()">
+                </div>
+
+                <div class="field">
+                    <label data-i18n="quickRange">Quick range</label>
+                    <div class="quick-ranges">
+                        <button type="button" class="quick-range-btn" data-days="7"  data-i18n="range7d">7d</button>
+                        <button type="button" class="quick-range-btn" data-days="14" data-i18n="range14d">14d</button>
+                        <button type="button" class="quick-range-btn" data-days="30" data-i18n="range30d">30d</button>
+                    </div>
                 </div>
 
                 <?php
@@ -1814,6 +1851,7 @@ const translations = {
         radius: 'Radius',
         from: 'From',
         to: 'To',
+        quickRange: 'Quick range',
         fuelType: 'Fuel type',
         fuelAll: 'All',
         fuelDiesel: 'Diesel',
@@ -1861,6 +1899,7 @@ const translations = {
         radius: 'Radius',
         from: 'Von',
         to: 'Bis',
+        quickRange: 'Zeitraum',
         fuelType: 'Kraftstoffart',
         fuelAll: 'Alle',
         fuelDiesel: 'Diesel',
@@ -2046,6 +2085,52 @@ themeToggle.addEventListener('click', () => {
 
 // Sync icon to current theme (set by head script)
 applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+
+/* ── Quick date-range buttons ──────────────────────────────────── */
+(function () {
+    const fromInput = document.getElementById('f-from');
+    const toInput   = document.getElementById('f-to');
+    const form      = fromInput?.closest('form');
+    if (!fromInput || !toInput || !form) return;
+
+    function toYMD(date) {
+        return date.toISOString().slice(0, 10);
+    }
+
+    function detectActiveDays() {
+        if (toInput.value) return null;
+        if (!fromInput.value) return null;
+        const from = new Date(fromInput.value + 'T00:00:00');
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const diffDays = Math.round((today - from) / 86_400_000);
+        return [7, 14, 30].includes(diffDays) ? diffDays : null;
+    }
+
+    function updateActiveStates() {
+        const active = detectActiveDays();
+        document.querySelectorAll('.quick-range-btn').forEach((btn) => {
+            btn.classList.toggle('active', Number(btn.dataset.days) === active);
+        });
+    }
+
+    document.querySelectorAll('.quick-range-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const days = Number(btn.dataset.days);
+            const from = new Date();
+            from.setDate(from.getDate() - days);
+            fromInput.value = toYMD(from);
+            toInput.value   = '';
+            updateActiveStates();
+            form.submit();
+        });
+    });
+
+    updateActiveStates();
+
+    fromInput.addEventListener('change', updateActiveStates);
+    toInput.addEventListener('change', updateActiveStates);
+})();
 
 /* ── City autocomplete ─────────────────────────────────────────── */
 (function () {
