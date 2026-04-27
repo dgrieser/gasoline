@@ -187,6 +187,7 @@ configure_defaults() {
   SUGGEST_TIME=07:30
   CHECK_COMMAND="$FAKE_NOTIFY --message {{message}}"
   SUGGEST_COMMAND="$FAKE_NOTIFY --message {{message}}"
+  CHECK_ALERT_PRICES=()
   : >"$GASOLINE_ARGS_FILE"
   : >"$NOTIFY_OUT"
 }
@@ -227,6 +228,32 @@ test_check_command_row_template_without_message_placeholder() {
   assert_not_contains "$output" 'ARG3=' "row-template command"
 }
 
+test_check_sends_only_changed_station_prices() {
+  configure_defaults
+  write_check_json
+
+  run_check_once
+  : >"$NOTIFY_OUT"
+
+  run_check_once
+  [[ ! -s "$NOTIFY_OUT" ]] || fail "expected no repeated check notification for unchanged prices"
+
+  local changed_json
+  changed_json=$TEST_DIR/check.changed.json
+  jq 'map(if .station_id == "station-1" then .current_price = 1.71 else . end)' "$CHECK_JSON_FILE" >"$changed_json"
+  mv "$changed_json" "$CHECK_JSON_FILE"
+
+  run_check_once
+
+  local output begin_count
+  output=$(<"$NOTIFY_OUT")
+  begin_count=$(grep -c '^BEGIN$' "$NOTIFY_OUT")
+
+  [[ "$begin_count" == 1 ]] || fail "expected one changed-price check notification, got $begin_count"
+  assert_contains "$output" 'Buy diesel at Station 1 (1.2 km): 1.710 EUR, confidence medium, verdict low' "changed-price notification"
+  assert_not_contains "$output" 'Station 2' "changed-price notification"
+}
+
 test_suggest_filters_and_batches_results() {
   configure_defaults
   write_suggest_json
@@ -258,6 +285,7 @@ test_invalid_json_does_not_notify() {
 write_fakes
 test_check_filters_and_batches_results
 test_check_command_row_template_without_message_placeholder
+test_check_sends_only_changed_station_prices
 test_suggest_filters_and_batches_results
 test_invalid_json_does_not_notify
 

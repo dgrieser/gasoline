@@ -57,6 +57,8 @@ GASOLINE_BIN="${GASOLINE_BIN:-}"
 SUGGEST_MINUTES=0
 LAST_CHECK_EPOCH=0
 LAST_SUGGEST_DATE=""
+declare -A CHECK_ALERT_PRICES=()
+FILTERED_ROWS=()
 
 usage() {
   cat <<'EOF'
@@ -427,6 +429,56 @@ send_matching_rows() {
   run_notification "$kind" "$command_template" "$message" "${rows[@]}"
 }
 
+check_alert_key() {
+  local row=$1
+  local station_id fuel
+
+  station_id=$(row_value check "$row" station_id)
+  fuel=$(row_value check "$row" fuel)
+  if [[ -z "$station_id" ]]; then
+    station_id=$(row_value check "$row" station_name)
+  fi
+  printf '%s|%s' "$station_id" "$fuel"
+}
+
+filter_changed_check_rows() {
+  local rows=("$@")
+  local row key price
+
+  FILTERED_ROWS=()
+  for row in "${rows[@]}"; do
+    key=$(check_alert_key "$row")
+    price=$(row_value check "$row" current_price)
+    if [[ -z "$key" || -z "$price" ]]; then
+      continue
+    fi
+    if [[ "${CHECK_ALERT_PRICES[$key]+set}" == set && "${CHECK_ALERT_PRICES[$key]}" == "$price" ]]; then
+      continue
+    fi
+    CHECK_ALERT_PRICES[$key]=$price
+    FILTERED_ROWS+=("$row")
+  done
+}
+
+send_changed_check_rows() {
+  local json=$1
+  local rows=()
+
+  mapfile -t rows < <(printf '%s' "$json" | jq -c 'if type == "array" then .[] else empty end | select(.recommendation == "buy" and (.confidence == "medium" or .confidence == "high"))')
+  if ((${#rows[@]} == 0)); then
+    return 0
+  fi
+
+  filter_changed_check_rows "${rows[@]}"
+  if ((${#FILTERED_ROWS[@]} == 0)); then
+    return 0
+  fi
+
+  local message
+  message=$(build_message check "$CHECK_ROW_TEMPLATE" "${FILTERED_ROWS[@]}")
+  run_notification check "$CHECK_COMMAND" "$message" "${FILTERED_ROWS[@]}"
+}
+
 run_check_once() {
   local output
   if ! output=$("$GASOLINE_BIN" check \
@@ -445,12 +497,7 @@ run_check_once() {
     return 0
   fi
 
-  send_matching_rows \
-    check \
-    "$CHECK_COMMAND" \
-    "$output" \
-    'if type == "array" then .[] else empty end | select(.recommendation == "buy" and (.confidence == "medium" or .confidence == "high"))' \
-    "$CHECK_ROW_TEMPLATE"
+  send_changed_check_rows "$output"
 }
 
 run_suggest_once() {
