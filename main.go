@@ -195,6 +195,17 @@ type suggestOptions struct {
 	Location    *time.Location
 }
 
+type checkOptions struct {
+	City        string
+	RangeKM     float64
+	Fuel        string
+	HistoryDays int
+	PredictDays int
+	Limit       int
+	Now         time.Time
+	Location    *time.Location
+}
+
 type suggestSnapshot struct {
 	StationID   string
 	StationName string
@@ -249,6 +260,35 @@ type forecastScore struct {
 	SampleCount    int
 }
 
+type priceCheckRow struct {
+	RecordedAt            string               `json:"recorded_at"`
+	StationID             string               `json:"station_id"`
+	StationName           string               `json:"station_name"`
+	DistanceKM            float64              `json:"distance_km"`
+	Station               suggestionStationRow `json:"station"`
+	Fuel                  string               `json:"fuel"`
+	CurrentPrice          float64              `json:"current_price"`
+	PredictedCurrentPrice float64              `json:"predicted_current_price"`
+	HistoryPercentile     float64              `json:"history_percentile"`
+	Verdict               string               `json:"verdict"`
+	Recommendation        string               `json:"recommendation"`
+	ExpectedLower         bool                 `json:"expected_lower"`
+	BestFutureDate        string               `json:"best_future_date,omitempty"`
+	BestFutureWeekday     string               `json:"best_future_weekday,omitempty"`
+	BestFutureStartTime   string               `json:"best_future_start_time,omitempty"`
+	BestFutureEndTime     string               `json:"best_future_end_time,omitempty"`
+	BestFuturePrice       float64              `json:"best_future_price,omitempty"`
+	ExpectedDrop          float64              `json:"expected_drop,omitempty"`
+	Confidence            string               `json:"confidence"`
+	SampleCount           int                  `json:"sample_count"`
+}
+
+type futureForecast struct {
+	Start time.Time
+	End   time.Time
+	Score forecastScore
+}
+
 var stdout io.Writer = os.Stdout
 var countryCodePattern = regexp.MustCompile(`^[A-Za-z]{2}$`)
 var geoNamesFeatureCodePattern = regexp.MustCompile(`^(PPL|PPLC|PPLA[1-9]*)$`)
@@ -293,6 +333,8 @@ func run(args []string) error {
 		return runHistory(args[1:])
 	case "suggest":
 		return runSuggest(args[1:])
+	case "check":
+		return runCheck(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -312,6 +354,7 @@ Commands:
   list stations list known stations with latest stored snapshot
   list history  show historical prices
   suggest       predict cheap fueling windows by day and time
+  check         check if latest stored prices are currently low
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
 
@@ -323,6 +366,7 @@ Examples:
   gasoline list stations --city "Berlin, Germany"
   gasoline list history --fuel diesel
   gasoline suggest --city "Berlin" --range-km 10 --fuel diesel
+  gasoline check --city "Berlin" --range-km 10 --fuel diesel
   gasoline import cities DE
   gasoline clear cities`)
 }
@@ -994,6 +1038,62 @@ func runSuggest(args []string) error {
 	return nil
 }
 
+func runCheck(args []string) error {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	city := fs.String("city", "", "Cached city to use as the range center")
+	rangeKM := fs.Float64("range-km", 5, "Maximum station distance from the city center in km")
+	fuel := fs.String("fuel", "diesel", "Fuel type: diesel, e5, e10")
+	historyDays := fs.Int("history-days", 21, "Historical days to use for prediction")
+	predictDays := fs.Int("predict-days", 3, "Calendar days to check for lower future prices, including today when future hours remain")
+	limit := fs.Int("limit", 5, "Maximum rows to print; 0 for no limit")
+	outputLong, outputShort := addOutputFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
+		return err
+	}
+
+	opts := checkOptions{
+		City:        strings.TrimSpace(*city),
+		RangeKM:     *rangeKM,
+		Fuel:        strings.TrimSpace(*fuel),
+		HistoryDays: *historyDays,
+		PredictDays: *predictDays,
+		Limit:       *limit,
+		Now:         time.Now().UTC(),
+		Location:    time.Local,
+	}
+	if err := validateCheckOptions(opts); err != nil {
+		return err
+	}
+
+	db, err := openDB(resolvedDBPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	checks, err := checkGas(ctx, db, opts)
+	if err != nil {
+		return err
+	}
+	if output == outputJSON {
+		return writeJSON(checks)
+	}
+
+	printPriceChecksText(checks)
+	return nil
+}
+
 func validateSuggestOptions(opts suggestOptions) error {
 	if strings.TrimSpace(opts.City) == "" {
 		return errors.New("suggest requires --city")
@@ -1012,6 +1112,28 @@ func validateSuggestOptions(opts suggestOptions) error {
 	}
 	if opts.LimitPerDay <= 0 {
 		return errors.New("--limit-per-day must be > 0")
+	}
+	return nil
+}
+
+func validateCheckOptions(opts checkOptions) error {
+	if strings.TrimSpace(opts.City) == "" {
+		return errors.New("check requires --city")
+	}
+	if opts.RangeKM <= 0 {
+		return errors.New("--range-km must be > 0")
+	}
+	if !isSuggestFuelType(opts.Fuel) {
+		return errors.New("--fuel must be one of: diesel, e5, e10")
+	}
+	if opts.HistoryDays <= 0 {
+		return errors.New("--history-days must be > 0")
+	}
+	if opts.PredictDays <= 0 {
+		return errors.New("--predict-days must be > 0")
+	}
+	if opts.Limit < 0 {
+		return errors.New("--limit must be >= 0")
 	}
 	return nil
 }
@@ -1050,6 +1172,42 @@ func suggestGas(ctx context.Context, db *sql.DB, opts suggestOptions) ([]suggest
 		return nil, errors.New("not enough historical price patterns for suggestions")
 	}
 	return suggestions, nil
+}
+
+func checkGas(ctx context.Context, db *sql.DB, opts checkOptions) ([]priceCheckRow, error) {
+	if err := validateCheckOptions(opts); err != nil {
+		return nil, err
+	}
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	location := opts.Location
+	if location == nil {
+		location = time.Local
+	}
+
+	city, err := loadCachedCity(ctx, db, opts.City)
+	if err != nil {
+		return nil, err
+	}
+
+	historyStart := now.AddDate(0, 0, -opts.HistoryDays)
+	snapshots, err := loadSuggestSnapshots(ctx, db, city, opts.Fuel, opts.RangeKM, historyStart, now)
+	if err != nil {
+		return nil, err
+	}
+	intervals := reconstructPriceIntervals(snapshots, historyStart, now)
+	if len(intervals) == 0 {
+		return nil, errors.New("not enough historical open-price data for checks")
+	}
+
+	model := buildForecastModel(intervals, now, location)
+	checks := generatePriceChecks(model, snapshots, opts.Fuel, now, location, opts.PredictDays, opts.Limit)
+	if len(checks) == 0 {
+		return nil, errors.New("not enough current open-price data for checks")
+	}
+	return checks, nil
 }
 
 func loadCachedCity(ctx context.Context, db *sql.DB, cityName string) (cachedCity, error) {
@@ -1333,6 +1491,128 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 	return suggestions
 }
 
+func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel string, now time.Time, location *time.Location, predictDays, limit int) []priceCheckRow {
+	nowLocal := now.In(location)
+	latestByStation := latestSnapshotsByStation(snapshots)
+	stationIDs := make([]string, 0, len(latestByStation))
+	for stationID := range latestByStation {
+		stationIDs = append(stationIDs, stationID)
+	}
+	sort.Strings(stationIDs)
+
+	var checks []priceCheckRow
+	for _, stationID := range stationIDs {
+		snapshot := latestByStation[stationID]
+		if !snapshot.IsOpen || !snapshot.Price.Valid {
+			continue
+		}
+
+		currentScore, ok := scoreForecast(model, stationID, nowLocal.Weekday(), nowLocal.Hour())
+		if !ok {
+			continue
+		}
+		percentile, ok := weightedPricePercentile(model.Recent[stationID], snapshot.Price.Float64)
+		if !ok {
+			continue
+		}
+
+		station := snapshot.Station
+		if modelStation, ok := model.Stations[stationID]; ok {
+			station = modelStation.Station
+		}
+		station.DistanceKM = roundTo(station.DistanceKM, 1)
+
+		row := priceCheckRow{
+			RecordedAt:            snapshot.RecordedAt.Format(time.RFC3339),
+			StationID:             station.ID,
+			StationName:           station.Name,
+			DistanceKM:            station.DistanceKM,
+			Station:               station,
+			Fuel:                  fuel,
+			CurrentPrice:          roundTo(snapshot.Price.Float64, 3),
+			PredictedCurrentPrice: roundTo(currentScore.PredictedPrice, 3),
+			HistoryPercentile:     roundTo(percentile, 1),
+			Confidence:            currentScore.Confidence,
+			SampleCount:           currentScore.SampleCount,
+		}
+		row.Verdict = priceCheckVerdict(snapshot.Price.Float64, currentScore.PredictedPrice, percentile)
+
+		if future, ok := bestFutureForecast(model, stationID, nowLocal, predictDays); ok {
+			row.BestFutureDate = future.Start.Format("2006-01-02")
+			row.BestFutureWeekday = future.Start.Weekday().String()
+			row.BestFutureStartTime = future.Start.Format("15:04")
+			row.BestFutureEndTime = future.End.Format("15:04")
+			row.BestFuturePrice = roundTo(future.Score.PredictedPrice, 3)
+			drop := snapshot.Price.Float64 - future.Score.PredictedPrice
+			if drop > 0 {
+				row.ExpectedDrop = roundTo(drop, 3)
+			}
+			if drop >= 0.020 {
+				row.ExpectedLower = true
+				row.Confidence = lowerConfidence(row.Confidence, future.Score.Confidence)
+			}
+		}
+		row.Recommendation = priceCheckRecommendation(row.Verdict, row.ExpectedLower)
+		checks = append(checks, row)
+	}
+
+	sort.SliceStable(checks, func(i, j int) bool {
+		return priceCheckLess(checks[i], checks[j])
+	})
+	if limit > 0 && len(checks) > limit {
+		checks = checks[:limit]
+	}
+	return checks
+}
+
+func latestSnapshotsByStation(snapshots []suggestSnapshot) map[string]suggestSnapshot {
+	latest := make(map[string]suggestSnapshot)
+	for _, snapshot := range snapshots {
+		existing, ok := latest[snapshot.StationID]
+		if !ok || snapshot.RecordedAt.After(existing.RecordedAt) {
+			latest[snapshot.StationID] = snapshot
+		}
+	}
+	return latest
+}
+
+func bestFutureForecast(model forecastModel, stationID string, nowLocal time.Time, predictDays int) (futureForecast, bool) {
+	start := localHourStart(nowLocal).Add(time.Hour)
+	firstDay := localDayStart(start)
+	end := firstDay.AddDate(0, 0, predictDays)
+
+	var (
+		best futureForecast
+		ok   bool
+	)
+	for candidateStart := start; candidateStart.Before(end); candidateStart = candidateStart.Add(time.Hour) {
+		score, scoreOK := scoreForecast(model, stationID, candidateStart.Weekday(), candidateStart.Hour())
+		if !scoreOK {
+			continue
+		}
+		candidate := futureForecast{
+			Start: candidateStart,
+			End:   candidateStart.Add(time.Hour),
+			Score: score,
+		}
+		if !ok || futureForecastLess(candidate, best) {
+			best = candidate
+			ok = true
+		}
+	}
+	return best, ok
+}
+
+func futureForecastLess(a, b futureForecast) bool {
+	if a.Score.PredictedPrice != b.Score.PredictedPrice {
+		return a.Score.PredictedPrice < b.Score.PredictedPrice
+	}
+	if confidenceRank(a.Score.Confidence) != confidenceRank(b.Score.Confidence) {
+		return confidenceRank(a.Score.Confidence) > confidenceRank(b.Score.Confidence)
+	}
+	return a.Start.Before(b.Start)
+}
+
 type suggestionCandidate struct {
 	suggestionRow
 	start time.Time
@@ -1411,6 +1691,58 @@ func weightedMedianPrice(samples []priceSample) (float64, bool) {
 	return ordered[len(ordered)-1].Price, true
 }
 
+func weightedPricePercentile(samples []priceSample, price float64) (float64, bool) {
+	var (
+		totalWeight float64
+		lowerWeight float64
+		equalWeight float64
+	)
+	for _, sample := range samples {
+		if sample.Weight <= 0 {
+			continue
+		}
+		totalWeight += sample.Weight
+		switch {
+		case sample.Price < price:
+			lowerWeight += sample.Weight
+		case sample.Price == price:
+			equalWeight += sample.Weight
+		}
+	}
+	if totalWeight <= 0 {
+		return 0, false
+	}
+	return 100 * (lowerWeight + equalWeight/2) / totalWeight, true
+}
+
+func priceCheckVerdict(currentPrice, predictedPrice, historyPercentile float64) string {
+	switch {
+	case historyPercentile <= 30 || currentPrice <= predictedPrice-0.020:
+		return "low"
+	case historyPercentile >= 70 || currentPrice >= predictedPrice+0.020:
+		return "high"
+	default:
+		return "typical"
+	}
+}
+
+func priceCheckRecommendation(verdict string, expectedLower bool) string {
+	if expectedLower {
+		return "wait"
+	}
+	if verdict == "low" {
+		return "buy"
+	}
+	return "hold"
+}
+
+func lowerConfidence(a, b string) string {
+	if confidenceRank(a) <= confidenceRank(b) {
+		return a
+	}
+	return b
+}
+
 func printSuggestionsText(suggestions []suggestionRow) {
 	currentDate := ""
 	for _, suggestion := range suggestions {
@@ -1439,6 +1771,53 @@ func printSuggestionsText(suggestions []suggestionRow) {
 			suggestion.SampleCount,
 		)
 	}
+}
+
+func printPriceChecksText(checks []priceCheckRow) {
+	for _, check := range checks {
+		stationLabel := formatStationLabel(check.StationName, check.Station)
+		futureLabel := "no lower forecast"
+		if check.ExpectedLower {
+			futureLabel = fmt.Sprintf("wait for %s %s-%s predicted %.3f drop %.3f",
+				check.BestFutureDate,
+				check.BestFutureStartTime,
+				check.BestFutureEndTime,
+				check.BestFuturePrice,
+				check.ExpectedDrop,
+			)
+		} else if check.BestFutureDate != "" {
+			futureLabel = fmt.Sprintf("best future %s %s-%s predicted %.3f",
+				check.BestFutureDate,
+				check.BestFutureStartTime,
+				check.BestFutureEndTime,
+				check.BestFuturePrice,
+			)
+		}
+		fmt.Fprintf(stdout, "%s  %.1f km  %s current %.3f  verdict %s  recommendation %s  confidence %s  percentile %.1f%%  forecast-now %.3f  at=%s  %s\n",
+			stationLabel,
+			check.DistanceKM,
+			check.Fuel,
+			check.CurrentPrice,
+			check.Verdict,
+			check.Recommendation,
+			check.Confidence,
+			check.HistoryPercentile,
+			check.PredictedCurrentPrice,
+			check.RecordedAt,
+			futureLabel,
+		)
+	}
+}
+
+func formatStationLabel(stationName string, station suggestionStationRow) string {
+	stationLabel := stationName
+	if station.Brand != "" {
+		stationLabel = fmt.Sprintf("%s [%s]", stationLabel, station.Brand)
+	}
+	if station.Address != "" {
+		stationLabel = fmt.Sprintf("%s | %s", stationLabel, station.Address)
+	}
+	return stationLabel
 }
 
 func printHistoryText(stationFilter, stationID, stationName, recordedAt, cityName string, isOpen bool, prices string) {
@@ -2606,6 +2985,35 @@ func nonEmptyStrings(values ...string) []string {
 		}
 	}
 	return result
+}
+
+func priceCheckLess(a, b priceCheckRow) bool {
+	if recommendationRank(a.Recommendation) != recommendationRank(b.Recommendation) {
+		return recommendationRank(a.Recommendation) > recommendationRank(b.Recommendation)
+	}
+	if a.CurrentPrice != b.CurrentPrice {
+		return a.CurrentPrice < b.CurrentPrice
+	}
+	if confidenceRank(a.Confidence) != confidenceRank(b.Confidence) {
+		return confidenceRank(a.Confidence) > confidenceRank(b.Confidence)
+	}
+	if a.DistanceKM != b.DistanceKM {
+		return a.DistanceKM < b.DistanceKM
+	}
+	return a.StationName < b.StationName
+}
+
+func recommendationRank(recommendation string) int {
+	switch recommendation {
+	case "buy":
+		return 3
+	case "hold":
+		return 2
+	case "wait":
+		return 1
+	default:
+		return 0
+	}
 }
 
 func suggestionCandidateLess(a, b suggestionCandidate) bool {

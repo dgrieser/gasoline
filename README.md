@@ -122,6 +122,14 @@ Useful `suggest` flags:
 
 Suggestion output includes the day, time window, predicted price, confidence, distance, and full persisted station metadata. JSON output keeps the existing top-level station fields and also includes a nested `station` object with address, brand, street, house number, post code, place, coordinates, and first/last seen timestamps.
 
+Check whether the latest stored prices are low right now:
+
+```bash
+gasoline check --city "Berlin" --range-km 10 --fuel diesel --history-days 21 --predict-days 3 --limit 5
+```
+
+The check command uses the same historical model as `suggest`, compares each open station's latest stored price with recent station history, and scans the coming forecast window for a lower expected price. It prints the station, current price, low/typical/high verdict, buy/wait/hold recommendation, confidence, and best lower future window when one is expected. Run `gasoline update` first when you need fresh current prices.
+
 Use `--limit 0` with `list stations` or `list history` to return all matching rows.
 
 The grouped commands above are the canonical interface shown by `gasoline help`. The older top-level forms `cities`, `stations`, `history`, and `import-cities` are still accepted as aliases.

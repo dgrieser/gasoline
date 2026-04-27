@@ -595,6 +595,58 @@ func TestRunListHistoryAllowsMissingStationID(t *testing.T) {
 	}
 }
 
+func TestRunCheckSupportsJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "check.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	city := cachedCity{
+		QueryName:   "Berlin",
+		Name:        "Berlin",
+		DisplayName: "Berlin",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	}
+	insertSuggestCity(t, db, city)
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+
+	nowLocal := time.Now().In(time.Local)
+	for daysAgo := 6; daysAgo >= 1; daysAgo-- {
+		dayStart := localDayStart(nowLocal).AddDate(0, 0, -daysAgo)
+		for hour := 0; hour < 24; hour++ {
+			insertSuggestSnapshot(t, db, "station-1", "Berlin", dayStart.Add(time.Duration(hour)*time.Hour).In(time.UTC), 2.100, true)
+		}
+	}
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Now().UTC(), 2.000, true)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"check", "--db", dbPath, "--city", "Berlin", "--fuel", "diesel", "--history-days", "10", "--predict-days", "1", "--output", "json"})
+	})
+
+	var checks []priceCheckRow
+	if err := json.Unmarshal([]byte(output), &checks); err != nil {
+		t.Fatalf("unmarshal check output: %v\noutput=%s", err, output)
+	}
+	if len(checks) != 1 {
+		t.Fatalf("len(checks) = %d, want 1", len(checks))
+	}
+	if checks[0].StationID != "station-1" || checks[0].Station.ID != "station-1" {
+		t.Fatalf("station fields = %+v, want station-1", checks[0])
+	}
+	if checks[0].Recommendation != "buy" {
+		t.Fatalf("recommendation = %q, want buy", checks[0].Recommendation)
+	}
+}
+
 func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -747,6 +799,133 @@ func TestGenerateSuggestionsStartsTomorrowWhenTodayHasNoFutureHours(t *testing.T
 	}
 	if suggestions[0].Date != "2026-04-27" || suggestions[0].StartTime != "00:00" {
 		t.Fatalf("suggestion = %s %s, want 2026-04-27 00:00", suggestions[0].Date, suggestions[0].StartTime)
+	}
+}
+
+func TestCheckGasRecommendsBuyForLowCurrentPrice(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	city := cachedCity{
+		QueryName:   "Berlin",
+		Name:        "Berlin",
+		DisplayName: "Berlin",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	}
+	insertSuggestCity(t, db, city)
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+
+	for day := 20; day <= 25; day++ {
+		insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, day, 15, 0, 0, 0, time.UTC), 2.200, true)
+		insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, day, 16, 0, 0, 0, time.UTC), 2.300, true)
+	}
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 26, 14, 0, 0, 0, time.UTC), 2.000, true)
+
+	checks, err := checkGas(ctx, db, checkOptions{
+		City:        "Berlin",
+		RangeKM:     5,
+		Fuel:        "diesel",
+		HistoryDays: 10,
+		PredictDays: 1,
+		Limit:       5,
+		Now:         time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC),
+		Location:    time.UTC,
+	})
+	if err != nil {
+		t.Fatalf("checkGas: %v", err)
+	}
+	if len(checks) != 1 {
+		t.Fatalf("len(checks) = %d, want 1: %+v", len(checks), checks)
+	}
+	check := checks[0]
+	if check.Recommendation != "buy" || check.Verdict != "low" {
+		t.Fatalf("recommendation/verdict = %s/%s, want buy/low", check.Recommendation, check.Verdict)
+	}
+	if check.ExpectedLower {
+		t.Fatal("expected no lower future forecast")
+	}
+	if check.Station.Address != "Test Street 1, 10115 Berlin" {
+		t.Fatalf("station address = %q, want formatted address", check.Station.Address)
+	}
+}
+
+func TestCheckGasRecommendsWaitForLowerFuturePrice(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	city := cachedCity{
+		QueryName:   "Berlin",
+		Name:        "Berlin",
+		DisplayName: "Berlin",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	}
+	insertSuggestCity(t, db, city)
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+
+	for day := 20; day <= 25; day++ {
+		insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, day, 15, 0, 0, 0, time.UTC), 2.200, true)
+		insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, day, 18, 0, 0, 0, time.UTC), 2.000, true)
+		insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, day, 19, 0, 0, 0, time.UTC), 2.200, true)
+	}
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 26, 15, 0, 0, 0, time.UTC), 2.200, true)
+
+	checks, err := checkGas(ctx, db, checkOptions{
+		City:        "Berlin",
+		RangeKM:     5,
+		Fuel:        "diesel",
+		HistoryDays: 10,
+		PredictDays: 1,
+		Limit:       5,
+		Now:         time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC),
+		Location:    time.UTC,
+	})
+	if err != nil {
+		t.Fatalf("checkGas: %v", err)
+	}
+	if len(checks) != 1 {
+		t.Fatalf("len(checks) = %d, want 1: %+v", len(checks), checks)
+	}
+	check := checks[0]
+	if check.Recommendation != "wait" || !check.ExpectedLower {
+		t.Fatalf("recommendation/expected_lower = %s/%t, want wait/true", check.Recommendation, check.ExpectedLower)
+	}
+	if check.BestFutureStartTime != "18:00" || check.BestFutureEndTime != "19:00" {
+		t.Fatalf("future window = %s-%s, want 18:00-19:00", check.BestFutureStartTime, check.BestFutureEndTime)
+	}
+	if check.ExpectedDrop < 0.140 {
+		t.Fatalf("expected_drop = %.3f, want modeled drop below current price", check.ExpectedDrop)
+	}
+}
+
+func TestValidateCheckOptions(t *testing.T) {
+	valid := checkOptions{
+		City:        "Berlin",
+		RangeKM:     5,
+		Fuel:        "diesel",
+		HistoryDays: 21,
+		PredictDays: 3,
+		Limit:       5,
+	}
+	if err := validateCheckOptions(valid); err != nil {
+		t.Fatalf("validateCheckOptions valid: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		opts checkOptions
+		want string
+	}{
+		{name: "city", opts: checkOptions{RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: 5}, want: "requires --city"},
+		{name: "fuel", opts: checkOptions{City: "Berlin", RangeKM: 5, Fuel: "premium", HistoryDays: 21, PredictDays: 3, Limit: 5}, want: "--fuel"},
+		{name: "limit", opts: checkOptions{City: "Berlin", RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: -1}, want: "--limit"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCheckOptions(tc.opts)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want containing %q", err, tc.want)
+			}
+		})
 	}
 }
 
