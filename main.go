@@ -1786,7 +1786,7 @@ func printSuggestionsText(suggestions []suggestionRow) {
 		if suggestion.Station.Address != "" {
 			stationLabel = fmt.Sprintf("%s | %s", stationLabel, suggestion.Station.Address)
 		}
-		fmt.Fprintf(stdout, "  %s-%s  %s  %.1f km  %s  predicted %.3f  confidence %s  samples=%d\n",
+		fmt.Fprintf(stdout, "  %s-%s  %s  %.1f km  %s  predicted %.2f  confidence %s  samples=%d\n",
 			suggestion.StartTime,
 			suggestion.EndTime,
 			stationLabel,
@@ -1804,7 +1804,7 @@ func printPriceChecksText(checks []priceCheckRow) {
 		stationLabel := formatStationLabel(check.StationName, check.Station)
 		futureLabel := "no lower forecast"
 		if check.ExpectedLower {
-			futureLabel = fmt.Sprintf("wait for %s %s-%s predicted %.3f drop %.3f",
+			futureLabel = fmt.Sprintf("wait for %s %s-%s predicted %.2f drop %.2f",
 				check.BestFutureDate,
 				check.BestFutureStartTime,
 				check.BestFutureEndTime,
@@ -1812,14 +1812,14 @@ func printPriceChecksText(checks []priceCheckRow) {
 				check.ExpectedDrop,
 			)
 		} else if check.BestFutureDate != "" {
-			futureLabel = fmt.Sprintf("best future %s %s-%s predicted %.3f",
+			futureLabel = fmt.Sprintf("best future %s %s-%s predicted %.2f",
 				check.BestFutureDate,
 				check.BestFutureStartTime,
 				check.BestFutureEndTime,
 				check.BestFuturePrice,
 			)
 		}
-		fmt.Fprintf(stdout, "%s  %.1f km  %s current %.3f  verdict %s  recommendation %s  confidence %s  percentile %.1f%%  forecast-now %.3f  at=%s  %s\n",
+		fmt.Fprintf(stdout, "%s  %.1f km  %s current %.2f  verdict %s  recommendation %s  confidence %s  percentile %.1f%%  forecast-now %.2f  at=%s  %s\n",
 			stationLabel,
 			check.DistanceKM,
 			check.Fuel,
