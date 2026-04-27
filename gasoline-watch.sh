@@ -249,12 +249,12 @@ row_value() {
     address) jq_value "$row" '.station.address // .address // ""' ;;
     best_future_date) jq_value "$row" '.best_future_date // ""' ;;
     best_future_end_time) jq_value "$row" '.best_future_end_time // ""' ;;
-    best_future_price) number_value "$row" '.best_future_price // ""' 3 ;;
+    best_future_price) number_value "$row" '.best_future_price // ""' 2 ;;
     best_future_start_time) jq_value "$row" '.best_future_start_time // ""' ;;
     best_future_weekday) jq_value "$row" '.best_future_weekday // ""' ;;
     brand) jq_value "$row" '.station.brand // .brand // ""' ;;
     confidence) jq_value "$row" '.confidence // ""' ;;
-    current_price) number_value "$row" '.current_price // ""' 3 ;;
+    current_price) number_value "$row" '.current_price // ""' 2 ;;
     date)
       if [[ "$kind" == check ]]; then
         jq_value "$row" '.best_future_date // .recorded_at // ""'
@@ -270,7 +270,7 @@ row_value() {
         jq_value "$row" '.end_time // ""'
       fi
       ;;
-    expected_drop) number_value "$row" '.expected_drop // ""' 3 ;;
+    expected_drop) number_value "$row" '.expected_drop // ""' 2 ;;
     expected_lower) jq_value "$row" '.expected_lower // ""' ;;
     first_seen_at) jq_value "$row" '.station.first_seen_at // ""' ;;
     fuel) jq_value "$row" '.fuel // ""' ;;
@@ -280,13 +280,13 @@ row_value() {
     lng) number_value "$row" '.station.lng // ""' 6 ;;
     place) jq_value "$row" '.station.place // ""' ;;
     post_code) jq_value "$row" '.station.post_code // ""' ;;
-    predicted_current_price) number_value "$row" '.predicted_current_price // ""' 3 ;;
-    predicted_price) number_value "$row" '.predicted_price // .predicted_current_price // ""' 3 ;;
+    predicted_current_price) number_value "$row" '.predicted_current_price // ""' 2 ;;
+    predicted_price) number_value "$row" '.predicted_price // .predicted_current_price // ""' 2 ;;
     price)
       if [[ "$kind" == check ]]; then
-        number_value "$row" '.current_price // ""' 3
+        number_value "$row" '.current_price // ""' 2
       else
-        number_value "$row" '.predicted_price // ""' 3
+        number_value "$row" '.predicted_price // ""' 2
       fi
       ;;
     recommendation) jq_value "$row" '.recommendation // ""' ;;
