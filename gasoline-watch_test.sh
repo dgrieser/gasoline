@@ -282,7 +282,45 @@ test_invalid_json_does_not_notify() {
   assert_contains "$(<"$TEST_DIR/invalid-json.err")" 'check returned invalid JSON' "invalid JSON log"
 }
 
+test_compute_sleep() {
+  configure_defaults
+  CHECK_MINUTES=10
+  SUGGEST_MINUTES=725  # 12:05
+  LAST_CHECK_EPOCH=0
+  LAST_SUGGEST_DATE=""
+
+  local now_epoch now_date
+  now_epoch=$(date +%s)
+  now_date=$(date +%F)
+
+  # Default max sleep when nothing is imminent
+  LAST_SUGGEST_DATE=$now_date  # suggest already done today
+  local s
+  s=$(compute_sleep 600 "$now_epoch")
+  [[ "$s" -le 600 ]] || fail "compute_sleep: expected <= 600, got $s"
+  [[ "$s" -ge 1 ]] || fail "compute_sleep: expected >= 1, got $s"
+
+  # Check interval shorter than max sleep
+  LAST_CHECK_EPOCH=$((now_epoch - 1))  # checked 1 second ago
+  s=$(compute_sleep 600 "$now_epoch")
+  local expected_max=$(( CHECK_MINUTES * 60 - 1 ))
+  [[ "$s" -le "$expected_max" ]] || fail "compute_sleep: check cap: expected <= $expected_max, got $s"
+
+  # Suggest time coming up soon: fake SUGGEST_MINUTES = now+2 minutes
+  LAST_CHECK_EPOCH=0
+  LAST_SUGGEST_DATE=""
+  local now_hour now_min now_minutes
+  now_hour=$(date +%H)
+  now_min=$(date +%M)
+  now_minutes=$((10#$now_hour * 60 + 10#$now_min))
+  SUGGEST_MINUTES=$((now_minutes + 2))
+  s=$(compute_sleep 600 "$now_epoch")
+  [[ "$s" -le 120 ]] || fail "compute_sleep: suggest cap: expected <= 120, got $s"
+  [[ "$s" -ge 1 ]] || fail "compute_sleep: suggest cap: expected >= 1, got $s"
+}
+
 write_fakes
+test_compute_sleep
 test_check_filters_and_batches_results
 test_check_command_row_template_without_message_placeholder
 test_check_sends_only_changed_station_prices

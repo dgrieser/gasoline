@@ -540,9 +540,45 @@ maybe_run_suggest() {
   fi
 }
 
+compute_sleep() {
+  local max_sleep=$1
+  local now_epoch=$2
+  local sleep=$max_sleep
+
+  local next_check_in
+  if ((LAST_CHECK_EPOCH == 0)); then
+    next_check_in=$((CHECK_MINUTES * 60))
+  else
+    next_check_in=$((CHECK_MINUTES * 60 - (now_epoch - LAST_CHECK_EPOCH)))
+  fi
+  if ((next_check_in > 0 && next_check_in < sleep)); then
+    sleep=$next_check_in
+  fi
+
+  local now_date now_hour now_min now_sec now_minutes suggest_in
+  now_date=$(date +%F)
+  now_hour=$(date +%H)
+  now_min=$(date +%M)
+  now_sec=$(date +%S)
+  now_minutes=$((10#$now_hour * 60 + 10#$now_min))
+
+  if [[ "$LAST_SUGGEST_DATE" != "$now_date" ]] && ((now_minutes < SUGGEST_MINUTES)); then
+    suggest_in=$(( (SUGGEST_MINUTES - now_minutes) * 60 - 10#$now_sec ))
+    if ((suggest_in > 0 && suggest_in < sleep)); then
+      sleep=$suggest_in
+    fi
+  fi
+
+  if ((sleep < 1)); then
+    sleep=1
+  fi
+
+  printf '%d' "$sleep"
+}
+
 main_loop() {
-  local sleep_seconds=${GASOLINE_WATCH_SLEEP_SECONDS:-300}
-  is_positive_int "$sleep_seconds" || die "GASOLINE_WATCH_SLEEP_SECONDS must be a positive integer"
+  local max_sleep=${GASOLINE_WATCH_SLEEP_SECONDS:-600}
+  is_positive_int "$max_sleep" || die "GASOLINE_WATCH_SLEEP_SECONDS must be a positive integer"
 
   while true; do
     local now_epoch
@@ -553,6 +589,10 @@ main_loop() {
     fi
 
     maybe_run_suggest
+
+    now_epoch=$(date +%s)
+    local sleep_seconds
+    sleep_seconds=$(compute_sleep "$max_sleep" "$now_epoch")
     sleep "$sleep_seconds"
   done
 }
