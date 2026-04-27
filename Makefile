@@ -11,6 +11,7 @@ build:
 test:
 	go test ./...
 	bash gasoline-watch_test.sh
+	@if locale -a | grep -qx 'de_DE.utf8'; then LC_ALL=de_DE.utf8 bash gasoline-watch_test.sh; else echo "skipping de_DE.utf8 watcher test"; fi
 
 tidy:
 	go mod tidy

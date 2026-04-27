@@ -232,7 +232,7 @@ number_value() {
     return 0
   fi
   if [[ "$value" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
-    printf "%.${decimals}f" "$value"
+    LC_ALL=C printf "%.${decimals}f" "$value"
   else
     printf '%s' "$value"
   fi
