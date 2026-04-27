@@ -6,6 +6,7 @@ Small Go CLI that stores Tankerkönig gas station prices historically in SQLite 
 
 - Go 1.24+
 - A Tankerkönig API key
+- `jq` for the optional watcher script
 - PHP with SQLite support if you want to use the web viewer
 
 ## Configuration
@@ -129,6 +130,23 @@ gasoline check --city "Berlin" --range-km 10 --fuel diesel --history-days 21 --p
 ```
 
 The check command uses the same historical model as `suggest`, compares each open station's latest stored price with recent station history, and scans the coming forecast window for a lower expected price. It prints the station, current price, low/typical/high verdict, buy/wait/hold recommendation, confidence, and best lower future window when one is expected. Run `gasoline update` first when you need fresh current prices.
+
+Run continuous buy/suggestion notifications:
+
+```bash
+./gasoline-watch.sh \
+  --city "Berlin" \
+  --radius-km 10 \
+  --fuel diesel \
+  --history-days 21 \
+  --predict-days 3 \
+  --check-minutes 15 \
+  --suggest-time 07:30 \
+  --check-command 'notify --message {{message}}' \
+  --suggest-command 'notify --message {{message}}'
+```
+
+The watcher runs `gasoline check` every `--check-minutes` and `gasoline suggest` once per local day after `--suggest-time`. It sends only medium/high-confidence rows: check notifications require `recommendation=buy`; suggestion notifications include all medium/high-confidence suggestions. Command templates can use `{{message}}` for the full multiline message or row placeholders such as `{{price}}`, `{{fuel}}`, `{{station_name}}`, `{{distance}}`, `{{confidence}}`, `{{date}}`, `{{start_time}}`, and `{{end_time}}`.
 
 Use `--limit 0` with `list stations` or `list history` to return all matching rows.
 

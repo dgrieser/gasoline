@@ -10,6 +10,7 @@ build:
 
 test:
 	go test ./...
+	bash gasoline-watch_test.sh
 
 tidy:
 	go mod tidy
