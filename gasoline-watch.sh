@@ -541,7 +541,7 @@ maybe_run_suggest() {
 }
 
 main_loop() {
-  local sleep_seconds=${GASOLINE_WATCH_SLEEP_SECONDS:-30}
+  local sleep_seconds=${GASOLINE_WATCH_SLEEP_SECONDS:-300}
   is_positive_int "$sleep_seconds" || die "GASOLINE_WATCH_SLEEP_SECONDS must be a positive integer"
 
   while true; do
