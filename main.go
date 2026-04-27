@@ -1459,7 +1459,7 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 					DistanceKM:     stationOutput.DistanceKM,
 					Station:        stationOutput,
 					Fuel:           fuel,
-					PredictedPrice: roundTo(score.PredictedPrice, 3),
+					PredictedPrice: roundTo(score.PredictedPrice, 2),
 					Confidence:     score.Confidence,
 					SampleCount:    score.SampleCount,
 				},
@@ -1555,8 +1555,8 @@ func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel 
 			DistanceKM:            station.DistanceKM,
 			Station:               station,
 			Fuel:                  fuel,
-			CurrentPrice:          roundTo(snapshot.Price.Float64, 3),
-			PredictedCurrentPrice: roundTo(currentScore.PredictedPrice, 3),
+			CurrentPrice:          roundTo(snapshot.Price.Float64, 2),
+			PredictedCurrentPrice: roundTo(currentScore.PredictedPrice, 2),
 			HistoryPercentile:     roundTo(percentile, 1),
 			Confidence:            currentScore.Confidence,
 			SampleCount:           currentScore.SampleCount,
@@ -1568,10 +1568,10 @@ func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel 
 			row.BestFutureWeekday = future.Start.Weekday().String()
 			row.BestFutureStartTime = future.Start.Format("15:04")
 			row.BestFutureEndTime = future.End.Format("15:04")
-			row.BestFuturePrice = roundTo(future.Score.PredictedPrice, 3)
+			row.BestFuturePrice = roundTo(future.Score.PredictedPrice, 2)
 			drop := snapshot.Price.Float64 - future.Score.PredictedPrice
 			if drop > 0 {
-				row.ExpectedDrop = roundTo(drop, 3)
+				row.ExpectedDrop = roundTo(drop, 2)
 			}
 			if drop >= 0.020 {
 				row.ExpectedLower = true
