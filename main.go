@@ -1167,7 +1167,7 @@ func suggestGas(ctx context.Context, db *sql.DB, opts suggestOptions) ([]suggest
 	}
 
 	model := buildForecastModel(intervals, now, location)
-	suggestions := generateSuggestions(model, opts.Fuel, now, location, opts.PredictDays, opts.LimitPerDay)
+	suggestions := mergeSuggestions(generateSuggestions(model, opts.Fuel, now, location, opts.PredictDays, opts.LimitPerDay))
 	if len(suggestions) == 0 {
 		return nil, errors.New("not enough historical price patterns for suggestions")
 	}
@@ -1489,6 +1489,32 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 		}
 	}
 	return suggestions
+}
+
+func mergeSuggestions(suggestions []suggestionRow) []suggestionRow {
+	type groupKey struct {
+		Date           string
+		StationID      string
+		PredictedPrice float64
+		Confidence     string
+	}
+	var result []suggestionRow
+	seen := make(map[groupKey]int)
+	for _, s := range suggestions {
+		key := groupKey{s.Date, s.StationID, s.PredictedPrice, s.Confidence}
+		if idx, ok := seen[key]; ok {
+			if s.EndTime > result[idx].EndTime {
+				result[idx].EndTime = s.EndTime
+			}
+			if s.SampleCount > result[idx].SampleCount {
+				result[idx].SampleCount = s.SampleCount
+			}
+		} else {
+			seen[key] = len(result)
+			result = append(result, s)
+		}
+	}
+	return result
 }
 
 func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel string, now time.Time, location *time.Location, predictDays, limit int) []priceCheckRow {

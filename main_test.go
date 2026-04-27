@@ -802,6 +802,41 @@ func TestGenerateSuggestionsStartsTomorrowWhenTodayHasNoFutureHours(t *testing.T
 	}
 }
 
+func TestMergeSuggestions(t *testing.T) {
+	stationA := suggestionStationRow{ID: "station-a", Name: "Station A"}
+	stationB := suggestionStationRow{ID: "station-b", Name: "Station B"}
+	input := []suggestionRow{
+		{Date: "2026-04-27", StationID: "station-a", Station: stationA, StartTime: "18:00", EndTime: "19:00", PredictedPrice: 2.115, Confidence: "medium", SampleCount: 5},
+		{Date: "2026-04-27", StationID: "station-b", Station: stationB, StartTime: "19:00", EndTime: "20:00", PredictedPrice: 2.100, Confidence: "high", SampleCount: 8},
+		{Date: "2026-04-27", StationID: "station-a", Station: stationA, StartTime: "20:00", EndTime: "21:00", PredictedPrice: 2.115, Confidence: "medium", SampleCount: 3},
+		{Date: "2026-04-27", StationID: "station-a", Station: stationA, StartTime: "22:00", EndTime: "23:00", PredictedPrice: 2.115, Confidence: "medium", SampleCount: 3},
+	}
+
+	got := mergeSuggestions(input)
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2: %+v", len(got), got)
+	}
+
+	a := got[0]
+	if a.StationID != "station-a" {
+		t.Fatalf("first entry station = %q, want station-a", a.StationID)
+	}
+	if a.StartTime != "18:00" || a.EndTime != "23:00" {
+		t.Fatalf("station-a window = %s-%s, want 18:00-23:00", a.StartTime, a.EndTime)
+	}
+	if a.SampleCount != 5 {
+		t.Fatalf("station-a SampleCount = %d, want 5 (max)", a.SampleCount)
+	}
+
+	b := got[1]
+	if b.StationID != "station-b" {
+		t.Fatalf("second entry station = %q, want station-b", b.StationID)
+	}
+	if b.StartTime != "19:00" || b.EndTime != "20:00" {
+		t.Fatalf("station-b window = %s-%s, want 19:00-20:00", b.StartTime, b.EndTime)
+	}
+}
+
 func TestCheckGasRecommendsBuyForLowCurrentPrice(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
