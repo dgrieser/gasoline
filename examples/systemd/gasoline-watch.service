@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=GASOLINE_DB_PATH=/etc/gasoline/gasoline.db
-ExecStart=/usr/local/bin/gasoline-watch.sh \
+ExecStart=/usr/local/bin/gasoline-watch \
   --city "Lübbecke" \
   --radius-km 5 \
   --fuel diesel \
