@@ -347,6 +347,9 @@ render_row_template() {
   local key value
 
   for key in "${PLACEHOLDERS[@]}"; do
+    if [[ "$rendered" != *"{{${key}}}"* ]]; then
+      continue
+    fi
     value=$(row_value "$kind" "$row" "$key")
     rendered=${rendered//\{\{$key\}\}/$value}
   done
