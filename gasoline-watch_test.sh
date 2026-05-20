@@ -187,6 +187,7 @@ configure_defaults() {
   SUGGEST_TIME=07:30
   CHECK_COMMAND="$FAKE_NOTIFY --message {{message}}"
   SUGGEST_COMMAND="$FAKE_NOTIFY --message {{message}}"
+  VERBOSE=0
   CHECK_ALERT_PRICES=()
   : >"$GASOLINE_ARGS_FILE"
   : >"$NOTIFY_OUT"
@@ -282,6 +283,32 @@ test_invalid_json_does_not_notify() {
   assert_contains "$(<"$TEST_DIR/invalid-json.err")" 'check returned invalid JSON' "invalid JSON log"
 }
 
+test_verbose_logs_parameters_and_actions() {
+  configure_defaults
+  write_check_json
+  VERBOSE=1
+
+  log_config 2>"$TEST_DIR/verbose.err"
+  run_check_once 2>>"$TEST_DIR/verbose.err"
+
+  local output
+  output=$(<"$TEST_DIR/verbose.err")
+
+  assert_contains "$output" '[gasoline-watch] city=Berlin' "verbose config"
+  assert_contains "$output" '[gasoline-watch] radius_km=10' "verbose config"
+  assert_contains "$output" '[gasoline-watch] fuel=diesel' "verbose config"
+  assert_contains "$output" '[gasoline-watch] predict_days=3' "verbose config"
+  assert_contains "$output" '[gasoline-watch] history_days=21' "verbose config"
+  assert_contains "$output" '[gasoline-watch] check_minutes=5' "verbose config"
+  assert_contains "$output" '[gasoline-watch] suggest_time=07:30' "verbose config"
+  assert_contains "$output" '[gasoline-watch] gasoline_bin=' "verbose config"
+  assert_contains "$output" 'running check:' "verbose check"
+  assert_contains "$output" 'check --city Berlin --range-km 10 --fuel diesel --history-days 21 --predict-days 3 --output json' "verbose check"
+  assert_contains "$output" 'check returned 4 row(s)' "verbose check"
+  assert_contains "$output" 'sending 2 changed check row(s)' "verbose check"
+  assert_contains "$output" 'running check notification:' "verbose notification"
+}
+
 test_compute_sleep() {
   configure_defaults
   CHECK_MINUTES=10
@@ -326,5 +353,6 @@ test_check_command_row_template_without_message_placeholder
 test_check_sends_only_changed_station_prices
 test_suggest_filters_and_batches_results
 test_invalid_json_does_not_notify
+test_verbose_logs_parameters_and_actions
 
 printf 'gasoline-watch_test: ok\n'

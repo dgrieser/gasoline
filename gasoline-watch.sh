@@ -54,6 +54,7 @@ SUGGEST_TIME=""
 CHECK_COMMAND=""
 SUGGEST_COMMAND=""
 GASOLINE_BIN="${GASOLINE_BIN:-}"
+VERBOSE=0
 SUGGEST_MINUTES=0
 LAST_CHECK_EPOCH=0
 LAST_SUGGEST_DATE=""
@@ -65,7 +66,8 @@ usage() {
 Usage:
   gasoline-watch.sh --city CITY --radius-km KM --fuel diesel|e5|e10 \
     --predict-days DAYS --history-days DAYS --check-minutes MINUTES \
-    --suggest-time HH:MM --check-command COMMAND --suggest-command COMMAND
+    --suggest-time HH:MM --check-command COMMAND --suggest-command COMMAND \
+    [--verbose]
 
 Commands are notification templates. Use {{message}} for the formatted
 multiline message, for example:
@@ -81,6 +83,12 @@ EOF
 
 log() {
   printf '[gasoline-watch] %s\n' "$*" >&2
+}
+
+verbose_log() {
+  if ((VERBOSE)); then
+    log "$*"
+  fi
 }
 
 die() {
@@ -144,6 +152,10 @@ parse_args() {
         SUGGEST_COMMAND=$2
         shift 2
         ;;
+      --verbose)
+        VERBOSE=1
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -199,6 +211,19 @@ require_tools() {
   command -v "$GASOLINE_BIN" >/dev/null 2>&1 || die "gasoline command not found: $GASOLINE_BIN"
 }
 
+log_config() {
+  verbose_log "city=$(shell_quote "$CITY")"
+  verbose_log "radius_km=$(shell_quote "$RADIUS_KM")"
+  verbose_log "fuel=$(shell_quote "$FUEL")"
+  verbose_log "predict_days=$(shell_quote "$PREDICT_DAYS")"
+  verbose_log "history_days=$(shell_quote "$HISTORY_DAYS")"
+  verbose_log "check_minutes=$(shell_quote "$CHECK_MINUTES")"
+  verbose_log "suggest_time=$(shell_quote "$SUGGEST_TIME")"
+  verbose_log "check_command=$(shell_quote "$CHECK_COMMAND")"
+  verbose_log "suggest_command=$(shell_quote "$SUGGEST_COMMAND")"
+  verbose_log "gasoline_bin=$(shell_quote "$GASOLINE_BIN")"
+}
+
 shell_quote() {
   printf '%q' "$1"
 }
@@ -249,12 +274,12 @@ row_value() {
     address) jq_value "$row" '.station.address // .address // ""' ;;
     best_future_date) jq_value "$row" '.best_future_date // ""' ;;
     best_future_end_time) jq_value "$row" '.best_future_end_time // ""' ;;
-    best_future_price) number_value "$row" '.best_future_price // ""' 2 ;;
+    best_future_price) number_value "$row" '.best_future_price // ""' 3 ;;
     best_future_start_time) jq_value "$row" '.best_future_start_time // ""' ;;
     best_future_weekday) jq_value "$row" '.best_future_weekday // ""' ;;
     brand) jq_value "$row" '.station.brand // .brand // ""' ;;
     confidence) jq_value "$row" '.confidence // ""' ;;
-    current_price) number_value "$row" '.current_price // ""' 2 ;;
+    current_price) number_value "$row" '.current_price // ""' 3 ;;
     date)
       if [[ "$kind" == check ]]; then
         jq_value "$row" '.best_future_date // .recorded_at // ""'
@@ -280,13 +305,13 @@ row_value() {
     lng) number_value "$row" '.station.lng // ""' 6 ;;
     place) jq_value "$row" '.station.place // ""' ;;
     post_code) jq_value "$row" '.station.post_code // ""' ;;
-    predicted_current_price) number_value "$row" '.predicted_current_price // ""' 2 ;;
-    predicted_price) number_value "$row" '.predicted_price // .predicted_current_price // ""' 2 ;;
+    predicted_current_price) number_value "$row" '.predicted_current_price // ""' 3 ;;
+    predicted_price) number_value "$row" '.predicted_price // .predicted_current_price // ""' 3 ;;
     price)
       if [[ "$kind" == check ]]; then
-        number_value "$row" '.current_price // ""' 2
+        number_value "$row" '.current_price // ""' 3
       else
-        number_value "$row" '.predicted_price // ""' 2
+        number_value "$row" '.predicted_price // ""' 3
       fi
       ;;
     recommendation) jq_value "$row" '.recommendation // ""' ;;
@@ -406,6 +431,7 @@ run_notification() {
 
   local command
   command=$(build_notification_command "$template" "$kind" "$message" "$@")
+  verbose_log "running $kind notification: $command"
   if ! bash -c "$command"; then
     log "$kind notification command failed"
   fi
@@ -421,9 +447,11 @@ send_matching_rows() {
 
   mapfile -t rows < <(printf '%s' "$json" | jq -c "$jq_filter")
   if ((${#rows[@]} == 0)); then
+    verbose_log "no matching $kind rows"
     return 0
   fi
 
+  verbose_log "sending ${#rows[@]} matching $kind row(s)"
   local message
   message=$(build_message "$kind" "$row_template" "${rows[@]}")
   run_notification "$kind" "$command_template" "$message" "${rows[@]}"
@@ -466,14 +494,17 @@ send_changed_check_rows() {
 
   mapfile -t rows < <(printf '%s' "$json" | jq -c 'if type == "array" then .[] else empty end | select(.recommendation == "buy" and (.confidence == "medium" or .confidence == "high"))')
   if ((${#rows[@]} == 0)); then
+    verbose_log "no matching check rows"
     return 0
   fi
 
   filter_changed_check_rows "${rows[@]}"
   if ((${#FILTERED_ROWS[@]} == 0)); then
+    verbose_log "no changed check prices"
     return 0
   fi
 
+  verbose_log "sending ${#FILTERED_ROWS[@]} changed check row(s)"
   local message
   message=$(build_message check "$CHECK_ROW_TEMPLATE" "${FILTERED_ROWS[@]}")
   run_notification check "$CHECK_COMMAND" "$message" "${FILTERED_ROWS[@]}"
@@ -481,6 +512,7 @@ send_changed_check_rows() {
 
 run_check_once() {
   local output
+  verbose_log "running check: $(shell_quote "$GASOLINE_BIN") check --city $(shell_quote "$CITY") --range-km $(shell_quote "$RADIUS_KM") --fuel $(shell_quote "$FUEL") --history-days $(shell_quote "$HISTORY_DAYS") --predict-days $(shell_quote "$PREDICT_DAYS") --output json"
   if ! output=$("$GASOLINE_BIN" check \
       --city "$CITY" \
       --range-km "$RADIUS_KM" \
@@ -497,11 +529,13 @@ run_check_once() {
     return 0
   fi
 
+  verbose_log "check returned $(printf '%s' "$output" | jq 'length') row(s)"
   send_changed_check_rows "$output"
 }
 
 run_suggest_once() {
   local output
+  verbose_log "running suggest: $(shell_quote "$GASOLINE_BIN") suggest --city $(shell_quote "$CITY") --range-km $(shell_quote "$RADIUS_KM") --fuel $(shell_quote "$FUEL") --history-days $(shell_quote "$HISTORY_DAYS") --predict-days $(shell_quote "$PREDICT_DAYS") --output json"
   if ! output=$("$GASOLINE_BIN" suggest \
       --city "$CITY" \
       --range-km "$RADIUS_KM" \
@@ -518,6 +552,7 @@ run_suggest_once() {
     return 0
   fi
 
+  verbose_log "suggest returned $(printf '%s' "$output" | jq 'length') row(s)"
   send_matching_rows \
     suggest \
     "$SUGGEST_COMMAND" \
@@ -535,8 +570,11 @@ maybe_run_suggest() {
   now_minutes=$((10#$now_hour * 60 + 10#$now_min))
 
   if ((now_minutes >= SUGGEST_MINUTES)) && [[ "$LAST_SUGGEST_DATE" != "$now_date" ]]; then
+    verbose_log "suggest due for $now_date at $SUGGEST_TIME"
     run_suggest_once
     LAST_SUGGEST_DATE=$now_date
+  else
+    verbose_log "suggest not due; now_minutes=$now_minutes suggest_minutes=$SUGGEST_MINUTES last_suggest_date=$(shell_quote "$LAST_SUGGEST_DATE")"
   fi
 }
 
@@ -593,6 +631,7 @@ main_loop() {
     now_epoch=$(date +%s)
     local sleep_seconds
     sleep_seconds=$(compute_sleep "$max_sleep" "$now_epoch")
+    verbose_log "sleeping ${sleep_seconds}s"
     sleep "$sleep_seconds"
   done
 }
@@ -601,6 +640,7 @@ main() {
   parse_args "$@"
   validate_args
   require_tools
+  log_config
   main_loop
 }
 
