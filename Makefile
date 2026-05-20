@@ -25,6 +25,7 @@ clean:
 install: build
 	install -d $(BINDIR)
 	install -m 0755 $(APP) $(BINDIR)/$(APP)
+	install -m 0755 gasoline-watch.sh $(BINDIR)/gasoline-watch
 	install -d $(WEB_INSTALL_DIR)
 	cp -R web/. $(WEB_INSTALL_DIR)/
 

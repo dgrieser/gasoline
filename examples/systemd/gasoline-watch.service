@@ -1,0 +1,24 @@
+[Unit]
+Description=Gasoline price watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=GASOLINE_DB_PATH=/etc/gasoline/gasoline.db
+ExecStart=/usr/local/bin/gasoline-watch.sh \
+  --city "Lübbecke" \
+  --radius-km 5 \
+  --fuel diesel \
+  --history-days 30 \
+  --predict-days 7 \
+  --check-minutes 15 \
+  --suggest-time 13:00 \
+  --check-command 'pushover gasoline Tankempfehlung {{current_price}} EUR {{fuel}} {{station_name}} {{place}}' \
+  --suggest-command 'pushover gasoline Vorhersage {{price}} EUR {{fuel}} {{station_name}} {{place}} {{start_time}} - {{end_time}}' \
+  --verbose
+Restart=always
+RestartSec=30s
+
+[Install]
+WantedBy=default.target

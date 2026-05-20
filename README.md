@@ -148,6 +148,13 @@ Run continuous buy/suggestion notifications:
 
 The watcher runs `gasoline check` every `--check-minutes` and `gasoline suggest` once per local day after `--suggest-time`. It sends only medium/high-confidence rows: check notifications require `recommendation=buy`; suggestion notifications include all medium/high-confidence suggestions. Command templates can use `{{message}}` for the full multiline message or row placeholders such as `{{price}}`, `{{fuel}}`, `{{station_name}}`, `{{distance}}`, `{{confidence}}`, `{{date}}`, `{{start_time}}`, and `{{end_time}}`.
 
+An example systemd user service is available at `examples/systemd/gasoline-watch.service`. Copy or symlink it to `~/.config/systemd/user/`, adjust the paths and command templates, then enable it with:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now gasoline-watch.service
+```
+
 Use `--limit 0` with `list stations` or `list history` to return all matching rows.
 
 The grouped commands above are the canonical interface shown by `gasoline help`. The older top-level forms `cities`, `stations`, `history`, and `import-cities` are still accepted as aliases.
