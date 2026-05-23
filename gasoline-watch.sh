@@ -626,7 +626,7 @@ run_suggest_once() {
     suggest \
     "$SUGGEST_COMMAND" \
     "$output" \
-    'if type == "array" then sort_by(.predicted_price) else [] end | .[] | select(.confidence == "medium" or .confidence == "high")' \
+    'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | sort_by(.predicted_price) | .[] else empty end' \
     "$SUGGEST_ROW_TEMPLATE"
 }
 
