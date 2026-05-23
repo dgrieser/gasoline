@@ -227,9 +227,39 @@ test_check_command_row_template_without_message_placeholder() {
   output=$(<"$NOTIFY_OUT")
 
   assert_contains "$output" 'ARG1=--message' "row-template command"
-  assert_contains "$output" 'ARG2=1.700 diesel Station 1 1.2' "row-template command"
-  assert_contains "$output" '1.680 diesel Station 2 2.3' "row-template command"
+  assert_contains "$output" 'ARG2=1.680 diesel Station 2 2.3' "row-template command"
+  assert_contains "$output" '1.700 diesel Station 1 1.2' "row-template command"
   assert_not_contains "$output" 'ARG3=' "row-template command"
+}
+
+test_check_cheapest_and_count_placeholders() {
+  configure_defaults
+  write_check_json
+  CHECK_COMMAND="$FAKE_NOTIFY --title Cheapest_{{cheapest_price}}_at_{{cheapest_station_name}}_count_{{count}} --message {{message}}"
+
+  run_check_once
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+
+  assert_contains "$output" 'ARG1=--title' "cheapest placeholders"
+  assert_contains "$output" 'ARG2=Cheapest_1.680_at_Station 2_count_2' "cheapest placeholders"
+  assert_contains "$output" 'ARG3=--message' "cheapest placeholders"
+  assert_contains "$output" 'Buy diesel at Station 2 (2.3 km): 1.680 EUR' "cheapest placeholders"
+  assert_contains "$output" 'Buy diesel at Station 1 (1.2 km): 1.700 EUR' "cheapest placeholders"
+}
+
+test_suggest_cheapest_placeholder() {
+  configure_defaults
+  write_suggest_json
+  SUGGEST_COMMAND="$FAKE_NOTIFY --title Cheap_{{cheapest_price}}_{{cheapest_station_name}}_n{{count}} --message {{message}}"
+
+  run_suggest_once
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+
+  assert_contains "$output" 'ARG2=Cheap_1.630_Station 2_n2' "suggest cheapest"
 }
 
 test_check_sends_only_cheaper_prices() {
@@ -407,6 +437,8 @@ write_fakes
 test_compute_sleep
 test_check_filters_and_batches_results
 test_check_command_row_template_without_message_placeholder
+test_check_cheapest_and_count_placeholders
+test_suggest_cheapest_placeholder
 test_check_sends_only_cheaper_prices
 test_check_reset_releases_baseline
 test_suggest_filters_and_batches_results
