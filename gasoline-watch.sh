@@ -222,6 +222,7 @@ validate_args() {
 
 require_tools() {
   command -v jq >/dev/null 2>&1 || die "jq is required"
+  command -v awk >/dev/null 2>&1 || die "awk is required"
   if [[ -z "$GASOLINE_BIN" ]]; then
     if [[ -x ./gasoline ]]; then
       GASOLINE_BIN=./gasoline
@@ -603,9 +604,7 @@ maybe_run_suggest() {
 maybe_reset_baseline() {
   local now_date now_hour now_min now_minutes
 
-  now_date=$(date +%F)
-  now_hour=$(date +%H)
-  now_min=$(date +%M)
+  read -r now_date now_hour now_min < <(date "+%F %H %M")
   now_minutes=$((10#$now_hour * 60 + 10#$now_min))
 
   if ((now_minutes >= RESET_MINUTES)) && [[ "$LAST_RESET_DATE" != "$now_date" ]]; then
