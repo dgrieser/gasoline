@@ -185,10 +185,13 @@ configure_defaults() {
   HISTORY_DAYS=21
   CHECK_MINUTES=5
   SUGGEST_TIME=07:30
+  RESET_TIME=00:00
+  RESET_MINUTES=0
   CHECK_COMMAND="$FAKE_NOTIFY --message {{message}}"
   SUGGEST_COMMAND="$FAKE_NOTIFY --message {{message}}"
   VERBOSE=0
-  CHECK_ALERT_PRICES=()
+  CHECK_LOWEST_PRICE=""
+  LAST_RESET_DATE=$(date +%F)
   : >"$GASOLINE_ARGS_FILE"
   : >"$NOTIFY_OUT"
 }
@@ -229,20 +232,26 @@ test_check_command_row_template_without_message_placeholder() {
   assert_not_contains "$output" 'ARG3=' "row-template command"
 }
 
-test_check_sends_only_changed_station_prices() {
+test_check_sends_only_cheaper_prices() {
   configure_defaults
   write_check_json
 
   run_check_once
+  [[ "$CHECK_LOWEST_PRICE" == "1.680" ]] || fail "expected baseline 1.680 after initial check, got $CHECK_LOWEST_PRICE"
   : >"$NOTIFY_OUT"
 
   run_check_once
   [[ ! -s "$NOTIFY_OUT" ]] || fail "expected no repeated check notification for unchanged prices"
+  [[ "$CHECK_LOWEST_PRICE" == "1.680" ]] || fail "expected baseline unchanged, got $CHECK_LOWEST_PRICE"
 
-  local changed_json
-  changed_json=$TEST_DIR/check.changed.json
-  jq 'map(if .station_id == "station-1" then .current_price = 1.71 else . end)' "$CHECK_JSON_FILE" >"$changed_json"
-  mv "$changed_json" "$CHECK_JSON_FILE"
+  local mutated_json
+  mutated_json=$TEST_DIR/check.mutated.json
+  jq 'map(
+        if .station_id == "station-1" then .current_price = 1.71
+        elif .station_id == "station-2" then .current_price = 1.66
+        else . end
+      )' "$CHECK_JSON_FILE" >"$mutated_json"
+  mv "$mutated_json" "$CHECK_JSON_FILE"
 
   run_check_once
 
@@ -250,9 +259,56 @@ test_check_sends_only_changed_station_prices() {
   output=$(<"$NOTIFY_OUT")
   begin_count=$(grep -c '^BEGIN$' "$NOTIFY_OUT")
 
-  [[ "$begin_count" == 1 ]] || fail "expected one changed-price check notification, got $begin_count"
-  assert_contains "$output" 'Buy diesel at Station 1 (1.2 km): 1.710 EUR, confidence medium, verdict low' "changed-price notification"
-  assert_not_contains "$output" 'Station 2' "changed-price notification"
+  [[ "$begin_count" == 1 ]] || fail "expected one cheaper-price check notification, got $begin_count"
+  assert_contains "$output" 'Buy diesel at Station 2 (2.3 km): 1.660 EUR, confidence high, verdict low' "cheaper-price notification"
+  assert_not_contains "$output" 'Station 1' "cheaper-price notification should drop more-expensive station"
+  [[ "$CHECK_LOWEST_PRICE" == "1.660" ]] || fail "expected baseline 1.660 after cheaper batch, got $CHECK_LOWEST_PRICE"
+
+  : >"$NOTIFY_OUT"
+  jq 'map(
+        if .station_id == "station-1" then .current_price = 1.65
+        else . end
+      )' "$CHECK_JSON_FILE" >"$mutated_json"
+  mv "$mutated_json" "$CHECK_JSON_FILE"
+
+  run_check_once
+
+  output=$(<"$NOTIFY_OUT")
+  begin_count=$(grep -c '^BEGIN$' "$NOTIFY_OUT")
+
+  [[ "$begin_count" == 1 ]] || fail "expected one notification on new low, got $begin_count"
+  assert_contains "$output" 'Buy diesel at Station 1 (1.2 km): 1.650 EUR, confidence medium, verdict low' "new-low notification"
+  assert_not_contains "$output" 'Station 2' "new-low notification should drop the previous-baseline station"
+  [[ "$CHECK_LOWEST_PRICE" == "1.650" ]] || fail "expected baseline 1.650, got $CHECK_LOWEST_PRICE"
+}
+
+test_check_reset_releases_baseline() {
+  configure_defaults
+  write_check_json
+
+  run_check_once
+  [[ "$CHECK_LOWEST_PRICE" == "1.680" ]] || fail "expected baseline 1.680, got $CHECK_LOWEST_PRICE"
+  : >"$NOTIFY_OUT"
+
+  run_check_once
+  [[ ! -s "$NOTIFY_OUT" ]] || fail "expected no notification before reset"
+
+  CHECK_LOWEST_PRICE=""
+  LAST_RESET_DATE=""
+  RESET_MINUTES=0
+  maybe_reset_baseline
+  [[ -z "$CHECK_LOWEST_PRICE" ]] || fail "expected baseline cleared after reset, got $CHECK_LOWEST_PRICE"
+
+  run_check_once
+
+  local output begin_count
+  output=$(<"$NOTIFY_OUT")
+  begin_count=$(grep -c '^BEGIN$' "$NOTIFY_OUT")
+
+  [[ "$begin_count" == 1 ]] || fail "expected one notification after reset, got $begin_count"
+  assert_contains "$output" 'Buy diesel at Station 1 (1.2 km): 1.700 EUR' "post-reset notification"
+  assert_contains "$output" 'Buy diesel at Station 2 (2.3 km): 1.680 EUR' "post-reset notification"
+  [[ "$CHECK_LOWEST_PRICE" == "1.680" ]] || fail "expected baseline 1.680 after reset re-seed, got $CHECK_LOWEST_PRICE"
 }
 
 test_suggest_filters_and_batches_results() {
@@ -301,11 +357,12 @@ test_verbose_logs_parameters_and_actions() {
   assert_contains "$output" '[gasoline-watch] history_days=21' "verbose config"
   assert_contains "$output" '[gasoline-watch] check_minutes=5' "verbose config"
   assert_contains "$output" '[gasoline-watch] suggest_time=07:30' "verbose config"
+  assert_contains "$output" '[gasoline-watch] reset_time=00:00' "verbose config"
   assert_contains "$output" '[gasoline-watch] gasoline_bin=' "verbose config"
   assert_contains "$output" 'running check:' "verbose check"
   assert_contains "$output" 'check --city Berlin --range-km 10 --fuel diesel --history-days 21 --predict-days 3 --output json' "verbose check"
   assert_contains "$output" 'check returned 4 row(s)' "verbose check"
-  assert_contains "$output" 'sending 2 changed check row(s)' "verbose check"
+  assert_contains "$output" 'sending 2 cheaper check row(s)' "verbose check"
   assert_contains "$output" 'running check notification:' "verbose notification"
 }
 
@@ -350,7 +407,8 @@ write_fakes
 test_compute_sleep
 test_check_filters_and_batches_results
 test_check_command_row_template_without_message_placeholder
-test_check_sends_only_changed_station_prices
+test_check_sends_only_cheaper_prices
+test_check_reset_releases_baseline
 test_suggest_filters_and_batches_results
 test_invalid_json_does_not_notify
 test_verbose_logs_parameters_and_actions

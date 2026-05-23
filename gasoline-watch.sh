@@ -51,14 +51,17 @@ PREDICT_DAYS=""
 HISTORY_DAYS=""
 CHECK_MINUTES=""
 SUGGEST_TIME=""
+RESET_TIME=""
 CHECK_COMMAND=""
 SUGGEST_COMMAND=""
 GASOLINE_BIN="${GASOLINE_BIN:-}"
 VERBOSE=0
 SUGGEST_MINUTES=0
+RESET_MINUTES=0
 LAST_CHECK_EPOCH=0
 LAST_SUGGEST_DATE=""
-declare -A CHECK_ALERT_PRICES=()
+LAST_RESET_DATE=""
+CHECK_LOWEST_PRICE=""
 FILTERED_ROWS=()
 
 usage() {
@@ -66,8 +69,13 @@ usage() {
 Usage:
   gasoline-watch.sh --city CITY --radius-km KM --fuel diesel|e5|e10 \
     --predict-days DAYS --history-days DAYS --check-minutes MINUTES \
-    --suggest-time HH:MM --check-command COMMAND --suggest-command COMMAND \
+    --suggest-time HH:MM [--reset-time HH:MM] \
+    --check-command COMMAND --suggest-command COMMAND \
     [--verbose]
+
+--reset-time defaults to 00:00. The watcher only emits a check
+notification when a buy recommendation is strictly cheaper than the
+lowest price reported since the last reset.
 
 Commands are notification templates. Use {{message}} for the formatted
 multiline message, for example:
@@ -142,6 +150,11 @@ parse_args() {
         SUGGEST_TIME=$2
         shift 2
         ;;
+      --reset-time)
+        need_value "$1" "${2-}"
+        RESET_TIME=$2
+        shift 2
+        ;;
       --check-command)
         need_value "$1" "${2-}"
         CHECK_COMMAND=$2
@@ -193,14 +206,23 @@ validate_args() {
   is_positive_int "$CHECK_MINUTES" || die "--check-minutes must be a positive integer"
   [[ "$SUGGEST_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "--suggest-time must be HH:MM"
 
+  if [[ -z "$RESET_TIME" ]]; then
+    RESET_TIME="00:00"
+  fi
+  [[ "$RESET_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "--reset-time must be HH:MM"
+
   local hour minute
   hour=${SUGGEST_TIME%:*}
   minute=${SUGGEST_TIME#*:}
   SUGGEST_MINUTES=$((10#$hour * 60 + 10#$minute))
+  hour=${RESET_TIME%:*}
+  minute=${RESET_TIME#*:}
+  RESET_MINUTES=$((10#$hour * 60 + 10#$minute))
 }
 
 require_tools() {
   command -v jq >/dev/null 2>&1 || die "jq is required"
+  command -v awk >/dev/null 2>&1 || die "awk is required"
   if [[ -z "$GASOLINE_BIN" ]]; then
     if [[ -x ./gasoline ]]; then
       GASOLINE_BIN=./gasoline
@@ -219,6 +241,7 @@ log_config() {
   verbose_log "history_days=$(shell_quote "$HISTORY_DAYS")"
   verbose_log "check_minutes=$(shell_quote "$CHECK_MINUTES")"
   verbose_log "suggest_time=$(shell_quote "$SUGGEST_TIME")"
+  verbose_log "reset_time=$(shell_quote "$RESET_TIME")"
   verbose_log "check_command=$(shell_quote "$CHECK_COMMAND")"
   verbose_log "suggest_command=$(shell_quote "$SUGGEST_COMMAND")"
   verbose_log "gasoline_bin=$(shell_quote "$GASOLINE_BIN")"
@@ -460,35 +483,32 @@ send_matching_rows() {
   run_notification "$kind" "$command_template" "$message" "${rows[@]}"
 }
 
-check_alert_key() {
-  local row=$1
-  local station_id fuel
-
-  station_id=$(row_value check "$row" station_id)
-  fuel=$(row_value check "$row" fuel)
-  if [[ -z "$station_id" ]]; then
-    station_id=$(row_value check "$row" station_name)
-  fi
-  printf '%s|%s' "$station_id" "$fuel"
+price_less_than() {
+  LC_ALL=C awk -v a="$1" -v b="$2" 'BEGIN { exit !(a+0 < b+0) }'
 }
 
-filter_changed_check_rows() {
+filter_cheaper_check_rows() {
   local rows=("$@")
-  local row key price
+  local row price batch_min=""
 
   FILTERED_ROWS=()
   for row in "${rows[@]}"; do
-    key=$(check_alert_key "$row")
     price=$(row_value check "$row" current_price)
-    if [[ -z "$key" || -z "$price" ]]; then
+    if [[ -z "$price" ]]; then
       continue
     fi
-    if [[ "${CHECK_ALERT_PRICES[$key]+set}" == set && "${CHECK_ALERT_PRICES[$key]}" == "$price" ]]; then
+    if [[ -n "$CHECK_LOWEST_PRICE" ]] && ! price_less_than "$price" "$CHECK_LOWEST_PRICE"; then
       continue
     fi
-    CHECK_ALERT_PRICES[$key]=$price
     FILTERED_ROWS+=("$row")
+    if [[ -z "$batch_min" ]] || price_less_than "$price" "$batch_min"; then
+      batch_min=$price
+    fi
   done
+
+  if [[ -n "$batch_min" ]]; then
+    CHECK_LOWEST_PRICE=$batch_min
+  fi
 }
 
 send_changed_check_rows() {
@@ -501,13 +521,13 @@ send_changed_check_rows() {
     return 0
   fi
 
-  filter_changed_check_rows "${rows[@]}"
+  filter_cheaper_check_rows "${rows[@]}"
   if ((${#FILTERED_ROWS[@]} == 0)); then
-    verbose_log "no changed check prices"
+    verbose_log "no cheaper check prices (baseline=$(shell_quote "$CHECK_LOWEST_PRICE"))"
     return 0
   fi
 
-  verbose_log "sending ${#FILTERED_ROWS[@]} changed check row(s)"
+  verbose_log "sending ${#FILTERED_ROWS[@]} cheaper check row(s), baseline now $(shell_quote "$CHECK_LOWEST_PRICE")"
   local message
   message=$(build_message check "$CHECK_ROW_TEMPLATE" "${FILTERED_ROWS[@]}")
   run_notification check "$CHECK_COMMAND" "$message" "${FILTERED_ROWS[@]}"
@@ -581,6 +601,19 @@ maybe_run_suggest() {
   fi
 }
 
+maybe_reset_baseline() {
+  local now_date now_hour now_min now_minutes
+
+  read -r now_date now_hour now_min < <(date "+%F %H %M")
+  now_minutes=$((10#$now_hour * 60 + 10#$now_min))
+
+  if ((now_minutes >= RESET_MINUTES)) && [[ "$LAST_RESET_DATE" != "$now_date" ]]; then
+    verbose_log "resetting baseline for $now_date at $RESET_TIME (was $(shell_quote "$CHECK_LOWEST_PRICE"))"
+    CHECK_LOWEST_PRICE=""
+    LAST_RESET_DATE=$now_date
+  fi
+}
+
 compute_sleep() {
   local max_sleep=$1
   local now_epoch=$2
@@ -610,6 +643,14 @@ compute_sleep() {
     fi
   fi
 
+  local reset_in
+  if [[ "$LAST_RESET_DATE" != "$now_date" ]] && ((now_minutes < RESET_MINUTES)); then
+    reset_in=$(( (RESET_MINUTES - now_minutes) * 60 - 10#$now_sec ))
+    if ((reset_in > 0 && reset_in < sleep)); then
+      sleep=$reset_in
+    fi
+  fi
+
   if ((sleep < 1)); then
     sleep=1
   fi
@@ -624,6 +665,7 @@ main_loop() {
   while true; do
     local now_epoch
     now_epoch=$(date +%s)
+    maybe_reset_baseline
     if ((LAST_CHECK_EPOCH == 0 || now_epoch - LAST_CHECK_EPOCH >= CHECK_MINUTES * 60)); then
       run_check_once
       LAST_CHECK_EPOCH=$(date +%s)
