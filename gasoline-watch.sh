@@ -443,17 +443,19 @@ expand_scalar_placeholders() {
     result=${result//\{\{count\}\}/$#}
   fi
 
-  for key in "${PLACEHOLDERS[@]}"; do
-    if [[ "$result" == *"{{cheapest_${key}}}"* ]]; then
-      if [[ -n "$first_row" ]]; then
-        value=$(row_value "$kind" "$first_row" "$key")
-      else
-        value=""
+  if [[ "$result" == *"{{cheapest_"* ]]; then
+    for key in "${PLACEHOLDERS[@]}"; do
+      if [[ "$result" == *"{{cheapest_${key}}}"* ]]; then
+        if [[ -n "$first_row" ]]; then
+          value=$(row_value "$kind" "$first_row" "$key")
+        else
+          value=""
+        fi
+        quoted=$(shell_quote "$value")
+        result=${result//\{\{cheapest_${key}\}\}/$quoted}
       fi
-      quoted=$(shell_quote "$value")
-      result=${result//\{\{cheapest_${key}\}\}/$quoted}
-    fi
-  done
+    done
+  fi
 
   printf '%s' "$result"
 }
