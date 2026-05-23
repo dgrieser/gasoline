@@ -142,11 +142,14 @@ Run continuous buy/suggestion notifications:
   --predict-days 3 \
   --check-minutes 15 \
   --suggest-time 07:30 \
+  --reset-time 00:00 \
   --check-command 'notify --message {{message}}' \
   --suggest-command 'notify --message {{message}}'
 ```
 
 The watcher runs `gasoline check` every `--check-minutes` and `gasoline suggest` once per local day after `--suggest-time`. It sends only medium/high-confidence rows: check notifications require `recommendation=buy`; suggestion notifications include all medium/high-confidence suggestions. Command templates can use `{{message}}` for the full multiline message or row placeholders such as `{{price}}`, `{{fuel}}`, `{{station_name}}`, `{{distance}}`, `{{confidence}}`, `{{date}}`, `{{start_time}}`, and `{{end_time}}`.
+
+Check notifications track a single global lowest reported price for the configured fuel. A new check notification only fires for stations whose current price is strictly cheaper than that running baseline, and the baseline drops to the new minimum after each notification. `--reset-time HH:MM` (default `00:00`) clears the baseline once per local day, so the next check after the reset re-establishes the day's cheapest-price baseline.
 
 An example systemd user service is available at `examples/systemd/gasoline-watch.service`. Copy or symlink it to `~/.config/systemd/user/`, adjust the paths and command templates, then enable it with:
 
