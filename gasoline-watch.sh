@@ -561,7 +561,7 @@ send_changed_check_rows() {
   local json=$1
   local rows=()
 
-  mapfile -t rows < <(printf '%s' "$json" | jq -c 'if type == "array" then sort_by(.current_price) else [] end | .[] | select(.recommendation == "buy" and (.confidence == "medium" or .confidence == "high"))')
+  mapfile -t rows < <(printf '%s' "$json" | jq -c 'if type == "array" then map(select(.recommendation == "buy" and (.confidence == "medium" or .confidence == "high"))) | sort_by(.current_price) | .[] else empty end')
   if ((${#rows[@]} == 0)); then
     verbose_log "no matching check rows"
     return 0
