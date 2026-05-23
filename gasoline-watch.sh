@@ -86,6 +86,18 @@ If {{message}} is omitted, the script treats everything from the first row
 placeholder onward as the per-result message format, for example:
 
   --check-command 'notify --message {{price}} {{fuel}} {{station_name}} {{distance}}'
+
+Rows are sorted ascending by price, so the first row is the cheapest. Use
+{{cheapest_<field>}} (e.g. {{cheapest_price}}, {{cheapest_station_name}})
+to interpolate a single scalar from the cheapest row, and {{count}} for the
+number of rows in the notification. These are substituted once and are
+useful for non-repeating titles, for example:
+
+  --check-command 'pushover gasoline "Cheapest {{cheapest_price}} EUR ({{count}} stations)" {{message}}'
+
+Like every other placeholder, scalar values are shell-quoted on substitution,
+so keep placeholders at argument boundaries rather than wrapping them in
+extra quotes when the value may contain whitespace.
 EOF
 }
 
@@ -415,13 +427,47 @@ build_value_lines() {
   printf '%s' "$lines"
 }
 
+expand_scalar_placeholders() {
+  local template=$1
+  local kind=$2
+  shift 2
+
+  local result=$template
+  local first_row="" key value quoted
+
+  if (($# > 0)); then
+    first_row=$1
+  fi
+
+  if [[ "$result" == *"{{count}}"* ]]; then
+    result=${result//\{\{count\}\}/$#}
+  fi
+
+  if [[ "$result" == *"{{cheapest_"* ]]; then
+    for key in "${PLACEHOLDERS[@]}"; do
+      if [[ "$result" == *"{{cheapest_${key}}}"* ]]; then
+        if [[ -n "$first_row" ]]; then
+          value=$(row_value "$kind" "$first_row" "$key")
+        else
+          value=""
+        fi
+        quoted=$(shell_quote "$value")
+        result=${result//\{\{cheapest_${key}\}\}/$quoted}
+      fi
+    done
+  fi
+
+  printf '%s' "$result"
+}
+
 build_notification_command() {
   local template=$1
   local kind=$2
   local message=$3
   shift 3
 
-  local command=$template
+  local command
+  command=$(expand_scalar_placeholders "$template" "$kind" "$@")
   local quoted key values prefix row_template
 
   if [[ "$command" == *"{{message}}"* ]]; then
@@ -515,7 +561,7 @@ send_changed_check_rows() {
   local json=$1
   local rows=()
 
-  mapfile -t rows < <(printf '%s' "$json" | jq -c 'if type == "array" then .[] else empty end | select(.recommendation == "buy" and (.confidence == "medium" or .confidence == "high"))')
+  mapfile -t rows < <(printf '%s' "$json" | jq -c 'if type == "array" then map(select(.recommendation == "buy" and (.confidence == "medium" or .confidence == "high"))) | sort_by(.current_price) | .[] else empty end')
   if ((${#rows[@]} == 0)); then
     verbose_log "no matching check rows"
     return 0
@@ -580,7 +626,7 @@ run_suggest_once() {
     suggest \
     "$SUGGEST_COMMAND" \
     "$output" \
-    'if type == "array" then .[] else empty end | select(.confidence == "medium" or .confidence == "high")' \
+    'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | sort_by(.predicted_price) | .[] else empty end' \
     "$SUGGEST_ROW_TEMPLATE"
 }
 
