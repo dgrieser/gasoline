@@ -396,6 +396,54 @@ test_verbose_logs_parameters_and_actions() {
   assert_contains "$output" 'running check notification:' "verbose notification"
 }
 
+test_check_formatted_placeholders() {
+  configure_defaults
+  write_check_json
+
+  local mutated_json
+  mutated_json=$TEST_DIR/check.formatted.json
+  jq 'map(
+        if .station_id == "station-2" then .current_price = 1.685
+        else . end
+      )' "$CHECK_JSON_FILE" >"$mutated_json"
+  mv "$mutated_json" "$CHECK_JSON_FILE"
+
+  CHECK_COMMAND="$FAKE_NOTIFY --title cheap_{{cheapest_price_formatted}}_{{cheapest_fuel_formatted}} --message {{current_price_formatted}}|{{price_formatted}}|{{predicted_current_price_formatted}}|{{fuel_formatted}}|{{station_name}}"
+
+  run_check_once
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+
+  assert_contains "$output" 'ARG2=cheap_1.68_Diesel' "cheapest formatted placeholders"
+  assert_contains "$output" '1.68|1.68|1.79|Diesel|Station 2' "truncated formatted row (1.685 -> 1.68)"
+  assert_contains "$output" '1.70|1.70|1.80|Diesel|Station 1' "padded formatted row (1.7 -> 1.70)"
+}
+
+test_suggest_formatted_placeholders() {
+  configure_defaults
+  write_suggest_json
+
+  local mutated_json
+  mutated_json=$TEST_DIR/suggest.formatted.json
+  jq 'map(
+        if .station_id == "station-2" then .predicted_price = 1.629
+        else . end
+      )' "$SUGGEST_JSON_FILE" >"$mutated_json"
+  mv "$mutated_json" "$SUGGEST_JSON_FILE"
+
+  SUGGEST_COMMAND="$FAKE_NOTIFY --title cheap_{{cheapest_price_formatted}}_{{cheapest_fuel_formatted}} --message {{predicted_price_formatted}}|{{price_formatted}}|{{fuel_formatted}}|{{station_name}}"
+
+  run_suggest_once
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+
+  assert_contains "$output" 'ARG2=cheap_1.62_Diesel' "suggest cheapest formatted placeholders"
+  assert_contains "$output" '1.62|1.62|Diesel|Station 2' "suggest truncated (1.629 -> 1.62)"
+  assert_contains "$output" '1.66|1.66|Diesel|Station 1' "suggest padded (1.66 -> 1.66)"
+}
+
 test_compute_sleep() {
   configure_defaults
   CHECK_MINUTES=10
@@ -444,5 +492,7 @@ test_check_reset_releases_baseline
 test_suggest_filters_and_batches_results
 test_invalid_json_does_not_notify
 test_verbose_logs_parameters_and_actions
+test_check_formatted_placeholders
+test_suggest_formatted_placeholders
 
 printf 'gasoline-watch_test: ok\n'

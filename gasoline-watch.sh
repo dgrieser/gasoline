@@ -8,11 +8,13 @@ PLACEHOLDERS=(
   best_future_date
   best_future_end_time
   best_future_price
+  best_future_price_formatted
   best_future_start_time
   best_future_weekday
   brand
   confidence
   current_price
+  current_price_formatted
   date
   distance
   distance_km
@@ -21,6 +23,7 @@ PLACEHOLDERS=(
   expected_lower
   first_seen_at
   fuel
+  fuel_formatted
   history_percentile
   house_number
   lat
@@ -28,8 +31,11 @@ PLACEHOLDERS=(
   place
   post_code
   predicted_current_price
+  predicted_current_price_formatted
   predicted_price
+  predicted_price_formatted
   price
+  price_formatted
   recommendation
   recorded_at
   sample_count
@@ -300,6 +306,45 @@ number_value() {
   fi
 }
 
+# String-based to avoid FP pitfalls (e.g. 1.7 * 100 = 169.999... truncating to 1.69).
+truncate_number_value() {
+  local row=$1
+  local expr=$2
+  local decimals=$3
+  local value
+
+  value=$(jq_value "$row" "$expr")
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+  if [[ "$value" =~ ^(-?[0-9]+)([.]([0-9]+))?$ ]]; then
+    local int_part=${BASH_REMATCH[1]}
+    local frac_part=${BASH_REMATCH[3]:-}
+    if ((${#frac_part} > decimals)); then
+      frac_part=${frac_part:0:decimals}
+    else
+      while ((${#frac_part} < decimals)); do
+        frac_part+="0"
+      done
+    fi
+    if ((decimals > 0)); then
+      printf '%s.%s' "$int_part" "$frac_part"
+    else
+      printf '%s' "$int_part"
+    fi
+  else
+    printf '%s' "$value"
+  fi
+}
+
+capitalize_first() {
+  local s=$1
+  if [[ -z "$s" ]]; then
+    return 0
+  fi
+  printf '%s' "${s^}"
+}
+
 row_value() {
   local kind=$1
   local row=$2
@@ -310,11 +355,13 @@ row_value() {
     best_future_date) jq_value "$row" '.best_future_date // ""' ;;
     best_future_end_time) jq_value "$row" '.best_future_end_time // ""' ;;
     best_future_price) number_value "$row" '.best_future_price // ""' 3 ;;
+    best_future_price_formatted) truncate_number_value "$row" '.best_future_price // ""' 2 ;;
     best_future_start_time) jq_value "$row" '.best_future_start_time // ""' ;;
     best_future_weekday) jq_value "$row" '.best_future_weekday // ""' ;;
     brand) jq_value "$row" '.station.brand // .brand // ""' ;;
     confidence) jq_value "$row" '.confidence // ""' ;;
     current_price) number_value "$row" '.current_price // ""' 3 ;;
+    current_price_formatted) truncate_number_value "$row" '.current_price // ""' 2 ;;
     date)
       if [[ "$kind" == check ]]; then
         jq_value "$row" '.best_future_date // .recorded_at // ""'
@@ -334,6 +381,7 @@ row_value() {
     expected_lower) jq_value "$row" '.expected_lower // ""' ;;
     first_seen_at) jq_value "$row" '.station.first_seen_at // ""' ;;
     fuel) jq_value "$row" '.fuel // ""' ;;
+    fuel_formatted) capitalize_first "$(jq_value "$row" '.fuel // ""')" ;;
     history_percentile) number_value "$row" '.history_percentile // ""' 1 ;;
     house_number) jq_value "$row" '.station.house_number // ""' ;;
     lat) number_value "$row" '.station.lat // ""' 6 ;;
@@ -341,12 +389,21 @@ row_value() {
     place) jq_value "$row" '.station.place // ""' ;;
     post_code) jq_value "$row" '.station.post_code // ""' ;;
     predicted_current_price) number_value "$row" '.predicted_current_price // ""' 3 ;;
+    predicted_current_price_formatted) truncate_number_value "$row" '.predicted_current_price // ""' 2 ;;
     predicted_price) number_value "$row" '.predicted_price // .predicted_current_price // ""' 3 ;;
+    predicted_price_formatted) truncate_number_value "$row" '.predicted_price // .predicted_current_price // ""' 2 ;;
     price)
       if [[ "$kind" == check ]]; then
         number_value "$row" '.current_price // ""' 3
       else
         number_value "$row" '.predicted_price // ""' 3
+      fi
+      ;;
+    price_formatted)
+      if [[ "$kind" == check ]]; then
+        truncate_number_value "$row" '.current_price // ""' 2
+      else
+        truncate_number_value "$row" '.predicted_price // ""' 2
       fi
       ;;
     recommendation) jq_value "$row" '.recommendation // ""' ;;
