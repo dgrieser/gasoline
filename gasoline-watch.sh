@@ -306,16 +306,33 @@ number_value() {
   fi
 }
 
-# Pulled from the active LC_ALL/LC_NUMERIC/LANG via `locale -k`. Falls back to "."
-# when locale lookup fails (e.g. the requested locale is not installed).
-locale_decimal_separator() {
-  local sep
-  sep=$(locale -k decimal_point 2>/dev/null | sed -n 's/^decimal_point="\(.*\)"$/\1/p')
-  if [[ -z "$sep" ]]; then
-    sep="."
+# Resolved once from the active LC_ALL/LC_NUMERIC/LANG via `locale -k` and
+# cached in LOCALE_DECIMAL_SEP — spawning `locale` per row was noticeable on
+# large result sets, and parsing with bash's built-in =~ avoids forking sed.
+# Tests can reset the cache by setting LOCALE_DECIMAL_SEP="" before invoking.
+# Falls back to "." when locale lookup fails.
+LOCALE_DECIMAL_SEP=""
+_compute_locale_decimal_separator() {
+  local output sep="."
+  output=$(locale -k decimal_point 2>/dev/null) || output=""
+  local pattern='decimal_point="([^"]*)"'
+  if [[ "$output" =~ $pattern ]] && [[ -n "${BASH_REMATCH[1]}" ]]; then
+    sep=${BASH_REMATCH[1]}
   fi
-  printf '%s' "$sep"
+  LOCALE_DECIMAL_SEP=$sep
 }
+
+locale_decimal_separator() {
+  if [[ -z "$LOCALE_DECIMAL_SEP" ]]; then
+    _compute_locale_decimal_separator
+  fi
+  printf '%s' "$LOCALE_DECIMAL_SEP"
+}
+
+# Resolve at script load so per-row callers (truncate_number_value runs inside
+# row_value's command substitution) inherit the cached value instead of each
+# subshell re-running `locale`.
+_compute_locale_decimal_separator
 
 # String-based to avoid FP pitfalls (e.g. 1.7 * 100 = 169.999... truncating to 1.69).
 truncate_number_value() {
