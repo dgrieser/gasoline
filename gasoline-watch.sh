@@ -315,7 +315,8 @@ LOCALE_DECIMAL_SEP=""
 _compute_locale_decimal_separator() {
   local output sep="."
   output=$(locale -k decimal_point 2>/dev/null) || output=""
-  if [[ "$output" =~ decimal_point=\"([^\"]*)\" ]] && [[ -n "${BASH_REMATCH[1]}" ]]; then
+  local pattern='decimal_point="([^"]*)"'
+  if [[ "$output" =~ $pattern ]] && [[ -n "${BASH_REMATCH[1]}" ]]; then
     sep=${BASH_REMATCH[1]}
   fi
   LOCALE_DECIMAL_SEP=$sep
