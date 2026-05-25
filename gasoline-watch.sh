@@ -306,6 +306,17 @@ number_value() {
   fi
 }
 
+# Pulled from the active LC_ALL/LC_NUMERIC/LANG via `locale -k`. Falls back to "."
+# when locale lookup fails (e.g. the requested locale is not installed).
+locale_decimal_separator() {
+  local sep
+  sep=$(locale -k decimal_point 2>/dev/null | sed -n 's/^decimal_point="\(.*\)"$/\1/p')
+  if [[ -z "$sep" ]]; then
+    sep="."
+  fi
+  printf '%s' "$sep"
+}
+
 # String-based to avoid FP pitfalls (e.g. 1.7 * 100 = 169.999... truncating to 1.69).
 truncate_number_value() {
   local row=$1
@@ -328,7 +339,7 @@ truncate_number_value() {
       done
     fi
     if ((decimals > 0)); then
-      printf '%s.%s' "$int_part" "$frac_part"
+      printf '%s%s%s' "$int_part" "$(locale_decimal_separator)" "$frac_part"
     else
       printf '%s' "$int_part"
     fi

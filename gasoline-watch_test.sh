@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+# Pin numeric locale so the `_formatted` price assertions stay deterministic
+# regardless of the developer's LANG. Per-test cases may override this to
+# exercise locale-specific behavior.
+export LC_ALL=C
+export LANG=C
+export LC_NUMERIC=C
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/gasoline-watch.sh"
 
@@ -444,6 +451,46 @@ test_suggest_formatted_placeholders() {
   assert_contains "$output" '1.66|1.66|Diesel|Station 1' "suggest padded (1.66 -> 1.66)"
 }
 
+test_formatted_uses_locale_decimal_separator() {
+  configure_defaults
+  write_check_json
+
+  local mutated_json
+  mutated_json=$TEST_DIR/check.locale.json
+  jq 'map(
+        if .station_id == "station-2" then .current_price = 1.685
+        else . end
+      )' "$CHECK_JSON_FILE" >"$mutated_json"
+  mv "$mutated_json" "$CHECK_JSON_FILE"
+
+  # Stub `locale -k decimal_point` so the test does not depend on a German
+  # locale actually being installed on the host. The stub is shadowed via PATH.
+  local stub_dir=$TEST_DIR/locale_stub
+  mkdir -p "$stub_dir"
+  cat >"$stub_dir/locale" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "-k" && "$2" == "decimal_point" ]]; then
+  printf 'decimal_point=","\n'
+  exit 0
+fi
+exec /usr/bin/env -i PATH="/usr/bin:/bin" locale "$@"
+EOF
+  chmod +x "$stub_dir/locale"
+
+  CHECK_COMMAND="$FAKE_NOTIFY --message {{current_price_formatted}}|{{predicted_current_price_formatted}}|{{station_name}}"
+
+  local saved_path=$PATH
+  PATH="$stub_dir:$PATH"
+  run_check_once
+  PATH=$saved_path
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+
+  assert_contains "$output" '1,68|1,79|Station 2' "locale decimal sep (1.685 -> 1,68)"
+  assert_contains "$output" '1,70|1,80|Station 1' "locale decimal sep (1.7 -> 1,70)"
+}
+
 test_compute_sleep() {
   configure_defaults
   CHECK_MINUTES=10
@@ -494,5 +541,6 @@ test_invalid_json_does_not_notify
 test_verbose_logs_parameters_and_actions
 test_check_formatted_placeholders
 test_suggest_formatted_placeholders
+test_formatted_uses_locale_decimal_separator
 
 printf 'gasoline-watch_test: ok\n'
