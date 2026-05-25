@@ -479,10 +479,12 @@ EOF
 
   CHECK_COMMAND="$FAKE_NOTIFY --message {{current_price_formatted}}|{{predicted_current_price_formatted}}|{{station_name}}"
 
-  local saved_path=$PATH
+  local saved_path=$PATH saved_sep=$LOCALE_DECIMAL_SEP
+  LOCALE_DECIMAL_SEP=""
   PATH="$stub_dir:$PATH"
   run_check_once
   PATH=$saved_path
+  LOCALE_DECIMAL_SEP=$saved_sep
 
   local output
   output=$(<"$NOTIFY_OUT")
