@@ -493,6 +493,44 @@ EOF
   assert_contains "$output" '1,70|1,80|Station 1' "locale decimal sep (1.7 -> 1,70)"
 }
 
+# Repros the reported bug: a comma-formatted scalar placeholder sitting
+# inside a user-supplied "..." title was rendering as 1\,88 because
+# `printf '%q'` backslash-escapes the comma and the backslash survives
+# inside double quotes.
+test_locale_scalar_inside_quoted_title() {
+  configure_defaults
+  write_check_json
+
+  local stub_dir=$TEST_DIR/locale_stub_scalar
+  mkdir -p "$stub_dir"
+  cat >"$stub_dir/locale" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "-k" && "$2" == "decimal_point" ]]; then
+  printf 'decimal_point=","\n'
+  exit 0
+fi
+exec /usr/bin/env -i PATH="/usr/bin:/bin" locale "$@"
+EOF
+  chmod +x "$stub_dir/locale"
+
+  CHECK_COMMAND="$FAKE_NOTIFY \"Tanken für {{cheapest_price_formatted}}\" {{current_price_formatted}} EUR {{fuel_formatted}}"
+
+  local saved_path=$PATH saved_sep=$LOCALE_DECIMAL_SEP
+  LOCALE_DECIMAL_SEP=""
+  PATH="$stub_dir:$PATH"
+  run_check_once
+  PATH=$saved_path
+  LOCALE_DECIMAL_SEP=$saved_sep
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+
+  assert_contains "$output" 'ARG1=Tanken für 1,68' "scalar in quoted title keeps literal comma"
+  assert_not_contains "$output" 'Tanken für 1\,68' "no backslash escape leaking into title"
+  assert_contains "$output" '1,68 EUR Diesel' "row placeholder keeps literal comma (row 1)"
+  assert_contains "$output" '1,70 EUR Diesel' "row placeholder keeps literal comma (row 2)"
+}
+
 test_compute_sleep() {
   configure_defaults
   CHECK_MINUTES=10
@@ -544,5 +582,6 @@ test_verbose_logs_parameters_and_actions
 test_check_formatted_placeholders
 test_suggest_formatted_placeholders
 test_formatted_uses_locale_decimal_separator
+test_locale_scalar_inside_quoted_title
 
 printf 'gasoline-watch_test: ok\n'
