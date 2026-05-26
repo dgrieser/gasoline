@@ -266,7 +266,7 @@ log_config() {
 }
 
 shell_quote() {
-  local s=$1
+  local s=${1-}
   if [[ -z "$s" ]]; then
     printf "''"
     return 0
