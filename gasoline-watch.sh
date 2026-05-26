@@ -266,7 +266,23 @@ log_config() {
 }
 
 shell_quote() {
-  printf '%q' "$1"
+  local s=${1-}
+  if [[ -z "$s" ]]; then
+    printf "''"
+    return 0
+  fi
+  # Pass through unquoted when every byte is shell-inert. Avoids bash's
+  # `printf '%q'` escaping locale-printable bytes like the German decimal
+  # comma (1,88 -> 1\,88) — the backslash survived inside user templates that
+  # wrap a placeholder in double quotes, leaking as a literal "1\,88".
+  if [[ "$s" != *[!A-Za-z0-9._,/:+=@%-]* ]]; then
+    printf '%s' "$s"
+    return 0
+  fi
+  # Otherwise single-quote, splicing in any embedded single quotes the
+  # POSIX-portable way ('  ->  '\''  ).
+  local escaped=${s//\'/\'\\\'\'}
+  printf "'%s'" "$escaped"
 }
 
 contains_row_placeholder() {
