@@ -131,6 +131,13 @@ gasoline check --city "Berlin" --range-km 10 --fuel diesel --history-days 21 --p
 
 The check command uses the same historical model as `suggest`, compares each open station's latest stored price with recent station history, and scans the coming forecast window for a lower expected price. It prints the station, current price, low/typical/high verdict, buy/wait/hold recommendation, confidence, and best lower future window when one is expected. Run `gasoline update` first when you need fresh current prices.
 
+Set a persistent display-name override for a station — useful when the Tankerkönig name is uninformative. Subsequent `update` runs keep the canonical name in sync but never touch the override, and every output path (CLI, JSON, PHP viewer, watcher notifications) prefers the override when set:
+
+```bash
+gasoline rename 474e5046-deaf-4f9b-9a32-9797b778f047 "Pumpe Ecke Bäckerstraße"
+gasoline rename --clear 474e5046-deaf-4f9b-9a32-9797b778f047
+```
+
 Run continuous buy/suggestion notifications:
 
 ```bash
