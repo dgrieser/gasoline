@@ -121,6 +121,13 @@ type clearCitiesResult struct {
 	DBPath       string `json:"db_path"`
 }
 
+type renameResult struct {
+	StationID string `json:"station_id"`
+	Previous  string `json:"previous"`
+	New       string `json:"new"`
+	Cleared   bool   `json:"cleared"`
+}
+
 type cityRow struct {
 	Name        string  `json:"name"`
 	DisplayName string  `json:"display_name"`
@@ -335,6 +342,8 @@ func run(args []string) error {
 		return runSuggest(args[1:])
 	case "check":
 		return runCheck(args[1:])
+	case "rename":
+		return runRename(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -355,6 +364,7 @@ Commands:
   list history  show historical prices
   suggest       predict cheap fueling windows by day and time
   check         check if latest stored prices are currently low
+  rename        set a persistent display-name override for a station
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
 
@@ -367,6 +377,8 @@ Examples:
   gasoline list history --fuel diesel
   gasoline suggest --city "Berlin" --range-km 10 --fuel diesel
   gasoline check --city "Berlin" --range-km 10 --fuel diesel
+  gasoline rename <station-id> "Custom Name"
+  gasoline rename --clear <station-id>
   gasoline import cities DE
   gasoline clear cities`)
 }
@@ -786,7 +798,7 @@ func runStations(args []string) error {
 	if strings.TrimSpace(*city) == "" {
 		rows, err = db.QueryContext(ctx, `
 			SELECT
-				s.id, s.name, COALESCE(s.brand, ''), COALESCE(s.street, ''), COALESCE(s.place, ''),
+				s.id, COALESCE(s.name_override, s.name), COALESCE(s.brand, ''), COALESCE(s.street, ''), COALESCE(s.place, ''),
 				ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
 			FROM stations s
 			JOIN (
@@ -797,13 +809,13 @@ func runStations(args []string) error {
 			JOIN price_snapshots ps
 				ON ps.station_id = latest.station_id
 				AND ps.recorded_at = latest.latest_recorded_at
-			ORDER BY s.name ASC
+			ORDER BY COALESCE(s.name_override, s.name) ASC
 			LIMIT ?
 		`, sqliteLimit(*limit))
 	} else {
 		rows, err = db.QueryContext(ctx, `
 			SELECT
-				s.id, s.name, COALESCE(s.brand, ''), COALESCE(s.street, ''), COALESCE(s.place, ''),
+				s.id, COALESCE(s.name_override, s.name), COALESCE(s.brand, ''), COALESCE(s.street, ''), COALESCE(s.place, ''),
 				ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
 			FROM stations s
 			JOIN (
@@ -815,7 +827,7 @@ func runStations(args []string) error {
 			JOIN price_snapshots ps
 				ON ps.station_id = latest.station_id
 				AND ps.recorded_at = latest.latest_recorded_at
-			ORDER BY s.name ASC
+			ORDER BY COALESCE(s.name_override, s.name) ASC
 			LIMIT ?
 		`, strings.TrimSpace(*city), sqliteLimit(*limit))
 	}
@@ -908,7 +920,7 @@ func runHistory(args []string) error {
 	var rows *sql.Rows
 	if stationFilter == "" {
 		rows, err = db.QueryContext(ctx, `
-			SELECT ps.station_id, s.name, ps.city_name, ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
+			SELECT ps.station_id, COALESCE(s.name_override, s.name), ps.city_name, ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
 			FROM price_snapshots ps
 			JOIN stations s ON s.id = ps.station_id
 			ORDER BY ps.recorded_at DESC
@@ -916,7 +928,7 @@ func runHistory(args []string) error {
 		`, sqliteLimit(*limit))
 	} else {
 		rows, err = db.QueryContext(ctx, `
-			SELECT ps.station_id, s.name, ps.city_name, ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
+			SELECT ps.station_id, COALESCE(s.name_override, s.name), ps.city_name, ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
 			FROM price_snapshots ps
 			JOIN stations s ON s.id = ps.station_id
 			WHERE ps.station_id = ?
@@ -1094,6 +1106,107 @@ func runCheck(args []string) error {
 	return nil
 }
 
+func runRename(args []string) error {
+	fs := flag.NewFlagSet("rename", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	clear := fs.Bool("clear", false, "Remove the name override (revert to the Tankerkönig name)")
+	outputLong, outputShort := addOutputFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	output, err := resolveOutputMode(*outputLong, *outputShort)
+	if err != nil {
+		return err
+	}
+
+	rest := fs.Args()
+	var stationID, newName string
+	if *clear {
+		if len(rest) != 1 {
+			return errors.New("rename --clear requires exactly one positional argument: <station-id>")
+		}
+		stationID = strings.TrimSpace(rest[0])
+	} else {
+		if len(rest) != 2 {
+			return errors.New("rename requires two positional arguments: <station-id> <new-name>")
+		}
+		stationID = strings.TrimSpace(rest[0])
+		newName = strings.TrimSpace(rest[1])
+		if newName == "" {
+			return errors.New("new name must not be empty; use --clear to remove an override")
+		}
+	}
+	if stationID == "" {
+		return errors.New("station id must not be empty")
+	}
+
+	db, err := openDB(resolvedDBPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := initSchema(ctx, db); err != nil {
+		return err
+	}
+
+	var (
+		canonicalName   string
+		currentOverride sql.NullString
+	)
+	if err := db.QueryRowContext(ctx, `SELECT name, name_override FROM stations WHERE id = ?`, stationID).Scan(&canonicalName, &currentOverride); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("station %q not found", stationID)
+		}
+		return err
+	}
+
+	previousEffective := canonicalName
+	if currentOverride.Valid {
+		previousEffective = currentOverride.String
+	}
+
+	var (
+		exec         sql.Result
+		newEffective string
+	)
+	if *clear {
+		exec, err = db.ExecContext(ctx, `UPDATE stations SET name_override = NULL WHERE id = ?`, stationID)
+		newEffective = canonicalName
+	} else {
+		exec, err = db.ExecContext(ctx, `UPDATE stations SET name_override = ? WHERE id = ?`, newName, stationID)
+		newEffective = newName
+	}
+	if err != nil {
+		return err
+	}
+	affected, err := exec.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("station %q not found", stationID)
+	}
+
+	result := renameResult{
+		StationID: stationID,
+		Previous:  previousEffective,
+		New:       newEffective,
+		Cleared:   *clear,
+	}
+	if output == outputJSON {
+		return writeJSON(result)
+	}
+	if *clear {
+		fmt.Fprintf(stdout, "cleared override for %s: %q → %q\n", stationID, previousEffective, newEffective)
+	} else {
+		fmt.Fprintf(stdout, "renamed %s: %q → %q\n", stationID, previousEffective, newEffective)
+	}
+	return nil
+}
+
 func validateSuggestOptions(opts suggestOptions) error {
 	if strings.TrimSpace(opts.City) == "" {
 		return errors.New("suggest requires --city")
@@ -1239,7 +1352,7 @@ func loadSuggestSnapshots(ctx context.Context, db *sql.DB, city cachedCity, fuel
 	query := fmt.Sprintf(`
 		SELECT
 			s.id,
-			s.name,
+			COALESCE(s.name_override, s.name),
 			COALESCE(s.brand, ''),
 			COALESCE(s.street, ''),
 			COALESCE(s.house_number, ''),
@@ -1986,6 +2099,7 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS stations (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
+		name_override TEXT,
 		brand TEXT,
 		street TEXT,
 		house_number TEXT,
@@ -2043,11 +2157,29 @@ func migrateSchema(ctx context.Context, db *sql.DB) (migrateResult, error) {
 	if err := migratePriceSnapshotsDropDistKM(ctx, tx, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateStationsNameOverride(ctx, tx, &result); err != nil {
+		return migrateResult{}, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return migrateResult{}, err
 	}
 	return result, nil
+}
+
+func migrateStationsNameOverride(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, "stations", "name_override")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE stations ADD COLUMN name_override TEXT`); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "stations.name_override")
+	return nil
 }
 
 func migrateCitiesNormalizedName(ctx context.Context, tx *sql.Tx, result *migrateResult) error {

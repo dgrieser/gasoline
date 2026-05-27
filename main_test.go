@@ -1304,6 +1304,9 @@ func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 	if !containsString(result.Applied, "price_snapshots.dist_km") {
 		t.Fatalf("applied migrations = %v, want price_snapshots.dist_km", result.Applied)
 	}
+	if !containsString(result.Applied, "stations.name_override") {
+		t.Fatalf("applied migrations = %v, want stations.name_override", result.Applied)
+	}
 
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -1327,6 +1330,14 @@ func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 	}
 	if hasDistKM {
 		t.Fatal("expected price_snapshots.dist_km to be removed")
+	}
+
+	hasNameOverride, err := tableHasColumn(ctx, db, "stations", "name_override")
+	if err != nil {
+		t.Fatalf("tableHasColumn stations.name_override: %v", err)
+	}
+	if !hasNameOverride {
+		t.Fatal("expected stations.name_override after migration")
 	}
 
 	var normalizedName string
@@ -1432,6 +1443,159 @@ func TestRunMigrateDeduplicatesCitiesByNormalizedName(t *testing.T) {
 	}
 	if displayName != "Lübbecke" {
 		t.Fatalf("display_name = %q", displayName)
+	}
+}
+
+func TestPersistUpdatePreservesNameOverride(t *testing.T) {
+	t.Parallel()
+
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	city := cachedCity{
+		QueryName:   "Berlin, Germany",
+		Name:        "Berlin",
+		DisplayName: "Berlin",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	}
+	diesel := 1.659
+	stations := []tankerStation{{
+		ID:     "station-1",
+		Name:   "Original Name",
+		Brand:  "ARAL",
+		Lat:    52.5,
+		Lng:    13.4,
+		Diesel: &diesel,
+		IsOpen: true,
+	}}
+	if err := persistUpdate(ctx, db, city, stations, time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC), 5); err != nil {
+		t.Fatalf("persistUpdate first: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `UPDATE stations SET name_override = ? WHERE id = ?`, "My Favourite", "station-1"); err != nil {
+		t.Fatalf("set override: %v", err)
+	}
+
+	stations[0].Name = "Upstream Renamed"
+	if err := persistUpdate(ctx, db, city, stations, time.Date(2026, 4, 2, 10, 15, 0, 0, time.UTC), 5); err != nil {
+		t.Fatalf("persistUpdate second: %v", err)
+	}
+
+	var canonical string
+	var override sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT name, name_override FROM stations WHERE id = ?`, "station-1").Scan(&canonical, &override); err != nil {
+		t.Fatalf("query station: %v", err)
+	}
+	if canonical != "Upstream Renamed" {
+		t.Fatalf("canonical name = %q, want %q", canonical, "Upstream Renamed")
+	}
+	if !override.Valid || override.String != "My Favourite" {
+		t.Fatalf("name_override = %+v, want %q", override, "My Favourite")
+	}
+}
+
+func TestRunListStationsPrefersNameOverride(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `UPDATE stations SET name_override = ? WHERE id = ?`, "Custom Display", "station-1"); err != nil {
+		t.Fatalf("set override: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"list", "stations", "--db", dbPath, "--output", "json"})
+	})
+
+	var stations []stationRow
+	if err := json.Unmarshal([]byte(output), &stations); err != nil {
+		t.Fatalf("unmarshal stations output: %v\noutput=%s", err, output)
+	}
+	if len(stations) != 1 {
+		t.Fatalf("len(stations) = %d, want 1", len(stations))
+	}
+	if stations[0].Name != "Custom Display" {
+		t.Fatalf("station name = %q, want %q", stations[0].Name, "Custom Display")
+	}
+}
+
+func TestRunRenameSetsAndClearsOverride(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+
+	output := captureStdout(t, func() error {
+		return run([]string{"rename", "--db", dbPath, "--output", "json", "station-1", "My Pump"})
+	})
+
+	var result renameResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal rename output: %v\noutput=%s", err, output)
+	}
+	if result.StationID != "station-1" || result.Previous != "Test Station" || result.New != "My Pump" || result.Cleared {
+		t.Fatalf("rename result = %+v", result)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	var override sql.NullString
+	if err := db.QueryRowContext(context.Background(), `SELECT name_override FROM stations WHERE id = ?`, "station-1").Scan(&override); err != nil {
+		t.Fatalf("query override: %v", err)
+	}
+	if !override.Valid || override.String != "My Pump" {
+		t.Fatalf("name_override = %+v, want %q", override, "My Pump")
+	}
+
+	clearOutput := captureStdout(t, func() error {
+		return run([]string{"rename", "--db", dbPath, "--output", "json", "--clear", "station-1"})
+	})
+	var clearResult renameResult
+	if err := json.Unmarshal([]byte(clearOutput), &clearResult); err != nil {
+		t.Fatalf("unmarshal clear output: %v\noutput=%s", err, clearOutput)
+	}
+	if clearResult.Previous != "My Pump" || clearResult.New != "Test Station" || !clearResult.Cleared {
+		t.Fatalf("clear result = %+v", clearResult)
+	}
+
+	if err := db.QueryRowContext(context.Background(), `SELECT name_override FROM stations WHERE id = ?`, "station-1").Scan(&override); err != nil {
+		t.Fatalf("query override after clear: %v", err)
+	}
+	if override.Valid {
+		t.Fatalf("expected NULL name_override after clear, got %q", override.String)
+	}
+}
+
+func TestRunRenameRejectsUnknownStation(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+
+	err := run([]string{"rename", "--db", dbPath, "missing-id", "Whatever"})
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("err = %v, want not-found error", err)
+	}
+}
+
+func TestRunRenameRejectsEmptyName(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+
+	err := run([]string{"rename", "--db", dbPath, "station-1", ""})
+	if err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("err = %v, want empty-name error", err)
+	}
+}
+
+func TestRunRenameClearRejectsExtraName(t *testing.T) {
+	dbPath := seedFixtureDB(t)
+
+	err := run([]string{"rename", "--db", dbPath, "--clear", "station-1", "Extra"})
+	if err == nil || !strings.Contains(err.Error(), "one positional") {
+		t.Fatalf("err = %v, want positional-arg error", err)
 	}
 }
 

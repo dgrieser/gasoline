@@ -155,7 +155,7 @@ if ($errors === []) {
                     <<<'SQL'
                     SELECT
                         s.id,
-                        s.name,
+                        COALESCE(s.name_override, s.name) AS name,
                         COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
                         TRIM(COALESCE(s.street, '')) AS street,
                         TRIM(COALESCE(s.house_number, '')) AS house_number,
@@ -206,14 +206,14 @@ if ($errors === []) {
                 <<<'SQL'
                 SELECT
                     s.id,
-                    s.name,
+                    COALESCE(s.name_override, s.name) AS name,
                     COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
                     TRIM(COALESCE(s.street, '')) AS street,
                     TRIM(COALESCE(s.house_number, '')) AS house_number,
                     TRIM(COALESCE(s.place, '')) AS place,
                     s.last_seen_at
                 FROM stations s
-                ORDER BY s.name ASC, s.id ASC
+                ORDER BY COALESCE(s.name_override, s.name) ASC, s.id ASC
                 SQL
             )->fetchAll();
         }
@@ -283,7 +283,7 @@ if ($errors === []) {
         $sql = <<<'SQL'
             SELECT
                 ps.station_id,
-                s.name AS station_name,
+                COALESCE(s.name_override, s.name) AS station_name,
                 COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
                 TRIM(COALESCE(s.street, '')) AS street,
                 TRIM(COALESCE(s.house_number, '')) AS house_number,
@@ -302,7 +302,7 @@ if ($errors === []) {
             $sql .= "\nWHERE " . implode("\n  AND ", $where);
         }
 
-        $sql .= "\nORDER BY ps.recorded_at ASC, s.name ASC";
+        $sql .= "\nORDER BY ps.recorded_at ASC, COALESCE(s.name_override, s.name) ASC";
 
         if ($errors === [] && $shouldRunRowQuery) {
             $statement = $pdo->prepare($sql);
