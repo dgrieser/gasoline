@@ -784,7 +784,7 @@ run_suggest_once() {
 
   verbose_log "suggest returned $(printf '%s' "$output" | jq 'length') row(s)"
   local cheapest_row
-  cheapest_row=$(printf '%s' "$output" | jq -c 'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | min_by(.predicted_price) // empty else empty end')
+  cheapest_row=$(printf '%s' "$output" | jq -c 'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | min_by(.predicted_price // .predicted_current_price) // empty else empty end')
   send_matching_rows \
     suggest \
     "$SUGGEST_COMMAND" \
