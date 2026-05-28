@@ -789,7 +789,7 @@ run_suggest_once() {
     suggest \
     "$SUGGEST_COMMAND" \
     "$output" \
-    'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | sort_by(.date, .start_time, .station_name) | .[] else empty end' \
+    'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | sort_by(.date, .start_time, (.station_name // .station.name)) | .[] else empty end' \
     "$SUGGEST_ROW_TEMPLATE" \
     "$cheapest_row"
 }
