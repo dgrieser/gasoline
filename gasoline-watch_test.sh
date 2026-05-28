@@ -531,6 +531,59 @@ EOF
   assert_contains "$output" '1,70 EUR Diesel' "row placeholder keeps literal comma (row 2)"
 }
 
+test_weekday_short_and_formatted_placeholders() {
+  configure_defaults
+  write_check_json
+  write_suggest_json
+
+  local mutated_json
+  mutated_json=$TEST_DIR/check.weekday.json
+  jq 'map(.best_future_weekday = "Tuesday")' "$CHECK_JSON_FILE" >"$mutated_json"
+  mv "$mutated_json" "$CHECK_JSON_FILE"
+
+  CHECK_COMMAND="$FAKE_NOTIFY --message {{weekday_short}}|{{weekday_formatted}}|{{weekday_short_formatted}}|{{best_future_weekday}}|{{best_future_weekday_short}}|{{best_future_weekday_formatted}}|{{best_future_weekday_short_formatted}}|{{station_name}}"
+  run_check_once
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+  assert_contains "$output" 'Tu|Tuesday|Tue|Tuesday|Tu|Tuesday|Tue|Station 1' "check weekday placeholders (Tuesday)"
+  assert_contains "$output" 'Tu|Tuesday|Tue|Tuesday|Tu|Tuesday|Tue|Station 2' "check weekday placeholders (Tuesday)"
+
+  : >"$NOTIFY_OUT"
+  SUGGEST_COMMAND="$FAKE_NOTIFY --message {{weekday_short}}|{{weekday_formatted}}|{{weekday_short_formatted}}|{{station_name}}"
+  run_suggest_once
+
+  output=$(<"$NOTIFY_OUT")
+  assert_contains "$output" 'Tu|Tuesday|Tue|Station 2' "suggest weekday placeholders (Tuesday)"
+  assert_contains "$output" 'Mo|Monday|Mon|Station 1' "suggest weekday placeholders (Monday)"
+}
+
+test_weekday_formatted_uses_locale() {
+  configure_defaults
+  write_suggest_json
+
+  SUGGEST_COMMAND="$FAKE_NOTIFY --message {{weekday_formatted}}|{{weekday_short_formatted}}|{{weekday_short}}|{{station_name}}"
+
+  local saved_mon_long=${LOCALE_WEEKDAY_LONG[Monday]:-}
+  local saved_mon_short=${LOCALE_WEEKDAY_SHORT[Monday]:-}
+  local saved_tue_long=${LOCALE_WEEKDAY_LONG[Tuesday]:-}
+  local saved_tue_short=${LOCALE_WEEKDAY_SHORT[Tuesday]:-}
+  LOCALE_WEEKDAY_LONG[Monday]=Montag
+  LOCALE_WEEKDAY_SHORT[Monday]=Mo
+  LOCALE_WEEKDAY_LONG[Tuesday]=Dienstag
+  LOCALE_WEEKDAY_SHORT[Tuesday]=Di
+  run_suggest_once
+  LOCALE_WEEKDAY_LONG[Monday]=$saved_mon_long
+  LOCALE_WEEKDAY_SHORT[Monday]=$saved_mon_short
+  LOCALE_WEEKDAY_LONG[Tuesday]=$saved_tue_long
+  LOCALE_WEEKDAY_SHORT[Tuesday]=$saved_tue_short
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+  assert_contains "$output" 'Montag|Mo|Mo|Station 1' "locale weekday (Monday -> Montag)"
+  assert_contains "$output" 'Dienstag|Di|Tu|Station 2' "locale weekday (Tuesday -> Dienstag); weekday_short stays English-derived"
+}
+
 test_compute_sleep() {
   configure_defaults
   CHECK_MINUTES=10
@@ -583,5 +636,7 @@ test_check_formatted_placeholders
 test_suggest_formatted_placeholders
 test_formatted_uses_locale_decimal_separator
 test_locale_scalar_inside_quoted_title
+test_weekday_short_and_formatted_placeholders
+test_weekday_formatted_uses_locale
 
 printf 'gasoline-watch_test: ok\n'

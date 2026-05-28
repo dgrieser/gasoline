@@ -11,6 +11,9 @@ PLACEHOLDERS=(
   best_future_price_formatted
   best_future_start_time
   best_future_weekday
+  best_future_weekday_formatted
+  best_future_weekday_short
+  best_future_weekday_short_formatted
   brand
   confidence
   current_price
@@ -45,6 +48,9 @@ PLACEHOLDERS=(
   street
   verdict
   weekday
+  weekday_formatted
+  weekday_short
+  weekday_short_formatted
 )
 
 CHECK_ROW_TEMPLATE='Buy {{fuel}} at {{station_name}} ({{distance}} km): {{current_price}} EUR, confidence {{confidence}}, verdict {{verdict}}'
@@ -350,6 +356,48 @@ locale_decimal_separator() {
 # subshell re-running `locale`.
 _compute_locale_decimal_separator
 
+# Locale weekday names, resolved once at script load. Same rationale as the
+# decimal separator cache: per-row `date` forks were noticeable. Seven known
+# reference dates (one per English weekday) get translated through the active
+# LC_TIME locale; fall back to the English name if `date -d` fails.
+declare -A LOCALE_WEEKDAY_LONG=()
+declare -A LOCALE_WEEKDAY_SHORT=()
+_compute_locale_weekdays() {
+  local -a en=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday)
+  local -a ref=(2024-01-07 2024-01-01 2024-01-02 2024-01-03 2024-01-04 2024-01-05 2024-01-06)
+  local i long short
+  for ((i = 0; i < 7; i++)); do
+    long=$(date -d "${ref[$i]}" +%A 2>/dev/null) || long=${en[$i]}
+    short=$(date -d "${ref[$i]}" +%a 2>/dev/null) || short=${en[$i]:0:3}
+    LOCALE_WEEKDAY_LONG[${en[$i]}]=$long
+    LOCALE_WEEKDAY_SHORT[${en[$i]}]=$short
+  done
+}
+_compute_locale_weekdays
+
+_weekday_source() {
+  local kind=$1 row=$2 field=$3
+  if [[ "$field" == best_future ]]; then
+    jq_value "$row" '.best_future_weekday // ""'
+  elif [[ "$kind" == check ]]; then
+    jq_value "$row" '.best_future_weekday // ""'
+  else
+    jq_value "$row" '.weekday // ""'
+  fi
+}
+
+format_weekday() {
+  local mode=$1 wd=$2
+  if [[ -z "$wd" ]]; then
+    return 0
+  fi
+  case "$mode" in
+    short)           printf '%s' "${wd:0:2}" ;;
+    long_formatted)  printf '%s' "${LOCALE_WEEKDAY_LONG[$wd]:-$wd}" ;;
+    short_formatted) printf '%s' "${LOCALE_WEEKDAY_SHORT[$wd]:-${wd:0:3}}" ;;
+  esac
+}
+
 # String-based to avoid FP pitfalls (e.g. 1.7 * 100 = 169.999... truncating to 1.69).
 truncate_number_value() {
   local row=$1
@@ -402,6 +450,9 @@ row_value() {
     best_future_price_formatted) truncate_number_value "$row" '.best_future_price // ""' 2 ;;
     best_future_start_time) jq_value "$row" '.best_future_start_time // ""' ;;
     best_future_weekday) jq_value "$row" '.best_future_weekday // ""' ;;
+    best_future_weekday_formatted) format_weekday long_formatted "$(_weekday_source "$kind" "$row" best_future)" ;;
+    best_future_weekday_short) format_weekday short "$(_weekday_source "$kind" "$row" best_future)" ;;
+    best_future_weekday_short_formatted) format_weekday short_formatted "$(_weekday_source "$kind" "$row" best_future)" ;;
     brand) jq_value "$row" '.station.brand // .brand // ""' ;;
     confidence) jq_value "$row" '.confidence // ""' ;;
     current_price) number_value "$row" '.current_price // ""' 3 ;;
@@ -471,6 +522,9 @@ row_value() {
         jq_value "$row" '.weekday // ""'
       fi
       ;;
+    weekday_formatted) format_weekday long_formatted "$(_weekday_source "$kind" "$row" auto)" ;;
+    weekday_short) format_weekday short "$(_weekday_source "$kind" "$row" auto)" ;;
+    weekday_short_formatted) format_weekday short_formatted "$(_weekday_source "$kind" "$row" auto)" ;;
     *) printf '' ;;
   esac
 }
