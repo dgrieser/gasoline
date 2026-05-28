@@ -584,6 +584,43 @@ test_weekday_formatted_uses_locale() {
   assert_contains "$output" 'Dienstag|Di|Tu|Station 2' "locale weekday (Tuesday -> Dienstag); weekday_short stays English-derived"
 }
 
+test_suggest_onchange_placeholders() {
+  configure_defaults
+  write_suggest_json
+
+  SUGGEST_COMMAND="$FAKE_NOTIFY --message {{fuel_onchange}}|{{date_onchange}}|{{station_name_onchange}}|{{station_name}}"
+
+  run_suggest_once
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+
+  assert_contains "$output" 'diesel|2026-04-27|Station 1|Station 1' "first onchange row keeps all values"
+  assert_contains "$output" '|2026-04-28|Station 2|Station 2' "second onchange row blanks unchanged fuel"
+  assert_not_contains "$output" 'diesel|2026-04-28' "second onchange row must not repeat unchanged fuel"
+}
+
+test_suggest_onchange_long_suffix_chain() {
+  configure_defaults
+  write_suggest_json
+
+  local mutated_json
+  mutated_json=$TEST_DIR/suggest.onchange.json
+  jq 'map(.weekday = "Monday")' "$SUGGEST_JSON_FILE" >"$mutated_json"
+  mv "$mutated_json" "$SUGGEST_JSON_FILE"
+
+  SUGGEST_COMMAND="$FAKE_NOTIFY --message {{weekday_short_formatted_onchange}}|{{station_name}}"
+
+  run_suggest_once
+
+  local output
+  output=$(<"$NOTIFY_OUT")
+
+  assert_contains "$output" 'Mon|Station 1' "longest onchange chain renders on first row"
+  assert_contains "$output" '|Station 2' "longest onchange chain blanks on second row"
+  assert_not_contains "$output" 'Mon|Station 2' "longest onchange chain must not repeat unchanged weekday"
+}
+
 test_compute_sleep() {
   configure_defaults
   CHECK_MINUTES=10
@@ -638,5 +675,7 @@ test_formatted_uses_locale_decimal_separator
 test_locale_scalar_inside_quoted_title
 test_weekday_short_and_formatted_placeholders
 test_weekday_formatted_uses_locale
+test_suggest_onchange_placeholders
+test_suggest_onchange_long_suffix_chain
 
 printf 'gasoline-watch_test: ok\n'

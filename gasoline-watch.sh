@@ -298,6 +298,9 @@ contains_row_placeholder() {
     if [[ "$template" == *"{{${key}}}"* ]]; then
       return 0
     fi
+    if [[ "$template" == *"{{${key}_onchange}}"* ]]; then
+      return 0
+    fi
   done
   return 1
 }
@@ -551,14 +554,44 @@ build_message() {
   local row_template=$2
   shift 2
 
-  local message=""
-  local row line
+  local onchange_keys=() key
+  for key in "${PLACEHOLDERS[@]}"; do
+    if [[ "$row_template" == *"{{${key}_onchange}}"* ]]; then
+      onchange_keys+=("$key")
+    fi
+  done
+
+  local message="" row line per_row_template value effective
+  local -A prev_values=()
+  local -A current_values=()
+  local have_prev=0
+
   for row in "$@"; do
-    line=$(render_row_template "$row_template" "$kind" "$row")
+    per_row_template=$row_template
+    current_values=()
+    if ((${#onchange_keys[@]})); then
+      for key in "${onchange_keys[@]}"; do
+        value=$(row_value "$kind" "$row" "$key")
+        current_values[$key]=$value
+        effective=$value
+        if ((have_prev)) && [[ "${prev_values[$key]-}" == "$value" ]]; then
+          effective=""
+        fi
+        per_row_template=${per_row_template//\{\{${key}_onchange\}\}/$effective}
+      done
+    fi
+    line=$(render_row_template "$per_row_template" "$kind" "$row")
     if [[ -z "$message" ]]; then
       message=$line
     else
       message+=$'\n'"$line"
+    fi
+    if ((${#onchange_keys[@]})); then
+      prev_values=()
+      for key in "${!current_values[@]}"; do
+        prev_values[$key]=${current_values[$key]}
+      done
+      have_prev=1
     fi
   done
   printf '%s' "$message"
