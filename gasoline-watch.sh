@@ -536,23 +536,8 @@ render_row_template() {
   local template=$1
   local kind=$2
   local row=$3
-  local prev_row=${4-}
   local rendered=$template
-  local key value prev_value
-
-  for key in "${PLACEHOLDERS[@]}"; do
-    if [[ "$rendered" != *"{{${key}_onchange}}"* ]]; then
-      continue
-    fi
-    value=$(row_value "$kind" "$row" "$key")
-    if [[ -n "$prev_row" ]]; then
-      prev_value=$(row_value "$kind" "$prev_row" "$key")
-      if [[ "$value" == "$prev_value" ]]; then
-        value=""
-      fi
-    fi
-    rendered=${rendered//\{\{${key}_onchange\}\}/$value}
-  done
+  local key value
 
   for key in "${PLACEHOLDERS[@]}"; do
     if [[ "$rendered" != *"{{${key}}}"* ]]; then
@@ -569,16 +554,45 @@ build_message() {
   local row_template=$2
   shift 2
 
-  local message=""
-  local row line prev_row=""
+  local onchange_keys=() key
+  for key in "${PLACEHOLDERS[@]}"; do
+    if [[ "$row_template" == *"{{${key}_onchange}}"* ]]; then
+      onchange_keys+=("$key")
+    fi
+  done
+
+  local message="" row line per_row_template value effective
+  local -A prev_values=()
+  local -A current_values=()
+  local have_prev=0
+
   for row in "$@"; do
-    line=$(render_row_template "$row_template" "$kind" "$row" "$prev_row")
+    per_row_template=$row_template
+    current_values=()
+    if ((${#onchange_keys[@]})); then
+      for key in "${onchange_keys[@]}"; do
+        value=$(row_value "$kind" "$row" "$key")
+        current_values[$key]=$value
+        effective=$value
+        if ((have_prev)) && [[ "${prev_values[$key]-}" == "$value" ]]; then
+          effective=""
+        fi
+        per_row_template=${per_row_template//\{\{${key}_onchange\}\}/$effective}
+      done
+    fi
+    line=$(render_row_template "$per_row_template" "$kind" "$row")
     if [[ -z "$message" ]]; then
       message=$line
     else
       message+=$'\n'"$line"
     fi
-    prev_row=$row
+    if ((${#onchange_keys[@]})); then
+      prev_values=()
+      for key in "${!current_values[@]}"; do
+        prev_values[$key]=${current_values[$key]}
+      done
+      have_prev=1
+    fi
   done
   printf '%s' "$message"
 }
