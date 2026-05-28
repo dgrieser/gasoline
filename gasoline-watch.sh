@@ -585,12 +585,15 @@ build_value_lines() {
 expand_scalar_placeholders() {
   local template=$1
   local kind=$2
-  shift 2
+  local scalar_row=$3
+  shift 3
 
   local result=$template
   local first_row="" key value quoted
 
-  if (($# > 0)); then
+  if [[ -n "$scalar_row" ]]; then
+    first_row=$scalar_row
+  elif (($# > 0)); then
     first_row=$1
   fi
 
@@ -619,10 +622,11 @@ build_notification_command() {
   local template=$1
   local kind=$2
   local message=$3
-  shift 3
+  local scalar_row=$4
+  shift 4
 
   local command
-  command=$(expand_scalar_placeholders "$template" "$kind" "$@")
+  command=$(expand_scalar_placeholders "$template" "$kind" "$scalar_row" "$@")
   local quoted key values prefix row_template
 
   if [[ "$command" == *"{{message}}"* ]]; then
@@ -654,10 +658,11 @@ run_notification() {
   local kind=$1
   local template=$2
   local message=$3
-  shift 3
+  local scalar_row=$4
+  shift 4
 
   local command
-  command=$(build_notification_command "$template" "$kind" "$message" "$@")
+  command=$(build_notification_command "$template" "$kind" "$message" "$scalar_row" "$@")
   verbose_log "running $kind notification: $command"
   if ! bash -c "$command"; then
     log "$kind notification command failed"
@@ -670,6 +675,7 @@ send_matching_rows() {
   local json=$3
   local jq_filter=$4
   local row_template=$5
+  local scalar_row=${6-}
   local rows=()
 
   mapfile -t rows < <(printf '%s' "$json" | jq -c "$jq_filter")
@@ -681,7 +687,7 @@ send_matching_rows() {
   verbose_log "sending ${#rows[@]} matching $kind row(s)"
   local message
   message=$(build_message "$kind" "$row_template" "${rows[@]}")
-  run_notification "$kind" "$command_template" "$message" "${rows[@]}"
+  run_notification "$kind" "$command_template" "$message" "$scalar_row" "${rows[@]}"
 }
 
 price_less_than() {
@@ -731,7 +737,7 @@ send_changed_check_rows() {
   verbose_log "sending ${#FILTERED_ROWS[@]} cheaper check row(s), baseline now $(shell_quote "$CHECK_LOWEST_PRICE")"
   local message
   message=$(build_message check "$CHECK_ROW_TEMPLATE" "${FILTERED_ROWS[@]}")
-  run_notification check "$CHECK_COMMAND" "$message" "${FILTERED_ROWS[@]}"
+  run_notification check "$CHECK_COMMAND" "$message" "" "${FILTERED_ROWS[@]}"
 }
 
 run_check_once() {
@@ -777,12 +783,15 @@ run_suggest_once() {
   fi
 
   verbose_log "suggest returned $(printf '%s' "$output" | jq 'length') row(s)"
+  local cheapest_row
+  cheapest_row=$(printf '%s' "$output" | jq -c 'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | min_by(.predicted_price // .predicted_current_price) // empty else empty end')
   send_matching_rows \
     suggest \
     "$SUGGEST_COMMAND" \
     "$output" \
-    'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | sort_by(.predicted_price) | .[] else empty end' \
-    "$SUGGEST_ROW_TEMPLATE"
+    'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | sort_by(.date, .start_time, (.station_name // .station.name)) | .[] else empty end' \
+    "$SUGGEST_ROW_TEMPLATE" \
+    "$cheapest_row"
 }
 
 maybe_run_suggest() {
