@@ -298,6 +298,9 @@ contains_row_placeholder() {
     if [[ "$template" == *"{{${key}}}"* ]]; then
       return 0
     fi
+    if [[ "$template" == *"{{${key}_onchange}}"* ]]; then
+      return 0
+    fi
   done
   return 1
 }
@@ -533,8 +536,23 @@ render_row_template() {
   local template=$1
   local kind=$2
   local row=$3
+  local prev_row=${4-}
   local rendered=$template
-  local key value
+  local key value prev_value
+
+  for key in "${PLACEHOLDERS[@]}"; do
+    if [[ "$rendered" != *"{{${key}_onchange}}"* ]]; then
+      continue
+    fi
+    value=$(row_value "$kind" "$row" "$key")
+    if [[ -n "$prev_row" ]]; then
+      prev_value=$(row_value "$kind" "$prev_row" "$key")
+      if [[ "$value" == "$prev_value" ]]; then
+        value=""
+      fi
+    fi
+    rendered=${rendered//\{\{${key}_onchange\}\}/$value}
+  done
 
   for key in "${PLACEHOLDERS[@]}"; do
     if [[ "$rendered" != *"{{${key}}}"* ]]; then
@@ -552,14 +570,15 @@ build_message() {
   shift 2
 
   local message=""
-  local row line
+  local row line prev_row=""
   for row in "$@"; do
-    line=$(render_row_template "$row_template" "$kind" "$row")
+    line=$(render_row_template "$row_template" "$kind" "$row" "$prev_row")
     if [[ -z "$message" ]]; then
       message=$line
     else
       message+=$'\n'"$line"
     fi
+    prev_row=$row
   done
   printf '%s' "$message"
 }
