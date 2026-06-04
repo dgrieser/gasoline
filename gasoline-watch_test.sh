@@ -621,6 +621,63 @@ test_suggest_onchange_long_suffix_chain() {
   assert_not_contains "$output" 'Mon|Station 2' "longest onchange chain must not repeat unchanged weekday"
 }
 
+test_build_message_skips_onchange_only_line() {
+  configure_defaults
+
+  local r1='{"fuel":"diesel","station_name":"Station 1"}'
+  local r2='{"fuel":"diesel","station_name":"Station 2"}'
+  local out
+  out=$(build_message suggest $'{{fuel_onchange}}\n{{station_name}}' "$r1" "$r2")
+
+  # First row prints fuel + station; second row's unchanged fuel line is
+  # dropped entirely (no blank line, no second "diesel").
+  [[ "$out" == $'diesel\nStation 1\nStation 2' ]] || \
+    fail "onchange-only line skip: expected [diesel\\nStation 1\\nStation 2], got [$out]"
+}
+
+test_build_message_skips_static_plus_onchange_line() {
+  configure_defaults
+
+  local r1='{"fuel":"diesel","station_name":"Station 1"}'
+  local r2='{"fuel":"diesel","station_name":"Station 2"}'
+  local out
+  out=$(build_message suggest $'Fuel: {{fuel_onchange}}\n{{station_name}}' "$r1" "$r2")
+
+  # The "Fuel: " static text must not keep the line alive when the onchange
+  # value is blank.
+  [[ "$out" == $'Fuel: diesel\nStation 1\nStation 2' ]] || \
+    fail "static+onchange line skip: expected [Fuel: diesel\\nStation 1\\nStation 2], got [$out]"
+  assert_not_contains "$out" $'\nFuel: \n' "static+onchange line must not emit a values-less Fuel line"
+}
+
+test_build_message_keeps_static_line() {
+  configure_defaults
+
+  local r1='{"fuel":"diesel","station_name":"Station 1"}'
+  local r2='{"fuel":"diesel","station_name":"Station 2"}'
+  local out
+  out=$(build_message suggest $'--- separator ---\n{{fuel_onchange}}|{{station_name}}' "$r1" "$r2")
+
+  # A line with no placeholders is always kept, once per row.
+  [[ "$out" == $'--- separator ---\ndiesel|Station 1\n--- separator ---\n|Station 2' ]] || \
+    fail "static line kept: expected separator on every row, got [$out]"
+}
+
+test_build_message_mixed_line_still_prints() {
+  configure_defaults
+
+  local r1='{"fuel":"diesel","date":"2026-04-27","station_name":"Station 1"}'
+  local r2='{"fuel":"diesel","date":"2026-04-28","station_name":"Station 2"}'
+  local out
+  out=$(build_message suggest \
+    '{{fuel_onchange}}|{{date_onchange}}|{{station_name_onchange}}|{{station_name}}' \
+    "$r1" "$r2")
+
+  # Line is kept because the regular {{station_name}} always has a value.
+  assert_contains "$out" '|2026-04-28|Station 2|Station 2' "mixed line keeps row with non-empty value"
+  assert_not_contains "$out" 'diesel|2026-04-28' "mixed line still blanks unchanged onchange value"
+}
+
 test_compute_sleep() {
   configure_defaults
   CHECK_MINUTES=10
@@ -677,5 +734,9 @@ test_weekday_short_and_formatted_placeholders
 test_weekday_formatted_uses_locale
 test_suggest_onchange_placeholders
 test_suggest_onchange_long_suffix_chain
+test_build_message_skips_onchange_only_line
+test_build_message_skips_static_plus_onchange_line
+test_build_message_keeps_static_line
+test_build_message_mixed_line_still_prints
 
 printf 'gasoline-watch_test: ok\n'

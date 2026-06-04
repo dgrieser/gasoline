@@ -532,23 +532,6 @@ row_value() {
   esac
 }
 
-render_row_template() {
-  local template=$1
-  local kind=$2
-  local row=$3
-  local rendered=$template
-  local key value
-
-  for key in "${PLACEHOLDERS[@]}"; do
-    if [[ "$rendered" != *"{{${key}}}"* ]]; then
-      continue
-    fi
-    value=$(row_value "$kind" "$row" "$key")
-    rendered=${rendered//\{\{$key\}\}/$value}
-  done
-  printf '%s' "$rendered"
-}
-
 build_message() {
   local kind=$1
   local row_template=$2
@@ -561,31 +544,85 @@ build_message() {
     fi
   done
 
-  local message="" row line per_row_template value effective
+  local message="" row value line rendered
+  local line_has_onchange line_has_value
   local -A prev_values=()
   local -A current_values=()
-  local have_prev=0
+  local -A onchange_effective=()
+  local have_prev=0 first_emitted=0
 
+  # Scalar placeholders ({{count}}, {{cheapest_*}}) are already expanded earlier
+  # in expand_scalar_placeholders, so only onchange and regular {{key}}
+  # placeholders remain to be substituted here.
   for row in "$@"; do
-    per_row_template=$row_template
+    # Resolve onchange values once per row for every onchange key, so the
+    # per-row change tracking below stays correct regardless of which physical
+    # lines a key appears on (or whether those lines end up skipped).
     current_values=()
+    onchange_effective=()
     if ((${#onchange_keys[@]})); then
       for key in "${onchange_keys[@]}"; do
         value=$(row_value "$kind" "$row" "$key")
         current_values[$key]=$value
-        effective=$value
         if ((have_prev)) && [[ "${prev_values[$key]-}" == "$value" ]]; then
-          effective=""
+          onchange_effective[$key]=""
+        else
+          onchange_effective[$key]=$value
         fi
-        per_row_template=${per_row_template//\{\{${key}_onchange\}\}/$effective}
       done
     fi
-    line=$(render_row_template "$per_row_template" "$kind" "$row")
-    if [[ -z "$message" ]]; then
-      message=$line
-    else
-      message+=$'\n'"$line"
+
+    # Render the per-row template one physical line at a time. A line is skipped
+    # only when it contains an onchange placeholder and none of its
+    # value-producing placeholders rendered anything (only static characters or
+    # whitespace would remain). Lines with no placeholders are always kept.
+    local row_block="" row_has_line=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      rendered=$line
+      line_has_onchange=0
+      line_has_value=0
+
+      for key in "${onchange_keys[@]}"; do
+        if [[ "$line" == *"{{${key}_onchange}}"* ]]; then
+          line_has_onchange=1
+          if [[ -n "${onchange_effective[$key]}" ]]; then
+            line_has_value=1
+          fi
+          rendered=${rendered//\{\{${key}_onchange\}\}/${onchange_effective[$key]}}
+        fi
+      done
+
+      for key in "${PLACEHOLDERS[@]}"; do
+        if [[ "$line" == *"{{${key}}}"* ]]; then
+          value=$(row_value "$kind" "$row" "$key")
+          if [[ -n "$value" ]]; then
+            line_has_value=1
+          fi
+          rendered=${rendered//\{\{$key\}\}/$value}
+        fi
+      done
+
+      if ((line_has_onchange)) && ((line_has_value == 0)); then
+        continue
+      fi
+
+      if ((row_has_line)); then
+        row_block+=$'\n'"$rendered"
+      else
+        row_block=$rendered
+        row_has_line=1
+      fi
+    done <<<"$row_template"
+
+    if ((row_has_line)); then
+      if ((first_emitted)); then
+        message+=$'\n'"$row_block"
+      else
+        message=$row_block
+        first_emitted=1
+      fi
     fi
+
     if ((${#onchange_keys[@]})); then
       prev_values=()
       for key in "${!current_values[@]}"; do
