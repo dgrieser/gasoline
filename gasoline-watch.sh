@@ -557,10 +557,7 @@ build_message() {
 
   local message="" row value line rendered
   local line_has_onchange line_has_value
-  local -A prev_values=()
-  local -A current_values=()
   local -A prev_sig=()
-  local -A current_sig=()
   local -A day_cache=()
   local -A onchange_effective=()
   local dayref dayval sig
@@ -573,14 +570,11 @@ build_message() {
     # Resolve onchange values once per row for every onchange key, so the
     # per-row change tracking below stays correct regardless of which physical
     # lines a key appears on (or whether those lines end up skipped).
-    current_values=()
-    current_sig=()
     day_cache=()
     onchange_effective=()
     if ((${#onchange_keys[@]})); then
       for key in "${onchange_keys[@]}"; do
         value=$(row_value "$kind" "$row" "$key")
-        current_values[$key]=$value
 
         # Build the change-detection signature. For day-scoped time keys the
         # signature also carries the referenced day's value, so a repeated time
@@ -597,13 +591,14 @@ build_message() {
         else
           sig=$value
         fi
-        current_sig[$key]=$sig
 
         if ((have_prev)) && [[ "${prev_sig[$key]-}" == "$sig" ]]; then
           onchange_effective[$key]=""
         else
           onchange_effective[$key]=$value
         fi
+        # Carry this row's signature forward as the baseline for the next row.
+        prev_sig[$key]=$sig
       done
     fi
 
@@ -659,14 +654,6 @@ build_message() {
     fi
 
     if ((${#onchange_keys[@]})); then
-      prev_values=()
-      for key in "${!current_values[@]}"; do
-        prev_values[$key]=${current_values[$key]}
-      done
-      prev_sig=()
-      for key in "${!current_sig[@]}"; do
-        prev_sig[$key]=${current_sig[$key]}
-      done
       have_prev=1
     fi
   done
