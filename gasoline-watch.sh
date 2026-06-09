@@ -53,6 +53,17 @@ PLACEHOLDERS=(
   weekday_short_formatted
 )
 
+# Onchange keys whose change detection is scoped by a reference day: a time-of-day
+# value that repeats is still "changed" when the day it refers to changed. The
+# value maps to another resolver key whose resolved value forms part of the
+# change-detection signature (it does NOT affect the rendered output).
+declare -A ONCHANGE_DAY_REF=(
+  [start_time]=date
+  [end_time]=date
+  [best_future_start_time]=best_future_date
+  [best_future_end_time]=best_future_date
+)
+
 CHECK_ROW_TEMPLATE='Buy {{fuel}} at {{station_name}} ({{distance}} km): {{current_price}} EUR, confidence {{confidence}}, verdict {{verdict}}'
 SUGGEST_ROW_TEMPLATE='{{date}} {{start_time}}-{{end_time}} {{fuel}} at {{station_name}} ({{distance}} km): predicted {{predicted_price}} EUR, confidence {{confidence}}'
 
@@ -546,9 +557,10 @@ build_message() {
 
   local message="" row value line rendered
   local line_has_onchange line_has_value
-  local -A prev_values=()
-  local -A current_values=()
+  local -A prev_sig=()
+  local -A day_cache=()
   local -A onchange_effective=()
+  local dayref dayval sig
   local have_prev=0 first_emitted=0
 
   # Scalar placeholders ({{count}}, {{cheapest_*}}) are already expanded earlier
@@ -558,17 +570,35 @@ build_message() {
     # Resolve onchange values once per row for every onchange key, so the
     # per-row change tracking below stays correct regardless of which physical
     # lines a key appears on (or whether those lines end up skipped).
-    current_values=()
+    day_cache=()
     onchange_effective=()
     if ((${#onchange_keys[@]})); then
       for key in "${onchange_keys[@]}"; do
         value=$(row_value "$kind" "$row" "$key")
-        current_values[$key]=$value
-        if ((have_prev)) && [[ "${prev_values[$key]-}" == "$value" ]]; then
+
+        # Build the change-detection signature. For day-scoped time keys the
+        # signature also carries the referenced day's value, so a repeated time
+        # string still counts as changed when the day it belongs to changed. The
+        # day value is memoized per row so time keys sharing a dayref resolve it
+        # only once. \x1f (unit separator) never appears in dates/times.
+        dayref=${ONCHANGE_DAY_REF[$key]-}
+        if [[ -n "$dayref" ]]; then
+          if [[ -z "${day_cache[$dayref]+x}" ]]; then
+            day_cache[$dayref]=$(row_value "$kind" "$row" "$dayref")
+          fi
+          dayval=${day_cache[$dayref]}
+          sig="${dayval}"$'\x1f'"${value}"
+        else
+          sig=$value
+        fi
+
+        if ((have_prev)) && [[ "${prev_sig[$key]-}" == "$sig" ]]; then
           onchange_effective[$key]=""
         else
           onchange_effective[$key]=$value
         fi
+        # Carry this row's signature forward as the baseline for the next row.
+        prev_sig[$key]=$sig
       done
     fi
 
@@ -624,10 +654,6 @@ build_message() {
     fi
 
     if ((${#onchange_keys[@]})); then
-      prev_values=()
-      for key in "${!current_values[@]}"; do
-        prev_values[$key]=${current_values[$key]}
-      done
       have_prev=1
     fi
   done

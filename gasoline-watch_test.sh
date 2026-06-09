@@ -678,6 +678,39 @@ test_build_message_mixed_line_still_prints() {
   assert_not_contains "$out" 'diesel|2026-04-28' "mixed line still blanks unchanged onchange value"
 }
 
+test_build_message_reprints_time_on_day_change() {
+  configure_defaults
+
+  # Two rows on different days that happen to share the same time-of-day window.
+  local r1='{"date":"2026-04-26","start_time":"11:00","end_time":"12:00","station_name":"S1"}'
+  local r2='{"date":"2026-04-27","start_time":"11:00","end_time":"12:00","station_name":"S2"}'
+  local out
+  out=$(build_message suggest \
+    $'{{date_onchange}}\n{{start_time_onchange}} {{end_time_onchange}}\n{{station_name}}' \
+    "$r1" "$r2")
+
+  # The time window must reprint under the second day even though the time
+  # string is identical, because the day it refers to changed.
+  [[ "$out" == $'2026-04-26\n11:00 12:00\nS1\n2026-04-27\n11:00 12:00\nS2' ]] || \
+    fail "time reprint on day change: expected time under both days, got [$out]"
+}
+
+test_build_message_suppresses_time_on_same_day() {
+  configure_defaults
+
+  # Two rows on the SAME day with the same time window: the time line must stay
+  # suppressed on the second row (regression guard for the day-scoped signature).
+  local r1='{"date":"2026-04-26","start_time":"11:00","end_time":"12:00","station_name":"S1"}'
+  local r2='{"date":"2026-04-26","start_time":"11:00","end_time":"12:00","station_name":"S2"}'
+  local out
+  out=$(build_message suggest \
+    $'{{date_onchange}}\n{{start_time_onchange}} {{end_time_onchange}}\n{{station_name}}' \
+    "$r1" "$r2")
+
+  [[ "$out" == $'2026-04-26\n11:00 12:00\nS1\nS2' ]] || \
+    fail "time suppressed on same day: expected single time line, got [$out]"
+}
+
 test_compute_sleep() {
   configure_defaults
   CHECK_MINUTES=10
@@ -738,5 +771,7 @@ test_build_message_skips_onchange_only_line
 test_build_message_skips_static_plus_onchange_line
 test_build_message_keeps_static_line
 test_build_message_mixed_line_still_prints
+test_build_message_reprints_time_on_day_change
+test_build_message_suppresses_time_on_same_day
 
 printf 'gasoline-watch_test: ok\n'
