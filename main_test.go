@@ -1319,6 +1319,107 @@ func TestRunUpdateMultiCityBestEffort(t *testing.T) {
 	}
 }
 
+// A station within range of two requested cities must keep a distinct snapshot
+// row per city; the later city must not compact over (steal) the earlier one.
+func TestRunUpdateMultiCityOverlap(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "overlap.db")
+	t.Setenv(envAPIKeyName, "test-key")
+
+	// Identical station (same id, same prices) reported for both cities.
+	sharedStation := `{"ok":true,"stations":[{"id":"shared-1","name":"S","brand":"B","street":"St","place":"P","lat":1,"lng":2,"dist":1,"diesel":1.5,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			switch q := u.Query().Get("q"); {
+			case strings.Contains(q, "Berlin"):
+				return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.5","lon":"13.4"}]`), nil
+			case strings.Contains(q, "Pforzheim"):
+				return jsonResponse(http.StatusOK, `[{"name":"Pforzheim","display_name":"Pforzheim, DE","lat":"48.9","lon":"8.7"}]`), nil
+			default:
+				return nil, fmt.Errorf("unexpected geocode q: %s", q)
+			}
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			return jsonResponse(http.StatusOK, sharedStation), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	_ = captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--city", "Pforzheim", "--output", "json"})
+	})
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.QueryContext(context.Background(),
+		`SELECT city_name FROM price_snapshots WHERE station_id = 'shared-1' ORDER BY city_name`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	var cities []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		cities = append(cities, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if len(cities) != 2 || cities[0] != "Berlin" || cities[1] != "Pforzheim" {
+		t.Fatalf("shared station city associations = %v, want [Berlin Pforzheim]", cities)
+	}
+}
+
+// recorded_at must be stamped after the data is fetched, not before the run
+// begins, so a slow fetch is not backdated.
+func TestRunUpdateStampsAfterFetch(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "stamp.db")
+	t.Setenv(envAPIKeyName, "test-key")
+
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.5","lon":"13.4"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			time.Sleep(2 * time.Second) // simulate a slow upstream fetch
+			body := `{"ok":true,"stations":[{"id":"s-1","name":"S","brand":"B","street":"St","place":"P","lat":1,"lng":2,"dist":1,"diesel":1.5,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`
+			return jsonResponse(http.StatusOK, body), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	before := time.Now().UTC()
+	output := captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--output", "json"})
+	})
+
+	var result updateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	recordedAt, err := time.Parse(time.RFC3339, result.RecordedAt)
+	if err != nil {
+		t.Fatalf("parse recorded_at %q: %v", result.RecordedAt, err)
+	}
+	if delta := recordedAt.Sub(before); delta < time.Second {
+		t.Fatalf("recorded_at only %v after run start; want >= 1s (stamped after the slow fetch)", delta)
+	}
+}
+
 func TestRunImportCitiesSupportsJSONOutput(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "cities.db")
