@@ -1065,6 +1065,260 @@ func TestRunUpdateSupportsJSONOutput(t *testing.T) {
 	}
 }
 
+func sameCityQueries(a, b []cityQuery) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestBuildCityQueries(t *testing.T) {
+	c := func(name string) updateArg { return updateArg{kind: argCity, city: name} }
+	r := func(v float64) updateArg { return updateArg{kind: argRadius, radius: v} }
+
+	cases := []struct {
+		name   string
+		events []updateArg
+		want   []cityQuery
+	}{
+		// The six precedence examples from the feature request, verbatim.
+		{"example1_per_city", []updateArg{c("Luebbecke"), r(25), c("Berlin"), r(5)},
+			[]cityQuery{{"Luebbecke", 25}, {"Berlin", 5}}},
+		{"example2_global_before", []updateArg{r(5), c("Luebbecke"), c("Berlin")},
+			[]cityQuery{{"Luebbecke", 5}, {"Berlin", 5}}},
+		{"example3_trailing_per_city", []updateArg{r(5), c("Luebbecke"), c("Berlin"), c("Pforzheim"), r(25)},
+			[]cityQuery{{"Luebbecke", 5}, {"Berlin", 5}, {"Pforzheim", 25}}},
+		{"example4_all_overridden", []updateArg{r(5), c("Luebbecke"), r(24), c("Berlin"), r(23), c("Pforzheim"), r(22)},
+			[]cityQuery{{"Luebbecke", 24}, {"Berlin", 23}, {"Pforzheim", 22}}},
+		{"example5_no_propagate", []updateArg{r(5), c("Luebbecke"), c("Berlin"), c("Pforzheim"), r(25), c("Enzberg")},
+			[]cityQuery{{"Luebbecke", 5}, {"Berlin", 5}, {"Pforzheim", 25}, {"Enzberg", 5}}},
+		{"example6_no_global_default", []updateArg{c("Luebbecke"), r(25), c("Berlin"), c("Pforzheim"), r(26), c("Enzberg")},
+			[]cityQuery{{"Luebbecke", 25}, {"Berlin", 5}, {"Pforzheim", 26}, {"Enzberg", 5}}},
+		// Edge cases.
+		{"trailing_radius_single", []updateArg{c("A"), r(7)}, []cityQuery{{"A", 7}}},
+		{"two_radii_one_slot_last_wins", []updateArg{c("A"), r(1), r(2)}, []cityQuery{{"A", 2}}},
+		{"two_leading_radii_last_wins", []updateArg{r(1), r(2), c("A")}, []cityQuery{{"A", 2}}},
+		{"radius_only_no_city", []updateArg{r(5)}, nil},
+		{"no_radius_uses_default", []updateArg{c("A"), c("B")}, []cityQuery{{"A", defaultRadiusKm}, {"B", defaultRadiusKm}}},
+		{"empty", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildCityQueries(tc.events)
+			if !sameCityQueries(got, tc.want) {
+				t.Fatalf("buildCityQueries = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUpdateFlagParseOrder(t *testing.T) {
+	parse := func(args ...string) ([]cityQuery, error) {
+		var events []updateArg
+		fs := flag.NewFlagSet("update", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		fs.Var(cityFlag{&events}, "city", "")
+		fs.Var(radiusFlag{&events}, "radius", "")
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		return buildCityQueries(events), nil
+	}
+
+	// Space-separated form preserves left-to-right interleave order.
+	got, err := parse("--city", "Luebbecke", "--radius", "25", "--city", "Berlin", "--radius", "5")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if want := []cityQuery{{"Luebbecke", 25}, {"Berlin", 5}}; !sameCityQueries(got, want) {
+		t.Fatalf("space form = %+v, want %+v", got, want)
+	}
+
+	// --flag=value form, with a leading global radius.
+	got, err = parse("--radius=10", "--city=Berlin", "--city=Pforzheim", "--radius=25")
+	if err != nil {
+		t.Fatalf("parse =form: %v", err)
+	}
+	if want := []cityQuery{{"Berlin", 10}, {"Pforzheim", 25}}; !sameCityQueries(got, want) {
+		t.Fatalf("=form = %+v, want %+v", got, want)
+	}
+
+	// A non-numeric radius is rejected at parse time.
+	if _, err := parse("--city", "Berlin", "--radius", "abc"); err == nil {
+		t.Fatalf("expected error for non-numeric --radius")
+	}
+}
+
+func TestValidateCityQueries(t *testing.T) {
+	if err := validateCityQueries([]cityQuery{{"Berlin", 5}, {"Pforzheim", 25}}); err != nil {
+		t.Fatalf("valid: %v", err)
+	}
+
+	// Names are trimmed in place.
+	qs := []cityQuery{{"  Berlin  ", 5}}
+	if err := validateCityQueries(qs); err != nil {
+		t.Fatalf("trim valid: %v", err)
+	}
+	if qs[0].name != "Berlin" {
+		t.Fatalf("name not trimmed: %q", qs[0].name)
+	}
+
+	cases := []struct {
+		name string
+		qs   []cityQuery
+		want string
+	}{
+		{"empty", nil, "requires --city"},
+		{"empty_name", []cityQuery{{"   ", 5}}, "must not be empty"},
+		{"radius_zero", []cityQuery{{"Berlin", 0}}, "> 0 and <= 25"},
+		{"radius_too_big", []cityQuery{{"Berlin", 26}}, "> 0 and <= 25"},
+		{"duplicate", []cityQuery{{"Berlin", 5}, {"Berlin", 10}}, "given more than once"},
+		{"duplicate_case_insensitive", []cityQuery{{"Berlin", 5}, {"berlin", 10}}, "given more than once"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCityQueries(tc.qs)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunUpdateMultiCity(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "multi.db")
+	t.Setenv(envAPIKeyName, "test-key")
+
+	radByLat := map[string]string{}
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			switch q := u.Query().Get("q"); {
+			case strings.Contains(q, "Berlin"):
+				return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.500000","lon":"13.400000"}]`), nil
+			case strings.Contains(q, "Pforzheim"):
+				return jsonResponse(http.StatusOK, `[{"name":"Pforzheim","display_name":"Pforzheim, DE","lat":"48.900000","lon":"8.700000"}]`), nil
+			default:
+				return nil, fmt.Errorf("unexpected geocode q: %s", q)
+			}
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			radByLat[u.Query().Get("lat")] = u.Query().Get("rad")
+			body := `{"ok":true,"stations":[{"id":"s-1","name":"S","brand":"B","street":"St","place":"P","lat":1,"lng":2,"dist":1,"diesel":1.5,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`
+			return jsonResponse(http.StatusOK, body), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	// --radius 10 (global) --city Berlin --city Pforzheim --radius 25 => Berlin=10, Pforzheim=25.
+	output := captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--radius", "10", "--city", "Berlin", "--city", "Pforzheim", "--radius", "25", "--output", "json"})
+	})
+
+	var result multiUpdateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	if len(result.Results) != 2 {
+		t.Fatalf("results = %d, want 2", len(result.Results))
+	}
+	if result.StoredCount != 2 {
+		t.Fatalf("stored_count = %d, want 2", result.StoredCount)
+	}
+	byCity := map[string]cityUpdateResult{}
+	for _, r := range result.Results {
+		byCity[r.City.Name] = r
+	}
+	if byCity["Berlin"].RadiusKm != 10 {
+		t.Fatalf("Berlin radius_km = %v, want 10", byCity["Berlin"].RadiusKm)
+	}
+	if byCity["Pforzheim"].RadiusKm != 25 {
+		t.Fatalf("Pforzheim radius_km = %v, want 25", byCity["Pforzheim"].RadiusKm)
+	}
+	if radByLat["52.500000"] != "10.00" {
+		t.Fatalf("Berlin rad param = %q, want 10.00", radByLat["52.500000"])
+	}
+	if radByLat["48.900000"] != "25.00" {
+		t.Fatalf("Pforzheim rad param = %q, want 25.00", radByLat["48.900000"])
+	}
+}
+
+func TestRunUpdateMultiCityBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "besteffort.db")
+	t.Setenv(envAPIKeyName, "test-key")
+
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			switch q := u.Query().Get("q"); {
+			case strings.Contains(q, "Berlin"):
+				return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.5","lon":"13.4"}]`), nil
+			case strings.Contains(q, "Pforzheim"):
+				return jsonResponse(http.StatusOK, `[{"name":"Pforzheim","display_name":"Pforzheim, DE","lat":"48.9","lon":"8.7"}]`), nil
+			default:
+				return nil, fmt.Errorf("unexpected geocode q: %s", q)
+			}
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			// Pforzheim (lat ~48.9) fails upstream; Berlin (lat ~52.5) succeeds.
+			if strings.HasPrefix(u.Query().Get("lat"), "48.9") {
+				return nil, fmt.Errorf("simulated upstream failure")
+			}
+			body := `{"ok":true,"stations":[{"id":"s-1","name":"S","brand":"B","street":"St","place":"P","lat":1,"lng":2,"dist":1,"diesel":1.5,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`
+			return jsonResponse(http.StatusOK, body), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	// run() returns a non-nil error here, so capture stdout manually.
+	old := stdout
+	var buf bytes.Buffer
+	stdout = &buf
+	t.Cleanup(func() { stdout = old })
+
+	err := run([]string{"update", "--db", dbPath, "--city", "Berlin", "--city", "Pforzheim", "--output", "json"})
+	if err == nil {
+		t.Fatalf("expected non-nil error when a city fails")
+	}
+	if !strings.Contains(err.Error(), "1 of 2 cities failed") {
+		t.Fatalf("err = %v, want containing '1 of 2 cities failed'", err)
+	}
+
+	var result multiUpdateResult
+	if e := json.Unmarshal(buf.Bytes(), &result); e != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", e, buf.String())
+	}
+	if result.StoredCount != 1 {
+		t.Fatalf("stored_count = %d, want 1 (Berlin persisted)", result.StoredCount)
+	}
+	var berlin, pforzheim *cityUpdateResult
+	for i := range result.Results {
+		switch result.Results[i].Query {
+		case "Berlin":
+			berlin = &result.Results[i]
+		case "Pforzheim":
+			pforzheim = &result.Results[i]
+		}
+	}
+	if berlin == nil || berlin.Error != "" || berlin.StoredCount != 1 {
+		t.Fatalf("Berlin result = %+v, want success with 1 snapshot", berlin)
+	}
+	if pforzheim == nil || pforzheim.Error == "" {
+		t.Fatalf("Pforzheim result = %+v, want a recorded error", pforzheim)
+	}
+}
+
 func TestRunImportCitiesSupportsJSONOutput(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "cities.db")
