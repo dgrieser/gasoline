@@ -137,7 +137,7 @@ func TestPersistUpdateAndQueryHistory(t *testing.T) {
 		},
 	}
 
-	if err := persistUpdate(ctx, db, city, stations, recordedAt, 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, stations, recordedAt, 5); err != nil {
 		t.Fatalf("persistUpdate: %v", err)
 	}
 
@@ -229,13 +229,13 @@ func TestPersistUpdateCompactsUnchangedSnapshots(t *testing.T) {
 		time.Date(2026, 4, 7, 10, 40, 8, 0, time.UTC),
 	}
 
-	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[0], 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, []tankerStation{station}, times[0], 5); err != nil {
 		t.Fatalf("persist initial update: %v", err)
 	}
 	assertSnapshotCount(t, db, 1)
 	assertLatestSnapshot(t, db, times[0].Format(time.RFC3339), 2.349)
 
-	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[1], 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, []tankerStation{station}, times[1], 5); err != nil {
 		t.Fatalf("persist unchanged update: %v", err)
 	}
 	assertSnapshotCount(t, db, 1)
@@ -243,19 +243,19 @@ func TestPersistUpdateCompactsUnchangedSnapshots(t *testing.T) {
 
 	diesel = 2.389
 	station.Diesel = &diesel
-	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[2], 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, []tankerStation{station}, times[2], 5); err != nil {
 		t.Fatalf("persist changed update: %v", err)
 	}
 	assertSnapshotCount(t, db, 2)
 	assertLatestSnapshot(t, db, times[2].Format(time.RFC3339), 2.389)
 
-	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[3], 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, []tankerStation{station}, times[3], 5); err != nil {
 		t.Fatalf("persist first unchanged update after change: %v", err)
 	}
 	assertSnapshotCount(t, db, 3)
 	assertLatestSnapshot(t, db, times[3].Format(time.RFC3339), 2.389)
 
-	if err := persistUpdate(ctx, db, city, []tankerStation{station}, times[4], 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, []tankerStation{station}, times[4], 5); err != nil {
 		t.Fatalf("persist later unchanged update after change: %v", err)
 	}
 	assertSnapshotCount(t, db, 3)
@@ -334,18 +334,18 @@ func TestPersistUpdateIgnoresDistanceChangeButTracksOpenChange(t *testing.T) {
 	second := time.Date(2026, 4, 7, 11, 5, 0, 0, time.UTC)
 	third := time.Date(2026, 4, 7, 11, 10, 0, 0, time.UTC)
 
-	if err := persistUpdate(ctx, db, city, []tankerStation{station}, first, 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, []tankerStation{station}, first, 5); err != nil {
 		t.Fatalf("persist first update: %v", err)
 	}
 
 	station.Dist = 9.99
-	if err := persistUpdate(ctx, db, city, []tankerStation{station}, second, 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, []tankerStation{station}, second, 5); err != nil {
 		t.Fatalf("persist distance-only update: %v", err)
 	}
 	assertSnapshotCount(t, db, 1)
 
 	station.IsOpen = false
-	if err := persistUpdate(ctx, db, city, []tankerStation{station}, third, 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, []tankerStation{station}, third, 5); err != nil {
 		t.Fatalf("persist open change update: %v", err)
 	}
 	assertSnapshotCount(t, db, 2)
@@ -603,7 +603,7 @@ func TestRunCheckSupportsJSONOutput(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
 		t.Fatalf("initSchema: %v", err)
 	}
 	city := cachedCity{
@@ -1526,7 +1526,7 @@ func TestRunImportCitiesUpsertsExistingRows(t *testing.T) {
 		t.Fatalf("insert seed city: %v", err)
 	}
 
-	imported, err := importCities(ctx, db, []cachedCity{{
+	imported, err := importCities(ctx, db, dialectSQLite, []cachedCity{{
 		Name:        "Berlin",
 		DisplayName: "Berlin",
 		Lat:         52.5200,
@@ -1671,7 +1671,7 @@ func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 
 	ctx := context.Background()
 
-	hasNormalizedName, err := tableHasColumn(ctx, db, "cities", "normalized_name")
+	hasNormalizedName, err := tableHasColumn(ctx, db, dialectSQLite, "cities", "normalized_name")
 	if err != nil {
 		t.Fatalf("tableHasColumn cities.normalized_name: %v", err)
 	}
@@ -1679,7 +1679,7 @@ func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 		t.Fatal("expected cities.normalized_name after migration")
 	}
 
-	hasDistKM, err := tableHasColumn(ctx, db, "price_snapshots", "dist_km")
+	hasDistKM, err := tableHasColumn(ctx, db, dialectSQLite, "price_snapshots", "dist_km")
 	if err != nil {
 		t.Fatalf("tableHasColumn price_snapshots.dist_km: %v", err)
 	}
@@ -1687,7 +1687,7 @@ func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 		t.Fatal("expected price_snapshots.dist_km to be removed")
 	}
 
-	hasNameOverride, err := tableHasColumn(ctx, db, "stations", "name_override")
+	hasNameOverride, err := tableHasColumn(ctx, db, dialectSQLite, "stations", "name_override")
 	if err != nil {
 		t.Fatalf("tableHasColumn stations.name_override: %v", err)
 	}
@@ -1824,7 +1824,7 @@ func TestPersistUpdatePreservesNameOverride(t *testing.T) {
 		Diesel: &diesel,
 		IsOpen: true,
 	}}
-	if err := persistUpdate(ctx, db, city, stations, time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC), 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, stations, time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC), 5); err != nil {
 		t.Fatalf("persistUpdate first: %v", err)
 	}
 
@@ -1833,7 +1833,7 @@ func TestPersistUpdatePreservesNameOverride(t *testing.T) {
 	}
 
 	stations[0].Name = "Upstream Renamed"
-	if err := persistUpdate(ctx, db, city, stations, time.Date(2026, 4, 2, 10, 15, 0, 0, time.UTC), 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, stations, time.Date(2026, 4, 2, 10, 15, 0, 0, time.UTC), 5); err != nil {
 		t.Fatalf("persistUpdate second: %v", err)
 	}
 
@@ -2000,7 +2000,7 @@ func openTestDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() {
 		_ = db.Close()
 	})
-	if err := initSchema(context.Background(), db); err != nil {
+	if err := initSchema(context.Background(), db, dialectSQLite); err != nil {
 		t.Fatalf("initSchema: %v", err)
 	}
 	return db
@@ -2052,7 +2052,7 @@ func seedFixtureDB(t *testing.T) string {
 	defer db.Close()
 
 	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
 		t.Fatalf("initSchema: %v", err)
 	}
 
@@ -2090,7 +2090,7 @@ func seedFixtureDB(t *testing.T) string {
 		HouseNumber: "1",
 		PostCode:    10115,
 	}}
-	if err := persistUpdate(ctx, db, city, stations, time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC), 5); err != nil {
+	if err := persistUpdate(ctx, db, dialectSQLite, city, stations, time.Date(2026, 4, 2, 9, 15, 0, 0, time.UTC), 5); err != nil {
 		t.Fatalf("persistUpdate: %v", err)
 	}
 
@@ -2108,7 +2108,7 @@ func seedUncompactedFixtureDB(t *testing.T) string {
 	defer db.Close()
 
 	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
 		t.Fatalf("initSchema: %v", err)
 	}
 
@@ -2238,7 +2238,7 @@ func seedDuplicateCitiesFixtureDB(t *testing.T) string {
 	defer db.Close()
 
 	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
 		t.Fatalf("initSchema: %v", err)
 	}
 

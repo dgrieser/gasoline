@@ -1,22 +1,64 @@
 # gasoline
 
-Small Go CLI that stores Tankerkönig gas station prices historically in SQLite and ships with a lightweight PHP viewer for browsing the collected data.
+Small Go CLI that stores Tankerkönig gas station prices historically in SQLite or an external MySQL server and ships with a lightweight PHP viewer for browsing the collected data.
 
 ## Requirements
 
 - Go 1.24+
 - A Tankerkönig API key
 - `jq` for the optional watcher script
-- PHP with SQLite support if you want to use the web viewer
+- PHP with SQLite (or MySQL) support if you want to use the web viewer
+- Optionally a MySQL 8.0+ (or MariaDB 10.5+) server if you don't want the local SQLite file
 
 ## Configuration
 
 The CLI reads the Tankerkönig API key from `TANKER_KOENIG_API_KEY`. If that variable is unset, it falls back to a local `.env` file in the repo root.
 
+### SQLite (default)
+
 The SQLite database path defaults to `gasoline.db`. You can override it with either:
 
 - `GASOLINE_DB_PATH`
 - `--db /path/to/file.db`
+
+### MySQL
+
+Every command can store its data on an external MySQL server instead of the local SQLite file. Select the driver with `--db-driver mysql` or `GASOLINE_DB_DRIVER=mysql`, then provide the connection settings either as one DSN or as individual values. Each setting can come from a command-line flag, the environment, or the `.env` file (flag beats environment beats `.env`):
+
+| Flag | Environment / `.env` | Default |
+| --- | --- | --- |
+| `--db-driver` | `GASOLINE_DB_DRIVER` | `sqlite` |
+| `--mysql-dsn` | `GASOLINE_MYSQL_DSN` | — |
+| `--mysql-host` | `GASOLINE_MYSQL_HOST` | `127.0.0.1` |
+| `--mysql-port` | `GASOLINE_MYSQL_PORT` | `3306` |
+| `--mysql-user` | `GASOLINE_MYSQL_USER` | — (required) |
+| `--mysql-password` | `GASOLINE_MYSQL_PASSWORD` | empty |
+| `--mysql-database` | `GASOLINE_MYSQL_DATABASE` | — (required) |
+
+The DSN uses the [go-sql-driver format](https://github.com/go-sql-driver/mysql#dsn-data-source-name) and must include a database name, e.g. `user:pass@tcp(db.example.com:3306)/gasoline`. Passing `--mysql-dsn` on the command line implies `--db-driver mysql`. The database itself must already exist; all tables and indexes are created automatically on first use.
+
+Example `.env` for a fully MySQL-backed setup:
+
+```dotenv
+TANKER_KOENIG_API_KEY=your-key
+GASOLINE_DB_DRIVER=mysql
+GASOLINE_MYSQL_HOST=db.example.com
+GASOLINE_MYSQL_USER=gasoline
+GASOLINE_MYSQL_PASSWORD=secret
+GASOLINE_MYSQL_DATABASE=gasoline
+```
+
+### Migrating an existing SQLite database to MySQL
+
+`migrate-to-mysql` copies all cities, stations, and price snapshots from a SQLite file into a MySQL server (creating the tables if needed). Snapshot ids are preserved, so history ordering stays identical:
+
+```bash
+gasoline migrate-to-mysql --db gasoline.db \
+  --mysql-host db.example.com --mysql-user gasoline \
+  --mysql-password secret --mysql-database gasoline
+```
+
+The command refuses to write into a MySQL database that already contains data; add `--overwrite` to replace the existing rows. The copy runs in a single transaction, so an interrupted migration leaves the target unchanged. After migrating, point the CLI (and viewer) at MySQL as shown above.
 
 ## Setup
 
@@ -184,7 +226,7 @@ gasoline update --city "Berlin, Germany" --output json
 
 ## PHP Viewer
 
-The viewer lives in `web/index.php`. It reads `GASOLINE_DB_PATH` when set; otherwise it opens `gasoline.db` next to the repo.
+The viewer lives in `web/index.php`. It reads `GASOLINE_DB_PATH` when set; otherwise it opens `gasoline.db` next to the repo. To browse a MySQL-backed database instead, set `GASOLINE_DB_DRIVER=mysql` together with `GASOLINE_MYSQL_HOST`, `GASOLINE_MYSQL_PORT`, `GASOLINE_MYSQL_USER`, `GASOLINE_MYSQL_PASSWORD`, and `GASOLINE_MYSQL_DATABASE` in the web server's environment (the viewer uses these individual variables, not `GASOLINE_MYSQL_DSN`).
 
 Features:
 
@@ -214,7 +256,7 @@ Pushing a tag that matches `v*` triggers the GitHub Actions release workflow. It
 
 ## Notes
 
-- City geocoding is cached in SQLite, so Nominatim is only queried once per place unless the cached row is cleared or refreshed.
+- City geocoding is cached in the database, so Nominatim is only queried once per place unless the cached row is cleared or refreshed.
 - `update` stores only changed snapshots plus the adjacent unchanged snapshots needed to preserve price graphs.
 - Distance-only changes do not create a new snapshot, but open/closed changes do.
 - `import cities` downloads populated-place data from GeoNames and keeps only matching entries for the requested 2-letter country code.
