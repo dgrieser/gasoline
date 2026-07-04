@@ -183,12 +183,14 @@ func copyTable(ctx context.Context, src *sql.DB, tx *sql.Tx, table string, colum
 		return nil
 	}
 
+	// Scan buffers are reused across rows: append copies the interface values
+	// into args, and database/sql clones []byte sources scanned into *any.
+	values := make([]any, len(columns))
+	pointers := make([]any, len(columns))
+	for i := range values {
+		pointers[i] = &values[i]
+	}
 	for rows.Next() {
-		values := make([]any, len(columns))
-		pointers := make([]any, len(columns))
-		for i := range values {
-			pointers[i] = &values[i]
-		}
 		if err := rows.Scan(pointers...); err != nil {
 			return 0, err
 		}

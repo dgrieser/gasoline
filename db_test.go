@@ -157,6 +157,51 @@ func TestResolveDBConfigMySQLFromDotEnv(t *testing.T) {
 	}
 }
 
+func TestResolveDBConfigMySQLFlagsOverrideEnvDSN(t *testing.T) {
+	clearDBEnv(t)
+	t.Setenv(envDBDriverName, "mysql")
+	t.Setenv(envMySQLDSNName, "gas:secret@tcp(env-host:3306)/envdb")
+
+	fs, dbf := parseDBFlags(t, "--mysql-host", "flag-host", "--mysql-database", "flagdb")
+	cfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		t.Fatalf("resolveDBConfig: %v", err)
+	}
+	parsed, err := mysql.ParseDSN(cfg.MySQLDSN)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q): %v", cfg.MySQLDSN, err)
+	}
+	if parsed.Addr != "flag-host:3306" {
+		t.Fatalf("Addr = %q, want %q", parsed.Addr, "flag-host:3306")
+	}
+	if parsed.DBName != "flagdb" {
+		t.Fatalf("DBName = %q, want %q", parsed.DBName, "flagdb")
+	}
+	// Fields without a flag keep the environment DSN's values.
+	if parsed.User != "gas" || parsed.Passwd != "secret" {
+		t.Fatalf("user/password = %q/%q, want gas/secret from env DSN", parsed.User, parsed.Passwd)
+	}
+}
+
+func TestResolveDBConfigMySQLPortFlagOverridesEnvDSN(t *testing.T) {
+	clearDBEnv(t)
+	t.Setenv(envDBDriverName, "mysql")
+	t.Setenv(envMySQLDSNName, "gas:secret@tcp(env-host:3306)/envdb")
+
+	fs, dbf := parseDBFlags(t, "--mysql-port", "3307")
+	cfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		t.Fatalf("resolveDBConfig: %v", err)
+	}
+	parsed, err := mysql.ParseDSN(cfg.MySQLDSN)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q): %v", cfg.MySQLDSN, err)
+	}
+	if parsed.Addr != "env-host:3307" {
+		t.Fatalf("Addr = %q, want %q", parsed.Addr, "env-host:3307")
+	}
+}
+
 func TestResolveDBConfigMySQLFlagBeatsEnv(t *testing.T) {
 	clearDBEnv(t)
 	t.Setenv(envDBDriverName, "mysql")

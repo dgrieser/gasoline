@@ -35,7 +35,7 @@ Every command can store its data on an external MySQL server instead of the loca
 | `--mysql-password` | `GASOLINE_MYSQL_PASSWORD` | empty |
 | `--mysql-database` | `GASOLINE_MYSQL_DATABASE` | — (required) |
 
-The DSN uses the [go-sql-driver format](https://github.com/go-sql-driver/mysql#dsn-data-source-name) and must include a database name, e.g. `user:pass@tcp(db.example.com:3306)/gasoline`. Passing `--mysql-dsn` on the command line implies `--db-driver mysql`. The database itself must already exist; all tables and indexes are created automatically on first use.
+The DSN uses the [go-sql-driver format](https://github.com/go-sql-driver/mysql#dsn-data-source-name) and must include a database name, e.g. `user:pass@tcp(db.example.com:3306)/gasoline`. Passing `--mysql-dsn` on the command line implies `--db-driver mysql`. When a DSN comes from `GASOLINE_MYSQL_DSN`, individual `--mysql-*` flags still override the matching part of it (e.g. `--mysql-host` retargets the host while keeping the DSN's credentials). The database itself must already exist; all tables and indexes are created automatically on first use.
 
 Example `.env` for a fully MySQL-backed setup:
 

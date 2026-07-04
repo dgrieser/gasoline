@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,7 +124,7 @@ func resolveMySQLDSN(f *dbFlags, env envLookup) (string, error) {
 		return normalizeMySQLDSN(dsn)
 	}
 	if dsn := env.get(envMySQLDSNName); dsn != "" {
-		return normalizeMySQLDSN(dsn)
+		return overrideMySQLDSN(dsn, f)
 	}
 
 	pick := func(flagValue string, envName string) string {
@@ -166,6 +167,50 @@ func normalizeMySQLDSN(dsn string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return "", fmt.Errorf("invalid mysql DSN: %w", err)
+	}
+	if cfg.DBName == "" {
+		return "", errors.New("mysql DSN must include a database name, e.g. user:pass@tcp(host:3306)/gasoline")
+	}
+	return cfg.FormatDSN(), nil
+}
+
+// overrideMySQLDSN overlays individual --mysql-* flags onto a DSN configured
+// via the environment, so each field keeps the documented flag-beats-environment
+// precedence.
+func overrideMySQLDSN(dsn string, f *dbFlags) (string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("invalid mysql DSN: %w", err)
+	}
+
+	host := strings.TrimSpace(*f.mysqlHost)
+	port := strings.TrimSpace(*f.mysqlPort)
+	if host != "" || port != "" {
+		currentHost, currentPort := defaultMySQLHost, defaultMySQLPort
+		if cfg.Net == "tcp" {
+			if h, p, err := net.SplitHostPort(cfg.Addr); err == nil {
+				currentHost, currentPort = h, p
+			} else if cfg.Addr != "" {
+				currentHost = cfg.Addr
+			}
+		}
+		if host == "" {
+			host = currentHost
+		}
+		if port == "" {
+			port = currentPort
+		}
+		cfg.Net = "tcp"
+		cfg.Addr = net.JoinHostPort(host, port)
+	}
+	if user := strings.TrimSpace(*f.mysqlUser); user != "" {
+		cfg.User = user
+	}
+	if password := strings.TrimSpace(*f.mysqlPassword); password != "" {
+		cfg.Passwd = password
+	}
+	if database := strings.TrimSpace(*f.mysqlDatabase); database != "" {
+		cfg.DBName = database
 	}
 	if cfg.DBName == "" {
 		return "", errors.New("mysql DSN must include a database name, e.g. user:pass@tcp(host:3306)/gasoline")
