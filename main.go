@@ -21,8 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 const (
@@ -320,6 +318,7 @@ var geoNamesFeatureCodePattern = regexp.MustCompile(`^(PPL|PPLC|PPLA[1-9]*)$`)
 
 type queryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 func main() {
@@ -342,6 +341,8 @@ func run(args []string) error {
 		return runCompact(args[1:])
 	case "migrate":
 		return runMigrate(args[1:])
+	case "migrate-to-mysql":
+		return runMigrateToMySQL(args[1:])
 	case "list":
 		return runList(args[1:])
 	case "import":
@@ -371,12 +372,13 @@ func run(args []string) error {
 }
 
 func printUsage() {
-	fmt.Println(`gasoline: persist Tankerkönig station prices into SQLite
+	fmt.Println(`gasoline: persist Tankerkönig station prices into SQLite or MySQL
 
 Commands:
   update   geocode a city if needed, query Tankerkönig, store station snapshots
   compact  compact existing price snapshots in-place
   migrate  apply schema migrations to an existing database
+  migrate-to-mysql copy a SQLite database into a MySQL server
   list cities   list cached city geocodes
   list stations list known stations with latest stored snapshot
   list history  show historical prices
@@ -386,11 +388,22 @@ Commands:
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
 
+Database:
+  Commands use SQLite (--db, default gasoline.db) unless MySQL is selected via
+  --db-driver mysql (or GASOLINE_DB_DRIVER=mysql). MySQL connection settings:
+  --mysql-dsn "user:pass@tcp(host:3306)/gasoline", or individual
+  --mysql-host/--mysql-port/--mysql-user/--mysql-password/--mysql-database flags.
+  All settings can also come from the environment or a local .env file:
+  GASOLINE_DB_DRIVER, GASOLINE_MYSQL_DSN, GASOLINE_MYSQL_HOST, GASOLINE_MYSQL_PORT,
+  GASOLINE_MYSQL_USER, GASOLINE_MYSQL_PASSWORD, GASOLINE_MYSQL_DATABASE.
+
 Examples:
   gasoline update --city "Berlin, Germany" --radius 5
   gasoline update --radius 10 --city Berlin --city "Lübbecke" --radius 25 --city Pforzheim
+  gasoline update --city Berlin --db-driver mysql --mysql-dsn "gas:secret@tcp(db.example.com:3306)/gasoline"
   gasoline compact
   gasoline migrate
+  gasoline migrate-to-mysql --db gasoline.db --mysql-host db.example.com --mysql-user gas --mysql-password secret --mysql-database gasoline
   gasoline list cities
   gasoline list stations --city "Berlin, Germany"
   gasoline list history --fuel diesel
@@ -536,7 +549,7 @@ func validateCityQueries(queries []cityQuery) error {
 
 func runUpdate(args []string) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	var events []updateArg
 	fs.Var(cityFlag{&events}, "city", "City or place to geocode (repeatable)")
 	fs.Var(radiusFlag{&events}, "radius", "Search radius in km, repeatable; default 5, max 25")
@@ -547,7 +560,10 @@ func runUpdate(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
@@ -571,20 +587,20 @@ func runUpdate(args []string) error {
 		return err
 	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
 	// Single city: preserve the original behavior and output shape.
 	if len(queries) == 1 {
-		res, err := updateCity(ctx, db, cfg, queries[0], *fuelType, *sortBy)
+		res, err := updateCity(ctx, db, dbCfg.Driver, cfg, queries[0], *fuelType, *sortBy)
 		if err != nil {
 			return err
 		}
@@ -594,11 +610,11 @@ func runUpdate(args []string) error {
 				CacheStatus: res.CacheStatus,
 				StoredCount: res.StoredCount,
 				RecordedAt:  res.RecordedAt,
-				DBPath:      resolvedDBPath,
+				DBPath:      dbCfg.Description(),
 			})
 		}
 		printCityUpdate(res)
-		fmt.Fprintf(stdout, "stored %d station snapshots at %s in %s\n", res.StoredCount, res.RecordedAt, resolvedDBPath)
+		fmt.Fprintf(stdout, "stored %d station snapshots at %s in %s\n", res.StoredCount, res.RecordedAt, dbCfg.Description())
 		return nil
 	}
 
@@ -611,7 +627,7 @@ func runUpdate(args []string) error {
 	total := 0
 	failures := 0
 	for _, q := range queries {
-		res, err := updateCity(ctx, db, cfg, q, *fuelType, *sortBy)
+		res, err := updateCity(ctx, db, dbCfg.Driver, cfg, q, *fuelType, *sortBy)
 		if err != nil {
 			failures++
 			results = append(results, cityUpdateResult{Query: q.name, RadiusKm: q.radius, Error: err.Error()})
@@ -626,7 +642,7 @@ func runUpdate(args []string) error {
 			Results:     results,
 			StoredCount: total,
 			RecordedAt:  runAt,
-			DBPath:      resolvedDBPath,
+			DBPath:      dbCfg.Description(),
 		}); err != nil {
 			return err
 		}
@@ -640,7 +656,7 @@ func runUpdate(args []string) error {
 			fmt.Fprintf(stdout, "  radius %.2f km, stored %d snapshots at %s\n\n", res.RadiusKm, res.StoredCount, res.RecordedAt)
 		}
 		fmt.Fprintf(stdout, "updated %d of %d cities, stored %d station snapshots in %s\n",
-			len(queries)-failures, len(queries), total, resolvedDBPath)
+			len(queries)-failures, len(queries), total, dbCfg.Description())
 	}
 
 	if failures > 0 {
@@ -650,7 +666,7 @@ func runUpdate(args []string) error {
 }
 
 // updateCity geocodes one city, fetches its stations, and persists the snapshots.
-func updateCity(ctx context.Context, db *sql.DB, cfg config, q cityQuery, fuelType, sortBy string) (cityUpdateResult, error) {
+func updateCity(ctx context.Context, db *sql.DB, d dialect, cfg config, q cityQuery, fuelType, sortBy string) (cityUpdateResult, error) {
 	location, cached, err := getOrCreateCity(ctx, db, q.name, cfg.UserAgent)
 	if err != nil {
 		return cityUpdateResult{}, err
@@ -662,7 +678,7 @@ func updateCity(ctx context.Context, db *sql.DB, cfg config, q cityQuery, fuelTy
 	// Stamp after the data is fetched so the snapshot reflects when it was
 	// observed, not when the (possibly multi-city) run began.
 	recordedAt := time.Now().UTC()
-	if err := persistUpdate(ctx, db, location, stations, recordedAt, q.radius); err != nil {
+	if err := persistUpdate(ctx, db, d, location, stations, recordedAt, q.radius); err != nil {
 		return cityUpdateResult{}, err
 	}
 	cacheStatus := "resolved via geocoder"
@@ -687,25 +703,28 @@ func printCityUpdate(res cityUpdateResult) {
 
 func runCompact(args []string) error {
 	fs := flag.NewFlagSet("compact", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
 	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
@@ -713,55 +732,58 @@ func runCompact(args []string) error {
 	if err != nil {
 		return err
 	}
-	result.DBPath = resolvedDBPath
+	result.DBPath = dbCfg.Description()
 
 	if output == outputJSON {
 		return writeJSON(result)
 	}
 
-	fmt.Fprintf(stdout, "compacted %d stations in %s\n", result.StationsProcessed, resolvedDBPath)
+	fmt.Fprintf(stdout, "compacted %d stations in %s\n", result.StationsProcessed, dbCfg.Description())
 	fmt.Fprintf(stdout, "snapshots: %d -> %d (deleted=%d, updated=%d)\n", result.BeforeCount, result.AfterCount, result.DeletedCount, result.UpdatedCount)
 	return nil
 }
 
 func runMigrate(args []string) error {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
 	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := ensureSchema(ctx, db); err != nil {
+	if err := ensureSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
-	result, err := migrateSchema(ctx, db)
+	result, err := migrateSchema(ctx, db, dbCfg.Driver)
 	if err != nil {
 		return err
 	}
-	result.DBPath = resolvedDBPath
+	result.DBPath = dbCfg.Description()
 
 	if output == outputJSON {
 		return writeJSON(result)
 	}
 	if len(result.Applied) == 0 {
-		fmt.Fprintf(stdout, "no migrations needed for %s\n", resolvedDBPath)
+		fmt.Fprintf(stdout, "no migrations needed for %s\n", dbCfg.Description())
 		return nil
 	}
-	fmt.Fprintf(stdout, "applied %d migrations to %s\n", len(result.Applied), resolvedDBPath)
+	fmt.Fprintf(stdout, "applied %d migrations to %s\n", len(result.Applied), dbCfg.Description())
 	for _, migration := range result.Applied {
 		fmt.Fprintf(stdout, "- %s\n", migration)
 	}
@@ -770,25 +792,28 @@ func runMigrate(args []string) error {
 
 func runCities(args []string) error {
 	fs := flag.NewFlagSet("cities", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
 	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
@@ -832,7 +857,7 @@ func runCities(args []string) error {
 
 func runImportCities(args []string) error {
 	fs := flag.NewFlagSet("import-cities", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -849,16 +874,19 @@ func runImportCities(args []string) error {
 	if !countryCodePattern.MatchString(countryCode) {
 		return errors.New("import-cities requires a 2-letter country code argument")
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
@@ -868,7 +896,7 @@ func runImportCities(args []string) error {
 		return err
 	}
 
-	importedCount, err := importCities(ctx, db, cities)
+	importedCount, err := importCities(ctx, db, dbCfg.Driver, cities)
 	if err != nil {
 		return err
 	}
@@ -878,7 +906,7 @@ func runImportCities(args []string) error {
 		SourceURL:     sourceURL,
 		ParsedCount:   len(cities),
 		ImportedCount: importedCount,
-		DBPath:        resolvedDBPath,
+		DBPath:        dbCfg.Description(),
 	}
 	if output == outputJSON {
 		return writeJSON(result)
@@ -887,13 +915,13 @@ func runImportCities(args []string) error {
 	fmt.Fprintf(stdout, "source: %s\n", sourceURL)
 	fmt.Fprintf(stdout, "country: %s\n", countryCode)
 	fmt.Fprintf(stdout, "parsed %d cities\n", result.ParsedCount)
-	fmt.Fprintf(stdout, "imported %d cities into %s\n", result.ImportedCount, resolvedDBPath)
+	fmt.Fprintf(stdout, "imported %d cities into %s\n", result.ImportedCount, dbCfg.Description())
 	return nil
 }
 
 func runClearCities(args []string) error {
 	fs := flag.NewFlagSet("clear cities", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -902,16 +930,19 @@ func runClearCities(args []string) error {
 	if err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
@@ -926,26 +957,29 @@ func runClearCities(args []string) error {
 
 	result := clearCitiesResult{
 		ClearedCount: int(clearedCount),
-		DBPath:       resolvedDBPath,
+		DBPath:       dbCfg.Description(),
 	}
 	if output == outputJSON {
 		return writeJSON(result)
 	}
 
-	fmt.Fprintf(stdout, "cleared %d cities from %s\n", result.ClearedCount, resolvedDBPath)
+	fmt.Fprintf(stdout, "cleared %d cities from %s\n", result.ClearedCount, dbCfg.Description())
 	return nil
 }
 
 func runStations(args []string) error {
 	fs := flag.NewFlagSet("stations", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	city := fs.String("city", "", "Optional city filter from stored sync runs")
 	limit := fs.Int("limit", 50, "Max rows to print; 0 for no limit")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
@@ -954,14 +988,14 @@ func runStations(args []string) error {
 		return errors.New("--limit must be >= 0")
 	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
@@ -984,7 +1018,7 @@ func runStations(args []string) error {
 				AND ps.recorded_at = latest.latest_recorded_at
 			ORDER BY COALESCE(s.name_override, s.name) ASC
 			LIMIT ?
-		`, sqliteLimit(*limit))
+		`, queryLimit(dbCfg.Driver, *limit))
 	} else {
 		rows, err = db.QueryContext(ctx, `
 			SELECT
@@ -1002,7 +1036,7 @@ func runStations(args []string) error {
 				AND ps.recorded_at = latest.latest_recorded_at
 			ORDER BY COALESCE(s.name_override, s.name) ASC
 			LIMIT ?
-		`, strings.TrimSpace(*city), sqliteLimit(*limit))
+		`, strings.TrimSpace(*city), queryLimit(dbCfg.Driver, *limit))
 	}
 	if err != nil {
 		return err
@@ -1058,7 +1092,7 @@ func runStations(args []string) error {
 
 func runHistory(args []string) error {
 	fs := flag.NewFlagSet("history", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	stationID := fs.String("station-id", "", "Station UUID")
 	fuel := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
 	limit := fs.Int("limit", 100, "Max history rows; 0 for no limit")
@@ -1066,7 +1100,10 @@ func runHistory(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
@@ -1078,14 +1115,14 @@ func runHistory(args []string) error {
 		return errors.New("--limit must be >= 0")
 	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
@@ -1098,7 +1135,7 @@ func runHistory(args []string) error {
 			JOIN stations s ON s.id = ps.station_id
 			ORDER BY ps.recorded_at DESC
 			LIMIT ?
-		`, sqliteLimit(*limit))
+		`, queryLimit(dbCfg.Driver, *limit))
 	} else {
 		rows, err = db.QueryContext(ctx, `
 			SELECT ps.station_id, COALESCE(s.name_override, s.name), ps.city_name, ps.recorded_at, ps.is_open, ps.e5, ps.e10, ps.diesel
@@ -1107,7 +1144,7 @@ func runHistory(args []string) error {
 			WHERE ps.station_id = ?
 			ORDER BY ps.recorded_at DESC
 			LIMIT ?
-		`, stationFilter, sqliteLimit(*limit))
+		`, stationFilter, queryLimit(dbCfg.Driver, *limit))
 	}
 	if err != nil {
 		return err
@@ -1169,7 +1206,7 @@ func runHistory(args []string) error {
 
 func runSuggest(args []string) error {
 	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	city := fs.String("city", "", "Cached city to use as the range center")
 	rangeKM := fs.Float64("range-km", 5, "Maximum station distance from the city center in km")
 	fuel := fs.String("fuel", "diesel", "Fuel type: diesel, e5, e10")
@@ -1180,7 +1217,10 @@ func runSuggest(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
@@ -1200,14 +1240,14 @@ func runSuggest(args []string) error {
 		return err
 	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
@@ -1225,7 +1265,7 @@ func runSuggest(args []string) error {
 
 func runCheck(args []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	city := fs.String("city", "", "Cached city to use as the range center")
 	rangeKM := fs.Float64("range-km", 5, "Maximum station distance from the city center in km")
 	fuel := fs.String("fuel", "diesel", "Fuel type: diesel, e5, e10")
@@ -1236,7 +1276,10 @@ func runCheck(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
@@ -1256,14 +1299,14 @@ func runCheck(args []string) error {
 		return err
 	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
@@ -1281,13 +1324,16 @@ func runCheck(args []string) error {
 
 func runRename(args []string) error {
 	fs := flag.NewFlagSet("rename", flag.ContinueOnError)
-	dbPath := fs.String("db", defaultDBPath, "SQLite database file")
+	dbf := addDBFlags(fs)
 	clear := fs.Bool("clear", false, "Remove the name override (revert to the Tankerkönig name)")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	resolvedDBPath := resolveDBPath(fs, *dbPath)
+	dbCfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		return err
+	}
 	output, err := resolveOutputMode(*outputLong, *outputShort)
 	if err != nil {
 		return err
@@ -1314,14 +1360,14 @@ func runRename(args []string) error {
 		return errors.New("station id must not be empty")
 	}
 
-	db, err := openDB(resolvedDBPath)
+	ctx := context.Background()
+	db, err := openDatabase(ctx, dbCfg)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-	if err := initSchema(ctx, db); err != nil {
+	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
 		return err
 	}
 
@@ -2141,13 +2187,6 @@ func printHistoryText(stationFilter, stationID, stationName, recordedAt, cityNam
 	fmt.Fprintf(stdout, "%s | city=%s | open=%t | %s\n", recordedAt, cityName, isOpen, prices)
 }
 
-func sqliteLimit(limit int) int {
-	if limit == 0 {
-		return -1
-	}
-	return limit
-}
-
 func addOutputFlags(fs *flag.FlagSet) (*string, *string) {
 	return fs.String("output", "", "Output format: txt or json"), fs.String("o", "", "Output format: txt or json")
 }
@@ -2222,14 +2261,6 @@ func loadDotEnv(path string) (map[string]string, error) {
 	return values, nil
 }
 
-func openDB(path string) (*sql.DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
-		return nil, err
-	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)", path, sqliteBusyTimeout)
-	return sql.Open("sqlite", dsn)
-}
-
 func resolveDBPath(fs *flag.FlagSet, flagValue string) string {
 	if flagWasSet(fs, "db") {
 		return flagValue
@@ -2250,67 +2281,24 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 	return found
 }
 
-func initSchema(ctx context.Context, db *sql.DB) error {
-	if err := ensureSchema(ctx, db); err != nil {
+func initSchema(ctx context.Context, db *sql.DB, d dialect) error {
+	if err := ensureSchema(ctx, db, d); err != nil {
 		return err
 	}
-	_, err := migrateSchema(ctx, db)
+	_, err := migrateSchema(ctx, db, d)
 	return err
 }
 
-func ensureSchema(ctx context.Context, db *sql.DB) error {
-	schema := `
-	CREATE TABLE IF NOT EXISTS cities (
-		name TEXT PRIMARY KEY,
-		normalized_name TEXT NOT NULL,
-		display_name TEXT NOT NULL,
-		lat REAL NOT NULL,
-		lng REAL NOT NULL,
-		created_at TEXT NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS stations (
-		id TEXT PRIMARY KEY,
-		name TEXT NOT NULL,
-		name_override TEXT,
-		brand TEXT,
-		street TEXT,
-		house_number TEXT,
-		post_code INTEGER,
-		place TEXT,
-		lat REAL NOT NULL,
-		lng REAL NOT NULL,
-		first_seen_at TEXT NOT NULL,
-		last_seen_at TEXT NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS price_snapshots (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		station_id TEXT NOT NULL,
-		city_name TEXT NOT NULL,
-		recorded_at TEXT NOT NULL,
-		search_radius_km REAL NOT NULL DEFAULT 5,
-		is_open INTEGER NOT NULL,
-		e5 REAL,
-		e10 REAL,
-		diesel REAL,
-		FOREIGN KEY (station_id) REFERENCES stations(id)
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_price_snapshots_station_recorded
-		ON price_snapshots(station_id, recorded_at DESC);
-
-	CREATE INDEX IF NOT EXISTS idx_price_snapshots_city_recorded
-		ON price_snapshots(city_name, recorded_at DESC);
-
-	CREATE INDEX IF NOT EXISTS idx_stations_lat_lng
-		ON stations(lat, lng);
-	`
-	_, err := db.ExecContext(ctx, schema)
-	return err
+func ensureSchema(ctx context.Context, db *sql.DB, d dialect) error {
+	for _, stmt := range schemaStatements(d) {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func migrateSchema(ctx context.Context, db *sql.DB) (migrateResult, error) {
+func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return migrateResult{}, err
@@ -2318,7 +2306,7 @@ func migrateSchema(ctx context.Context, db *sql.DB) (migrateResult, error) {
 	defer tx.Rollback()
 
 	var result migrateResult
-	if err := migrateCitiesNormalizedName(ctx, tx, &result); err != nil {
+	if err := migrateCitiesNormalizedName(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
 	if err := migrateCitiesDisplayName(ctx, tx, &result); err != nil {
@@ -2327,10 +2315,10 @@ func migrateSchema(ctx context.Context, db *sql.DB) (migrateResult, error) {
 	if err := migrateCitiesDeduplicate(ctx, tx, &result); err != nil {
 		return migrateResult{}, err
 	}
-	if err := migratePriceSnapshotsDropDistKM(ctx, tx, &result); err != nil {
+	if err := migratePriceSnapshotsDropDistKM(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
-	if err := migrateStationsNameOverride(ctx, tx, &result); err != nil {
+	if err := migrateStationsNameOverride(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
 
@@ -2340,8 +2328,8 @@ func migrateSchema(ctx context.Context, db *sql.DB) (migrateResult, error) {
 	return result, nil
 }
 
-func migrateStationsNameOverride(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
-	hasColumn, err := tableHasColumn(ctx, tx, "stations", "name_override")
+func migrateStationsNameOverride(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "stations", "name_override")
 	if err != nil {
 		return err
 	}
@@ -2355,16 +2343,21 @@ func migrateStationsNameOverride(ctx context.Context, tx *sql.Tx, result *migrat
 	return nil
 }
 
-func migrateCitiesNormalizedName(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
-	hasColumn, err := tableHasColumn(ctx, tx, "cities", "normalized_name")
+func migrateCitiesNormalizedName(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "cities", "normalized_name")
 	if err != nil {
 		return err
 	}
 	if !hasColumn {
-		if _, err := tx.ExecContext(ctx, `
+		// MySQL forbids DEFAULT on TEXT columns, so use a bounded VARCHAR there.
+		columnDef := `normalized_name TEXT NOT NULL DEFAULT ''`
+		if d == dialectMySQL {
+			columnDef = `normalized_name VARCHAR(255) NOT NULL DEFAULT ''`
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			ALTER TABLE cities
-			ADD COLUMN normalized_name TEXT NOT NULL DEFAULT ''
-		`); err != nil {
+			ADD COLUMN %s
+		`, columnDef)); err != nil {
 			return err
 		}
 		result.Applied = append(result.Applied, "cities.normalized_name")
@@ -2472,12 +2465,20 @@ func migrateCitiesDisplayName(ctx context.Context, tx *sql.Tx, result *migrateRe
 	return nil
 }
 
-func migratePriceSnapshotsDropDistKM(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
-	hasColumn, err := tableHasColumn(ctx, tx, "price_snapshots", "dist_km")
+func migratePriceSnapshotsDropDistKM(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "price_snapshots", "dist_km")
 	if err != nil {
 		return err
 	}
 	if !hasColumn {
+		return nil
+	}
+
+	if d == dialectMySQL {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE price_snapshots DROP COLUMN dist_km`); err != nil {
+			return err
+		}
+		result.Applied = append(result.Applied, "price_snapshots.dist_km")
 		return nil
 	}
 
@@ -2531,7 +2532,20 @@ func migratePriceSnapshotsDropDistKM(ctx context.Context, tx *sql.Tx, result *mi
 	return nil
 }
 
-func tableHasColumn(ctx context.Context, q queryer, tableName, columnName string) (bool, error) {
+func tableHasColumn(ctx context.Context, q queryer, d dialect, tableName, columnName string) (bool, error) {
+	if d == dialectMySQL {
+		var count int
+		row := q.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM information_schema.columns
+			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?
+		`, tableName, columnName)
+		if err := row.Scan(&count); err != nil {
+			return false, err
+		}
+		return count > 0, nil
+	}
+
 	rows, err := q.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
 		return false, err
@@ -2660,22 +2674,14 @@ func parseGeoNamesCities(r io.Reader, countryCode string) ([]cachedCity, error) 
 	}
 }
 
-func importCities(ctx context.Context, db *sql.DB, cities []cachedCity) (int, error) {
+func importCities(ctx context.Context, db *sql.DB, d dialect, cities []cachedCity) (int, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(name) DO UPDATE SET
-			normalized_name = excluded.normalized_name,
-			display_name = excluded.display_name,
-			lat = excluded.lat,
-			lng = excluded.lng
-	`)
+	stmt, err := tx.PrepareContext(ctx, citiesUpsertSQL(d))
 	if err != nil {
 		return 0, err
 	}
@@ -2920,7 +2926,7 @@ func fetchStations(ctx context.Context, cfg config, lat, lng, radius float64, fu
 	return payload.Stations, nil
 }
 
-func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
+func persistUpdate(ctx context.Context, db *sql.DB, d dialect, city cachedCity, stations []tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -2928,21 +2934,8 @@ func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []
 	defer tx.Rollback()
 
 	for _, station := range stations {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO stations (
-				id, name, brand, street, house_number, post_code, place, lat, lng, first_seen_at, last_seen_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET
-				name = excluded.name,
-				brand = excluded.brand,
-				street = excluded.street,
-				house_number = excluded.house_number,
-				post_code = excluded.post_code,
-				place = excluded.place,
-				lat = excluded.lat,
-				lng = excluded.lng,
-				last_seen_at = excluded.last_seen_at
-		`, station.ID, station.Name, station.Brand, station.Street, station.HouseNumber, station.PostCode, station.Place, station.Lat, station.Lng, recordedAt.Format(time.RFC3339), recordedAt.Format(time.RFC3339)); err != nil {
+		if _, err := tx.ExecContext(ctx, stationsUpsertSQL(d),
+			station.ID, station.Name, station.Brand, station.Street, station.HouseNumber, station.PostCode, station.Place, station.Lat, station.Lng, recordedAt.Format(time.RFC3339), recordedAt.Format(time.RFC3339)); err != nil {
 			return err
 		}
 
@@ -2951,7 +2944,7 @@ func persistUpdate(ctx context.Context, db *sql.DB, city cachedCity, stations []
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO cities (name, normalized_name, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+	if _, err := tx.ExecContext(ctx, citiesInsertIgnoreSQL(d),
 		city.QueryName, city.Name, city.DisplayName, city.Lat, city.Lng, recordedAt.Format(time.RFC3339),
 	); err != nil {
 		return err

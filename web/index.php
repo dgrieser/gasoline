@@ -5,6 +5,33 @@ declare(strict_types=1);
 $envDBPath = trim((string) getenv('GASOLINE_DB_PATH'));
 $defaultDBPath = realpath(__DIR__ . '/../gasoline.db') ?: (__DIR__ . '/../gasoline.db');
 $dbPath = $envDBPath !== '' ? $envDBPath : $defaultDBPath;
+$dbDriver = strtolower(trim((string) getenv('GASOLINE_DB_DRIVER')));
+if (!in_array($dbDriver, ['sqlite', 'mysql'], true)) {
+    $dbDriver = 'sqlite';
+}
+
+function gasolineConnect(string $driver, string $sqlitePath): PDO
+{
+    if ($driver === 'mysql') {
+        $host = trim((string) getenv('GASOLINE_MYSQL_HOST')) ?: '127.0.0.1';
+        $port = trim((string) getenv('GASOLINE_MYSQL_PORT')) ?: '3306';
+        $database = trim((string) getenv('GASOLINE_MYSQL_DATABASE'));
+        $user = trim((string) getenv('GASOLINE_MYSQL_USER'));
+        $password = trim((string) getenv('GASOLINE_MYSQL_PASSWORD'));
+        if ($database === '' || $user === '') {
+            throw new RuntimeException('GASOLINE_MYSQL_DATABASE and GASOLINE_MYSQL_USER must be set when GASOLINE_DB_DRIVER=mysql');
+        }
+        $dsn = sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $host, $port, $database);
+        $pdo = new PDO($dsn, $user, $password);
+    } else {
+        $pdo = new PDO('sqlite:' . $sqlitePath);
+    }
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+
+    return $pdo;
+}
+
 $errors = [];
 $stations = [];
 $rows = [];
@@ -56,7 +83,7 @@ $selectedRadiusKm = in_array((int) $selectedRadiusKmRaw, $validRadiusOptions, tr
     ? (int) $selectedRadiusKmRaw
     : ($selectedCity !== '' ? 5 : $validRadiusOptions[0]);
 
-if (!file_exists($dbPath)) {
+if ($dbDriver === 'sqlite' && !file_exists($dbPath)) {
     $errors[] = [
         'key' => 'dbNotFound',
         'params' => ['path' => $dbPath],
@@ -68,14 +95,12 @@ if (!file_exists($dbPath)) {
 if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
     header('Content-Type: application/json; charset=utf-8');
     $q = trim((string) ($_GET['q'] ?? ''));
-    if (strlen($q) < 3 || !file_exists($dbPath)) {
+    if (strlen($q) < 3 || ($dbDriver === 'sqlite' && !file_exists($dbPath))) {
         echo '[]';
         exit;
     }
     try {
-        $searchPdo = new PDO('sqlite:' . $dbPath);
-        $searchPdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        $searchPdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        $searchPdo = gasolineConnect($dbDriver, $dbPath);
         $searchStmt = $searchPdo->prepare(
             "SELECT normalized_name AS city_key, display_name
              FROM cities
@@ -122,9 +147,7 @@ function haversineKm(float $lat1, float $lng1, float $lat2, float $lng2): float
 
 if ($errors === []) {
     try {
-        $pdo = new PDO('sqlite:' . $dbPath);
-        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        $pdo = gasolineConnect($dbDriver, $dbPath);
 
         if ($selectedCity !== '') {
             $cityStatement = $pdo->prepare(
