@@ -329,6 +329,14 @@ if ($errors === []) {
             $where[] = 'ps.station_id IN (' . implode(', ', $placeholders) . ')';
         }
 
+        // Without a city or an explicit station selection there is no scope to
+        // display, so skip the snapshot query instead of loading every station's
+        // full history for the default date range.
+        if ($selectedCityRow === null && $selectedStationIds === []) {
+            $shouldRunRowQuery = false;
+            $rows = [];
+        }
+
         $sql = <<<'SQL'
             SELECT
                 ps.station_id,
