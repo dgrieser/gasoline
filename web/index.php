@@ -22,7 +22,28 @@ function gasolineConnect(string $driver, string $sqlitePath): PDO
             throw new RuntimeException('GASOLINE_MYSQL_DATABASE and GASOLINE_MYSQL_USER must be set when GASOLINE_DB_DRIVER=mysql');
         }
         $dsn = sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $host, $port, $database);
-        $pdo = new PDO($dsn, $user, $password);
+        $options = [];
+        $tls = strtolower(trim((string) getenv('GASOLINE_MYSQL_TLS')));
+        switch ($tls) {
+            case '':
+            case 'false':
+                break;
+            case 'skip-verify':
+            case 'preferred':
+                // Encrypt the connection but do not validate the server certificate.
+                $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
+                break;
+            case 'true':
+                $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = true;
+                $ca = trim((string) getenv('GASOLINE_MYSQL_SSL_CA'));
+                if ($ca !== '') {
+                    $options[PDO::MYSQL_ATTR_SSL_CA] = $ca;
+                }
+                break;
+            default:
+                throw new RuntimeException(sprintf('invalid GASOLINE_MYSQL_TLS %s (expected true, false, skip-verify, or preferred)', $tls));
+        }
+        $pdo = new PDO($dsn, $user, $password, $options);
     } else {
         $pdo = new PDO('sqlite:' . $sqlitePath);
     }

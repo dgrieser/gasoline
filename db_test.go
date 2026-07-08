@@ -28,6 +28,7 @@ func clearDBEnv(t *testing.T) {
 		envMySQLUserName,
 		envMySQLPasswordName,
 		envMySQLDatabaseName,
+		envMySQLTLSName,
 	} {
 		t.Setenv(name, "")
 	}
@@ -243,8 +244,76 @@ func TestResolveDBConfigRejectsUnknownDriver(t *testing.T) {
 }
 
 func TestNormalizeMySQLDSNRequiresDatabase(t *testing.T) {
-	if _, err := normalizeMySQLDSN("gas:secret@tcp(host:3306)/"); err == nil || !strings.Contains(err.Error(), "database name") {
+	if _, err := normalizeMySQLDSN("gas:secret@tcp(host:3306)/", ""); err == nil || !strings.Contains(err.Error(), "database name") {
 		t.Fatalf("err = %v, want missing database name error", err)
+	}
+}
+
+func TestResolveDBConfigMySQLTLSFlag(t *testing.T) {
+	clearDBEnv(t)
+
+	fs, dbf := parseDBFlags(t, "--db-driver", "mysql",
+		"--mysql-user", "gas", "--mysql-database", "gasoline", "--mysql-tls", "skip-verify")
+	cfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		t.Fatalf("resolveDBConfig: %v", err)
+	}
+	parsed, err := mysql.ParseDSN(cfg.MySQLDSN)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q): %v", cfg.MySQLDSN, err)
+	}
+	if parsed.TLSConfig != "skip-verify" {
+		t.Fatalf("TLSConfig = %q, want skip-verify", parsed.TLSConfig)
+	}
+}
+
+func TestResolveDBConfigMySQLTLSFlagOverridesDSN(t *testing.T) {
+	clearDBEnv(t)
+
+	fs, dbf := parseDBFlags(t,
+		"--mysql-dsn", "gas:secret@tcp(host:3306)/gasoline?tls=true",
+		"--mysql-tls", "skip-verify")
+	cfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		t.Fatalf("resolveDBConfig: %v", err)
+	}
+	parsed, err := mysql.ParseDSN(cfg.MySQLDSN)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q): %v", cfg.MySQLDSN, err)
+	}
+	if parsed.TLSConfig != "skip-verify" {
+		t.Fatalf("TLSConfig = %q, want skip-verify to override the DSN's tls=true", parsed.TLSConfig)
+	}
+}
+
+func TestResolveDBConfigMySQLTLSEnv(t *testing.T) {
+	clearDBEnv(t)
+	t.Setenv(envDBDriverName, "mysql")
+	t.Setenv(envMySQLUserName, "gas")
+	t.Setenv(envMySQLDatabaseName, "gasoline")
+	t.Setenv(envMySQLTLSName, "true")
+
+	fs, dbf := parseDBFlags(t)
+	cfg, err := resolveDBConfig(fs, dbf)
+	if err != nil {
+		t.Fatalf("resolveDBConfig: %v", err)
+	}
+	parsed, err := mysql.ParseDSN(cfg.MySQLDSN)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q): %v", cfg.MySQLDSN, err)
+	}
+	if parsed.TLSConfig != "true" {
+		t.Fatalf("TLSConfig = %q, want true", parsed.TLSConfig)
+	}
+}
+
+func TestResolveDBConfigMySQLTLSRejectsInvalid(t *testing.T) {
+	clearDBEnv(t)
+
+	fs, dbf := parseDBFlags(t, "--db-driver", "mysql",
+		"--mysql-user", "gas", "--mysql-database", "gasoline", "--mysql-tls", "yes")
+	if _, err := resolveDBConfig(fs, dbf); err == nil || !strings.Contains(err.Error(), "invalid mysql TLS mode") {
+		t.Fatalf("err = %v, want invalid TLS mode error", err)
 	}
 }
 

@@ -32,6 +32,7 @@ const (
 	envMySQLUserName     = "GASOLINE_MYSQL_USER"
 	envMySQLPasswordName = "GASOLINE_MYSQL_PASSWORD"
 	envMySQLDatabaseName = "GASOLINE_MYSQL_DATABASE"
+	envMySQLTLSName      = "GASOLINE_MYSQL_TLS"
 
 	defaultMySQLHost = "127.0.0.1"
 	defaultMySQLPort = "3306"
@@ -47,6 +48,7 @@ type dbFlags struct {
 	mysqlUser     *string
 	mysqlPassword *string
 	mysqlDatabase *string
+	mysqlTLS      *string
 }
 
 func addDBFlags(fs *flag.FlagSet) *dbFlags {
@@ -59,6 +61,7 @@ func addDBFlags(fs *flag.FlagSet) *dbFlags {
 		mysqlUser:     fs.String("mysql-user", "", "MySQL user"),
 		mysqlPassword: fs.String("mysql-password", "", "MySQL password"),
 		mysqlDatabase: fs.String("mysql-database", "", "MySQL database name"),
+		mysqlTLS:      fs.String("mysql-tls", "", "MySQL TLS mode: true, skip-verify, preferred, or false"),
 	}
 }
 
@@ -120,18 +123,23 @@ func resolveDBConfig(fs *flag.FlagSet, f *dbFlags) (dbConfig, error) {
 }
 
 func resolveMySQLDSN(f *dbFlags, env envLookup) (string, error) {
-	if dsn := strings.TrimSpace(*f.mysqlDSN); dsn != "" {
-		return normalizeMySQLDSN(dsn)
-	}
-	if dsn := env.get(envMySQLDSNName); dsn != "" {
-		return overrideMySQLDSN(dsn, f)
-	}
-
 	pick := func(flagValue string, envName string) string {
 		if v := strings.TrimSpace(flagValue); v != "" {
 			return v
 		}
 		return env.get(envName)
+	}
+
+	tls, err := normalizeTLSMode(pick(*f.mysqlTLS, envMySQLTLSName))
+	if err != nil {
+		return "", err
+	}
+
+	if dsn := strings.TrimSpace(*f.mysqlDSN); dsn != "" {
+		return normalizeMySQLDSN(dsn, tls)
+	}
+	if dsn := env.get(envMySQLDSNName); dsn != "" {
+		return overrideMySQLDSN(dsn, f, tls)
 	}
 
 	user := pick(*f.mysqlUser, envMySQLUserName)
@@ -158,12 +166,30 @@ func resolveMySQLDSN(f *dbFlags, env envLookup) (string, error) {
 	cfg.Net = "tcp"
 	cfg.Addr = host + ":" + port
 	cfg.DBName = database
+	if tls != "" {
+		cfg.TLSConfig = tls
+	}
 	return cfg.FormatDSN(), nil
 }
 
+// normalizeTLSMode validates a --mysql-tls / GASOLINE_MYSQL_TLS value against
+// the TLS modes go-sql-driver understands out of the box. An empty value leaves
+// the DSN's own tls setting (if any) untouched.
+func normalizeTLSMode(v string) (string, error) {
+	switch mode := strings.ToLower(strings.TrimSpace(v)); mode {
+	case "":
+		return "", nil
+	case "true", "false", "skip-verify", "preferred":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid mysql TLS mode %q (expected true, false, skip-verify, or preferred)", v)
+	}
+}
+
 // normalizeMySQLDSN validates a user-supplied DSN and rebuilds it through
-// mysql.Config so driver defaults (native passwords, collation) apply.
-func normalizeMySQLDSN(dsn string) (string, error) {
+// mysql.Config so driver defaults (native passwords, collation) apply. A
+// non-empty tls overrides any tls setting already in the DSN.
+func normalizeMySQLDSN(dsn, tls string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return "", fmt.Errorf("invalid mysql DSN: %w", err)
@@ -171,13 +197,16 @@ func normalizeMySQLDSN(dsn string) (string, error) {
 	if cfg.DBName == "" {
 		return "", errors.New("mysql DSN must include a database name, e.g. user:pass@tcp(host:3306)/gasoline")
 	}
+	if tls != "" {
+		cfg.TLSConfig = tls
+	}
 	return cfg.FormatDSN(), nil
 }
 
 // overrideMySQLDSN overlays individual --mysql-* flags onto a DSN configured
 // via the environment, so each field keeps the documented flag-beats-environment
 // precedence.
-func overrideMySQLDSN(dsn string, f *dbFlags) (string, error) {
+func overrideMySQLDSN(dsn string, f *dbFlags, tls string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return "", fmt.Errorf("invalid mysql DSN: %w", err)
@@ -211,6 +240,9 @@ func overrideMySQLDSN(dsn string, f *dbFlags) (string, error) {
 	}
 	if database := strings.TrimSpace(*f.mysqlDatabase); database != "" {
 		cfg.DBName = database
+	}
+	if tls != "" {
+		cfg.TLSConfig = tls
 	}
 	if cfg.DBName == "" {
 		return "", errors.New("mysql DSN must include a database name, e.g. user:pass@tcp(host:3306)/gasoline")

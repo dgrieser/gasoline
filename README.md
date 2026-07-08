@@ -34,8 +34,11 @@ Every command can store its data on an external MySQL server instead of the loca
 | `--mysql-user` | `GASOLINE_MYSQL_USER` | — (required) |
 | `--mysql-password` | `GASOLINE_MYSQL_PASSWORD` | empty |
 | `--mysql-database` | `GASOLINE_MYSQL_DATABASE` | — (required) |
+| `--mysql-tls` | `GASOLINE_MYSQL_TLS` | — |
 
 The DSN uses the [go-sql-driver format](https://github.com/go-sql-driver/mysql#dsn-data-source-name) and must include a database name, e.g. `user:pass@tcp(db.example.com:3306)/gasoline`. Passing `--mysql-dsn` on the command line implies `--db-driver mysql`. When a DSN comes from `GASOLINE_MYSQL_DSN`, individual `--mysql-*` flags still override the matching part of it (e.g. `--mysql-host` retargets the host while keeping the DSN's credentials). The database itself must already exist; all tables and indexes are created automatically on first use.
+
+`--mysql-tls` controls transport encryption and accepts `true` (encrypt and verify the server certificate), `skip-verify` (encrypt without verifying the certificate, e.g. self-signed certs), `preferred` (encrypt only if the server offers it), or `false` (plaintext). It applies whether you configure MySQL via `--mysql-dsn` or the individual `--mysql-*` values, and overrides any `tls=` already present in a DSN. Set it when the server rejects plaintext connections — for example a ProxySQL frontend returning `Error 1045 (28000): ... SSL is required`.
 
 Example `.env` for a fully MySQL-backed setup:
 
@@ -46,6 +49,7 @@ GASOLINE_MYSQL_HOST=db.example.com
 GASOLINE_MYSQL_USER=gasoline
 GASOLINE_MYSQL_PASSWORD=secret
 GASOLINE_MYSQL_DATABASE=gasoline
+# GASOLINE_MYSQL_TLS=skip-verify   # uncomment when the server requires SSL
 ```
 
 ### Migrating an existing SQLite database to MySQL
@@ -57,6 +61,8 @@ gasoline migrate-to-mysql --db gasoline.db \
   --mysql-host db.example.com --mysql-user gasoline \
   --mysql-password secret --mysql-database gasoline
 ```
+
+Add `--mysql-tls skip-verify` (or `true`) if the target server requires SSL.
 
 The command refuses to write into a MySQL database that already contains data; add `--overwrite` to replace the existing rows. The copy runs in a single transaction, so an interrupted migration leaves the target unchanged. After migrating, point the CLI (and viewer) at MySQL as shown above.
 
@@ -226,7 +232,7 @@ gasoline update --city "Berlin, Germany" --output json
 
 ## PHP Viewer
 
-The viewer lives in `web/index.php`. It reads `GASOLINE_DB_PATH` when set; otherwise it opens `gasoline.db` next to the repo. To browse a MySQL-backed database instead, set `GASOLINE_DB_DRIVER=mysql` together with `GASOLINE_MYSQL_HOST`, `GASOLINE_MYSQL_PORT`, `GASOLINE_MYSQL_USER`, `GASOLINE_MYSQL_PASSWORD`, and `GASOLINE_MYSQL_DATABASE` in the web server's environment (the viewer uses these individual variables, not `GASOLINE_MYSQL_DSN`).
+The viewer lives in `web/index.php`. It reads `GASOLINE_DB_PATH` when set; otherwise it opens `gasoline.db` next to the repo. To browse a MySQL-backed database instead, set `GASOLINE_DB_DRIVER=mysql` together with `GASOLINE_MYSQL_HOST`, `GASOLINE_MYSQL_PORT`, `GASOLINE_MYSQL_USER`, `GASOLINE_MYSQL_PASSWORD`, and `GASOLINE_MYSQL_DATABASE` in the web server's environment (the viewer uses these individual variables, not `GASOLINE_MYSQL_DSN`). If the server requires SSL, set `GASOLINE_MYSQL_TLS` (`true`, `skip-verify`, or `preferred`); with `true` you can point `GASOLINE_MYSQL_SSL_CA` at a CA bundle to validate the certificate.
 
 Features:
 
