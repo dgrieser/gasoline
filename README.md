@@ -210,12 +210,20 @@ Any row placeholder also has an `*_onchange` variant (including formatted ones, 
 
 Check notifications track a single global lowest reported price for the configured fuel. A new check notification only fires for stations whose current price is strictly cheaper than that running baseline, and the baseline drops to the new minimum after each notification. `--reset-time HH:MM` (default `00:00`) clears the baseline once per local day, so the next check after the reset re-establishes the day's cheapest-price baseline.
 
-An example systemd user service is available at `examples/systemd/gasoline-watch.service`. Copy or symlink it to `~/.config/systemd/user/`, adjust the paths and command templates, then enable it with:
+An example systemd user service is available at `examples/systemd/gasoline-watch.service`, with its configuration in a companion `examples/systemd/gasoline.env`. The service reads all storage, API-key, and MySQL settings from that file via `EnvironmentFile=`, so switching between SQLite and MySQL is just an edit there — no unit changes. Set it up with:
 
 ```bash
+# 1. Install the environment file and lock it down (it holds the API key and DB password).
+sudo install -D -m 600 examples/systemd/gasoline.env /etc/gasoline/gasoline.env
+sudo editor /etc/gasoline/gasoline.env        # fill in the API key; for MySQL, uncomment the block
+
+# 2. Install the unit, adjust the command templates/paths, then enable it.
+cp examples/systemd/gasoline-watch.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now gasoline-watch.service
 ```
+
+The `EnvironmentFile=` path in the unit (`/etc/gasoline/gasoline.env`) must match where you installed the file. For a system-wide service under `/etc/systemd/system/` use `systemctl` without `--user`.
 
 Use `--limit 0` with `list stations` or `list history` to return all matching rows.
 

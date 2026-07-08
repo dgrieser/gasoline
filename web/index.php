@@ -84,6 +84,11 @@ if (!in_array($selectedRange, $validRanges, true)) {
 $fromDate = trim((string) ($_GET['from'] ?? ''));
 $toDate = trim((string) ($_GET['to'] ?? ''));
 
+// Default to the last 7 days when the visitor hasn't chosen a range or explicit dates.
+if ($selectedRange === '' && $fromDate === '' && $toDate === '') {
+    $selectedRange = '7d';
+}
+
 if ($selectedRange !== '') {
     $rangeDays = ['7d' => 7, '14d' => 14, '30d' => 30];
     $fromDate = (new DateTimeImmutable('now', new DateTimeZone('UTC')))

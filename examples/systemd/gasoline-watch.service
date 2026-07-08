@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=GASOLINE_DB_PATH=/etc/gasoline/gasoline.db
+# Storage, API key, and MySQL settings live here (see examples/systemd/gasoline.env).
+EnvironmentFile=/etc/gasoline/gasoline.env
 ExecStart=/usr/local/bin/gasoline-watch \
   --city "Lübbecke" \
   --radius-km 5 \
