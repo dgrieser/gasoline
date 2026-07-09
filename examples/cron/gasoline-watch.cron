@@ -1,0 +1,14 @@
+# Gasoline watcher via cron — for hosts without systemd or a long-running service.
+# Install with `crontab -e` (or drop into /etc/cron.d/ with a user field after the schedule).
+#
+# The watcher normally runs forever; --once makes it do a single pass and exit, so
+# cron drives the cadence (every 15 min below). --state-file persists the price
+# baseline and last-suggest date between runs, so check notifications still fire only
+# on a new daily low and suggest still fires just once per day. Create the state dir
+# once and make it writable by the cron user:  mkdir -p /var/lib/gasoline
+#
+# Cron starts with an empty environment: source the env file first (`set -a` exports
+# TANKER_KOENIG_API_KEY and storage settings) and set GASOLINE_BIN to an absolute path
+# since cron's PATH usually omits /usr/local/bin. Everything below is ONE physical line.
+
+*/15 * * * * set -a; . /etc/gasoline/gasoline.env; set +a; GASOLINE_BIN=/usr/local/bin/gasoline /usr/local/bin/gasoline-watch --once --state-file /var/lib/gasoline/gasoline-watch.state --city 'Lübbecke' --radius-km 5 --fuel diesel --history-days 30 --predict-days 7 --suggest-time 13:00 --check-command 'pushover gasoline Tankempfehlung {{current_price}} EUR {{fuel}} {{station_name}} {{place}}' --suggest-command 'pushover gasoline Vorhersage {{price}} EUR {{fuel}} {{station_name}} {{place}} {{start_time}} - {{end_time}}'

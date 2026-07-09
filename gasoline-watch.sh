@@ -79,6 +79,8 @@ CHECK_COMMAND=""
 SUGGEST_COMMAND=""
 GASOLINE_BIN="${GASOLINE_BIN:-}"
 VERBOSE=0
+ONCE=0
+STATE_FILE=""
 SUGGEST_MINUTES=0
 RESET_MINUTES=0
 LAST_CHECK_EPOCH=0
@@ -94,11 +96,18 @@ Usage:
     --predict-days DAYS --history-days DAYS --check-minutes MINUTES \
     --suggest-time HH:MM [--reset-time HH:MM] \
     --check-command COMMAND --suggest-command COMMAND \
-    [--verbose]
+    [--once --state-file PATH] [--verbose]
 
 --reset-time defaults to 00:00. The watcher only emits a check
 notification when a buy recommendation is strictly cheaper than the
 lowest price reported since the last reset.
+
+By default the script runs forever, checking every --check-minutes and
+suggesting once per day after --suggest-time. On hosts without systemd or a
+persistent service, use --once to run a single pass and exit; drive the cadence
+from cron instead and pass --state-file PATH so the price baseline and
+last-suggest date persist between runs. In --once mode --check-minutes is
+ignored (cron sets the interval) and --state-file is required.
 
 Commands are notification templates. Use {{message}} for the formatted
 multiline message, for example:
@@ -200,6 +209,15 @@ parse_args() {
         SUGGEST_COMMAND=$2
         shift 2
         ;;
+      --once)
+        ONCE=1
+        shift
+        ;;
+      --state-file)
+        need_value "$1" "${2-}"
+        STATE_FILE=$2
+        shift 2
+        ;;
       --verbose)
         VERBOSE=1
         shift
@@ -229,16 +247,24 @@ validate_args() {
   [[ -n "$FUEL" ]] || die "missing --fuel"
   [[ -n "$PREDICT_DAYS" ]] || die "missing --predict-days"
   [[ -n "$HISTORY_DAYS" ]] || die "missing --history-days"
-  [[ -n "$CHECK_MINUTES" ]] || die "missing --check-minutes"
   [[ -n "$SUGGEST_TIME" ]] || die "missing --suggest-time"
   [[ -n "$CHECK_COMMAND" ]] || die "missing --check-command"
   [[ -n "$SUGGEST_COMMAND" ]] || die "missing --suggest-command"
+
+  # In --once mode cron drives the cadence, so --check-minutes is not used; a
+  # --state-file is required instead so the price baseline and last-suggest date
+  # survive between invocations.
+  if ((ONCE)); then
+    [[ -n "$STATE_FILE" ]] || die "--once requires --state-file"
+  else
+    [[ -n "$CHECK_MINUTES" ]] || die "missing --check-minutes"
+    is_positive_int "$CHECK_MINUTES" || die "--check-minutes must be a positive integer"
+  fi
 
   is_positive_number "$RADIUS_KM" || die "--radius-km must be a positive number"
   [[ "$FUEL" =~ ^(diesel|e5|e10)$ ]] || die "--fuel must be one of: diesel, e5, e10"
   is_positive_int "$PREDICT_DAYS" || die "--predict-days must be a positive integer"
   is_positive_int "$HISTORY_DAYS" || die "--history-days must be a positive integer"
-  is_positive_int "$CHECK_MINUTES" || die "--check-minutes must be a positive integer"
   [[ "$SUGGEST_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "--suggest-time must be HH:MM"
 
   if [[ -z "$RESET_TIME" ]]; then
@@ -964,6 +990,44 @@ compute_sleep() {
   printf '%d' "$sleep"
 }
 
+load_state() {
+  [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]] || return 0
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    case "$key" in
+      CHECK_LOWEST_PRICE) CHECK_LOWEST_PRICE=$value ;;
+      LAST_SUGGEST_DATE) LAST_SUGGEST_DATE=$value ;;
+      LAST_RESET_DATE) LAST_RESET_DATE=$value ;;
+    esac
+  done < "$STATE_FILE"
+  verbose_log "loaded state from $(shell_quote "$STATE_FILE"): baseline=$(shell_quote "$CHECK_LOWEST_PRICE") last_suggest=$(shell_quote "$LAST_SUGGEST_DATE") last_reset=$(shell_quote "$LAST_RESET_DATE")"
+}
+
+save_state() {
+  [[ -n "$STATE_FILE" ]] || return 0
+  local tmp="${STATE_FILE}.tmp.$$"
+  if {
+    printf 'CHECK_LOWEST_PRICE=%s\n' "$CHECK_LOWEST_PRICE"
+    printf 'LAST_SUGGEST_DATE=%s\n' "$LAST_SUGGEST_DATE"
+    printf 'LAST_RESET_DATE=%s\n' "$LAST_RESET_DATE"
+  } > "$tmp"; then
+    mv -f "$tmp" "$STATE_FILE"
+  else
+    rm -f "$tmp"
+    log "failed to write state file: $(shell_quote "$STATE_FILE")"
+  fi
+}
+
+# One pass of the watch logic for cron-driven use: reset the daily baseline if
+# due, run a check, run the daily suggest if due, then persist state and exit.
+run_once() {
+  load_state
+  maybe_reset_baseline
+  run_check_once
+  maybe_run_suggest
+  save_state
+}
+
 main_loop() {
   local max_sleep=${GASOLINE_WATCH_SLEEP_SECONDS:-600}
   is_positive_int "$max_sleep" || die "GASOLINE_WATCH_SLEEP_SECONDS must be a positive integer"
@@ -992,7 +1056,11 @@ main() {
   validate_args
   require_tools
   log_config
-  main_loop
+  if ((ONCE)); then
+    run_once
+  else
+    main_loop
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
