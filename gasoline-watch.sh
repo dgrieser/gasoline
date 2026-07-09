@@ -1010,11 +1010,12 @@ save_state() {
     printf 'CHECK_LOWEST_PRICE=%s\n' "$CHECK_LOWEST_PRICE"
     printf 'LAST_SUGGEST_DATE=%s\n' "$LAST_SUGGEST_DATE"
     printf 'LAST_RESET_DATE=%s\n' "$LAST_RESET_DATE"
-  } > "$tmp"; then
-    mv -f "$tmp" "$STATE_FILE"
+  } > "$tmp" && mv -f "$tmp" "$STATE_FILE"; then
+    :
   else
     rm -f "$tmp"
     log "failed to write state file: $(shell_quote "$STATE_FILE")"
+    return 1
   fi
 }
 
