@@ -137,7 +137,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
 }
 
 $selectedCityRow = null;
-$selectedCityDistances = [];
 
 function boundingBox(float $lat, float $lng, int $radiusKm): array
 {
@@ -436,17 +435,26 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
             // For a city scope the meaningful tie-break among equal timestamps is
             // proximity to the city centre; mirror the previous server ordering.
             if ($cityRow !== null) {
-                usort($rawRows, static function (array $left, array $right) use ($distances): int {
+                usort($rawRows, static function (array $left, array $right) use ($distances, $metaById): int {
                     $timeCompare = strcmp((string) $left['recorded_at'], (string) $right['recorded_at']);
                     if ($timeCompare !== 0) {
                         return $timeCompare;
                     }
-                    $distCompare = (($distances[(string) $left['station_id']] ?? INF)
-                        <=> ($distances[(string) $right['station_id']] ?? INF));
+                    $leftId = (string) $left['station_id'];
+                    $rightId = (string) $right['station_id'];
+                    $distCompare = (($distances[$leftId] ?? INF) <=> ($distances[$rightId] ?? INF));
                     if ($distCompare !== 0) {
                         return $distCompare;
                     }
-                    return strcmp((string) $left['station_id'], (string) $right['station_id']);
+                    // Preserve the previous name tie-break (metadata is already loaded).
+                    $nameCompare = strcmp(
+                        (string) ($metaById[$leftId]['name'] ?? ''),
+                        (string) ($metaById[$rightId]['name'] ?? '')
+                    );
+                    if ($nameCompare !== 0) {
+                        return $nameCompare;
+                    }
+                    return strcmp($leftId, $rightId);
                 });
             }
 
@@ -478,7 +486,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
             }
         }
     } catch (Throwable $e) {
-        $out['errors'][] = ['key' => null, 'params' => [], 'message' => $e->getMessage()];
+        // Never leak the raw message (DB host, DSN, paths, SQL) to the client.
+        error_log('gasoline data endpoint error: ' . $e->getMessage());
+        $out['errors'][] = ['key' => 'loadError', 'params' => [], 'message' => 'Could not load data.'];
     }
 
     echo json_encode($out, $jsonFlags);
@@ -500,13 +510,17 @@ if ($errors === []) {
                 'message' => 'Selected city not found.',
             ];
         } else {
-            [$stations, $selectedCityDistances] = loadScopeStations($pdo, $selectedCityRow, $selectedRadiusKm);
+            // Distances are only needed client-side (sent via ?action=data), so
+            // the shell just needs the in-scope station list for the dropdown.
+            [$stations] = loadScopeStations($pdo, $selectedCityRow, $selectedRadiusKm);
         }
     } catch (Throwable $e) {
+        // Never leak the raw message (DB host, DSN, paths, SQL) to the client.
+        error_log('gasoline shell error: ' . $e->getMessage());
         $errors[] = [
-            'key' => null,
+            'key' => 'loadError',
             'params' => [],
-            'message' => $e->getMessage(),
+            'message' => 'Could not load data.',
         ];
     }
 }
@@ -1188,6 +1202,22 @@ function stationLabel(array $station): string
             border-top: 1px solid var(--border);
         }
 
+        .chart-retry {
+            padding: 0 1.25rem 1.25rem;
+            text-align: center;
+        }
+
+        .chart-retry .btn-reset { display: inline-block; width: auto; padding: 0.55rem 1.4rem; }
+
+        /* Visually hidden but exposed to assistive tech. */
+        .sr-only {
+            position: absolute;
+            width: 1px; height: 1px;
+            padding: 0; margin: -1px;
+            overflow: hidden; clip: rect(0, 0, 0, 0);
+            white-space: nowrap; border: 0;
+        }
+
         /* ── Table card ────────────────────────────────────────── */
         .table-card {
             background: var(--surface);
@@ -1545,33 +1575,33 @@ function stationLabel(array $station): string
             <?php endforeach; ?>
 
             <!-- Stats -->
-            <div class="stats">
+            <div class="stats" aria-live="polite">
                 <div class="stat">
                     <div class="stat-label" data-i18n="snapshots">Snapshots</div>
-                    <div class="stat-value skeleton" id="stat-points">&nbsp;</div>
+                    <div class="stat-value skeleton" id="stat-points" aria-busy="true">&nbsp;</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label" data-i18n="stationsCount">Stations</div>
-                    <div class="stat-value skeleton" id="stat-stations">&nbsp;</div>
+                    <div class="stat-value skeleton" id="stat-stations" aria-busy="true">&nbsp;</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label" data-i18n="firstRecorded">First recorded</div>
-                    <div class="stat-value skeleton" id="stat-first" style="font-size:1rem">&nbsp;</div>
+                    <div class="stat-value skeleton" id="stat-first" style="font-size:1rem" aria-busy="true">&nbsp;</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label" data-i18n="lastRecorded">Last recorded</div>
-                    <div class="stat-value skeleton" id="stat-last" style="font-size:1rem">&nbsp;</div>
+                    <div class="stat-value skeleton" id="stat-last" style="font-size:1rem" aria-busy="true">&nbsp;</div>
                 </div>
             </div>
 
             <!-- Cheapest now -->
-            <div class="cheapest-card" id="cheapest-card"><div class="cheapest-empty"><span class="spinner"></span></div></div>
+            <div class="cheapest-card" id="cheapest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Cheapest in selected range -->
-            <div class="cheapest-card" id="cheapest-range-card"><div class="cheapest-empty"><span class="spinner"></span></div></div>
+            <div class="cheapest-card" id="cheapest-range-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Highest in selected range -->
-            <div class="cheapest-card" id="highest-card"><div class="cheapest-empty"><span class="spinner"></span></div></div>
+            <div class="cheapest-card" id="highest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Chart -->
             <div class="chart-card">
@@ -1591,11 +1621,14 @@ function stationLabel(array $station): string
                     </div>
                 </div>
                 <div class="chart-body" id="chart-body">
-                    <div class="chart-loading" id="chart-loading"><span class="spinner"></span></div>
+                    <div class="chart-loading" id="chart-loading" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div>
                     <svg id="chart" viewBox="0 0 960 380" preserveAspectRatio="none" aria-label="Fuel price history chart" data-i18n-aria-label="chartAriaLabel" hidden></svg>
                 </div>
                 <div class="chart-legend" id="legend" hidden></div>
-                <div class="chart-empty" id="chart-empty" data-i18n="noSnapshots" hidden>No snapshots match the current filters.</div>
+                <div class="chart-empty" id="chart-empty" data-i18n="noSnapshots" role="status" hidden>No snapshots match the current filters.</div>
+                <div class="chart-retry" id="chart-retry" hidden>
+                    <button type="button" class="btn-reset" id="retry-btn" data-i18n="retry">Retry</button>
+                </div>
             </div>
 
             <!-- Table -->
@@ -1619,7 +1652,7 @@ function stationLabel(array $station): string
                         </tr>
                         </thead>
                         <tbody id="snapshot-tbody">
-                            <tr><td colspan="9" class="table-loading"><span class="spinner"></span></td></tr>
+                            <tr><td colspan="9" class="table-loading" role="status" aria-busy="true"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -2090,6 +2123,10 @@ const translations = {
         showMore: 'Show more',
         showingRows: 'Showing {shown} of {total}',
         loadError: 'Could not load data. Please retry.',
+        retry: 'Retry',
+        cityNotFound: 'Selected city not found.',
+        invalidFromDate: 'Invalid from date.',
+        invalidToDate: 'Invalid to date.',
         noSnapshots: 'No snapshots match the current filters.',
         cheapestNow: 'Cheapest — current',
         cheapestNoData: 'No price data available.',
@@ -2142,6 +2179,10 @@ const translations = {
         showMore: 'Mehr anzeigen',
         showingRows: 'Zeige {shown} von {total}',
         loadError: 'Daten konnten nicht geladen werden. Bitte erneut versuchen.',
+        retry: 'Erneut versuchen',
+        cityNotFound: 'Ausgewählte Stadt nicht gefunden.',
+        invalidFromDate: 'Ungültiges Von-Datum.',
+        invalidToDate: 'Ungültiges Bis-Datum.',
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
         cheapestNow: 'Günstigster Preis — aktuell',
         cheapestNoData: 'Keine Preisdaten vorhanden.',
@@ -2276,6 +2317,7 @@ function applyLang(lang) {
         renderCheapestRange();
         renderHighest();
         if (chartEl) renderChart();
+        updateShowMore(); // re-translate the "Show more (N)" button label
     }
 }
 
@@ -2467,7 +2509,6 @@ const tableMoreWrap = document.getElementById('table-more');
 const tableMoreBtn  = document.getElementById('table-more-btn');
 const TABLE_PAGE    = 1000; // rows rendered per chunk — nobody scrolls 100k <tr>
 
-let tableRows    = [];
 let tableRendered = 0;
 
 function fmtPrice(v) { return (v === null || v === undefined) ? '-' : Number(v).toFixed(3); }
@@ -2493,7 +2534,7 @@ function tableRowHtml(row) {
 
 function updateShowMore() {
     if (!tableMoreWrap || !tableMoreBtn) return;
-    const remaining = tableRows.length - tableRendered;
+    const remaining = chartData.length - tableRendered;
     if (remaining <= 0) { tableMoreWrap.hidden = true; return; }
     const t = translations[currentLang];
     tableMoreBtn.textContent = `${t.showMore} (${remaining})`;
@@ -2502,19 +2543,21 @@ function updateShowMore() {
 
 function renderMoreRows() {
     if (!tbodyEl) return;
-    const next = tableRows.slice(tableRendered, tableRendered + TABLE_PAGE);
-    tbodyEl.insertAdjacentHTML('beforeend', next.map(tableRowHtml).join(''));
-    tableRendered += next.length;
+    // Newest-first without copying the whole dataset: take a page-sized window
+    // from the end of chartData (sorted oldest→newest) and reverse only that.
+    const upper = chartData.length - tableRendered;
+    const lower = Math.max(0, upper - TABLE_PAGE);
+    const slice = chartData.slice(lower, upper).reverse();
+    tbodyEl.insertAdjacentHTML('beforeend', slice.map(tableRowHtml).join(''));
+    tableRendered += slice.length;
     updateShowMore();
 }
 
 function renderTable() {
     if (!tbodyEl) return;
-    // Newest-first, mirroring the previous array_reverse($rows).
-    tableRows = chartData.slice().reverse();
     tableRendered = 0;
     tbodyEl.innerHTML = '';
-    if (tableRows.length === 0) {
+    if (chartData.length === 0) {
         const t = translations[currentLang];
         tbodyEl.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem">${h(t.noData)}</td></tr>`;
         updateShowMore();
@@ -2530,9 +2573,11 @@ function setStat(id, value) {
     if (!el) return;
     el.textContent = String(value);
     el.classList.remove('skeleton');
+    el.removeAttribute('aria-busy');
 }
 
 function applyData(payload) {
+    if (retryWrap) retryWrap.hidden = true;
     const meta = payload.stations || {};
     // Expand slim rows back into the shape the existing renderers expect by
     // joining each row to its station metadata (sent once, keyed by id).
@@ -2572,19 +2617,45 @@ function applyData(payload) {
     if (chartEl) renderChart();
 }
 
-function showDataError() {
+// Deliberately leaves dataLoaded=false so a later language/theme change does
+// NOT re-run the data renderers and wipe the error UI with empty placeholders.
+function showDataError(err) {
     const t = translations[currentLang];
-    dataLoaded = true;
+    const key = (err && err.key && t[err.key]) ? err.key : 'loadError';
+    const msg = (err && err.key && t[err.key]) ? t[err.key]
+        : (err && err.message) ? err.message
+        : t.loadError;
     ['stat-points', 'stat-stations', 'stat-first', 'stat-last'].forEach((id) => setStat(id, '—'));
     const loadingEl = document.getElementById('chart-loading');
     if (loadingEl) loadingEl.hidden = true;
     const emptyEl = document.getElementById('chart-empty');
-    if (emptyEl) { emptyEl.hidden = false; emptyEl.textContent = t.loadError; }
+    if (emptyEl) {
+        emptyEl.hidden = false;
+        emptyEl.removeAttribute('aria-busy');
+        // Retarget i18n so a later language switch keeps the error text.
+        emptyEl.dataset.i18n = key;
+        emptyEl.textContent = msg;
+    }
     if (chartEl)  chartEl.hidden = true;
     if (legendEl) legendEl.hidden = true;
+    if (tableMoreWrap) tableMoreWrap.hidden = true;
     if (tbodyEl) {
-        tbodyEl.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--red);padding:2rem;font-family:var(--mono);font-size:.82rem">${h(t.loadError)}</td></tr>`;
+        tbodyEl.innerHTML = `<tr><td colspan="9" role="alert" style="text-align:center;color:var(--red);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="${key}">${h(msg)}</td></tr>`;
     }
+    if (retryWrap) retryWrap.hidden = false;
+}
+
+function resetLoadingUI() {
+    if (retryWrap) retryWrap.hidden = true;
+    const loadingEl = document.getElementById('chart-loading');
+    if (loadingEl) loadingEl.hidden = false;
+    const emptyEl = document.getElementById('chart-empty');
+    if (emptyEl) { emptyEl.hidden = true; emptyEl.dataset.i18n = 'noSnapshots'; }
+    ['stat-points', 'stat-stations', 'stat-first', 'stat-last'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) { el.textContent = ' '; el.classList.add('skeleton'); el.setAttribute('aria-busy', 'true'); }
+    });
+    if (tbodyEl) tbodyEl.innerHTML = '<tr><td colspan="9" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
 }
 
 async function loadData() {
@@ -2593,11 +2664,23 @@ async function loadData() {
     try {
         const res = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
         if (!res.ok) throw new Error('HTTP ' + res.status);
-        applyData(await res.json());
+        const payload = await res.json();
+        // Surface application-level errors (invalid date, city not found, …)
+        // instead of silently rendering an empty result — matches the old
+        // synchronous behaviour where errors showed in the error box.
+        if (payload.errors && payload.errors.length) {
+            showDataError(payload.errors[0]);
+            return;
+        }
+        applyData(payload);
     } catch (e) {
         showDataError();
     }
 }
+
+const retryWrap = document.getElementById('chart-retry');
+const retryBtn  = document.getElementById('retry-btn');
+if (retryBtn) retryBtn.addEventListener('click', () => { resetLoadingUI(); loadData(); });
 
 loadData();
 </script>
