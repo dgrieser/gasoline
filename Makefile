@@ -3,7 +3,7 @@ DIST_DIR := dist
 BINDIR ?= /usr/local/bin
 WEB_INSTALL_DIR ?= /var/www/html/$(APP)
 
-.PHONY: build test tidy fmt clean install release
+.PHONY: build test tidy fmt clean install release snapshot
 
 build:
 	go build -o $(APP) .
@@ -29,8 +29,10 @@ install: build
 	install -d $(WEB_INSTALL_DIR)
 	cp -R web/. $(WEB_INSTALL_DIR)/
 
+# Full cross-platform release (linux/darwin/windows), static binaries + archives.
 release:
-	mkdir -p $(DIST_DIR)
-	GOOS=linux GOARCH=amd64 go build -o $(DIST_DIR)/$(APP)-linux-amd64 .
-	GOOS=linux GOARCH=arm64 go build -o $(DIST_DIR)/$(APP)-linux-arm64 .
-	GOOS=linux GOARCH=arm GOARM=7 go build -o $(DIST_DIR)/$(APP)-linux-armv7 .
+	goreleaser release --clean
+
+# Local build of all targets without publishing.
+snapshot:
+	goreleaser build --snapshot --clean

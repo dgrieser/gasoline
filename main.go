@@ -23,6 +23,13 @@ import (
 	"time"
 )
 
+// Build metadata, injected via -ldflags by goreleaser.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 const (
 	defaultDBPath     = "gasoline.db"
 	tankerKoenigBase  = "https://creativecommons.tankerkoenig.de/json"
@@ -363,6 +370,9 @@ func run(args []string) error {
 		return runCheck(args[1:])
 	case "rename":
 		return runRename(args[1:])
+	case "version", "-v", "--version":
+		fmt.Fprintf(stdout, "gasoline %s (commit %s, built %s)\n", version, commit, date)
+		return nil
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -387,6 +397,7 @@ Commands:
   rename        set a persistent display-name override for a station
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
+  version       print build version information
 
 Database:
   Commands use SQLite (--db, default gasoline.db) unless MySQL is selected via
