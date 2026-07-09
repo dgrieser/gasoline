@@ -371,7 +371,7 @@ func run(args []string) error {
 	case "rename":
 		return runRename(args[1:])
 	case "version", "-v", "--version":
-		fmt.Printf("gasoline %s (commit %s, built %s)\n", version, commit, date)
+		fmt.Fprintf(stdout, "gasoline %s (commit %s, built %s)\n", version, commit, date)
 		return nil
 	case "help", "-h", "--help":
 		printUsage()

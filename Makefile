@@ -35,4 +35,4 @@ release:
 
 # Local build of all targets without publishing.
 snapshot:
-	goreleaser release --snapshot --clean
+	goreleaser build --snapshot --clean
