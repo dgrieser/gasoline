@@ -1,0 +1,8 @@
+# Gasoline price update every 5 minutes — install with `crontab -e`
+# (or drop into /etc/cron.d/ with a user field: `*/5 * * * * root set -a; ...`).
+#
+# Cron starts with an empty environment, so source the env file first; `set -a`
+# exports every KEY=value it defines (TANKER_KOENIG_API_KEY, storage settings).
+# See examples/systemd/gasoline.env for the file this expects at /etc/gasoline/gasoline.env.
+
+*/5 * * * * set -a; . /etc/gasoline/gasoline.env; set +a; /usr/local/bin/gasoline update --radius 25 --city 'Luebbecke'

@@ -1,0 +1,10 @@
+[Unit]
+Description=Gasoline price update (Lübbecke, 25km)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Storage and API-key settings live here (see examples/systemd/gasoline.env).
+EnvironmentFile=/etc/gasoline/gasoline.env
+ExecStart=/usr/local/bin/gasoline update --radius 25 --city 'Luebbecke'

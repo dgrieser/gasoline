@@ -225,6 +225,36 @@ systemctl --user enable --now gasoline-watch.service
 
 The `EnvironmentFile=` path in the unit (`/etc/gasoline/gasoline.env`) must match where you installed the file. For a system-wide service under `/etc/systemd/system/` use `systemctl` without `--user`.
 
+#### Watcher via cron (no systemd)
+
+On hosts without systemd — or where you can't keep a long-running service alive — run the watcher from cron instead. Pass `--once` so it does a single pass and exits, and `--state-file PATH` so the price baseline and last-suggest date survive between runs (without it, every run would restart from a blank baseline and re-notify). In `--once` mode cron sets the cadence, so `--check-minutes` is ignored. A ready-to-use line is in `examples/cron/gasoline-watch.cron`:
+
+```bash
+mkdir -p /var/lib/gasoline                    # writable state dir for the cron user
+crontab -e                                    # paste the line from examples/cron/gasoline-watch.cron
+```
+
+Edit the city/radius/fuel and the `--check-command` / `--suggest-command` templates to taste, and confirm the paths to `gasoline`, `gasoline-watch`, and `/etc/gasoline/gasoline.env` match your install.
+
+### Continuous updates with a timer
+
+To keep prices fresh without the full watcher, run `gasoline update` on a schedule. A oneshot service plus a timer live at `examples/systemd/gasoline-update.service` and `examples/systemd/gasoline-update.timer`; the timer fires the service every 5 minutes:
+
+```bash
+# 1. Install the environment file (skip if already done for the watcher above).
+sudo install -D -m 600 examples/systemd/gasoline.env /etc/gasoline/gasoline.env
+sudo editor /etc/gasoline/gasoline.env        # fill in the API key; for MySQL, uncomment the block
+
+# 2. Install the service + timer, then enable the timer.
+cp examples/systemd/gasoline-update.service examples/systemd/gasoline-update.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now gasoline-update.timer
+```
+
+The service runs `gasoline update --radius 25 --city 'Luebbecke'`; edit the `ExecStart` line to change city/radius. Check status and the next scheduled run with `systemctl --user list-timers gasoline-update.timer` and see past runs with `journalctl --user -u gasoline-update.service`. For a system-wide timer under `/etc/systemd/system/` use `systemctl` without `--user`.
+
+Prefer cron? `examples/cron/gasoline-update.cron` holds a ready-to-use line — add it with `crontab -e`. Unlike systemd, cron starts with an empty environment, so the line sources the env file first (`set -a` exports every variable it defines).
+
 Use `--limit 0` with `list stations` or `list history` to return all matching rows.
 
 The grouped commands above are the canonical interface shown by `gasoline help`. The older top-level forms `cities`, `stations`, `history`, and `import-cities` are still accepted as aliases.

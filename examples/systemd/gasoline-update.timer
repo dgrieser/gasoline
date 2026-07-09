@@ -1,0 +1,13 @@
+[Unit]
+Description=Run gasoline update every 5 minutes
+
+[Timer]
+# First run 1 min after boot, then every 5 minutes after the last run finishes.
+OnBootSec=1min
+OnUnitActiveSec=5min
+# Catch up on a missed run if the machine was asleep/off at the scheduled time.
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
