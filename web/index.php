@@ -55,13 +55,6 @@ function gasolineConnect(string $driver, string $sqlitePath): PDO
 
 $errors = [];
 $stations = [];
-$rows = [];
-$summary = [
-    'points' => 0,
-    'stations' => 0,
-    'first_recorded_at' => null,
-    'last_recorded_at' => null,
-];
 
 $selectedStationIds = array_values(array_filter(
     array_map(
@@ -144,7 +137,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
 }
 
 $selectedCityRow = null;
-$selectedCityDistances = [];
 
 function boundingBox(float $lat, float $lng, int $radiusKm): array
 {
@@ -171,250 +163,367 @@ function haversineKm(float $lat1, float $lng1, float $lat2, float $lng2): float
     return $earthRadiusKm * 2 * asin(min(1.0, sqrt($a)));
 }
 
-if ($errors === []) {
-    try {
-        $pdo = gasolineConnect($dbDriver, $dbPath);
+/**
+ * Resolve the selected city to its cities-table row, or null when no city is
+ * selected or the key is unknown. Callers distinguish the two by also checking
+ * whether $selectedCity was non-empty.
+ */
+function resolveCity(PDO $pdo, string $selectedCity): ?array
+{
+    if ($selectedCity === '') {
+        return null;
+    }
+    $stmt = $pdo->prepare(
+        <<<'SQL'
+        SELECT normalized_name AS city_key, normalized_name AS city_name, display_name, lat, lng
+        FROM cities
+        WHERE normalized_name = :city_key
+        LIMIT 1
+        SQL
+    );
+    $stmt->bindValue(':city_key', $selectedCity);
+    $stmt->execute();
 
-        if ($selectedCity !== '') {
-            $cityStatement = $pdo->prepare(
-                <<<'SQL'
-                SELECT normalized_name AS city_key, normalized_name AS city_name, display_name, lat, lng
-                FROM cities
-                WHERE normalized_name = :city_key
-                LIMIT 1
-                SQL
-            );
-            $cityStatement->bindValue(':city_key', $selectedCity);
-            $cityStatement->execute();
-            $selectedCityRow = $cityStatement->fetch() ?: null;
+    return $stmt->fetch() ?: null;
+}
 
-            if ($selectedCityRow === null) {
-                $errors[] = [
-                    'key' => 'cityNotFound',
-                    'params' => [],
-                    'message' => 'Selected city not found.',
-                ];
-            } else {
-                $bbox = boundingBox(
-                    (float) $selectedCityRow['lat'],
-                    (float) $selectedCityRow['lng'],
-                    $selectedRadiusKm
-                );
-                $stationStatement = $pdo->prepare(
-                    <<<'SQL'
-                    SELECT
-                        s.id,
-                        COALESCE(s.name_override, s.name) AS name,
-                        COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
-                        TRIM(COALESCE(s.street, '')) AS street,
-                        TRIM(COALESCE(s.house_number, '')) AS house_number,
-                        TRIM(COALESCE(s.place, '')) AS place,
-                        s.last_seen_at,
-                        s.lat,
-                        s.lng
-                    FROM stations s
-                    WHERE s.lat BETWEEN :min_lat AND :max_lat
-                      AND s.lng BETWEEN :min_lng AND :max_lng
-                    SQL
-                );
-                foreach ($bbox as $key => $value) {
-                    $stationStatement->bindValue(':' . $key, $value);
-                }
-                $stationStatement->execute();
-                $candidateStations = $stationStatement->fetchAll();
+/**
+ * Load the stations in scope for the filter sidebar and data endpoint.
+ * With a city: the stations inside the radius (bbox pre-filter + haversine),
+ * sorted by distance. Without a city: every station, sorted by name.
+ *
+ * @return array{0: array<int, array<string, mixed>>, 1: array<string, float>}
+ *   [$stations, $distancesById]
+ */
+function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
+{
+    if ($cityRow === null) {
+        $stations = $pdo->query(
+            <<<'SQL'
+            SELECT
+                s.id,
+                COALESCE(s.name_override, s.name) AS name,
+                COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
+                TRIM(COALESCE(s.street, '')) AS street,
+                TRIM(COALESCE(s.house_number, '')) AS house_number,
+                TRIM(COALESCE(s.place, '')) AS place,
+                s.last_seen_at
+            FROM stations s
+            ORDER BY COALESCE(s.name_override, s.name) ASC, s.id ASC
+            SQL
+        )->fetchAll();
 
-                foreach ($candidateStations as $station) {
-                    $selectedDistKm = haversineKm(
-                        (float) $selectedCityRow['lat'],
-                        (float) $selectedCityRow['lng'],
-                        (float) $station['lat'],
-                        (float) $station['lng']
-                    );
-                    if ($selectedDistKm > $selectedRadiusKm) {
-                        continue;
-                    }
-                    $station['selected_dist_km'] = $selectedDistKm;
-                    $stations[] = $station;
-                    $selectedCityDistances[(string) $station['id']] = $selectedDistKm;
-                }
+        return [$stations, []];
+    }
 
-                usort($stations, static function (array $left, array $right): int {
-                    $distCompare = ($left['selected_dist_km'] ?? INF) <=> ($right['selected_dist_km'] ?? INF);
-                    if ($distCompare !== 0) {
-                        return $distCompare;
-                    }
-                    $nameCompare = strcmp((string) $left['name'], (string) $right['name']);
-                    if ($nameCompare !== 0) {
-                        return $nameCompare;
-                    }
-                    return strcmp((string) $left['id'], (string) $right['id']);
-                });
-            }
+    $bbox = boundingBox((float) $cityRow['lat'], (float) $cityRow['lng'], $radiusKm);
+    $stmt = $pdo->prepare(
+        <<<'SQL'
+        SELECT
+            s.id,
+            COALESCE(s.name_override, s.name) AS name,
+            COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
+            TRIM(COALESCE(s.street, '')) AS street,
+            TRIM(COALESCE(s.house_number, '')) AS house_number,
+            TRIM(COALESCE(s.place, '')) AS place,
+            s.last_seen_at,
+            s.lat,
+            s.lng
+        FROM stations s
+        WHERE s.lat BETWEEN :min_lat AND :max_lat
+          AND s.lng BETWEEN :min_lng AND :max_lng
+        SQL
+    );
+    foreach ($bbox as $key => $value) {
+        $stmt->bindValue(':' . $key, $value);
+    }
+    $stmt->execute();
+    $candidateStations = $stmt->fetchAll();
+
+    $stations = [];
+    $distances = [];
+    foreach ($candidateStations as $station) {
+        $distKm = haversineKm(
+            (float) $cityRow['lat'],
+            (float) $cityRow['lng'],
+            (float) $station['lat'],
+            (float) $station['lng']
+        );
+        if ($distKm > $radiusKm) {
+            continue;
+        }
+        $station['selected_dist_km'] = $distKm;
+        $stations[] = $station;
+        $distances[(string) $station['id']] = $distKm;
+    }
+
+    usort($stations, static function (array $left, array $right): int {
+        $distCompare = ($left['selected_dist_km'] ?? INF) <=> ($right['selected_dist_km'] ?? INF);
+        if ($distCompare !== 0) {
+            return $distCompare;
+        }
+        $nameCompare = strcmp((string) $left['name'], (string) $right['name']);
+        if ($nameCompare !== 0) {
+            return $nameCompare;
+        }
+        return strcmp((string) $left['id'], (string) $right['id']);
+    });
+
+    return [$stations, $distances];
+}
+
+/**
+ * Assemble the price-snapshot query for the active filters.
+ * Station metadata is intentionally NOT joined in — the client joins rows to the
+ * separately-sent station map — so the row payload stays small.
+ *
+ * @return array{0: string, 1: array<string, mixed>, 2: bool, 3: array<int, array<string, mixed>>}
+ *   [$sql, $params, $shouldRun, $errors]
+ */
+function buildSnapshotQuery(
+    ?array $cityRow,
+    array $stations,
+    array $selectedStationIds,
+    string $fromDate,
+    string $toDate
+): array {
+    $where = [];
+    $params = [];
+    $shouldRun = true;
+    $errors = [];
+
+    if ($fromDate !== '') {
+        $from = DateTimeImmutable::createFromFormat('Y-m-d', $fromDate, new DateTimeZone('UTC'));
+        if ($from === false) {
+            $errors[] = ['key' => 'invalidFromDate', 'params' => [], 'message' => 'Invalid from date.'];
         } else {
-            $stations = $pdo->query(
-                <<<'SQL'
-                SELECT
-                    s.id,
-                    COALESCE(s.name_override, s.name) AS name,
-                    COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
-                    TRIM(COALESCE(s.street, '')) AS street,
-                    TRIM(COALESCE(s.house_number, '')) AS house_number,
-                    TRIM(COALESCE(s.place, '')) AS place,
-                    s.last_seen_at
-                FROM stations s
-                ORDER BY COALESCE(s.name_override, s.name) ASC, s.id ASC
-                SQL
-            )->fetchAll();
+            $where[] = 'ps.recorded_at >= :from_recorded_at';
+            $params[':from_recorded_at'] = $from->setTime(0, 0, 0)->format(DateTimeInterface::RFC3339);
+        }
+    }
+
+    if ($toDate !== '') {
+        $to = DateTimeImmutable::createFromFormat('Y-m-d', $toDate, new DateTimeZone('UTC'));
+        if ($to === false) {
+            $errors[] = ['key' => 'invalidToDate', 'params' => [], 'message' => 'Invalid to date.'];
+        } else {
+            $where[] = 'ps.recorded_at <= :to_recorded_at';
+            $params[':to_recorded_at'] = $to->setTime(23, 59, 59)->format(DateTimeInterface::RFC3339);
+        }
+    }
+
+    if ($cityRow !== null) {
+        $effectiveStationIds = array_column($stations, 'id');
+        if ($selectedStationIds !== []) {
+            $effectiveStationIds = array_values(array_intersect($effectiveStationIds, $selectedStationIds));
         }
 
-        $where = [];
-        $params = [];
-        $shouldRunRowQuery = true;
-
-        if ($fromDate !== '') {
-            $from = DateTimeImmutable::createFromFormat('Y-m-d', $fromDate, new DateTimeZone('UTC'));
-            if ($from === false) {
-                $errors[] = [
-                    'key' => 'invalidFromDate',
-                    'params' => [],
-                    'message' => 'Invalid from date.',
-                ];
-            } else {
-                $where[] = 'ps.recorded_at >= :from_recorded_at';
-                $params[':from_recorded_at'] = $from->setTime(0, 0, 0)->format(DateTimeInterface::RFC3339);
-            }
-        }
-
-        if ($toDate !== '') {
-            $to = DateTimeImmutable::createFromFormat('Y-m-d', $toDate, new DateTimeZone('UTC'));
-            if ($to === false) {
-                $errors[] = [
-                    'key' => 'invalidToDate',
-                    'params' => [],
-                    'message' => 'Invalid to date.',
-                ];
-            } else {
-                $where[] = 'ps.recorded_at <= :to_recorded_at';
-                $params[':to_recorded_at'] = $to->setTime(23, 59, 59)->format(DateTimeInterface::RFC3339);
-            }
-        }
-
-        if ($selectedCityRow !== null) {
-            $effectiveStationIds = array_column($stations, 'id');
-            if ($selectedStationIds !== []) {
-                $effectiveStationIds = array_values(array_intersect($effectiveStationIds, $selectedStationIds));
-            }
-
-            if ($effectiveStationIds === []) {
-                $shouldRunRowQuery = false;
-                $rows = [];
-            } else {
-                $placeholders = [];
-                foreach ($effectiveStationIds as $index => $stationId) {
-                    $placeholder = ':station_scope_id_' . $index;
-                    $placeholders[] = $placeholder;
-                    $params[$placeholder] = $stationId;
-                }
-                $where[] = 'ps.station_id IN (' . implode(', ', $placeholders) . ')';
-            }
-        }
-
-        if ($selectedCityRow === null && $selectedStationIds !== []) {
+        if ($effectiveStationIds === []) {
+            $shouldRun = false;
+        } else {
             $placeholders = [];
-            foreach ($selectedStationIds as $index => $stationId) {
-                $placeholder = ':station_id_' . $index;
+            foreach ($effectiveStationIds as $index => $stationId) {
+                $placeholder = ':station_scope_id_' . $index;
                 $placeholders[] = $placeholder;
                 $params[$placeholder] = $stationId;
             }
             $where[] = 'ps.station_id IN (' . implode(', ', $placeholders) . ')';
         }
+    }
 
-        // Without a city or an explicit station selection there is no scope to
-        // display, so skip the snapshot query instead of loading every station's
-        // full history for the default date range.
-        if ($selectedCityRow === null && $selectedStationIds === []) {
-            $shouldRunRowQuery = false;
-            $rows = [];
+    if ($cityRow === null && $selectedStationIds !== []) {
+        $placeholders = [];
+        foreach ($selectedStationIds as $index => $stationId) {
+            $placeholder = ':station_id_' . $index;
+            $placeholders[] = $placeholder;
+            $params[$placeholder] = $stationId;
         }
+        $where[] = 'ps.station_id IN (' . implode(', ', $placeholders) . ')';
+    }
 
-        $sql = <<<'SQL'
-            SELECT
-                ps.station_id,
-                COALESCE(s.name_override, s.name) AS station_name,
-                COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
-                TRIM(COALESCE(s.street, '')) AS street,
-                TRIM(COALESCE(s.house_number, '')) AS house_number,
-                TRIM(COALESCE(s.place, '')) AS place,
-                ps.city_name,
-                ps.recorded_at,
-                ps.is_open,
-                ps.e5,
-                ps.e10,
-                ps.diesel
-            FROM price_snapshots ps
-            INNER JOIN stations s ON s.id = ps.station_id
+    // Without a city or an explicit station selection there is no scope to
+    // display, so skip the snapshot query instead of loading every station's
+    // full history for the default date range.
+    if ($cityRow === null && $selectedStationIds === []) {
+        $shouldRun = false;
+    }
+
+    $sql = <<<'SQL'
+        SELECT
+            ps.station_id,
+            ps.recorded_at,
+            ps.is_open,
+            ps.e5,
+            ps.e10,
+            ps.diesel
+        FROM price_snapshots ps
         SQL;
 
-        if ($where !== []) {
-            $sql .= "\nWHERE " . implode("\n  AND ", $where);
+    if ($where !== []) {
+        $sql .= "\nWHERE " . implode("\n  AND ", $where);
+    }
+
+    $sql .= "\nORDER BY ps.recorded_at ASC, ps.station_id ASC";
+
+    return [$sql, $params, $shouldRun, $errors];
+}
+
+// ── AJAX: async snapshot data ─────────────────────────────────────────────────
+// The page renders a fast shell; the heavy snapshot payload is fetched here and
+// rendered client-side. Station metadata is sent once (keyed by id) and rows
+// omit the repeated name/brand/street/place strings.
+if (isset($_GET['action']) && $_GET['action'] === 'data') {
+    header('Content-Type: application/json; charset=utf-8');
+    $jsonFlags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR;
+    $out = [
+        'summary' => ['points' => 0, 'stations' => 0, 'first_recorded_at' => null, 'last_recorded_at' => null],
+        'stations' => [],
+        'rows' => [],
+        'errors' => $errors,
+    ];
+
+    if ($errors !== []) {
+        echo json_encode($out, $jsonFlags);
+        exit;
+    }
+
+    try {
+        $pdo = gasolineConnect($dbDriver, $dbPath);
+        $cityRow = resolveCity($pdo, $selectedCity);
+        if ($selectedCity !== '' && $cityRow === null) {
+            $out['errors'][] = ['key' => 'cityNotFound', 'params' => [], 'message' => 'Selected city not found.'];
+            echo json_encode($out, $jsonFlags);
+            exit;
         }
 
-        $sql .= "\nORDER BY ps.recorded_at ASC, COALESCE(s.name_override, s.name) ASC";
+        [$stations, $distances] = loadScopeStations($pdo, $cityRow, $selectedRadiusKm);
 
-        if ($errors === [] && $shouldRunRowQuery) {
+        $metaById = [];
+        foreach ($stations as $station) {
+            $id = (string) $station['id'];
+            $metaById[$id] = [
+                'name' => (string) $station['name'],
+                'brand' => (string) $station['brand'],
+                'street' => trim(implode(' ', array_filter([
+                    (string) $station['street'],
+                    (string) $station['house_number'],
+                ]))),
+                'place' => trim((string) ($station['place'] ?? '')),
+                'dist' => isset($distances[$id]) ? round($distances[$id], 3) : null,
+            ];
+        }
+
+        [$sql, $params, $shouldRun, $queryErrors] = buildSnapshotQuery(
+            $cityRow,
+            $stations,
+            $selectedStationIds,
+            $fromDate,
+            $toDate
+        );
+        foreach ($queryErrors as $queryError) {
+            $out['errors'][] = $queryError;
+        }
+
+        if ($out['errors'] === [] && $shouldRun) {
             $statement = $pdo->prepare($sql);
             foreach ($params as $key => $value) {
                 $statement->bindValue($key, $value);
             }
             $statement->execute();
-            $rows = $statement->fetchAll();
+            $rawRows = $statement->fetchAll();
 
-            if ($selectedCityRow !== null) {
-                usort($rows, static function (array $left, array $right) use ($selectedCityDistances): int {
+            // For a city scope the meaningful tie-break among equal timestamps is
+            // proximity to the city centre; mirror the previous server ordering.
+            if ($cityRow !== null) {
+                usort($rawRows, static function (array $left, array $right) use ($distances, $metaById): int {
                     $timeCompare = strcmp((string) $left['recorded_at'], (string) $right['recorded_at']);
                     if ($timeCompare !== 0) {
                         return $timeCompare;
                     }
-                    $distCompare = (($selectedCityDistances[(string) $left['station_id']] ?? INF)
-                        <=> ($selectedCityDistances[(string) $right['station_id']] ?? INF));
+                    $leftId = (string) $left['station_id'];
+                    $rightId = (string) $right['station_id'];
+                    $distCompare = (($distances[$leftId] ?? INF) <=> ($distances[$rightId] ?? INF));
                     if ($distCompare !== 0) {
                         return $distCompare;
                     }
-                    return strcmp((string) $left['station_name'], (string) $right['station_name']);
+                    // Preserve the previous name tie-break (metadata is already loaded).
+                    $nameCompare = strcmp(
+                        (string) ($metaById[$leftId]['name'] ?? ''),
+                        (string) ($metaById[$rightId]['name'] ?? '')
+                    );
+                    if ($nameCompare !== 0) {
+                        return $nameCompare;
+                    }
+                    return strcmp($leftId, $rightId);
                 });
             }
-        }
 
-        if ($rows !== []) {
-            $summary['points'] = count($rows);
-            $summary['stations'] = count(array_unique(array_column($rows, 'station_id')));
-            $summary['first_recorded_at'] = $rows[0]['recorded_at'];
-            $summary['last_recorded_at'] = $rows[count($rows) - 1]['recorded_at'];
+            $usedStationIds = [];
+            foreach ($rawRows as $row) {
+                $id = (string) $row['station_id'];
+                $usedStationIds[$id] = true;
+                $out['rows'][] = [
+                    's' => $id,
+                    't' => (string) $row['recorded_at'],
+                    'o' => (int) $row['is_open'],
+                    'e5' => $row['e5'] !== null ? (float) $row['e5'] : null,
+                    'e10' => $row['e10'] !== null ? (float) $row['e10'] : null,
+                    'diesel' => $row['diesel'] !== null ? (float) $row['diesel'] : null,
+                ];
+            }
+
+            foreach (array_keys($usedStationIds) as $id) {
+                if (isset($metaById[$id])) {
+                    $out['stations'][$id] = $metaById[$id];
+                }
+            }
+
+            if ($out['rows'] !== []) {
+                $out['summary']['points'] = count($out['rows']);
+                $out['summary']['stations'] = count($usedStationIds);
+                $out['summary']['first_recorded_at'] = $out['rows'][0]['t'];
+                $out['summary']['last_recorded_at'] = $out['rows'][count($out['rows']) - 1]['t'];
+            }
         }
     } catch (Throwable $e) {
+        // Never leak the raw message (DB host, DSN, paths, SQL) to the client.
+        error_log('gasoline data endpoint error: ' . $e->getMessage());
+        $out['errors'][] = ['key' => 'loadError', 'params' => [], 'message' => 'Could not load data.'];
+    }
+
+    echo json_encode($out, $jsonFlags);
+    exit;
+}
+
+if ($errors === []) {
+    try {
+        $pdo = gasolineConnect($dbDriver, $dbPath);
+
+        // Shell only resolves the filter scope (city + station list) so the
+        // sidebar renders immediately. The heavy snapshot payload is fetched
+        // asynchronously via ?action=data.
+        $selectedCityRow = resolveCity($pdo, $selectedCity);
+        if ($selectedCity !== '' && $selectedCityRow === null) {
+            $errors[] = [
+                'key' => 'cityNotFound',
+                'params' => [],
+                'message' => 'Selected city not found.',
+            ];
+        } else {
+            // Distances are only needed client-side (sent via ?action=data), so
+            // the shell just needs the in-scope station list for the dropdown.
+            [$stations] = loadScopeStations($pdo, $selectedCityRow, $selectedRadiusKm);
+        }
+    } catch (Throwable $e) {
+        // Never leak the raw message (DB host, DSN, paths, SQL) to the client.
+        error_log('gasoline shell error: ' . $e->getMessage());
         $errors[] = [
-            'key' => null,
+            'key' => 'loadError',
             'params' => [],
-            'message' => $e->getMessage(),
+            'message' => 'Could not load data.',
         ];
     }
 }
-
-$chartRows = array_map(static function (array $row): array {
-    return [
-        'station_id' => $row['station_id'],
-        'station_name' => $row['station_name'],
-        'brand' => $row['brand'],
-        'street' => trim(implode(' ', array_filter([(string) $row['street'], (string) $row['house_number']]))),
-        'place' => trim((string) $row['place']),
-        'city_name' => $row['city_name'],
-        'recorded_at' => $row['recorded_at'],
-        'is_open' => (bool) $row['is_open'],
-        'e5' => $row['e5'] !== null ? (float) $row['e5'] : null,
-        'e10' => $row['e10'] !== null ? (float) $row['e10'] : null,
-        'diesel' => $row['diesel'] !== null ? (float) $row['diesel'] : null,
-    ];
-}, $rows);
 
 function h(?string $value): string
 {
@@ -436,14 +545,6 @@ function stationLabel(array $station): string
     $suffix = implode(' ', array_filter([$place, $dist !== '' ? "({$dist})" : '']));
 
     return $suffix !== '' ? "{$name}, {$suffix}" : $name;
-}
-
-function formatPrice($value): string
-{
-    if ($value === null || $value === '') {
-        return '-';
-    }
-    return number_format((float) $value, 3);
 }
 
 ?>
@@ -1062,6 +1163,61 @@ function formatPrice($value): string
             color: var(--muted);
         }
 
+        /* ── Loading states ────────────────────────────────────── */
+        @keyframes skeleton-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 0.25; } }
+
+        .skeleton {
+            border-radius: 6px;
+            background: var(--surface-hi);
+            animation: skeleton-pulse 1.2s ease-in-out infinite;
+            min-height: 1em;
+            max-width: 5ch;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .spinner {
+            display: inline-block;
+            width: 22px;
+            height: 22px;
+            border: 2px solid var(--border-hi);
+            border-top-color: var(--amber);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+
+        .chart-loading {
+            display: grid;
+            place-items: center;
+            min-height: 380px;
+        }
+
+        .table-loading {
+            text-align: center;
+            padding: 2.5rem 1rem !important;
+        }
+
+        .table-more {
+            padding: 0.85rem 1.25rem;
+            border-top: 1px solid var(--border);
+        }
+
+        .chart-retry {
+            padding: 0 1.25rem 1.25rem;
+            text-align: center;
+        }
+
+        .chart-retry .btn-reset { display: inline-block; width: auto; padding: 0.55rem 1.4rem; }
+
+        /* Visually hidden but exposed to assistive tech. */
+        .sr-only {
+            position: absolute;
+            width: 1px; height: 1px;
+            padding: 0; margin: -1px;
+            overflow: hidden; clip: rect(0, 0, 0, 0);
+            white-space: nowrap; border: 0;
+        }
+
         /* ── Table card ────────────────────────────────────────── */
         .table-card {
             background: var(--surface);
@@ -1419,33 +1575,33 @@ function formatPrice($value): string
             <?php endforeach; ?>
 
             <!-- Stats -->
-            <div class="stats">
+            <div class="stats" aria-live="polite">
                 <div class="stat">
                     <div class="stat-label" data-i18n="snapshots">Snapshots</div>
-                    <div class="stat-value"><?= h((string) $summary['points']) ?></div>
+                    <div class="stat-value skeleton" id="stat-points" aria-busy="true">&nbsp;</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label" data-i18n="stationsCount">Stations</div>
-                    <div class="stat-value"><?= h((string) $summary['stations']) ?></div>
+                    <div class="stat-value skeleton" id="stat-stations" aria-busy="true">&nbsp;</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label" data-i18n="firstRecorded">First recorded</div>
-                    <div class="stat-value" style="font-size:1rem" <?= $summary['first_recorded_at'] ? 'data-recorded-at="' . h((string) $summary['first_recorded_at']) . '"' : '' ?>><?= h($summary['first_recorded_at'] ? substr((string) $summary['first_recorded_at'], 0, 10) : '—') ?></div>
+                    <div class="stat-value skeleton" id="stat-first" style="font-size:1rem" aria-busy="true">&nbsp;</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label" data-i18n="lastRecorded">Last recorded</div>
-                    <div class="stat-value" style="font-size:1rem" <?= $summary['last_recorded_at'] ? 'data-recorded-at="' . h((string) $summary['last_recorded_at']) . '"' : '' ?>><?= h($summary['last_recorded_at'] ? substr((string) $summary['last_recorded_at'], 0, 10) : '—') ?></div>
+                    <div class="stat-value skeleton" id="stat-last" style="font-size:1rem" aria-busy="true">&nbsp;</div>
                 </div>
             </div>
 
             <!-- Cheapest now -->
-            <div class="cheapest-card" id="cheapest-card"></div>
+            <div class="cheapest-card" id="cheapest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Cheapest in selected range -->
-            <div class="cheapest-card" id="cheapest-range-card"></div>
+            <div class="cheapest-card" id="cheapest-range-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Highest in selected range -->
-            <div class="cheapest-card" id="highest-card"></div>
+            <div class="cheapest-card" id="highest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Chart -->
             <div class="chart-card">
@@ -1464,14 +1620,15 @@ function formatPrice($value): string
                         <button type="button" class="fuel-toggle active" data-fuel="diesel" data-i18n="fuelDiesel">Diesel</button>
                     </div>
                 </div>
-                <?php if ($rows !== [] || $errors !== []): ?>
-                    <div class="chart-body">
-                        <svg id="chart" viewBox="0 0 960 380" preserveAspectRatio="none" aria-label="Fuel price history chart" data-i18n-aria-label="chartAriaLabel"></svg>
-                    </div>
-                    <div class="chart-legend" id="legend"></div>
-                <?php else: ?>
-                    <div class="chart-empty" data-i18n="noSnapshots">No snapshots match the current filters.</div>
-                <?php endif; ?>
+                <div class="chart-body" id="chart-body">
+                    <div class="chart-loading" id="chart-loading" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div>
+                    <svg id="chart" viewBox="0 0 960 380" preserveAspectRatio="none" aria-label="Fuel price history chart" data-i18n-aria-label="chartAriaLabel" hidden></svg>
+                </div>
+                <div class="chart-legend" id="legend" hidden></div>
+                <div class="chart-empty" id="chart-empty" data-i18n="noSnapshots" role="status" hidden>No snapshots match the current filters.</div>
+                <div class="chart-retry" id="chart-retry" hidden>
+                    <button type="button" class="btn-reset" id="retry-btn" data-i18n="retry">Retry</button>
+                </div>
             </div>
 
             <!-- Table -->
@@ -1494,35 +1651,13 @@ function formatPrice($value): string
                             <th data-i18n="fuelDiesel">Diesel</th>
                         </tr>
                         </thead>
-                        <tbody>
-                        <?php foreach (array_reverse($rows) as $row): ?>
-                            <?php
-                            $streetFull = trim(implode(' ', array_filter([
-                                (string) $row['street'],
-                                (string) $row['house_number'],
-                            ])));
-                            $rowStationDistance = $selectedCityDistances[(string) $row['station_id']] ?? null;
-                            $stationDistance = $rowStationDistance !== null
-                                ? ' (' . number_format((float) $rowStationDistance, 1) . ' km)'
-                                : '';
-                            ?>
-                            <tr>
-                                <td class="td-muted" data-recorded-at="<?= h((string) $row['recorded_at']) ?>"><?= h((string) $row['recorded_at']) ?></td>
-                                <td><?= h((string) $row['station_name'] . $stationDistance) ?></td>
-                                <td class="td-muted"><?= h((string) $row['brand']) ?></td>
-                                <td class="td-muted"><?= h($streetFull) ?></td>
-                                <td class="td-muted"><?= h((string) $row['place']) ?></td>
-                                <td class="<?= !empty($row['is_open']) ? 'open-yes' : 'open-no' ?>" data-i18n="<?= !empty($row['is_open']) ? 'openYes' : 'openNo' ?>"><?= !empty($row['is_open']) ? 'open' : 'closed' ?></td>
-                                <td class="price-e5"><?= h(formatPrice($row['e5'])) ?></td>
-                                <td class="price-e10"><?= h(formatPrice($row['e10'])) ?></td>
-                                <td class="price-diesel"><?= h(formatPrice($row['diesel'])) ?></td>
-                            </tr>
-                        <?php endforeach; ?>
-                        <?php if ($rows === []): ?>
-                            <tr><td colspan="9" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="noData">No data</td></tr>
-                        <?php endif; ?>
+                        <tbody id="snapshot-tbody">
+                            <tr><td colspan="9" class="table-loading" role="status" aria-busy="true"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></td></tr>
                         </tbody>
                     </table>
+                </div>
+                <div class="table-more" id="table-more" hidden>
+                    <button type="button" class="btn-reset" id="table-more-btn"></button>
                 </div>
             </div>
 
@@ -1590,17 +1725,21 @@ function h(str) {
         .replace(/'/g, '&#39;');
 }
 
-const chartData = <?= json_encode($chartRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
-const stationDistancesById = <?= json_encode($selectedCityDistances, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
-chartData.forEach((r) => { r._ts = Date.parse(r.recorded_at); });
+// Populated asynchronously by loadData() from the ?action=data endpoint.
+let chartData = [];
+let stationDistancesById = {};
+let dataLoaded = false;
 
 // Evenly-spread hues for all stations in this view using golden-angle spacing.
-// Stations sorted alphabetically → deterministic within a place.
-const _stationHues = (() => {
+// Stations sorted alphabetically → deterministic within a place. Recomputed
+// whenever new data arrives.
+function computeStationHues() {
     const GOLDEN_ANGLE = 137.508;
     const names = [...new Set(chartData.map((r) => r.station_name))].sort();
     return Object.fromEntries(names.map((name, i) => [name, (i * GOLDEN_ANGLE) % 360]));
-})();
+}
+
+let _stationHues = computeStationHues();
 
 function stationFuelColor(stationName, fuel) {
     const hue = _stationHues[stationName] ?? nameToHue(stationName);
@@ -1737,15 +1876,24 @@ if (!chartEl) {
         });
     });
 
+    function setChartVisibility(isEmpty) {
+        const emptyEl = document.getElementById('chart-empty');
+        const loadingEl = document.getElementById('chart-loading');
+        if (loadingEl) loadingEl.hidden = true;
+        if (emptyEl) emptyEl.hidden = !isEmpty;
+        chartEl.hidden = isEmpty;
+        legendEl.hidden = isEmpty;
+    }
+
     function renderChart() {
         chartEl.innerHTML = '';
         legendEl.innerHTML = '';
 
         const rangeData = getRangeFilteredData();
-        if (rangeData.length === 0) return;
+        if (rangeData.length === 0) { setChartVisibility(true); return; }
 
         const visibleRows = rangeData.filter((row) => [...activeFuels].some((f) => row[f] !== null));
-        if (visibleRows.length === 0) return;
+        if (visibleRows.length === 0) { setChartVisibility(true); return; }
 
         const margin = { top: 24, right: 24, bottom: 60, left: 68 };
         const W = 960, H = 380;
@@ -1762,18 +1910,31 @@ if (!chartEl) {
 
         // no fill — line-only chart
 
-        const timestamps = visibleRows.map((r) => r._ts);
-        const allVals = [];
-        for (const f of activeFuels)
-            for (const r of visibleRows)
-                if (r[f] !== null) allVals.push(r[f]);
+        // Single-pass min/max — never spread a per-point array into Math.min/max,
+        // which overflows the call stack once there are ~100k points.
+        let minX = Infinity, maxX = -Infinity;
+        for (const r of visibleRows) {
+            if (r._ts < minX) minX = r._ts;
+            if (r._ts > maxX) maxX = r._ts;
+        }
 
-        if (!allVals.length) return;
+        let minY = Infinity, maxY = -Infinity, valCount = 0;
+        for (const fuel of activeFuels) {
+            for (const r of visibleRows) {
+                const v = r[fuel];
+                if (v !== null) {
+                    valCount++;
+                    if (v < minY) minY = v;
+                    if (v > maxY) maxY = v;
+                }
+            }
+        }
 
-        let minX = Math.min(...timestamps), maxX = Math.max(...timestamps);
+        if (valCount === 0) { setChartVisibility(true); return; }
+        setChartVisibility(false);
+
         if (minX === maxX) maxX += 3_600_000;
 
-        let minY = Math.min(...allVals), maxY = Math.max(...allVals);
         const padY = Math.max((maxY - minY) * 0.15, 0.02);
         minY -= padY; maxY += padY;
 
@@ -1830,12 +1991,20 @@ if (!chartEl) {
         mk('line', { x1: margin.left, y1: margin.top, x2: margin.left, y2: H - margin.bottom,
             stroke: axisStroke, 'stroke-width': 1 });
 
-        const stations = [...new Set(visibleRows.map((r) => r.station_id))];
+        // Group rows by station ONCE (visibleRows stays sorted by _ts), so the
+        // line/dot/legend passes are O(N) instead of re-scanning the whole array
+        // per station per fuel.
+        const byStation = new Map();
+        for (const r of visibleRows) {
+            let arr = byStation.get(r.station_id);
+            if (!arr) { arr = []; byStation.set(r.station_id, arr); }
+            arr.push(r);
+        }
 
         // Line only — per-station colour, per-fuel tint
         for (const fuel of activeFuels) {
-            for (const stationId of stations) {
-                const series = visibleRows.filter((r) => r.station_id === stationId && r[fuel] !== null);
+            for (const stationRows of byStation.values()) {
+                const series = stationRows.filter((r) => r[fuel] !== null);
                 if (series.length < 2) continue;
 
                 const color = stationFuelColor(series[0].station_name, fuel);
@@ -1850,8 +2019,8 @@ if (!chartEl) {
         // Dots on top — per-station colour, per-fuel tint
         for (const fuel of activeFuels) {
             const cfg = fuelConfig[fuel];
-            for (const stationId of stations) {
-                const series = visibleRows.filter((r) => r.station_id === stationId && r[fuel] !== null);
+            for (const stationRows of byStation.values()) {
+                const series = stationRows.filter((r) => r[fuel] !== null);
                 for (const row of series) {
                     if (row._synthetic) continue;
                     const xp = px(row._ts);
@@ -1884,8 +2053,8 @@ if (!chartEl) {
         }
 
         // Legend — one entry per station; dots show each active fuel tint
-        for (const stationId of stations) {
-            const sample = visibleRows.find((r) => r.station_id === stationId);
+        for (const stationRows of byStation.values()) {
+            const sample = stationRows[0];
             const item = document.createElement('div');
             item.className = 'legend-item';
             const swatches = [...activeFuels].map((fuel) => {
@@ -1910,7 +2079,7 @@ if (!chartEl) {
         });
     }
 
-    renderChart();
+    // Initial render is triggered by loadData() once the async payload arrives.
 }
 
 /* ── i18n ──────────────────────────────────────────────────────── */
@@ -1950,6 +2119,14 @@ const translations = {
         openYes: 'open',
         openNo: 'closed',
         noData: 'No data',
+        loading: 'Loading…',
+        showMore: 'Show more',
+        showingRows: 'Showing {shown} of {total}',
+        loadError: 'Could not load data. Please retry.',
+        retry: 'Retry',
+        cityNotFound: 'Selected city not found.',
+        invalidFromDate: 'Invalid from date.',
+        invalidToDate: 'Invalid to date.',
         noSnapshots: 'No snapshots match the current filters.',
         cheapestNow: 'Cheapest — current',
         cheapestNoData: 'No price data available.',
@@ -1998,6 +2175,14 @@ const translations = {
         openYes: 'offen',
         openNo: 'geschlossen',
         noData: 'Keine Daten',
+        loading: 'Wird geladen…',
+        showMore: 'Mehr anzeigen',
+        showingRows: 'Zeige {shown} von {total}',
+        loadError: 'Daten konnten nicht geladen werden. Bitte erneut versuchen.',
+        retry: 'Erneut versuchen',
+        cityNotFound: 'Ausgewählte Stadt nicht gefunden.',
+        invalidFromDate: 'Ungültiges Von-Datum.',
+        invalidToDate: 'Ungültiges Bis-Datum.',
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
         cheapestNow: 'Günstigster Preis — aktuell',
         cheapestNoData: 'Keine Preisdaten vorhanden.',
@@ -2126,10 +2311,14 @@ function applyLang(lang) {
     document.querySelectorAll('[data-recorded-at]').forEach((el) => {
         el.textContent = formatDateTime(el.dataset.recordedAt);
     });
-    renderCheapest();
-    renderCheapestRange();
-    renderHighest();
-    if (chartEl) renderChart();
+    // Data views only exist once the async payload has arrived.
+    if (dataLoaded) {
+        renderCheapest();
+        renderCheapestRange();
+        renderHighest();
+        if (chartEl) renderChart();
+        updateShowMore(); // re-translate the "Show more (N)" button label
+    }
 }
 
 document.querySelectorAll('.lang-btn').forEach((btn) => {
@@ -2148,7 +2337,7 @@ function applyTheme(theme) {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('theme', theme);
     themeToggle.innerHTML = theme === 'light' ? moonIcon : sunIcon;
-    if (chartEl) renderChart();
+    if (chartEl && dataLoaded) renderChart();
 }
 
 themeToggle.addEventListener('click', () => {
@@ -2311,6 +2500,189 @@ function onDateChange(el) {
         if (!wrap.contains(e.target)) hideList();
     });
 })();
+
+/* ── Async snapshot data ───────────────────────────────────────── */
+// The shell paints immediately; the (potentially huge) snapshot payload is
+// fetched here and rendered client-side, so first paint is never blocked on it.
+const tbodyEl       = document.getElementById('snapshot-tbody');
+const tableMoreWrap = document.getElementById('table-more');
+const tableMoreBtn  = document.getElementById('table-more-btn');
+const TABLE_PAGE    = 1000; // rows rendered per chunk — nobody scrolls 100k <tr>
+
+let tableRendered = 0;
+
+function fmtPrice(v) { return (v === null || v === undefined) ? '-' : Number(v).toFixed(3); }
+
+function tableRowHtml(row) {
+    const t = translations[currentLang];
+    const dist = stationDistancesById[row.station_id];
+    const distSuffix = (dist !== undefined && dist !== null) ? ` (${dist.toFixed(1)} km)` : '';
+    const openClass = row.is_open ? 'open-yes' : 'open-no';
+    const openKey   = row.is_open ? 'openYes' : 'openNo';
+    return '<tr>' +
+        `<td class="td-muted" data-recorded-at="${h(row.recorded_at)}">${h(formatDateTime(row.recorded_at))}</td>` +
+        `<td>${h(row.station_name + distSuffix)}</td>` +
+        `<td class="td-muted">${h(row.brand)}</td>` +
+        `<td class="td-muted">${h(row.street)}</td>` +
+        `<td class="td-muted">${h(row.place)}</td>` +
+        `<td class="${openClass}" data-i18n="${openKey}">${h(t[openKey])}</td>` +
+        `<td class="price-e5">${fmtPrice(row.e5)}</td>` +
+        `<td class="price-e10">${fmtPrice(row.e10)}</td>` +
+        `<td class="price-diesel">${fmtPrice(row.diesel)}</td>` +
+    '</tr>';
+}
+
+function updateShowMore() {
+    if (!tableMoreWrap || !tableMoreBtn) return;
+    const remaining = chartData.length - tableRendered;
+    if (remaining <= 0) { tableMoreWrap.hidden = true; return; }
+    const t = translations[currentLang];
+    tableMoreBtn.textContent = `${t.showMore} (${remaining})`;
+    tableMoreWrap.hidden = false;
+}
+
+function renderMoreRows() {
+    if (!tbodyEl) return;
+    // Newest-first without copying the whole dataset: take a page-sized window
+    // from the end of chartData (sorted oldest→newest) and reverse only that.
+    const upper = chartData.length - tableRendered;
+    const lower = Math.max(0, upper - TABLE_PAGE);
+    const slice = chartData.slice(lower, upper).reverse();
+    tbodyEl.insertAdjacentHTML('beforeend', slice.map(tableRowHtml).join(''));
+    tableRendered += slice.length;
+    updateShowMore();
+}
+
+function renderTable() {
+    if (!tbodyEl) return;
+    tableRendered = 0;
+    tbodyEl.innerHTML = '';
+    if (chartData.length === 0) {
+        const t = translations[currentLang];
+        tbodyEl.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem">${h(t.noData)}</td></tr>`;
+        updateShowMore();
+        return;
+    }
+    renderMoreRows();
+}
+
+if (tableMoreBtn) tableMoreBtn.addEventListener('click', renderMoreRows);
+
+function setStat(id, value) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = String(value);
+    el.classList.remove('skeleton');
+    el.removeAttribute('aria-busy');
+}
+
+function applyData(payload) {
+    if (retryWrap) retryWrap.hidden = true;
+    const meta = payload.stations || {};
+    // Expand slim rows back into the shape the existing renderers expect by
+    // joining each row to its station metadata (sent once, keyed by id).
+    chartData = (payload.rows || []).map((r) => {
+        const s = meta[r.s] || {};
+        return {
+            station_id:  r.s,
+            station_name: s.name || r.s,
+            brand:  s.brand  || '',
+            street: s.street || '',
+            place:  s.place  || '',
+            recorded_at: r.t,
+            is_open: !!r.o,
+            e5:     r.e5 ?? null,
+            e10:    r.e10 ?? null,
+            diesel: r.diesel ?? null,
+            _ts:    Date.parse(r.t),
+        };
+    });
+    stationDistancesById = {};
+    for (const [id, s] of Object.entries(meta)) {
+        if (s.dist !== null && s.dist !== undefined) stationDistancesById[id] = s.dist;
+    }
+    _stationHues = computeStationHues();
+    dataLoaded = true;
+
+    const sum = payload.summary || {};
+    setStat('stat-points',   sum.points   ?? 0);
+    setStat('stat-stations', sum.stations ?? 0);
+    setStat('stat-first', sum.first_recorded_at ? String(sum.first_recorded_at).slice(0, 10) : '—');
+    setStat('stat-last',  sum.last_recorded_at  ? String(sum.last_recorded_at).slice(0, 10)  : '—');
+
+    renderCheapest();
+    renderCheapestRange();
+    renderHighest();
+    renderTable();
+    if (chartEl) renderChart();
+}
+
+// Deliberately leaves dataLoaded=false so a later language/theme change does
+// NOT re-run the data renderers and wipe the error UI with empty placeholders.
+function showDataError(err) {
+    const t = translations[currentLang];
+    const key = (err && err.key && t[err.key]) ? err.key : 'loadError';
+    const msg = (err && err.key && t[err.key]) ? t[err.key]
+        : (err && err.message) ? err.message
+        : t.loadError;
+    ['stat-points', 'stat-stations', 'stat-first', 'stat-last'].forEach((id) => setStat(id, '—'));
+    const loadingEl = document.getElementById('chart-loading');
+    if (loadingEl) loadingEl.hidden = true;
+    const emptyEl = document.getElementById('chart-empty');
+    if (emptyEl) {
+        emptyEl.hidden = false;
+        emptyEl.removeAttribute('aria-busy');
+        // Retarget i18n so a later language switch keeps the error text.
+        emptyEl.dataset.i18n = key;
+        emptyEl.textContent = msg;
+    }
+    if (chartEl)  chartEl.hidden = true;
+    if (legendEl) legendEl.hidden = true;
+    if (tableMoreWrap) tableMoreWrap.hidden = true;
+    if (tbodyEl) {
+        tbodyEl.innerHTML = `<tr><td colspan="9" role="alert" style="text-align:center;color:var(--red);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="${key}">${h(msg)}</td></tr>`;
+    }
+    if (retryWrap) retryWrap.hidden = false;
+}
+
+function resetLoadingUI() {
+    if (retryWrap) retryWrap.hidden = true;
+    const loadingEl = document.getElementById('chart-loading');
+    if (loadingEl) loadingEl.hidden = false;
+    const emptyEl = document.getElementById('chart-empty');
+    if (emptyEl) { emptyEl.hidden = true; emptyEl.dataset.i18n = 'noSnapshots'; }
+    ['stat-points', 'stat-stations', 'stat-first', 'stat-last'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) { el.textContent = ' '; el.classList.add('skeleton'); el.setAttribute('aria-busy', 'true'); }
+    });
+    if (tbodyEl) tbodyEl.innerHTML = '<tr><td colspan="9" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
+}
+
+async function loadData() {
+    const url = new URL(location.href);
+    url.searchParams.set('action', 'data');
+    try {
+        const res = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const payload = await res.json();
+        // Surface application-level errors (invalid date, city not found, …)
+        // instead of silently rendering an empty result — matches the old
+        // synchronous behaviour where errors showed in the error box.
+        if (payload.errors && payload.errors.length) {
+            showDataError(payload.errors[0]);
+            return;
+        }
+        applyData(payload);
+    } catch (e) {
+        showDataError();
+    }
+}
+
+const retryWrap = document.getElementById('chart-retry');
+const retryBtn  = document.getElementById('retry-btn');
+if (retryBtn) retryBtn.addEventListener('click', () => { resetLoadingUI(); loadData(); });
+
+loadData();
 </script>
 </body>
 </html>
