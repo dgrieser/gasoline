@@ -1,5 +1,7 @@
-.env
+*.env
+*.state
 gasoline
 *.db
 dist/
+bin/
 .codex
