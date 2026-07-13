@@ -1164,6 +1164,11 @@ function stationLabel(array $station): string
         }
 
         /* ── Loading states ────────────────────────────────────── */
+        /* Author display rules (grid/flex/block) on elements like
+           .chart-loading, #chart and .chart-legend override the UA's
+           [hidden] { display: none }, so toggling el.hidden had no effect. */
+        [hidden] { display: none !important; }
+
         @keyframes skeleton-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 0.25; } }
 
         .skeleton {
@@ -1748,6 +1753,11 @@ function stationFuelColor(stationName, fuel) {
 }
 
 const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
+// Whether a city or station filter is set. Without one the server never runs
+// the snapshot query (the payload is known-empty), so the client can skip the
+// fetch and render the empty state immediately instead of showing spinners.
+// Server-side errors still force a fetch so the usual error UI renders.
+const hasDataScope = <?= json_encode($selectedCity !== '' || $selectedStationIds !== [] || $errors !== [], JSON_THROW_ON_ERROR) ?>;
 
 const fuelConfig = {
     e5:     { label: 'E5',     color: '#f5a623', glow: 'rgba(245,166,35,0.18)' },
@@ -1881,7 +1891,9 @@ if (!chartEl) {
         const loadingEl = document.getElementById('chart-loading');
         if (loadingEl) loadingEl.hidden = true;
         if (emptyEl) emptyEl.hidden = !isEmpty;
-        chartEl.hidden = isEmpty;
+        // chartEl is an SVG element: the `hidden` IDL property only exists on
+        // HTMLElement, so assigning chartEl.hidden would not touch the attribute.
+        chartEl.toggleAttribute('hidden', isEmpty);
         legendEl.hidden = isEmpty;
     }
 
@@ -2636,7 +2648,7 @@ function showDataError(err) {
         emptyEl.dataset.i18n = key;
         emptyEl.textContent = msg;
     }
-    if (chartEl)  chartEl.hidden = true;
+    if (chartEl)  chartEl.toggleAttribute('hidden', true);
     if (legendEl) legendEl.hidden = true;
     if (tableMoreWrap) tableMoreWrap.hidden = true;
     if (tbodyEl) {
@@ -2682,7 +2694,11 @@ const retryWrap = document.getElementById('chart-retry');
 const retryBtn  = document.getElementById('retry-btn');
 if (retryBtn) retryBtn.addEventListener('click', () => { resetLoadingUI(); loadData(); });
 
-loadData();
+if (hasDataScope) {
+    loadData();
+} else {
+    applyData({});
+}
 </script>
 </body>
 </html>
