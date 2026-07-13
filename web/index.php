@@ -1343,7 +1343,7 @@ $cookieSecure = (($_SERVER['HTTPS'] ?? '') !== '' && strtolower((string) $_SERVE
     || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
 
 if (isset($_GET['reset'])) {
-    setcookie($filterCookieName, '', ['expires' => time() - 3600, 'path' => '/', 'secure' => $cookieSecure, 'samesite' => 'Lax']);
+    setcookie($filterCookieName, '', ['expires' => time() - 3600, 'path' => '/', 'secure' => $cookieSecure, 'httponly' => true, 'samesite' => 'Lax']);
     redirectTo('');
 }
 
@@ -1365,7 +1365,7 @@ if ($hasFilterParams) {
                 $filtersToSave[$filterKey] = $_GET[$filterKey];
             }
         }
-        setcookie($filterCookieName, json_encode($filtersToSave), ['expires' => time() + 60 * 60 * 24 * 365, 'path' => '/', 'secure' => $cookieSecure, 'samesite' => 'Lax']);
+        setcookie($filterCookieName, json_encode($filtersToSave), ['expires' => time() + 60 * 60 * 24 * 365, 'path' => '/', 'secure' => $cookieSecure, 'httponly' => true, 'samesite' => 'Lax']);
     }
 } else {
     $savedFilters = json_decode((string) ($_COOKIE[$filterCookieName] ?? ''), true);
