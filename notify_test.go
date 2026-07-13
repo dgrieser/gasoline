@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -305,6 +306,31 @@ func TestNotifyOnceSendsCheckAndSuggestPerSchedule(t *testing.T) {
 	}
 	if lastSuggest != "2026-04-26T13:00" {
 		t.Fatalf("notify_last_suggest = %q, want 2026-04-26T13:00", lastSuggest)
+	}
+}
+
+func TestNotifyBaseURLRequiresHTTPScheme(t *testing.T) {
+	t.Chdir(t.TempDir()) // keep any developer .env out of the fallback lookup
+
+	t.Setenv(envBaseURLName, "https://gasoline.example.com")
+	if got := notifyBaseURL(); got != "https://gasoline.example.com" {
+		t.Fatalf("notifyBaseURL = %q, want the configured URL", got)
+	}
+	// Pushover rejects scheme-less urls with "url is invalid", which would
+	// block every notification: the link must be dropped instead.
+	t.Setenv(envBaseURLName, "gasoline.example.com")
+	if got := notifyBaseURL(); got != "" {
+		t.Fatalf("notifyBaseURL = %q, want empty for a scheme-less value", got)
+	}
+	t.Setenv(envBaseURLName, "")
+	if got := notifyBaseURL(); got != "" {
+		t.Fatalf("notifyBaseURL = %q, want empty when unset", got)
+	}
+	if err := os.WriteFile(".env", []byte(envBaseURLName+"=https://dotenv.example.com\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	if got := notifyBaseURL(); got != "https://dotenv.example.com" {
+		t.Fatalf("notifyBaseURL = %q, want the .env fallback", got)
 	}
 }
 

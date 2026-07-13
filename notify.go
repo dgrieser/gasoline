@@ -37,16 +37,26 @@ type notifyOptions struct {
 
 // notifyBaseURL resolves the viewer base URL attached to notifications as a
 // supplementary link, from the environment or the .env file (same precedence
-// as the API key).
+// as the API key). A value without an HTTP/HTTPS scheme would make Pushover
+// reject every send with "url is invalid", so it is dropped with a warning
+// instead of blocking all notifications.
 func notifyBaseURL() string {
-	if v := strings.TrimSpace(os.Getenv(envBaseURLName)); v != "" {
-		return v
+	rawURL := strings.TrimSpace(os.Getenv(envBaseURLName))
+	if rawURL == "" {
+		values, err := loadDotEnv(".env")
+		if err != nil {
+			return ""
+		}
+		rawURL = strings.TrimSpace(values[envBaseURLName])
 	}
-	values, err := loadDotEnv(".env")
-	if err != nil {
+	if rawURL == "" {
 		return ""
 	}
-	return strings.TrimSpace(values[envBaseURLName])
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		fmt.Fprintf(os.Stderr, "warning: %s %q is not an absolute HTTP/HTTPS URL; omitting the notification link\n", envBaseURLName, rawURL)
+		return ""
+	}
+	return rawURL
 }
 
 type notifySendRecord struct {
