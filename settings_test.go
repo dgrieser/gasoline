@@ -129,6 +129,33 @@ func TestLoadSettingsOverlaysDefaultsAndRejectsBadNumbers(t *testing.T) {
 	}
 }
 
+func TestLoadSettingsUnescapesTemplates(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"),
+		settingSuggestTemplate, `{{weekday_formatted}}\n{{start_time}}\n{{price_formatted}} EUR`, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert setting: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"),
+		settingCheckTitleTemplate, `Tanken\nfür {{cheapest_price_formatted}} EUR`, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert setting: %v", err)
+	}
+	s, err := loadSettings(ctx, db)
+	if err != nil {
+		t.Fatalf("loadSettings: %v", err)
+	}
+	if want := "{{weekday_formatted}}\n{{start_time}}\n{{price_formatted}} EUR"; s.SuggestTemplate != want {
+		t.Fatalf("SuggestTemplate = %q, want %q", s.SuggestTemplate, want)
+	}
+	if want := "Tanken\nfür {{cheapest_price_formatted}} EUR"; s.CheckTitleTemplate != want {
+		t.Fatalf("CheckTitleTemplate = %q, want %q", s.CheckTitleTemplate, want)
+	}
+	if s.CheckTemplate != defaultCheckTemplate {
+		t.Fatalf("CheckTemplate = %q, want default", s.CheckTemplate)
+	}
+}
+
 func TestApplySuggestSettingsPrecedence(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

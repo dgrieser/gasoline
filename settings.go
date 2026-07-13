@@ -181,14 +181,16 @@ func loadSettings(ctx context.Context, q settingsQuerier) (appSettings, error) {
 			s.NotifyDays = value
 		case settingNotifyWindows:
 			s.NotifyWindows = value
+		// Templates are unescaped here (\n, \t, \\) so the single-line
+		// settings fields can express multi-line notifications.
 		case settingCheckTemplate:
-			s.CheckTemplate = value
+			s.CheckTemplate = unescapeTemplate(value)
 		case settingSuggestTemplate:
-			s.SuggestTemplate = value
+			s.SuggestTemplate = unescapeTemplate(value)
 		case settingCheckTitleTemplate:
-			s.CheckTitleTemplate = value
+			s.CheckTitleTemplate = unescapeTemplate(value)
 		case settingSuggestTitleTemplate:
-			s.SuggestTitleTemplate = value
+			s.SuggestTitleTemplate = unescapeTemplate(value)
 		}
 	}
 	return s, rows.Err()

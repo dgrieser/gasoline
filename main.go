@@ -37,6 +37,7 @@ const (
 	defaultUserAgent  = "gasoline-cli/1.0 (local utility)"
 	envAPIKeyName     = "TANKER_KOENIG_API_KEY"
 	envDBPathName     = "GASOLINE_DB_PATH"
+	envBaseURLName    = "GASOLINE_BASE_URL"
 	sqliteBusyTimeout = 5000
 	defaultRadiusKm   = 5.0
 )

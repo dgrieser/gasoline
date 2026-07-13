@@ -32,6 +32,31 @@ type notifyOptions struct {
 	Location *time.Location
 	DryRun   bool
 	APIURL   string // "" -> pushoverMessagesURL
+	BaseURL  string // viewer base URL sent as the notification link; "" -> no link
+}
+
+// notifyBaseURL resolves the viewer base URL attached to notifications as a
+// supplementary link, from the environment or the .env file (same precedence
+// as the API key). A value without an HTTP/HTTPS scheme would make Pushover
+// reject every send with "url is invalid", so it is dropped with a warning
+// instead of blocking all notifications.
+func notifyBaseURL() string {
+	rawURL := strings.TrimSpace(os.Getenv(envBaseURLName))
+	if rawURL == "" {
+		values, err := loadDotEnv(".env")
+		if err != nil {
+			return ""
+		}
+		rawURL = strings.TrimSpace(values[envBaseURLName])
+	}
+	if rawURL == "" {
+		return ""
+	}
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		fmt.Fprintf(os.Stderr, "warning: %s %q is not an absolute HTTP/HTTPS URL; omitting the notification link\n", envBaseURLName, rawURL)
+		return ""
+	}
+	return rawURL
 }
 
 type notifySendRecord struct {
@@ -84,6 +109,7 @@ func runNotify(args []string) error {
 		Now:      time.Now().UTC(),
 		Location: time.Local,
 		DryRun:   *dryRun,
+		BaseURL:  notifyBaseURL(),
 	})
 	if err != nil {
 		return err
@@ -436,7 +462,7 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 			}
 			if err := sendPushover(ctx, apiURL, pushoverMessage{
 				Token: u.PushoverToken, UserKey: u.PushoverUserKey,
-				Title: title, Message: message,
+				Title: title, Message: message, URL: opts.BaseURL,
 			}); err != nil {
 				// Leave this user's baselines untouched so the next run
 				// retries them.
@@ -489,6 +515,7 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 				Token: u.PushoverToken, UserKey: u.PushoverUserKey,
 				Title:   notifyTitle(settings.SuggestTitleTemplate, notifyKindSuggest, cheapest, len(suggestRows), u.PushoverAppName),
 				Message: message,
+				URL:     opts.BaseURL,
 			}); err != nil {
 				// Leave the marker untouched so the next run retries.
 				rec.Error = err.Error()
