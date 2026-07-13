@@ -166,6 +166,59 @@ func TestRenderNotifyMessageRowTemplateAndScalars(t *testing.T) {
 	}
 }
 
+func TestRenderNotifyTitle(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	rows := []notifyRow{
+		checkRowFixture("Station 1", "2026-04-27", "11:00", 1.599),
+		checkRowFixture("Station 2", "2026-04-27", "11:00", 1.659),
+	}
+
+	// Scalar and row placeholders both resolve against the cheapest row.
+	got := renderNotifyTitle("Tanken für {{cheapest_price_formatted}} EUR bei {{station_name}}", notifyKindCheck, &rows[0], len(rows))
+	if got != "Tanken für 1.59 EUR bei Station 1" {
+		t.Fatalf("title = %q", got)
+	}
+
+	// Onchange variants have no row-to-row context in a title and resolve
+	// like their plain counterparts; newlines collapse to spaces.
+	got = renderNotifyTitle("{{station_name_onchange}}\n({{count}})", notifyKindCheck, &rows[0], len(rows))
+	if got != "Station 1 (2)" {
+		t.Fatalf("title = %q", got)
+	}
+
+	// Windows-style line endings leave no stray carriage returns behind.
+	got = renderNotifyTitle("{{station_name}}\r\n({{count}})", notifyKindCheck, &rows[0], len(rows))
+	if got != "Station 1 (2)" {
+		t.Fatalf("CRLF title = %q", got)
+	}
+
+	// A title that renders to nothing (all placeholders empty) is reported
+	// as empty so callers can fall back to the app name.
+	suggest := suggestRowFixture("S", "2026-04-28", "Tuesday", "10:00", 1.5)
+	if got = renderNotifyTitle("{{verdict}}", notifyKindSuggest, &suggest, 1); got != "" {
+		t.Fatalf("title = %q, want empty", got)
+	}
+}
+
+func TestNotifyTitleFallsBackToAppName(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	row := checkRowFixture("Station 1", "2026-04-27", "11:00", 1.599)
+
+	if got := notifyTitle("", notifyKindCheck, &row, 1, "gasoline"); got != "gasoline" {
+		t.Fatalf("empty template title = %q, want gasoline", got)
+	}
+	if got := notifyTitle("  ", notifyKindCheck, &row, 1, "gasoline"); got != "gasoline" {
+		t.Fatalf("blank template title = %q, want gasoline", got)
+	}
+	suggest := suggestRowFixture("S", "2026-04-28", "Tuesday", "10:00", 1.5)
+	if got := notifyTitle("{{verdict}}", notifyKindSuggest, &suggest, 1, "gasoline"); got != "gasoline" {
+		t.Fatalf("empty-render title = %q, want gasoline", got)
+	}
+	if got := notifyTitle("Buy now: {{price_formatted}} EUR", notifyKindCheck, &row, 1, "gasoline"); got != "Buy now: 1.59 EUR" {
+		t.Fatalf("rendered title = %q", got)
+	}
+}
+
 func TestRenderNotifyMessageMessagePlaceholder(t *testing.T) {
 	withDecimalSeparator(t, ".")
 	rows := []notifyRow{

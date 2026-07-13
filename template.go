@@ -648,6 +648,40 @@ func defaultRowTemplate(kind notifyKind) string {
 	return defaultSuggestTemplate
 }
 
+// renderNotifyTitle renders a notification title template. A title is a
+// single line, so row placeholders resolve against the cheapest row instead
+// of expanding once per row; scalar placeholders ({{count}}, {{cheapest_*}})
+// work exactly like in message templates. Newlines collapse to spaces. An
+// empty result means "no title" and callers fall back to the user's
+// configured application name.
+func renderNotifyTitle(template string, kind notifyKind, cheapest *notifyRow, rowCount int) string {
+	result := expandScalars(template, kind, cheapest, rowCount)
+	for _, key := range templatePlaceholders {
+		// There is no per-row change tracking in a single-line title, so
+		// *_onchange variants resolve like their plain counterparts. Resolve
+		// the value only for placeholders the template actually contains.
+		plain := "{{" + key + "}}"
+		onchange := "{{" + key + "_onchange}}"
+		hasPlain := strings.Contains(result, plain)
+		hasOnchange := strings.Contains(result, onchange)
+		if !hasPlain && !hasOnchange {
+			continue
+		}
+		value := ""
+		if cheapest != nil {
+			value = rowValue(kind, *cheapest, key)
+		}
+		if hasPlain {
+			result = strings.ReplaceAll(result, plain, value)
+		}
+		if hasOnchange {
+			result = strings.ReplaceAll(result, onchange, value)
+		}
+	}
+	result = strings.ReplaceAll(result, "\r", "")
+	return strings.TrimSpace(strings.ReplaceAll(result, "\n", " "))
+}
+
 // renderNotifyMessage mirrors build_notification_command, minus the shell:
 // the template renders straight to the notification text. The three layering
 // branches are preserved: a {{message}} template gets the default multi-row

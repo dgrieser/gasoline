@@ -36,6 +36,10 @@ func TestInitSchemaCreatesAuthAndSettingsTables(t *testing.T) {
 		settingNotifyWindows:   "07:00-21:00",
 		settingCheckTemplate:   defaultCheckTemplate,
 		settingSuggestTemplate: defaultSuggestTemplate,
+		// Title templates default to empty: notifications fall back to the
+		// user's pushover_app_name until an admin configures a template.
+		settingCheckTitleTemplate:   "",
+		settingSuggestTitleTemplate: "",
 	}
 	rows, err := db.QueryContext(ctx, `SELECT name, value FROM settings`)
 	if err != nil {

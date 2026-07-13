@@ -137,7 +137,7 @@ func seedNotifyFixture(t *testing.T, db *sql.DB) {
 	})
 	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
 	for daysAgo := 28; daysAgo >= 1; daysAgo-- {
-		dayStart := notifyFixtureNow.Truncate(24 * time.Hour).AddDate(0, 0, -daysAgo)
+		dayStart := notifyFixtureNow.Truncate(24*time.Hour).AddDate(0, 0, -daysAgo)
 		for hour := 0; hour < 24; hour++ {
 			insertSuggestSnapshot(t, db, "station-1", "Berlin", dayStart.Add(time.Duration(hour)*time.Hour), 2.100, true)
 		}
@@ -300,6 +300,50 @@ func TestNotifyOnceSendsCheckAndSuggestPerSchedule(t *testing.T) {
 	}
 	if lastSuggest != "2026-04-26T13:00" {
 		t.Fatalf("notify_last_suggest = %q, want 2026-04-26T13:00", lastSuggest)
+	}
+}
+
+func TestNotifyOnceUsesTitleTemplates(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "in@example.com", UserKey: "user-in", Token: "token-in",
+		SuggestTimes: "08:00,13:00", CheckEnabled: true,
+	})
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"),
+		settingCheckTitleTemplate, "Tanken für {{cheapest_current_price_formatted}} EUR", "2026-04-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert setting: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"),
+		settingSuggestTitleTemplate, "Tanken {{weekday_short_formatted}} {{start_time}} ({{count}})", "2026-04-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert setting: %v", err)
+	}
+
+	pushes := stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+	if len(result.Failed) != 0 {
+		t.Fatalf("failed sends: %+v", result.Failed)
+	}
+	if len(*pushes) != 2 {
+		t.Fatalf("pushover calls = %d, want 2", len(*pushes))
+	}
+	titles := map[string]string{}
+	for _, push := range *pushes {
+		if strings.Contains(push.Message, "predicted") {
+			titles["suggest"] = push.Title
+		} else {
+			titles["check"] = push.Title
+		}
+	}
+	// The fixture's fresh snapshot is 2.000 EUR, so the check title renders
+	// the cheapest row's truncated price.
+	if titles["check"] != "Tanken für 2.00 EUR" {
+		t.Fatalf("check title = %q", titles["check"])
+	}
+	if titles["suggest"] == "" || titles["suggest"] == "gasoline" || strings.Contains(titles["suggest"], "{{") {
+		t.Fatalf("suggest title = %q, want rendered template", titles["suggest"])
 	}
 }
 

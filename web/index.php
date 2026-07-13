@@ -771,6 +771,10 @@ function handlePost(PDO $pdo, string $driver): void
                 'notify_windows' => static fn (string $v): bool => validWindowListString($v),
                 'check_template' => static fn (string $v): bool => $v !== '',
                 'suggest_template' => static fn (string $v): bool => $v !== '',
+                // Title templates may be empty: notifications then fall back
+                // to each user's configured notification title.
+                'check_title_template' => static fn (string $v): bool => true,
+                'suggest_title_template' => static fn (string $v): bool => true,
             ];
             $kv = [];
             foreach ($fields as $name => $validate) {
@@ -972,9 +976,9 @@ function renderScheduleEditor(string $days, string $windows, string $times): voi
                             $to = h(trim($pair[1] ?? ''));
                         ?>
                         <div class="row-item">
-                            <input type="time" name="notify_windows_from[]" value="<?= $from ?>" required>
+                            <input type="text" class="time-input" name="notify_windows_from[]" value="<?= $from ?>" required maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
                             <span>–</span>
-                            <input type="time" name="notify_windows_to[]" value="<?= $to ?>" required>
+                            <input type="text" class="time-input" name="notify_windows_to[]" value="<?= $to ?>" required maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
                             <button type="button" class="btn-row-remove" data-i18n-aria-label="removeRow" aria-label="Remove">×</button>
                         </div>
                         <?php } ?>
@@ -986,7 +990,7 @@ function renderScheduleEditor(string $days, string $windows, string $times): voi
                     <div class="row-list" id="suggest-time-list">
                         <?php foreach ($timeRows as $time) { ?>
                         <div class="row-item">
-                            <input type="time" name="notify_suggest_times[]" value="<?= h($time) ?>" required>
+                            <input type="text" class="time-input" name="notify_suggest_times[]" value="<?= h($time) ?>" required maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
                             <button type="button" class="btn-row-remove" data-i18n-aria-label="removeRow" aria-label="Remove">×</button>
                         </div>
                         <?php } ?>
@@ -1035,8 +1039,9 @@ function renderAccountPage(PDO $pdo, array $user): never
                     </select>
                 </div>
                 <div class="field">
-                    <label for="nf-app" data-i18n="pushoverAppName">Application name (notification title)</label>
+                    <label for="nf-app" data-i18n="pushoverAppName">Notification title</label>
                     <input type="text" id="nf-app" name="pushover_app_name" value="<?= h($user['pushover_app_name']) ?>">
+                    <p class="field-hint" data-i18n="pushoverAppNameHint">Shown as the title of your notifications unless an administrator has configured a title template.</p>
                 </div>
                 <div class="field">
                     <label for="nf-user" data-i18n="pushoverUserKey">Pushover user key</label>
@@ -1084,7 +1089,7 @@ function renderAdminUsersPage(PDO $pdo, array $user): never
         <div class="settings-card">
             <h2 data-i18n="adminUsersTitle">Users</h2>
             <div class="table-scroll">
-            <table>
+            <table class="stack-table">
                 <thead>
                     <tr>
                         <th data-i18n="colEmail">Email</th>
@@ -1098,11 +1103,11 @@ function renderAdminUsersPage(PDO $pdo, array $user): never
                 <tbody>
                     <?php foreach ($users as $row) { $isSelf = (int) $row['id'] === (int) $user['id']; ?>
                     <tr>
-                        <td><?= h($row['email']) ?><?= $isSelf ? ' <span class="badge">you</span>' : '' ?></td>
-                        <td><span class="badge <?= $row['status'] === 'approved' ? 'ok' : 'warn' ?>" data-i18n="status<?= h(ucfirst($row['status'])) ?>"><?= h($row['status']) ?></span></td>
-                        <td><?= (int) $row['is_admin'] === 1 ? '<span class="badge ok" data-i18n="adminYes">admin</span>' : '' ?></td>
-                        <td data-recorded-at="<?= h((string) $row['created_at']) ?>"><?= h((string) $row['created_at']) ?></td>
-                        <td <?= $row['approved_at'] !== null ? 'data-recorded-at="' . h((string) $row['approved_at']) . '"' : '' ?>><?= h((string) ($row['approved_at'] ?? '—')) ?></td>
+                        <td class="stack-primary"><?= h($row['email']) ?><?= $isSelf ? ' <span class="badge">you</span>' : '' ?></td>
+                        <td data-label="Status" data-i18n-label="colStatus"><span class="badge <?= $row['status'] === 'approved' ? 'ok' : 'warn' ?>" data-i18n="status<?= h(ucfirst($row['status'])) ?>"><?= h($row['status']) ?></span></td>
+                        <td <?= (int) $row['is_admin'] === 1 ? 'data-label="Admin" data-i18n-label="colAdmin"' : '' ?>><?= (int) $row['is_admin'] === 1 ? '<span class="badge ok" data-i18n="adminYes">admin</span>' : '' ?></td>
+                        <td data-label="Registered" data-i18n-label="colCreated" data-recorded-at="<?= h((string) $row['created_at']) ?>"><?= h((string) $row['created_at']) ?></td>
+                        <td data-label="Approved" data-i18n-label="colApproved" <?= $row['approved_at'] !== null ? 'data-recorded-at="' . h((string) $row['approved_at']) . '"' : '' ?>><?= h((string) ($row['approved_at'] ?? '—')) ?></td>
                         <td class="actions-cell">
                             <?php if ($row['status'] === 'pending') { ?>
                             <form method="post" action="" class="table-form"><?= csrfField() ?><input type="hidden" name="action" value="approve_user"><input type="hidden" name="user_id" value="<?= (int) $row['id'] ?>"><button type="submit" class="btn-small" data-i18n="actionApprove">Approve</button></form>
@@ -1138,15 +1143,15 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
             <h2 data-i18n="updateTargets">Automatic updates</h2>
             <p class="auth-note" data-i18n="updateTargetsHint">These cities are updated automatically by `gasoline update` (and used by suggest/check/notify) when the CLI is invoked without --city/--radius flags.</p>
             <div class="table-scroll">
-            <table>
+            <table class="stack-table">
                 <thead>
                     <tr><th data-i18n="targetCity">City</th><th data-i18n="targetRadius">Radius (km)</th><th data-i18n="colActions">Actions</th></tr>
                 </thead>
                 <tbody>
                     <?php foreach ($targets as $target) { ?>
                     <tr>
-                        <td><?= h($target['city']) ?></td>
-                        <td><?= h((string) round((float) $target['radius_km'], 1)) ?></td>
+                        <td class="stack-primary"><?= h($target['city']) ?></td>
+                        <td data-label="Radius (km)" data-i18n-label="targetRadius"><?= h((string) round((float) $target['radius_km'], 1)) ?></td>
                         <td class="actions-cell"><form method="post" action="" class="table-form"><?= csrfField() ?><input type="hidden" name="action" value="delete_target"><input type="hidden" name="target_id" value="<?= (int) $target['id'] ?>"><button type="submit" class="btn-small danger" data-i18n="removeTarget">Remove</button></form></td>
                     </tr>
                     <?php } ?>
@@ -1205,7 +1210,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                     </div>
                     <div class="field">
                         <label for="st-reset" data-i18n="settingCheckResetTime">Check baseline reset</label>
-                        <input type="time" id="st-reset" name="check_reset_time" value="<?= h($get('check_reset_time', '00:00')) ?>">
+                        <input type="text" id="st-reset" name="check_reset_time" value="<?= h($get('check_reset_time', '00:00')) ?>" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
                     </div>
                 </div>
                 <div class="field">
@@ -1222,14 +1227,23 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                     </div>
                 </div>
                 <div class="field">
-                    <label for="st-check-tpl" data-i18n="templateCheck">Check notification template</label>
+                    <label for="st-check-title" data-i18n="templateCheckTitle">Buy-alert notification title</label>
+                    <input type="text" id="st-check-title" name="check_title_template" data-i18n-placeholder="titleTemplatePlaceholder" placeholder="e.g. Fill up for {{cheapest_current_price_formatted}} EUR" value="<?= h($get('check_title_template')) ?>">
+                </div>
+                <div class="field">
+                    <label for="st-check-tpl" data-i18n="templateCheck">Buy-alert notification template</label>
                     <textarea id="st-check-tpl" name="check_template" rows="3"><?= h($get('check_template')) ?></textarea>
+                </div>
+                <div class="field">
+                    <label for="st-suggest-title" data-i18n="templateSuggestTitle">Suggestion notification title</label>
+                    <input type="text" id="st-suggest-title" name="suggest_title_template" data-i18n-placeholder="titleTemplatePlaceholder" placeholder="e.g. Fill up for {{cheapest_current_price_formatted}} EUR" value="<?= h($get('suggest_title_template')) ?>">
                 </div>
                 <div class="field">
                     <label for="st-suggest-tpl" data-i18n="templateSuggest">Suggestion notification template</label>
                     <textarea id="st-suggest-tpl" name="suggest_template" rows="3"><?= h($get('suggest_template')) ?></textarea>
                 </div>
                 <p class="auth-note" data-i18n="templatePlaceholdersHint">Templates use {{placeholder}} syntax with the full gasoline-watch set, e.g. {{station_name}}, {{price}}, {{price_formatted}}, {{fuel}}, {{date}}, {{start_time}}, {{end_time}}, {{distance}}, {{confidence}}, {{count}}, {{cheapest_price}}, {{message}} and *_onchange variants.</p>
+                <p class="auth-note" data-i18n="titleTemplatesHint">Title templates use the same placeholders; row placeholders resolve against the cheapest row. Leave a title empty to use each user's notification title instead.</p>
                 <button type="submit" class="btn-primary" data-i18n="save">Save</button>
             </form>
         </div>
@@ -1877,6 +1891,10 @@ function renderDocumentHead(string $titleSuffix): void
             margin: 0 auto;
             padding: 2rem 0 4rem;
             display: grid;
+            /* Clamp the single implicit track to the container so wide
+               content (tables, template strings) scrolls inside its own
+               overflow container instead of stretching the whole page. */
+            grid-template-columns: minmax(0, 1fr);
             gap: 1.5rem;
         }
 
@@ -2008,7 +2026,7 @@ function renderDocumentHead(string $titleSuffix): void
             font-weight: 500;
         }
 
-        .field input,
+        .field input:not([type="checkbox"]),
         .field select {
             width: 100%;
             background: var(--surface-hi);
@@ -2023,8 +2041,47 @@ function renderDocumentHead(string $titleSuffix): void
             outline: none;
         }
 
-        .field input:focus,
+        .field input:not([type="checkbox"]):focus,
         .field select:focus {
+            border-color: var(--amber);
+            box-shadow: 0 0 0 3px var(--amber-dim);
+        }
+
+        /* ── Checkboxes ────────────────────────────────────────── */
+        input[type="checkbox"] {
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            flex-shrink: 0;
+            margin: 0;
+            border: 1px solid var(--border-hi);
+            border-radius: 5px;
+            background: var(--surface-hi);
+            cursor: pointer;
+            display: inline-grid;
+            place-items: center;
+            transition: background 0.15s, border-color 0.15s;
+        }
+
+        input[type="checkbox"]::after {
+            content: "";
+            width: 10px;
+            height: 10px;
+            background: #0d0e11; /* dark check on the amber fill in both themes */
+            clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 82% 2%, 43% 66%);
+            transform: scale(0);
+            transition: transform 0.12s;
+        }
+
+        input[type="checkbox"]:checked {
+            background: var(--amber);
+            border-color: var(--amber);
+        }
+
+        input[type="checkbox"]:checked::after { transform: scale(1); }
+
+        input[type="checkbox"]:focus-visible {
+            outline: none;
             border-color: var(--amber);
             box-shadow: 0 0 0 3px var(--amber-dim);
         }
@@ -2716,6 +2773,7 @@ function renderDocumentHead(string $titleSuffix): void
             top: calc(100% + 10px);
             right: 0;
             min-width: 230px;
+            max-width: calc(100vw - 2rem);
             background: var(--surface);
             border: 1px solid var(--border-hi);
             border-radius: 12px;
@@ -2785,6 +2843,7 @@ function renderDocumentHead(string $titleSuffix): void
             color: var(--muted);
             line-height: 1.5;
             margin: 0.9rem 0 0.9rem;
+            overflow-wrap: anywhere;
         }
         .auth-note a { color: var(--amber); }
         .auth-code {
@@ -2863,6 +2922,55 @@ function renderDocumentHead(string $titleSuffix): void
         .table-form { display: inline-block; margin: 0 0.15rem 0 0; }
         .actions-cell { white-space: nowrap; }
         .table-scroll { overflow-x: auto; }
+        /* Stack admin tables into label/value cards on small screens instead
+           of forcing a horizontal scroll. */
+        @media (max-width: 640px) {
+            .stack-table thead { display: none; }
+            .stack-table, .stack-table tbody, .stack-table tr, .stack-table td { display: block; width: 100%; }
+            .stack-table tr {
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                padding: 0.55rem 0.75rem;
+                margin-bottom: 0.6rem;
+            }
+            .stack-table tr:last-child { margin-bottom: 0; }
+            .stack-table td {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 1rem;
+                padding: 0.3rem 0;
+                border: none;
+            }
+            .stack-table td[data-label]::before {
+                content: attr(data-label);
+                font-size: 0.66rem;
+                text-transform: uppercase;
+                letter-spacing: 0.1em;
+                color: var(--muted);
+                flex-shrink: 0;
+            }
+            .stack-table td.stack-primary {
+                justify-content: flex-start;
+                flex-wrap: wrap;
+                gap: 0.4rem;
+                font-size: 0.9rem;
+                padding-bottom: 0.45rem;
+                border-bottom: 1px solid var(--border);
+                margin-bottom: 0.2rem;
+                /* `anywhere` (unlike break-word) also affects min-content
+                   sizing, so a long unbroken email cannot widen the card. */
+                overflow-wrap: anywhere;
+            }
+            .stack-table td.actions-cell {
+                white-space: normal;
+                justify-content: flex-start;
+                flex-wrap: wrap;
+                gap: 0.35rem;
+                padding-top: 0.5rem;
+            }
+            .stack-table td:empty { display: none; }
+        }
         .badge {
             display: inline-block;
             padding: 0.1rem 0.5rem;
@@ -2878,14 +2986,21 @@ function renderDocumentHead(string $titleSuffix): void
         .day-toggle {
             display: inline-flex;
             align-items: center;
-            gap: 0.3rem;
+            gap: 0.4rem;
             font-family: var(--mono);
             font-size: 0.75rem;
             color: var(--ink);
             border: 1px solid var(--border-hi);
             border-radius: 8px;
-            padding: 0.3rem 0.55rem;
+            padding: 0.35rem 0.6rem;
             cursor: pointer;
+            user-select: none;
+            transition: border-color 0.15s, color 0.15s, background 0.15s;
+        }
+        .day-toggle:has(input:checked) {
+            border-color: var(--amber);
+            color: var(--amber);
+            background: var(--amber-dim);
         }
         .check-toggle {
             display: inline-flex;
@@ -2895,11 +3010,22 @@ function renderDocumentHead(string $titleSuffix): void
             font-size: 0.78rem;
             color: var(--ink);
             cursor: pointer;
+            line-height: 1.45;
+        }
+        .field-hint {
+            font-family: var(--mono);
+            font-size: 0.7rem;
+            color: var(--muted);
+            line-height: 1.5;
+            margin-top: 0.35rem;
         }
         .row-list { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 0.5rem; }
         .row-item { display: flex; align-items: center; gap: 0.45rem; }
-        .row-item input[type="time"] {
-            padding: 0.4rem 0.6rem;
+        .field .row-item input.time-input {
+            width: 5.4rem;
+            flex: none;
+            text-align: center;
+            padding: 0.45rem 0.4rem;
             border-radius: 8px;
             border: 1px solid var(--border-hi);
             background: var(--bg);
@@ -2930,7 +3056,7 @@ function renderDocumentHead(string $titleSuffix): void
             cursor: pointer;
         }
         .btn-row-add:hover { color: var(--amber); border-color: var(--amber); }
-        .inline-form { display: flex; gap: 0.5rem; margin-top: 0.8rem; }
+        .inline-form { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.8rem; }
         .inline-form input[type="text"] {
             flex: 1;
             padding: 0.5rem 0.7rem;
@@ -2958,6 +3084,11 @@ function renderDocumentHead(string $titleSuffix): void
             gap: 0.4rem 1rem;
         }
         html[data-theme="light"] .menu-panel { box-shadow: 0 14px 36px rgba(0, 0, 0, 0.15); }
+        @media (max-width: 560px) {
+            .settings-card { padding: 1.1rem 1rem; }
+            .inline-form input[type="text"] { min-width: 0; flex: 1 1 10rem; }
+            .field-grid { grid-template-columns: 1fr; gap: 0; }
+        }
     </style>
 </head>
 <?php
@@ -3116,7 +3247,8 @@ const translations = {
         save: 'Save',
         notifySettings: 'Notifications',
         notifyMethod: 'Delivery method',
-        pushoverAppName: 'Application name (notification title)',
+        pushoverAppName: 'Notification title',
+        pushoverAppNameHint: 'Shown as the title of your notifications unless an administrator has configured a title template.',
         pushoverUserKey: 'Pushover user key',
         pushoverToken: 'Pushover API token',
         notifyDays: 'Days of the week',
@@ -3187,9 +3319,13 @@ const translations = {
         settingCheckResetTime: 'Check baseline reset',
         settingNotifyWindows: 'Default notification windows',
         settingNotifyDays: 'Default notification days',
-        templateCheck: 'Check notification template',
+        templateCheck: 'Buy-alert notification template',
         templateSuggest: 'Suggestion notification template',
+        templateCheckTitle: 'Buy-alert notification title',
+        templateSuggestTitle: 'Suggestion notification title',
+        titleTemplatePlaceholder: 'e.g. Fill up for {{cheapest_current_price_formatted}} EUR',
         templatePlaceholdersHint: 'Templates use {{placeholder}} syntax with the full gasoline-watch set, e.g. {{station_name}}, {{price}}, {{price_formatted}}, {{fuel}}, {{date}}, {{start_time}}, {{end_time}}, {{distance}}, {{confidence}}, {{count}}, {{cheapest_price}}, {{message}} and *_onchange variants.',
+        titleTemplatesHint: 'Title templates use the same placeholders; row placeholders resolve against the cheapest row. Leave a title empty to use each user\'s notification title instead.',
         settingsSaved: 'Settings saved.',
         invalidSettings: 'Invalid settings. Please check the highlighted values.',
         schemaOutdatedTitle: 'Database not ready',
@@ -3288,7 +3424,8 @@ const translations = {
         save: 'Speichern',
         notifySettings: 'Benachrichtigungen',
         notifyMethod: 'Versandweg',
-        pushoverAppName: 'Anwendungsname (Titel der Benachrichtigung)',
+        pushoverAppName: 'Titel der Benachrichtigung',
+        pushoverAppNameHint: 'Wird als Titel deiner Benachrichtigungen angezeigt, sofern kein Administrator eine Titel-Vorlage konfiguriert hat.',
         pushoverUserKey: 'Pushover User-Key',
         pushoverToken: 'Pushover API-Token',
         notifyDays: 'Wochentage',
@@ -3361,7 +3498,11 @@ const translations = {
         settingNotifyDays: 'Standard-Wochentage',
         templateCheck: 'Vorlage für Kaufalarme',
         templateSuggest: 'Vorlage für Vorschläge',
+        templateCheckTitle: 'Titel für Kaufalarme',
+        templateSuggestTitle: 'Titel für Vorschläge',
+        titleTemplatePlaceholder: 'z. B. Tanken für {{cheapest_current_price_formatted}} EUR',
         templatePlaceholdersHint: 'Vorlagen nutzen die {{placeholder}}-Syntax mit dem vollen gasoline-watch-Satz, z. B. {{station_name}}, {{price}}, {{price_formatted}}, {{fuel}}, {{date}}, {{start_time}}, {{end_time}}, {{distance}}, {{confidence}}, {{count}}, {{cheapest_price}}, {{message}} und *_onchange-Varianten.',
+        titleTemplatesHint: 'Titel-Vorlagen nutzen dieselben Platzhalter; Zeilen-Platzhalter beziehen sich auf die günstigste Zeile. Leer lassen, um den Benachrichtigungstitel des jeweiligen Benutzers zu verwenden.',
         settingsSaved: 'Einstellungen gespeichert.',
         invalidSettings: 'Ungültige Einstellungen. Bitte die markierten Werte prüfen.',
         schemaOutdatedTitle: 'Datenbank nicht bereit',
@@ -3405,6 +3546,11 @@ function applyLang(lang) {
     document.querySelectorAll('[data-i18n-aria-label]').forEach((el) => {
         const key = el.dataset.i18nAriaLabel;
         if (t[key] !== undefined) el.setAttribute('aria-label', t[key]);
+    });
+    // Stacked-table row labels (mobile card layout).
+    document.querySelectorAll('[data-i18n-label]').forEach((el) => {
+        const key = el.dataset.i18nLabel;
+        if (t[key] !== undefined) el.setAttribute('data-label', t[key]);
     });
     document.querySelectorAll('.lang-btn').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.lang === lang);
@@ -3483,12 +3629,14 @@ function scheduleRow(kind) {
     const row = document.createElement('div');
     row.className = 'row-item';
     const removeLabel = translations[currentLang].removeRow || 'Remove';
+    const timeInput = (name) => '<input type="text" class="time-input" name="' + name + '" required ' +
+        'maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">';
     if (kind === 'window') {
-        row.innerHTML = '<input type="time" name="notify_windows_from[]" required> <span>–</span> ' +
-            '<input type="time" name="notify_windows_to[]" required> ' +
+        row.innerHTML = timeInput('notify_windows_from[]') + ' <span>–</span> ' +
+            timeInput('notify_windows_to[]') + ' ' +
             '<button type="button" class="btn-row-remove" aria-label="' + removeLabel + '">×</button>';
     } else {
-        row.innerHTML = '<input type="time" name="notify_suggest_times[]" required> ' +
+        row.innerHTML = timeInput('notify_suggest_times[]') + ' ' +
             '<button type="button" class="btn-row-remove" aria-label="' + removeLabel + '">×</button>';
     }
     return row;

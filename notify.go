@@ -297,6 +297,19 @@ func dueSuggestSlot(now time.Time, slots []string, lastFired string) (string, bo
 
 // --- notify orchestration ---
 
+// notifyTitle renders the admin-configured title template of a notification.
+// An unset template — or one that renders to nothing — falls back to the
+// user's configured application name, matching the pre-template behavior.
+func notifyTitle(template string, kind notifyKind, cheapest *notifyRow, rowCount int, fallback string) string {
+	if strings.TrimSpace(template) == "" {
+		return fallback
+	}
+	if title := renderNotifyTitle(template, kind, cheapest, rowCount); title != "" {
+		return title
+	}
+	return fallback
+}
+
 func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) (notifyResult, error) {
 	apiURL := opts.APIURL
 	if apiURL == "" {
@@ -415,6 +428,7 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 			result.CheckRows += len(userRows)
 			cheapest := userRows[0]
 			message := renderNotifyMessage(settings.CheckTemplate, notifyKindCheck, userRows, &cheapest)
+			title := notifyTitle(settings.CheckTitleTemplate, notifyKindCheck, &cheapest, len(userRows), u.PushoverAppName)
 			rec := notifySendRecord{Email: u.Email, Kind: "check"}
 			if opts.DryRun {
 				result.Sent = append(result.Sent, rec)
@@ -422,7 +436,7 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 			}
 			if err := sendPushover(ctx, apiURL, pushoverMessage{
 				Token: u.PushoverToken, UserKey: u.PushoverUserKey,
-				Title: u.PushoverAppName, Message: message,
+				Title: title, Message: message,
 			}); err != nil {
 				// Leave this user's baselines untouched so the next run
 				// retries them.
@@ -473,7 +487,8 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 			}
 			if err := sendPushover(ctx, apiURL, pushoverMessage{
 				Token: u.PushoverToken, UserKey: u.PushoverUserKey,
-				Title: u.PushoverAppName, Message: message,
+				Title:   notifyTitle(settings.SuggestTitleTemplate, notifyKindSuggest, cheapest, len(suggestRows), u.PushoverAppName),
+				Message: message,
 			}); err != nil {
 				// Leave the marker untouched so the next run retries.
 				rec.Error = err.Error()
