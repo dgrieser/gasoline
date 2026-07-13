@@ -21,6 +21,8 @@ type pushoverMessage struct {
 	UserKey string
 	Title   string
 	Message string
+	// URL is the optional supplementary link shown below the message.
+	URL string
 }
 
 // sendPushover posts one notification to the Pushover message API. A non-2xx
@@ -42,6 +44,9 @@ func sendPushover(ctx context.Context, apiURL string, msg pushoverMessage) error
 	}
 	if msg.Title != "" {
 		form.Set("title", msg.Title)
+	}
+	if msg.URL != "" {
+		form.Set("url", msg.URL)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)

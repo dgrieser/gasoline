@@ -74,6 +74,23 @@ func suggestRowFixture(station, date, weekday, start string, price float64) noti
 	}}
 }
 
+func TestUnescapeTemplate(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"no escapes", "no escapes"},
+		{`{{weekday}}\n{{start_time}}`, "{{weekday}}\n{{start_time}}"},
+		{`a\tb`, "a\tb"},
+		{`literal \\n stays`, `literal \n stays`},
+		{`unknown \x kept`, `unknown \x kept`},
+		{`trailing backslash \`, `trailing backslash \`},
+		{`\n\n`, "\n\n"},
+	}
+	for _, tc := range cases {
+		if got := unescapeTemplate(tc.in); got != tc.want {
+			t.Errorf("unescapeTemplate(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestTruncateDecimals(t *testing.T) {
 	withDecimalSeparator(t, ".")
 	cases := []struct {

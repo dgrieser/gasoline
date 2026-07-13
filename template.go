@@ -501,6 +501,37 @@ func rowValue(kind notifyKind, r notifyRow, key string) string {
 	return ""
 }
 
+// unescapeTemplate turns the escape sequences \n, \t and \\ typed into the
+// admin template fields into real characters, so a single-line settings value
+// can still produce multi-line notifications. Unknown sequences are kept
+// verbatim.
+func unescapeTemplate(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+1 == len(s) {
+			b.WriteByte(s[i])
+			continue
+		}
+		switch s[i+1] {
+		case 'n':
+			b.WriteByte('\n')
+		case 't':
+			b.WriteByte('\t')
+		case '\\':
+			b.WriteByte('\\')
+		default:
+			b.WriteByte(s[i])
+			b.WriteByte(s[i+1])
+		}
+		i++
+	}
+	return b.String()
+}
+
 func containsRowPlaceholder(template string) bool {
 	for _, key := range templatePlaceholders {
 		if strings.Contains(template, "{{"+key+"}}") || strings.Contains(template, "{{"+key+"_onchange}}") {

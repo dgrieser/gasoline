@@ -195,6 +195,7 @@ type capturedPush struct {
 	User    string
 	Title   string
 	Message string
+	URL     string
 }
 
 // stubPushover intercepts Pushover API calls; requests to other hosts fail.
@@ -218,6 +219,7 @@ func stubPushover(t *testing.T, fail func(user string) bool) *[]capturedPush {
 			User:    form.Get("user"),
 			Title:   form.Get("title"),
 			Message: form.Get("message"),
+			URL:     form.Get("url"),
 		})
 		return jsonResponse(http.StatusOK, `{"status":1,"request":"r"}`), nil
 	})
@@ -291,6 +293,9 @@ func TestNotifyOnceSendsCheckAndSuggestPerSchedule(t *testing.T) {
 		if push.Message == "" {
 			t.Fatal("empty push message")
 		}
+		if push.URL != "" {
+			t.Fatalf("push url = %q, want none without a base URL", push.URL)
+		}
 	}
 
 	var lastSuggest string
@@ -300,6 +305,54 @@ func TestNotifyOnceSendsCheckAndSuggestPerSchedule(t *testing.T) {
 	}
 	if lastSuggest != "2026-04-26T13:00" {
 		t.Fatalf("notify_last_suggest = %q, want 2026-04-26T13:00", lastSuggest)
+	}
+}
+
+func TestNotifyOnceSendsBaseURLLinkAndUnescapesTemplateNewlines(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "in@example.com", UserKey: "user-in", Token: "token-in",
+		SuggestTimes: "08:00,13:00", CheckEnabled: true,
+	})
+	ctx := context.Background()
+	// The template is stored the way the admin form sends it: a literal
+	// backslash-n, which must arrive at Pushover as a real line break.
+	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"),
+		settingCheckTemplate, `{{station_name}}\n{{current_price}} EUR`, "2026-04-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert setting: %v", err)
+	}
+
+	pushes := stubPushover(t, nil)
+	result, err := notifyOnce(ctx, db, dialectSQLite, notifyOptions{
+		Now:      notifyFixtureNow,
+		Location: time.UTC,
+		BaseURL:  "https://gasoline.example.com",
+	})
+	if err != nil {
+		t.Fatalf("notifyOnce: %v", err)
+	}
+	if len(result.Failed) != 0 {
+		t.Fatalf("failed sends: %+v", result.Failed)
+	}
+	if len(*pushes) != 2 {
+		t.Fatalf("pushover calls = %d, want check+suggest", len(*pushes))
+	}
+	foundCheck := false
+	for _, push := range *pushes {
+		if push.URL != "https://gasoline.example.com" {
+			t.Fatalf("push url = %q, want the base URL", push.URL)
+		}
+		if strings.Contains(push.Message, "Station 1\n2.000 EUR") {
+			foundCheck = true
+		}
+		if strings.Contains(push.Message, `\n`) {
+			t.Fatalf("message contains a raw \\n: %q", push.Message)
+		}
+	}
+	if !foundCheck {
+		t.Fatalf("no check message with a real line break in %+v", *pushes)
 	}
 }
 

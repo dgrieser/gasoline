@@ -32,6 +32,21 @@ type notifyOptions struct {
 	Location *time.Location
 	DryRun   bool
 	APIURL   string // "" -> pushoverMessagesURL
+	BaseURL  string // viewer base URL sent as the notification link; "" -> no link
+}
+
+// notifyBaseURL resolves the viewer base URL attached to notifications as a
+// supplementary link, from the environment or the .env file (same precedence
+// as the API key).
+func notifyBaseURL() string {
+	if v := strings.TrimSpace(os.Getenv(envBaseURLName)); v != "" {
+		return v
+	}
+	values, err := loadDotEnv(".env")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(values[envBaseURLName])
 }
 
 type notifySendRecord struct {
@@ -84,6 +99,7 @@ func runNotify(args []string) error {
 		Now:      time.Now().UTC(),
 		Location: time.Local,
 		DryRun:   *dryRun,
+		BaseURL:  notifyBaseURL(),
 	})
 	if err != nil {
 		return err
@@ -436,7 +452,7 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 			}
 			if err := sendPushover(ctx, apiURL, pushoverMessage{
 				Token: u.PushoverToken, UserKey: u.PushoverUserKey,
-				Title: title, Message: message,
+				Title: title, Message: message, URL: opts.BaseURL,
 			}); err != nil {
 				// Leave this user's baselines untouched so the next run
 				// retries them.
@@ -489,6 +505,7 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 				Token: u.PushoverToken, UserKey: u.PushoverUserKey,
 				Title:   notifyTitle(settings.SuggestTitleTemplate, notifyKindSuggest, cheapest, len(suggestRows), u.PushoverAppName),
 				Message: message,
+				URL:     opts.BaseURL,
 			}); err != nil {
 				// Leave the marker untouched so the next run retries.
 				rec.Error = err.Error()

@@ -59,7 +59,7 @@ The PHP viewer requires a login (see [Web viewer & user accounts](#web-viewer--u
 | Environment | Purpose |
 | --- | --- |
 | `GASOLINE_ADMIN_EMAIL` | Initial administrator: registering with exactly this email creates an approved admin account immediately. |
-| `GASOLINE_BASE_URL` | Absolute base URL of the viewer, used for links in emails (derived from the request when unset). |
+| `GASOLINE_BASE_URL` | Absolute base URL of the viewer, used for links in emails (derived from the request when unset). `gasoline notify` also reads it (environment or `.env`) and attaches it as the link of every Pushover notification. |
 | `GASOLINE_SMTP_HOST` | SMTP relay for registration/approval emails. When unset, emails are skipped (logged) and the flows still work. |
 | `GASOLINE_SMTP_PORT` | SMTP port (default `587`). |
 | `GASOLINE_SMTP_USER` / `GASOLINE_SMTP_PASSWORD` | SMTP credentials (AUTH LOGIN/PLAIN); leave the user empty for an unauthenticated relay. |
@@ -216,7 +216,7 @@ gasoline notify --dry-run  # render and report what would be sent, write nothing
 - the **daily suggestion times** (default 08:00 and 13:00): each slot fires one suggestion notification per day; missed slots collapse into one on the next run instead of bursting.
 - the **buy-now alerts** opt-in: check notifications fire only for buy recommendations with medium/high confidence that are strictly cheaper than the day's running baseline (reset daily at the admin-configured reset time), mirroring `gasoline-watch.sh`.
 
-The notification texts come from the admin-configured templates and support the full `gasoline-watch.sh` placeholder language — per-row placeholders such as `{{station_name}}`, `{{price}}`, `{{date}}`, `{{start_time}}`, all `*_formatted` variants (locale-aware decimal separator and weekday names), all `*_onchange` variants with day-aware time reprinting and line skipping, plus `{{count}}`, `{{cheapest_<field>}}`, and `{{message}}`. The only difference: the template renders directly into the Pushover message text instead of a shell command, so no quoting is involved. Message titles come from the admin-configured title templates (`check_title_template` / `suggest_title_template`), which support the same placeholder language rendered against the cheapest row; when no title template is set, the title falls back to each user's configured notification title.
+The notification texts come from the admin-configured templates and support the full `gasoline-watch.sh` placeholder language — per-row placeholders such as `{{station_name}}`, `{{price}}`, `{{date}}`, `{{start_time}}`, all `*_formatted` variants (locale-aware decimal separator and weekday names), all `*_onchange` variants with day-aware time reprinting and line skipping, plus `{{count}}`, `{{cheapest_<field>}}`, and `{{message}}`. The only difference: the template renders directly into the Pushover message text instead of a shell command, so no quoting is involved. A literal `\n` (and `\t`) in a template is unescaped into a real line break (tab), so multi-line rows can be configured in the single-line settings fields; write `\\n` for a literal backslash-n. Message titles come from the admin-configured title templates (`check_title_template` / `suggest_title_template`), which support the same placeholder language rendered against the cheapest row; when no title template is set, the title falls back to each user's configured notification title.
 
 Ready-to-use scheduling examples: `examples/systemd/gasoline-notify.service` + `gasoline-notify.timer` and `examples/cron/gasoline-notify.cron`.
 
