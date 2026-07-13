@@ -351,6 +351,40 @@ func schemaStatements(d dialect) []string {
 				INDEX idx_price_snapshots_city_recorded (city_name, recorded_at DESC),
 				FOREIGN KEY (station_id) REFERENCES stations(id)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS users (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				email VARCHAR(255) NOT NULL UNIQUE,
+				password_hash VARCHAR(255) NOT NULL,
+				is_admin TINYINT NOT NULL DEFAULT 0,
+				status VARCHAR(16) NOT NULL DEFAULT 'pending',
+				created_at VARCHAR(64) NOT NULL,
+				approved_at VARCHAR(64),
+				notify_method VARCHAR(32) NOT NULL DEFAULT 'pushover',
+				pushover_app_name VARCHAR(255) NOT NULL DEFAULT 'gasoline',
+				pushover_user_key VARCHAR(64) NOT NULL DEFAULT '',
+				pushover_token VARCHAR(64) NOT NULL DEFAULT '',
+				notify_days VARCHAR(32) NOT NULL DEFAULT 'mon,tue,wed,thu,fri,sat,sun',
+				notify_windows VARCHAR(255) NOT NULL DEFAULT '07:00-21:00',
+				notify_suggest_times VARCHAR(255) NOT NULL DEFAULT '08:00,13:00',
+				notify_check_enabled TINYINT NOT NULL DEFAULT 0,
+				notify_last_suggest VARCHAR(20) NOT NULL DEFAULT ''
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS settings (
+				name VARCHAR(191) PRIMARY KEY,
+				value TEXT NOT NULL,
+				updated_at VARCHAR(64) NOT NULL
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS update_targets (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				city VARCHAR(255) NOT NULL UNIQUE,
+				radius_km DOUBLE NOT NULL DEFAULT 5,
+				created_at VARCHAR(64) NOT NULL
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS notification_state (
+				name VARCHAR(191) PRIMARY KEY,
+				value TEXT NOT NULL,
+				updated_at VARCHAR(64) NOT NULL
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 		}
 	}
 	return []string{
@@ -394,6 +428,40 @@ func schemaStatements(d dialect) []string {
 			ON price_snapshots(city_name, recorded_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_stations_lat_lng
 			ON stations(lat, lng)`,
+		`CREATE TABLE IF NOT EXISTS users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			email TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			is_admin INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'pending',
+			created_at TEXT NOT NULL,
+			approved_at TEXT,
+			notify_method TEXT NOT NULL DEFAULT 'pushover',
+			pushover_app_name TEXT NOT NULL DEFAULT 'gasoline',
+			pushover_user_key TEXT NOT NULL DEFAULT '',
+			pushover_token TEXT NOT NULL DEFAULT '',
+			notify_days TEXT NOT NULL DEFAULT 'mon,tue,wed,thu,fri,sat,sun',
+			notify_windows TEXT NOT NULL DEFAULT '07:00-21:00',
+			notify_suggest_times TEXT NOT NULL DEFAULT '08:00,13:00',
+			notify_check_enabled INTEGER NOT NULL DEFAULT 0,
+			notify_last_suggest TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			name TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS update_targets (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			city TEXT NOT NULL UNIQUE,
+			radius_km REAL NOT NULL DEFAULT 5,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS notification_state (
+			name TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 	}
 }
 
@@ -459,6 +527,26 @@ func citiesInsertIgnoreSQL(d dialect) string {
 		return `INSERT IGNORE INTO cities (name, normalized_name, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?)`
 	}
 	return `INSERT OR IGNORE INTO cities (name, normalized_name, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?)`
+}
+
+// kvUpsertSQL upserts one name/value row into a key-value table (settings or
+// notification_state).
+func kvUpsertSQL(d dialect, table string) string {
+	if d == dialectMySQL {
+		return `INSERT INTO ` + table + ` (name, value, updated_at) VALUES (?, ?, ?)
+			ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`
+	}
+	return `INSERT INTO ` + table + ` (name, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+}
+
+// kvInsertIgnoreSQL inserts a name/value row only when the name is not present
+// yet — used to seed defaults without overwriting admin edits.
+func kvInsertIgnoreSQL(d dialect, table string) string {
+	if d == dialectMySQL {
+		return `INSERT IGNORE INTO ` + table + ` (name, value, updated_at) VALUES (?, ?, ?)`
+	}
+	return `INSERT OR IGNORE INTO ` + table + ` (name, value, updated_at) VALUES (?, ?, ?)`
 }
 
 // queryLimit converts "0 = no limit" into the dialect's unlimited LIMIT value.

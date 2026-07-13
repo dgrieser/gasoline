@@ -53,6 +53,1272 @@ function gasolineConnect(string $driver, string $sqlitePath): PDO
     return $pdo;
 }
 
+// ── Auth: session / CSRF / flash helpers ─────────────────────────────────────
+
+function gasolineStartSession(): void
+{
+    $isHttps = (($_SERVER['HTTPS'] ?? '') !== '' && strtolower((string) $_SERVER['HTTPS']) !== 'off')
+        || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
+    ini_set('session.use_strict_mode', '1');
+    session_set_cookie_params([
+        'httponly' => true,
+        'samesite' => 'Lax',
+        'secure' => $isHttps,
+        'path' => '/',
+    ]);
+    session_name('gasoline_session');
+    session_start();
+}
+
+function csrfToken(): string
+{
+    if (!isset($_SESSION['csrf']) || !is_string($_SESSION['csrf']) || $_SESSION['csrf'] === '') {
+        $_SESSION['csrf'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf'];
+}
+
+function csrfField(): string
+{
+    return '<input type="hidden" name="csrf" value="' . h(csrfToken()) . '">';
+}
+
+function csrfValid(): bool
+{
+    $sent = (string) ($_POST['csrf'] ?? '');
+    return $sent !== '' && hash_equals(csrfToken(), $sent);
+}
+
+function setFlash(string $type, string $key): void
+{
+    $_SESSION['flash'] = ['type' => $type, 'key' => $key];
+}
+
+function takeFlash(): ?array
+{
+    $flash = $_SESSION['flash'] ?? null;
+    unset($_SESSION['flash']);
+    return is_array($flash) ? $flash : null;
+}
+
+// English fallback texts for flash messages; the client i18n re-translates
+// them via the data-i18n key (both en and de exist in the translations map).
+function flashText(string $key): string
+{
+    $texts = [
+        'csrfError' => 'The form has expired. Please try again.',
+        'invalidCredentials' => 'Invalid email address or password.',
+        'awaitingApproval' => 'Your account is awaiting approval by an administrator.',
+        'registerPendingSent' => 'Account created. You will receive an email once an administrator approves it.',
+        'accountCreated' => 'Account created. You can log in now.',
+        'invalidEmail' => 'Please enter a valid email address.',
+        'emailTaken' => 'An account with this email address already exists.',
+        'passwordTooShort' => 'The password must be at least 10 characters long.',
+        'passwordMismatch' => 'The passwords do not match.',
+        'wrongPassword' => 'The current password is incorrect.',
+        'passwordChanged' => 'Password changed.',
+        'notifySaved' => 'Notification settings saved.',
+        'invalidNotifySettings' => 'Invalid notification settings. Check days, time windows, and times.',
+        'lastAdminGuard' => 'You are the last administrator and cannot delete this account.',
+        'accountDeleted' => 'Your account has been deleted.',
+        'confirmRequired' => 'Please confirm the deletion.',
+        'userApproved' => 'User approved.',
+        'userApprovedEmailFailed' => 'User approved, but the notification email could not be sent.',
+        'userDeleted' => 'User deleted.',
+        'userPromoted' => 'User is now an administrator.',
+        'userDemoted' => 'User is no longer an administrator.',
+        'cannotActOnSelf' => 'You cannot perform this action on your own account.',
+        'settingsSaved' => 'Settings saved.',
+        'invalidSettings' => 'Invalid settings. Please check the highlighted values.',
+        'targetAdded' => 'Update target added.',
+        'targetRemoved' => 'Update target removed.',
+        'invalidTarget' => 'Invalid city or radius (1-25 km).',
+        'targetExists' => 'This city is already an update target.',
+        'notFound' => 'The requested item was not found.',
+        'loggedOut' => 'You have been signed out.',
+    ];
+    return $texts[$key] ?? $key;
+}
+
+function redirectTo(string $query): never
+{
+    $base = strtok((string) ($_SERVER['REQUEST_URI'] ?? ''), '?') ?: '';
+    header('Location: ' . $base . $query);
+    exit;
+}
+
+// ── Auth: schema guard ────────────────────────────────────────────────────────
+
+function gasolineSchemaReady(PDO $pdo, string $driver): bool
+{
+    try {
+        if ($driver === 'mysql') {
+            $stmt = $pdo->query(
+                "SELECT COUNT(*) AS n FROM information_schema.tables
+                 WHERE table_schema = DATABASE() AND table_name IN ('users', 'settings', 'update_targets')"
+            );
+        } else {
+            $stmt = $pdo->query(
+                "SELECT COUNT(*) AS n FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('users', 'settings', 'update_targets')"
+            );
+        }
+        $row = $stmt->fetch();
+        return (int) ($row['n'] ?? 0) === 3;
+    } catch (Throwable $e) {
+        error_log('gasoline schema check error: ' . $e->getMessage());
+        return false;
+    }
+}
+
+// ── Auth: user helpers ────────────────────────────────────────────────────────
+
+function normalizeEmail(string $email): string
+{
+    return strtolower(trim($email));
+}
+
+function findUserByEmail(PDO $pdo, string $email): ?array
+{
+    $stmt = $pdo->prepare('SELECT * FROM users WHERE email = :email');
+    $stmt->bindValue(':email', normalizeEmail($email));
+    $stmt->execute();
+    $user = $stmt->fetch();
+    return $user === false ? null : $user;
+}
+
+function findUserByID(PDO $pdo, int $id): ?array
+{
+    $stmt = $pdo->prepare('SELECT * FROM users WHERE id = :id');
+    $stmt->bindValue(':id', $id, PDO::PARAM_INT);
+    $stmt->execute();
+    $user = $stmt->fetch();
+    return $user === false ? null : $user;
+}
+
+function currentUser(PDO $pdo): ?array
+{
+    static $cached = false;
+    static $user = null;
+    if ($cached) {
+        return $user;
+    }
+    $cached = true;
+    $userId = $_SESSION['user_id'] ?? null;
+    if (!is_int($userId) && !ctype_digit((string) $userId)) {
+        return $user = null;
+    }
+    $row = findUserByID($pdo, (int) $userId);
+    if ($row === null || $row['status'] !== 'approved') {
+        // Deleted, demoted to pending, or otherwise stale: sign out.
+        $_SESSION = [];
+        session_destroy();
+        return $user = null;
+    }
+    return $user = $row;
+}
+
+function countApprovedAdmins(PDO $pdo): int
+{
+    $stmt = $pdo->query("SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND status = 'approved'");
+    $row = $stmt->fetch();
+    return (int) ($row['n'] ?? 0);
+}
+
+function nowUTC(): string
+{
+    return gmdate('Y-m-d\TH:i:s\Z');
+}
+
+function adminEmailFromEnv(): string
+{
+    return normalizeEmail((string) getenv('GASOLINE_ADMIN_EMAIL'));
+}
+
+// ── Email: minimal dependency-free SMTP client ───────────────────────────────
+
+function smtpReadReply($socket): string
+{
+    $reply = '';
+    while (($line = fgets($socket, 2048)) !== false) {
+        $reply .= $line;
+        if (preg_match('/^\d{3} /', $line)) {
+            break;
+        }
+    }
+    return $reply;
+}
+
+function smtpCommand($socket, string $command, array $okCodes): void
+{
+    if ($command !== '') {
+        fwrite($socket, $command . "\r\n");
+    }
+    $reply = smtpReadReply($socket);
+    $code = (int) substr($reply, 0, 3);
+    if (!in_array($code, $okCodes, true)) {
+        throw new RuntimeException(sprintf('SMTP command failed (%s): %s', $command === '' ? 'greeting' : strtok($command, ' '), trim($reply)));
+    }
+}
+
+/**
+ * Sends a plain-text email via the SMTP relay configured in the environment
+ * (GASOLINE_SMTP_HOST/PORT/USER/PASSWORD/FROM/TLS). Returns false — after
+ * logging — when SMTP is unconfigured or anything fails; callers proceed
+ * regardless so registration/approval never block on email delivery.
+ */
+function smtpSend(string $to, string $subject, string $body): bool
+{
+    $host = trim((string) getenv('GASOLINE_SMTP_HOST'));
+    if ($host === '') {
+        error_log('gasoline smtp: GASOLINE_SMTP_HOST not set, skipping email to ' . $to);
+        return false;
+    }
+    $port = (int) (trim((string) getenv('GASOLINE_SMTP_PORT')) ?: '587');
+    $user = trim((string) getenv('GASOLINE_SMTP_USER'));
+    $password = (string) getenv('GASOLINE_SMTP_PASSWORD');
+    $from = trim((string) getenv('GASOLINE_SMTP_FROM')) ?: ('gasoline@' . gethostname());
+    $tls = strtolower(trim((string) getenv('GASOLINE_SMTP_TLS')));
+    if ($tls === '') {
+        $tls = $port === 465 ? 'implicit' : 'starttls';
+    }
+
+    $socket = null;
+    try {
+        $address = ($tls === 'implicit' ? 'ssl://' : 'tcp://') . $host . ':' . $port;
+        $socket = stream_socket_client($address, $errno, $errstr, 10);
+        if ($socket === false) {
+            throw new RuntimeException(sprintf('connect to %s failed: %s', $address, $errstr));
+        }
+        stream_set_timeout($socket, 10);
+
+        smtpCommand($socket, '', [220]);
+        smtpCommand($socket, 'EHLO ' . (gethostname() ?: 'localhost'), [250]);
+        if ($tls === 'starttls') {
+            smtpCommand($socket, 'STARTTLS', [220]);
+            if (!stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+                throw new RuntimeException('STARTTLS negotiation failed');
+            }
+            smtpCommand($socket, 'EHLO ' . (gethostname() ?: 'localhost'), [250]);
+        }
+        if ($user !== '') {
+            fwrite($socket, "AUTH LOGIN\r\n");
+            $reply = smtpReadReply($socket);
+            $code = (int) substr($reply, 0, 3);
+            if ($code === 334) {
+                smtpCommand($socket, base64_encode($user), [334]);
+                smtpCommand($socket, base64_encode($password), [235]);
+            } else {
+                // Fall back to AUTH PLAIN when LOGIN is not offered.
+                smtpCommand($socket, 'AUTH PLAIN ' . base64_encode("\0" . $user . "\0" . $password), [235]);
+            }
+        }
+        smtpCommand($socket, 'MAIL FROM:<' . $from . '>', [250]);
+        smtpCommand($socket, 'RCPT TO:<' . $to . '>', [250, 251]);
+        smtpCommand($socket, 'DATA', [354]);
+
+        $headers = [
+            'From: ' . $from,
+            'To: ' . $to,
+            'Subject: ' . mb_encode_mimeheader($subject, 'UTF-8'),
+            'Date: ' . gmdate('r'),
+            'Message-ID: <' . bin2hex(random_bytes(16)) . '@gasoline>',
+            'MIME-Version: 1.0',
+            'Content-Type: text/plain; charset=utf-8',
+            'Content-Transfer-Encoding: 8bit',
+        ];
+        // Dot-stuff lines starting with a period (RFC 5321 §4.5.2).
+        $stuffed = preg_replace('/^\./m', '..', str_replace(["\r\n", "\r"], "\n", $body));
+        $data = implode("\r\n", $headers) . "\r\n\r\n" . str_replace("\n", "\r\n", (string) $stuffed);
+        smtpCommand($socket, $data . "\r\n.", [250]);
+        smtpCommand($socket, 'QUIT', [221]);
+        return true;
+    } catch (Throwable $e) {
+        error_log('gasoline smtp: sending to ' . $to . ' failed: ' . $e->getMessage());
+        return false;
+    } finally {
+        if (is_resource($socket)) {
+            fclose($socket);
+        }
+    }
+}
+
+function gasolineBaseURL(): string
+{
+    $base = trim((string) getenv('GASOLINE_BASE_URL'));
+    if ($base !== '') {
+        return rtrim($base, '/');
+    }
+    $isHttps = (($_SERVER['HTTPS'] ?? '') !== '' && strtolower((string) $_SERVER['HTTPS']) !== 'off')
+        || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
+    $host = (string) ($_SERVER['HTTP_HOST'] ?? 'localhost');
+    $path = strtok((string) ($_SERVER['REQUEST_URI'] ?? '/'), '?') ?: '/';
+    return ($isHttps ? 'https' : 'http') . '://' . $host . rtrim(dirname($path . 'x'), '/');
+}
+
+function sendPendingEmail(string $to): bool
+{
+    $body = "Hello,\n\n"
+        . "your gasoline account (" . $to . ") has been created and is waiting for\n"
+        . "approval by an administrator. You will receive another email as soon as\n"
+        . "your account has been approved.\n\n"
+        . "This is an automated message.\n";
+    return smtpSend($to, 'gasoline: your account is awaiting approval', $body);
+}
+
+function sendApprovedEmail(string $to): bool
+{
+    $body = "Hello,\n\n"
+        . "your gasoline account (" . $to . ") has been approved. You can log in now:\n\n"
+        . gasolineBaseURL() . "/?page=login\n\n"
+        . "This is an automated message.\n";
+    return smtpSend($to, 'gasoline: your account has been approved', $body);
+}
+
+// ── Admin settings storage ────────────────────────────────────────────────────
+
+function settingsAll(PDO $pdo): array
+{
+    $settings = [];
+    foreach ($pdo->query('SELECT name, value FROM settings') as $row) {
+        $settings[$row['name']] = $row['value'];
+    }
+    return $settings;
+}
+
+function settingsSave(PDO $pdo, string $driver, array $kv): void
+{
+    if ($driver === 'mysql') {
+        $sql = 'INSERT INTO settings (name, value, updated_at) VALUES (:name, :value, :now)
+                ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)';
+    } else {
+        $sql = 'INSERT INTO settings (name, value, updated_at) VALUES (:name, :value, :now)
+                ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at';
+    }
+    $stmt = $pdo->prepare($sql);
+    foreach ($kv as $name => $value) {
+        $stmt->bindValue(':name', (string) $name);
+        $stmt->bindValue(':value', (string) $value);
+        $stmt->bindValue(':now', nowUTC());
+        $stmt->execute();
+    }
+}
+
+// ── Validation helpers for notification schedules ────────────────────────────
+
+function validHHMM(string $value): bool
+{
+    return preg_match('/^([01][0-9]|2[0-3]):[0-5][0-9]$/', $value) === 1;
+}
+
+const GASOLINE_WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+
+/** Normalizes a submitted weekday list to canonical order; null when invalid/empty. */
+function normalizeDayList(array $days): ?string
+{
+    $selected = [];
+    foreach ($days as $day) {
+        $day = strtolower(trim((string) $day));
+        if (!in_array($day, GASOLINE_WEEKDAYS, true)) {
+            return null;
+        }
+        $selected[$day] = true;
+    }
+    if ($selected === []) {
+        return null;
+    }
+    $ordered = array_values(array_filter(GASOLINE_WEEKDAYS, static fn (string $d): bool => isset($selected[$d])));
+    return implode(',', $ordered);
+}
+
+/** Pairs from[]/to[] time inputs into a "HH:MM-HH:MM,..." list; null when invalid/empty. */
+function normalizeWindowList(array $from, array $to): ?string
+{
+    $windows = [];
+    $count = count($from);
+    if ($count !== count($to)) {
+        return null;
+    }
+    for ($i = 0; $i < $count; $i++) {
+        $f = trim((string) $from[$i]);
+        $t = trim((string) $to[$i]);
+        if ($f === '' && $t === '') {
+            continue;
+        }
+        if (!validHHMM($f) || !validHHMM($t)) {
+            return null;
+        }
+        $windows[] = $f . '-' . $t;
+    }
+    if ($windows === []) {
+        return null;
+    }
+    $windows = array_values(array_unique($windows));
+    sort($windows);
+    return implode(',', $windows);
+}
+
+/** Normalizes a list of HH:MM inputs into a sorted, deduplicated CSV; null when invalid/empty. */
+function normalizeTimeList(array $times): ?string
+{
+    $normalized = [];
+    foreach ($times as $time) {
+        $time = trim((string) $time);
+        if ($time === '') {
+            continue;
+        }
+        if (!validHHMM($time)) {
+            return null;
+        }
+        $normalized[$time] = true;
+    }
+    if ($normalized === []) {
+        return null;
+    }
+    $list = array_keys($normalized);
+    sort($list);
+    return implode(',', $list);
+}
+
+/** Validates an already comma-separated windows string (admin text input). */
+function validWindowListString(string $value): bool
+{
+    foreach (explode(',', $value) as $part) {
+        $part = trim($part);
+        if ($part === '') {
+            return false;
+        }
+        $pair = explode('-', $part);
+        if (count($pair) !== 2 || !validHHMM(trim($pair[0])) || !validHHMM(trim($pair[1]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Validates an already comma-separated HH:MM list string (admin text input). */
+function validTimeListString(string $value): bool
+{
+    foreach (explode(',', $value) as $part) {
+        if (!validHHMM(trim($part))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ── POST router ───────────────────────────────────────────────────────────────
+
+function handlePost(PDO $pdo, string $driver): void
+{
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+        return;
+    }
+    $action = (string) ($_POST['action'] ?? '');
+    if (!csrfValid()) {
+        setFlash('error', 'csrfError');
+        redirectTo(in_array($action, ['login', 'register'], true) ? '?page=' . $action : '');
+    }
+    $user = currentUser($pdo);
+
+    switch ($action) {
+        case 'login':
+            if ($user !== null) {
+                redirectTo('');
+            }
+            $email = normalizeEmail((string) ($_POST['email'] ?? ''));
+            $password = (string) ($_POST['password'] ?? '');
+            $row = $email !== '' ? findUserByEmail($pdo, $email) : null;
+            // Constant-shape verification: always run password_verify so
+            // unknown emails take the same time as wrong passwords.
+            $hash = $row['password_hash'] ?? '$2y$10$mUvx7uH2ZDLLLSAybMwuVOxuDgKzc4Cul5xEQmk9RIYBYEnp3eLJa';
+            $ok = password_verify($password, $hash);
+            if ($row === null || !$ok) {
+                usleep(300000);
+                setFlash('error', 'invalidCredentials');
+                redirectTo('?page=login');
+            }
+            if ($row['status'] !== 'approved') {
+                setFlash('info', 'awaitingApproval');
+                redirectTo('?page=login');
+            }
+            session_regenerate_id(true);
+            $_SESSION['user_id'] = (int) $row['id'];
+            if (password_needs_rehash($hash, PASSWORD_DEFAULT)) {
+                $stmt = $pdo->prepare('UPDATE users SET password_hash = :hash WHERE id = :id');
+                $stmt->bindValue(':hash', password_hash($password, PASSWORD_DEFAULT));
+                $stmt->bindValue(':id', (int) $row['id'], PDO::PARAM_INT);
+                $stmt->execute();
+            }
+            redirectTo('');
+            // no break (redirectTo exits)
+
+        case 'register':
+            if ($user !== null) {
+                redirectTo('');
+            }
+            $email = normalizeEmail((string) ($_POST['email'] ?? ''));
+            $password = (string) ($_POST['password'] ?? '');
+            $repeat = (string) ($_POST['password_repeat'] ?? '');
+            if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+                setFlash('error', 'invalidEmail');
+                redirectTo('?page=register&email=' . urlencode($email));
+            }
+            if (strlen($password) < 10) {
+                setFlash('error', 'passwordTooShort');
+                redirectTo('?page=register&email=' . urlencode($email));
+            }
+            if ($password !== $repeat) {
+                setFlash('error', 'passwordMismatch');
+                redirectTo('?page=register&email=' . urlencode($email));
+            }
+            if (findUserByEmail($pdo, $email) !== null) {
+                setFlash('error', 'emailTaken');
+                redirectTo('?page=register');
+            }
+            $isInitialAdmin = $email !== '' && $email === adminEmailFromEnv();
+            try {
+                $stmt = $pdo->prepare(
+                    'INSERT INTO users (email, password_hash, is_admin, status, created_at, approved_at)
+                     VALUES (:email, :hash, :is_admin, :status, :created_at, :approved_at)'
+                );
+                $stmt->bindValue(':email', $email);
+                $stmt->bindValue(':hash', password_hash($password, PASSWORD_DEFAULT));
+                $stmt->bindValue(':is_admin', $isInitialAdmin ? 1 : 0, PDO::PARAM_INT);
+                $stmt->bindValue(':status', $isInitialAdmin ? 'approved' : 'pending');
+                $stmt->bindValue(':created_at', nowUTC());
+                $stmt->bindValue(':approved_at', $isInitialAdmin ? nowUTC() : null);
+                $stmt->execute();
+            } catch (PDOException $e) {
+                // Unique-constraint race: someone registered the email in between.
+                error_log('gasoline register error: ' . $e->getMessage());
+                setFlash('error', 'emailTaken');
+                redirectTo('?page=register');
+            }
+            if ($isInitialAdmin) {
+                setFlash('success', 'accountCreated');
+            } else {
+                sendPendingEmail($email);
+                setFlash('success', 'registerPendingSent');
+            }
+            redirectTo('?page=login');
+            // no break
+
+        case 'logout':
+            if ($user !== null) {
+                $_SESSION = [];
+                session_destroy();
+            }
+            redirectTo('?page=login');
+            // no break
+    }
+
+    // Everything below requires a signed-in, approved user.
+    if ($user === null) {
+        redirectTo('?page=login');
+    }
+
+    switch ($action) {
+        case 'change_password':
+            $current = (string) ($_POST['current_password'] ?? '');
+            $new = (string) ($_POST['new_password'] ?? '');
+            $repeat = (string) ($_POST['new_password_repeat'] ?? '');
+            if (!password_verify($current, $user['password_hash'])) {
+                setFlash('error', 'wrongPassword');
+                redirectTo('?page=account');
+            }
+            if (strlen($new) < 10) {
+                setFlash('error', 'passwordTooShort');
+                redirectTo('?page=account');
+            }
+            if ($new !== $repeat) {
+                setFlash('error', 'passwordMismatch');
+                redirectTo('?page=account');
+            }
+            $stmt = $pdo->prepare('UPDATE users SET password_hash = :hash WHERE id = :id');
+            $stmt->bindValue(':hash', password_hash($new, PASSWORD_DEFAULT));
+            $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
+            $stmt->execute();
+            session_regenerate_id(true);
+            setFlash('success', 'passwordChanged');
+            redirectTo('?page=account');
+            // no break
+
+        case 'save_notify':
+            $method = (string) ($_POST['notify_method'] ?? 'pushover');
+            $days = normalizeDayList((array) ($_POST['notify_days'] ?? []));
+            $windows = normalizeWindowList(
+                (array) ($_POST['notify_windows_from'] ?? []),
+                (array) ($_POST['notify_windows_to'] ?? [])
+            );
+            $times = normalizeTimeList((array) ($_POST['notify_suggest_times'] ?? []));
+            if ($method !== 'pushover' || $days === null || $windows === null || $times === null) {
+                setFlash('error', 'invalidNotifySettings');
+                redirectTo('?page=account');
+            }
+            $stmt = $pdo->prepare(
+                'UPDATE users SET notify_method = :method, pushover_app_name = :app,
+                    pushover_user_key = :user_key, pushover_token = :token,
+                    notify_days = :days, notify_windows = :windows,
+                    notify_suggest_times = :times, notify_check_enabled = :check_enabled
+                 WHERE id = :id'
+            );
+            $stmt->bindValue(':method', 'pushover');
+            $stmt->bindValue(':app', trim((string) ($_POST['pushover_app_name'] ?? '')) ?: 'gasoline');
+            $stmt->bindValue(':user_key', trim((string) ($_POST['pushover_user_key'] ?? '')));
+            $stmt->bindValue(':token', trim((string) ($_POST['pushover_token'] ?? '')));
+            $stmt->bindValue(':days', $days);
+            $stmt->bindValue(':windows', $windows);
+            $stmt->bindValue(':times', $times);
+            $stmt->bindValue(':check_enabled', isset($_POST['notify_check_enabled']) ? 1 : 0, PDO::PARAM_INT);
+            $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
+            $stmt->execute();
+            setFlash('success', 'notifySaved');
+            redirectTo('?page=account');
+            // no break
+
+        case 'delete_account':
+            $password = (string) ($_POST['current_password'] ?? '');
+            if (!isset($_POST['confirm'])) {
+                setFlash('error', 'confirmRequired');
+                redirectTo('?page=account');
+            }
+            if (!password_verify($password, $user['password_hash'])) {
+                setFlash('error', 'wrongPassword');
+                redirectTo('?page=account');
+            }
+            if ((int) $user['is_admin'] === 1 && countApprovedAdmins($pdo) <= 1) {
+                setFlash('error', 'lastAdminGuard');
+                redirectTo('?page=account');
+            }
+            $stmt = $pdo->prepare('DELETE FROM users WHERE id = :id');
+            $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
+            $stmt->execute();
+            $_SESSION = [];
+            session_destroy();
+            gasolineStartSession();
+            setFlash('success', 'accountDeleted');
+            redirectTo('?page=login');
+            // no break
+    }
+
+    // Everything below requires an administrator.
+    if ((int) $user['is_admin'] !== 1) {
+        redirectTo('');
+    }
+
+    switch ($action) {
+        case 'approve_user':
+            $target = findUserByID($pdo, (int) ($_POST['user_id'] ?? 0));
+            if ($target === null || $target['status'] !== 'pending') {
+                setFlash('error', 'notFound');
+                redirectTo('?page=admin_users');
+            }
+            $stmt = $pdo->prepare("UPDATE users SET status = 'approved', approved_at = :now WHERE id = :id");
+            $stmt->bindValue(':now', nowUTC());
+            $stmt->bindValue(':id', (int) $target['id'], PDO::PARAM_INT);
+            $stmt->execute();
+            setFlash('success', sendApprovedEmail($target['email']) ? 'userApproved' : 'userApprovedEmailFailed');
+            redirectTo('?page=admin_users');
+            // no break
+
+        case 'delete_user':
+            $targetId = (int) ($_POST['user_id'] ?? 0);
+            if ($targetId === (int) $user['id']) {
+                setFlash('error', 'cannotActOnSelf');
+                redirectTo('?page=admin_users');
+            }
+            $stmt = $pdo->prepare('DELETE FROM users WHERE id = :id');
+            $stmt->bindValue(':id', $targetId, PDO::PARAM_INT);
+            $stmt->execute();
+            setFlash($stmt->rowCount() > 0 ? 'success' : 'error', $stmt->rowCount() > 0 ? 'userDeleted' : 'notFound');
+            redirectTo('?page=admin_users');
+            // no break
+
+        case 'set_admin':
+            $targetId = (int) ($_POST['user_id'] ?? 0);
+            $makeAdmin = (string) ($_POST['admin'] ?? '') === '1';
+            if ($targetId === (int) $user['id']) {
+                // An admin can never demote themselves, so at least one
+                // admin always remains.
+                setFlash('error', 'cannotActOnSelf');
+                redirectTo('?page=admin_users');
+            }
+            $target = findUserByID($pdo, $targetId);
+            if ($target === null) {
+                setFlash('error', 'notFound');
+                redirectTo('?page=admin_users');
+            }
+            $stmt = $pdo->prepare('UPDATE users SET is_admin = :admin WHERE id = :id');
+            $stmt->bindValue(':admin', $makeAdmin ? 1 : 0, PDO::PARAM_INT);
+            $stmt->bindValue(':id', $targetId, PDO::PARAM_INT);
+            $stmt->execute();
+            setFlash('success', $makeAdmin ? 'userPromoted' : 'userDemoted');
+            redirectTo('?page=admin_users');
+            // no break
+
+        case 'save_settings':
+            $fields = [
+                'fuel' => static fn (string $v): bool => in_array($v, ['diesel', 'e5', 'e10'], true),
+                'range_km' => static fn (string $v): bool => is_numeric($v) && (float) $v > 0 && (float) $v <= 100,
+                'history_days' => static fn (string $v): bool => ctype_digit($v) && (int) $v > 0 && (int) $v <= 365,
+                'predict_days' => static fn (string $v): bool => ctype_digit($v) && (int) $v > 0 && (int) $v <= 14,
+                'limit_per_day' => static fn (string $v): bool => ctype_digit($v) && (int) $v >= 0 && (int) $v <= 50,
+                'check_limit' => static fn (string $v): bool => ctype_digit($v) && (int) $v >= 0 && (int) $v <= 50,
+                'suggest_times' => static fn (string $v): bool => validTimeListString($v),
+                'check_reset_time' => static fn (string $v): bool => validHHMM($v),
+                'notify_days' => null, // submitted as checkbox array below
+                'notify_windows' => static fn (string $v): bool => validWindowListString($v),
+                'check_template' => static fn (string $v): bool => $v !== '',
+                'suggest_template' => static fn (string $v): bool => $v !== '',
+            ];
+            $kv = [];
+            foreach ($fields as $name => $validate) {
+                if ($name === 'notify_days') {
+                    if (isset($_POST['notify_days'])) {
+                        $days = normalizeDayList((array) $_POST['notify_days']);
+                        if ($days === null) {
+                            setFlash('error', 'invalidSettings');
+                            redirectTo('?page=admin_settings');
+                        }
+                        $kv[$name] = $days;
+                    }
+                    continue;
+                }
+                if (!isset($_POST[$name])) {
+                    continue;
+                }
+                $value = trim((string) $_POST[$name]);
+                if ($validate !== null && !$validate($value)) {
+                    setFlash('error', 'invalidSettings');
+                    redirectTo('?page=admin_settings');
+                }
+                $kv[$name] = $value;
+            }
+            settingsSave($pdo, $driver, $kv);
+            setFlash('success', 'settingsSaved');
+            redirectTo('?page=admin_settings');
+            // no break
+
+        case 'add_target':
+            $city = trim((string) ($_POST['city'] ?? ''));
+            $radius = (string) ($_POST['radius_km'] ?? '');
+            if ($city === '' || !ctype_digit($radius) || (int) $radius < 1 || (int) $radius > 25) {
+                setFlash('error', 'invalidTarget');
+                redirectTo('?page=admin_settings');
+            }
+            try {
+                $stmt = $pdo->prepare('INSERT INTO update_targets (city, radius_km, created_at) VALUES (:city, :radius, :now)');
+                $stmt->bindValue(':city', $city);
+                $stmt->bindValue(':radius', (int) $radius, PDO::PARAM_INT);
+                $stmt->bindValue(':now', nowUTC());
+                $stmt->execute();
+            } catch (PDOException $e) {
+                setFlash('error', 'targetExists');
+                redirectTo('?page=admin_settings');
+            }
+            setFlash('success', 'targetAdded');
+            redirectTo('?page=admin_settings');
+            // no break
+
+        case 'delete_target':
+            $stmt = $pdo->prepare('DELETE FROM update_targets WHERE id = :id');
+            $stmt->bindValue(':id', (int) ($_POST['target_id'] ?? 0), PDO::PARAM_INT);
+            $stmt->execute();
+            setFlash($stmt->rowCount() > 0 ? 'success' : 'error', $stmt->rowCount() > 0 ? 'targetRemoved' : 'notFound');
+            redirectTo('?page=admin_settings');
+            // no break
+    }
+
+    // Unknown action: back to the dashboard.
+    redirectTo('');
+}
+
+// ── Page renderers (auth, account, admin) ────────────────────────────────────
+// renderDocumentHead / renderHeader / renderCommonScript are defined further
+// down (top-level functions are hoisted), so these can call them freely.
+
+function renderFlash(): void
+{
+    $flash = takeFlash();
+    if ($flash === null) {
+        return;
+    }
+    $class = $flash['type'] === 'error' ? 'error-box' : 'success-box';
+    echo '<div class="' . h($class) . '" data-i18n="' . h($flash['key']) . '">' . h(flashText($flash['key'])) . "</div>\n";
+}
+
+function renderPageStart(string $titleSuffix, ?array $user, string $activePage): void
+{
+    renderDocumentHead($titleSuffix);
+    echo "<body>\n<main class=\"page\">\n";
+    renderHeader($user, $activePage);
+}
+
+function renderPageEnd(): never
+{
+    echo "</main>\n";
+    renderCommonScript();
+    echo "</body>\n</html>\n";
+    exit;
+}
+
+function renderSchemaGuardPage(string $reasonKey): never
+{
+    renderDocumentHead('Setup');
+    ?>
+<body>
+<main class="page">
+    <div class="auth-wrap">
+        <div class="auth-card">
+            <h2 data-i18n="schemaOutdatedTitle">Database not ready</h2>
+            <?php if ($reasonKey === 'dbNotFound') { ?>
+            <p class="auth-note" data-i18n="schemaDbNotFound">The database was not found.</p>
+            <?php } ?>
+            <p class="auth-note" data-i18n="schemaOutdatedBody">The database schema is missing the required tables. Run the following command on the server, then reload this page:</p>
+            <pre class="auth-code">gasoline migrate</pre>
+        </div>
+    </div>
+</main>
+<?php
+    renderCommonScript();
+    echo "</body>\n</html>\n";
+    exit;
+}
+
+function renderLoginPage(): never
+{
+    renderPageStart('Sign in', null, 'login');
+    $email = trim((string) ($_GET['email'] ?? ''));
+    ?>
+    <div class="auth-wrap">
+        <div class="auth-card">
+            <h2 data-i18n="loginTitle">Sign in</h2>
+            <?php renderFlash(); ?>
+            <form method="post" action="">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="login">
+                <div class="field">
+                    <label for="login-email" data-i18n="email">Email address</label>
+                    <input type="email" id="login-email" name="email" required autofocus autocomplete="username" value="<?= h($email) ?>">
+                </div>
+                <div class="field">
+                    <label for="login-password" data-i18n="password">Password</label>
+                    <input type="password" id="login-password" name="password" required autocomplete="current-password">
+                </div>
+                <button type="submit" class="btn-primary" data-i18n="signIn">Sign in</button>
+            </form>
+            <p class="auth-note"><span data-i18n="noAccountYet">No account yet?</span> <a href="?page=register" data-i18n="createAccount">Create an account</a></p>
+        </div>
+    </div>
+    <?php
+    renderPageEnd();
+}
+
+function renderRegisterPage(): never
+{
+    renderPageStart('Register', null, 'register');
+    $email = trim((string) ($_GET['email'] ?? ''));
+    ?>
+    <div class="auth-wrap">
+        <div class="auth-card">
+            <h2 data-i18n="registerTitle">Create an account</h2>
+            <?php renderFlash(); ?>
+            <p class="auth-note" data-i18n="registerHint">Your email address is your username. After registration an administrator has to approve your account before you can sign in.</p>
+            <form method="post" action="">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="register">
+                <div class="field">
+                    <label for="reg-email" data-i18n="email">Email address</label>
+                    <input type="email" id="reg-email" name="email" required autofocus autocomplete="username" value="<?= h($email) ?>">
+                </div>
+                <div class="field">
+                    <label for="reg-password" data-i18n="password">Password</label>
+                    <input type="password" id="reg-password" name="password" required minlength="10" autocomplete="new-password">
+                </div>
+                <div class="field">
+                    <label for="reg-password2" data-i18n="passwordRepeat">Repeat password</label>
+                    <input type="password" id="reg-password2" name="password_repeat" required minlength="10" autocomplete="new-password">
+                </div>
+                <button type="submit" class="btn-primary" data-i18n="createAccount">Create an account</button>
+            </form>
+            <p class="auth-note"><span data-i18n="haveAccount">Already have an account?</span> <a href="?page=login" data-i18n="signIn">Sign in</a></p>
+        </div>
+    </div>
+    <?php
+    renderPageEnd();
+}
+
+function renderScheduleEditor(string $days, string $windows, string $times): void
+{
+    $selectedDays = array_flip(array_filter(array_map('trim', explode(',', $days))));
+    $windowRows = array_values(array_filter(array_map('trim', explode(',', $windows))));
+    $timeRows = array_values(array_filter(array_map('trim', explode(',', $times))));
+    ?>
+                <div class="field">
+                    <label data-i18n="notifyDays">Days of the week</label>
+                    <div class="day-toggles">
+                        <?php foreach (GASOLINE_WEEKDAYS as $day) { ?>
+                        <label class="day-toggle"><input type="checkbox" name="notify_days[]" value="<?= h($day) ?>" <?= isset($selectedDays[$day]) ? 'checked' : '' ?>><span data-i18n="day_<?= h($day) ?>"><?= h(ucfirst($day)) ?></span></label>
+                        <?php } ?>
+                    </div>
+                </div>
+                <div class="field">
+                    <label data-i18n="notifyWindows">Time windows</label>
+                    <div class="row-list" id="window-list">
+                        <?php foreach ($windowRows as $window) {
+                            $pair = explode('-', $window);
+                            $from = h(trim($pair[0] ?? ''));
+                            $to = h(trim($pair[1] ?? ''));
+                        ?>
+                        <div class="row-item">
+                            <input type="time" name="notify_windows_from[]" value="<?= $from ?>" required>
+                            <span>–</span>
+                            <input type="time" name="notify_windows_to[]" value="<?= $to ?>" required>
+                            <button type="button" class="btn-row-remove" data-i18n-aria-label="removeRow" aria-label="Remove">×</button>
+                        </div>
+                        <?php } ?>
+                    </div>
+                    <button type="button" class="btn-row-add" data-add-row="window" data-i18n="addWindow">Add window</button>
+                </div>
+                <div class="field">
+                    <label data-i18n="notifySuggestTimes">Daily suggestion times</label>
+                    <div class="row-list" id="suggest-time-list">
+                        <?php foreach ($timeRows as $time) { ?>
+                        <div class="row-item">
+                            <input type="time" name="notify_suggest_times[]" value="<?= h($time) ?>" required>
+                            <button type="button" class="btn-row-remove" data-i18n-aria-label="removeRow" aria-label="Remove">×</button>
+                        </div>
+                        <?php } ?>
+                    </div>
+                    <button type="button" class="btn-row-add" data-add-row="suggest-time" data-i18n="addTime">Add time</button>
+                </div>
+    <?php
+}
+
+function renderAccountPage(PDO $pdo, array $user): never
+{
+    renderPageStart('My Account', $user, 'account');
+    ?>
+    <div class="settings-layout">
+        <?php renderFlash(); ?>
+        <div class="settings-card">
+            <h2 data-i18n="changePassword">Change password</h2>
+            <form method="post" action="">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="change_password">
+                <div class="field">
+                    <label for="cp-current" data-i18n="currentPassword">Current password</label>
+                    <input type="password" id="cp-current" name="current_password" required autocomplete="current-password">
+                </div>
+                <div class="field">
+                    <label for="cp-new" data-i18n="newPassword">New password</label>
+                    <input type="password" id="cp-new" name="new_password" required minlength="10" autocomplete="new-password">
+                </div>
+                <div class="field">
+                    <label for="cp-new2" data-i18n="passwordRepeat">Repeat password</label>
+                    <input type="password" id="cp-new2" name="new_password_repeat" required minlength="10" autocomplete="new-password">
+                </div>
+                <button type="submit" class="btn-primary" data-i18n="save">Save</button>
+            </form>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="notifySettings">Notifications</h2>
+            <form method="post" action="">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="save_notify">
+                <div class="field">
+                    <label for="nf-method" data-i18n="notifyMethod">Delivery method</label>
+                    <select id="nf-method" name="notify_method">
+                        <option value="pushover" selected>Pushover</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="nf-app" data-i18n="pushoverAppName">Application name (notification title)</label>
+                    <input type="text" id="nf-app" name="pushover_app_name" value="<?= h($user['pushover_app_name']) ?>">
+                </div>
+                <div class="field">
+                    <label for="nf-user" data-i18n="pushoverUserKey">Pushover user key</label>
+                    <input type="text" id="nf-user" name="pushover_user_key" value="<?= h($user['pushover_user_key']) ?>" autocomplete="off">
+                </div>
+                <div class="field">
+                    <label for="nf-token" data-i18n="pushoverToken">Pushover API token</label>
+                    <input type="text" id="nf-token" name="pushover_token" value="<?= h($user['pushover_token']) ?>" autocomplete="off">
+                </div>
+                <?php renderScheduleEditor((string) $user['notify_days'], (string) $user['notify_windows'], (string) $user['notify_suggest_times']); ?>
+                <div class="field">
+                    <label class="check-toggle"><input type="checkbox" name="notify_check_enabled" <?= (int) $user['notify_check_enabled'] === 1 ? 'checked' : '' ?>><span data-i18n="notifyCheckEnabled">Send buy-now alerts when prices drop</span></label>
+                </div>
+                <button type="submit" class="btn-primary" data-i18n="save">Save</button>
+            </form>
+        </div>
+
+        <div class="settings-card danger">
+            <h2 data-i18n="dangerZone">Danger zone</h2>
+            <form method="post" action="" data-confirm="deleteAccountConfirm">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="delete_account">
+                <div class="field">
+                    <label for="da-password" data-i18n="currentPassword">Current password</label>
+                    <input type="password" id="da-password" name="current_password" required autocomplete="current-password">
+                </div>
+                <div class="field">
+                    <label class="check-toggle"><input type="checkbox" name="confirm" required><span data-i18n="deleteAccountConfirmLabel">I understand that my account and settings will be permanently deleted.</span></label>
+                </div>
+                <button type="submit" class="btn-danger" data-i18n="deleteAccount">Delete account</button>
+            </form>
+        </div>
+    </div>
+    <?php
+    renderPageEnd();
+}
+
+function renderAdminUsersPage(PDO $pdo, array $user): never
+{
+    $users = $pdo->query('SELECT id, email, is_admin, status, created_at, approved_at FROM users ORDER BY created_at ASC, id ASC')->fetchAll();
+    renderPageStart('Users', $user, 'admin_users');
+    ?>
+    <div class="settings-layout wide">
+        <?php renderFlash(); ?>
+        <div class="settings-card">
+            <h2 data-i18n="adminUsersTitle">Users</h2>
+            <div class="table-scroll">
+            <table>
+                <thead>
+                    <tr>
+                        <th data-i18n="colEmail">Email</th>
+                        <th data-i18n="colStatus">Status</th>
+                        <th data-i18n="colAdmin">Admin</th>
+                        <th data-i18n="colCreated">Registered</th>
+                        <th data-i18n="colApproved">Approved</th>
+                        <th data-i18n="colActions">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($users as $row) { $isSelf = (int) $row['id'] === (int) $user['id']; ?>
+                    <tr>
+                        <td><?= h($row['email']) ?><?= $isSelf ? ' <span class="badge">you</span>' : '' ?></td>
+                        <td><span class="badge <?= $row['status'] === 'approved' ? 'ok' : 'warn' ?>" data-i18n="status<?= h(ucfirst($row['status'])) ?>"><?= h($row['status']) ?></span></td>
+                        <td><?= (int) $row['is_admin'] === 1 ? '<span class="badge ok" data-i18n="adminYes">admin</span>' : '' ?></td>
+                        <td data-recorded-at="<?= h((string) $row['created_at']) ?>"><?= h((string) $row['created_at']) ?></td>
+                        <td <?= $row['approved_at'] !== null ? 'data-recorded-at="' . h((string) $row['approved_at']) . '"' : '' ?>><?= h((string) ($row['approved_at'] ?? '—')) ?></td>
+                        <td class="actions-cell">
+                            <?php if ($row['status'] === 'pending') { ?>
+                            <form method="post" action="" class="table-form"><?= csrfField() ?><input type="hidden" name="action" value="approve_user"><input type="hidden" name="user_id" value="<?= (int) $row['id'] ?>"><button type="submit" class="btn-small" data-i18n="actionApprove">Approve</button></form>
+                            <?php } ?>
+                            <?php if (!$isSelf) { ?>
+                            <form method="post" action="" class="table-form"><?= csrfField() ?><input type="hidden" name="action" value="set_admin"><input type="hidden" name="user_id" value="<?= (int) $row['id'] ?>"><input type="hidden" name="admin" value="<?= (int) $row['is_admin'] === 1 ? '0' : '1' ?>"><button type="submit" class="btn-small" data-i18n="<?= (int) $row['is_admin'] === 1 ? 'actionDemote' : 'actionPromote' ?>"><?= (int) $row['is_admin'] === 1 ? 'Demote' : 'Promote' ?></button></form>
+                            <form method="post" action="" class="table-form" data-confirm="confirmDeleteUser"><?= csrfField() ?><input type="hidden" name="action" value="delete_user"><input type="hidden" name="user_id" value="<?= (int) $row['id'] ?>"><button type="submit" class="btn-small danger" data-i18n="actionDelete">Delete</button></form>
+                            <?php } ?>
+                        </td>
+                    </tr>
+                    <?php } ?>
+                </tbody>
+            </table>
+            </div>
+        </div>
+    </div>
+    <?php
+    renderPageEnd();
+}
+
+function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
+{
+    $settings = settingsAll($pdo);
+    $targets = $pdo->query('SELECT id, city, radius_km FROM update_targets ORDER BY id ASC')->fetchAll();
+    $get = static fn (string $name, string $fallback = ''): string => trim((string) ($settings[$name] ?? $fallback));
+    $fuel = $get('fuel', 'diesel');
+    renderPageStart('Settings', $user, 'admin_settings');
+    ?>
+    <div class="settings-layout wide">
+        <?php renderFlash(); ?>
+
+        <div class="settings-card">
+            <h2 data-i18n="updateTargets">Automatic updates</h2>
+            <p class="auth-note" data-i18n="updateTargetsHint">These cities are updated automatically by `gasoline update` (and used by suggest/check/notify) when the CLI is invoked without --city/--radius flags.</p>
+            <div class="table-scroll">
+            <table>
+                <thead>
+                    <tr><th data-i18n="targetCity">City</th><th data-i18n="targetRadius">Radius (km)</th><th data-i18n="colActions">Actions</th></tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($targets as $target) { ?>
+                    <tr>
+                        <td><?= h($target['city']) ?></td>
+                        <td><?= h((string) round((float) $target['radius_km'], 1)) ?></td>
+                        <td class="actions-cell"><form method="post" action="" class="table-form"><?= csrfField() ?><input type="hidden" name="action" value="delete_target"><input type="hidden" name="target_id" value="<?= (int) $target['id'] ?>"><button type="submit" class="btn-small danger" data-i18n="removeTarget">Remove</button></form></td>
+                    </tr>
+                    <?php } ?>
+                    <?php if ($targets === []) { ?>
+                    <tr><td colspan="3" data-i18n="noTargets">No update targets configured yet.</td></tr>
+                    <?php } ?>
+                </tbody>
+            </table>
+            </div>
+            <form method="post" action="" class="inline-form">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="add_target">
+                <input type="text" name="city" data-i18n-placeholder="targetCity" placeholder="City" required>
+                <input type="number" name="radius_km" min="1" max="25" value="5" required>
+                <button type="submit" class="btn-primary" data-i18n="addTarget">Add</button>
+            </form>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="suggestionSettings">Suggestions &amp; checks</h2>
+            <form method="post" action="">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="save_settings">
+                <div class="field-grid">
+                    <div class="field">
+                        <label for="st-fuel" data-i18n="settingFuel">Fuel</label>
+                        <select id="st-fuel" name="fuel">
+                            <option value="diesel" <?= $fuel === 'diesel' ? 'selected' : '' ?>>Diesel</option>
+                            <option value="e5" <?= $fuel === 'e5' ? 'selected' : '' ?>>E5</option>
+                            <option value="e10" <?= $fuel === 'e10' ? 'selected' : '' ?>>E10</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="st-range" data-i18n="settingRangeKm">Range (km)</label>
+                        <input type="number" id="st-range" name="range_km" min="1" max="100" step="0.5" value="<?= h($get('range_km', '5')) ?>">
+                    </div>
+                    <div class="field">
+                        <label for="st-history" data-i18n="settingHistoryDays">History days</label>
+                        <input type="number" id="st-history" name="history_days" min="1" max="365" value="<?= h($get('history_days', '21')) ?>">
+                    </div>
+                    <div class="field">
+                        <label for="st-predict" data-i18n="settingPredictDays">Prediction days</label>
+                        <input type="number" id="st-predict" name="predict_days" min="1" max="14" value="<?= h($get('predict_days', '3')) ?>">
+                    </div>
+                    <div class="field">
+                        <label for="st-limit-day" data-i18n="settingLimitPerDay">Suggestions per day</label>
+                        <input type="number" id="st-limit-day" name="limit_per_day" min="0" max="50" value="<?= h($get('limit_per_day', '3')) ?>">
+                    </div>
+                    <div class="field">
+                        <label for="st-check-limit" data-i18n="settingCheckLimit">Check row limit</label>
+                        <input type="number" id="st-check-limit" name="check_limit" min="0" max="50" value="<?= h($get('check_limit', '5')) ?>">
+                    </div>
+                    <div class="field">
+                        <label for="st-suggest-times" data-i18n="settingSuggestTimes">Default suggestion times</label>
+                        <input type="text" id="st-suggest-times" name="suggest_times" pattern="\s*([01][0-9]|2[0-3]):[0-5][0-9](\s*,\s*([01][0-9]|2[0-3]):[0-5][0-9])*\s*" placeholder="08:00,13:00" value="<?= h($get('suggest_times', '08:00,13:00')) ?>">
+                    </div>
+                    <div class="field">
+                        <label for="st-reset" data-i18n="settingCheckResetTime">Check baseline reset</label>
+                        <input type="time" id="st-reset" name="check_reset_time" value="<?= h($get('check_reset_time', '00:00')) ?>">
+                    </div>
+                </div>
+                <div class="field">
+                    <label for="st-windows" data-i18n="settingNotifyWindows">Default notification windows</label>
+                    <input type="text" id="st-windows" name="notify_windows" placeholder="07:00-21:00" value="<?= h($get('notify_windows', '07:00-21:00')) ?>">
+                </div>
+                <div class="field">
+                    <label data-i18n="settingNotifyDays">Default notification days</label>
+                    <div class="day-toggles">
+                        <?php $defaultDays = array_flip(array_filter(array_map('trim', explode(',', $get('notify_days', 'mon,tue,wed,thu,fri,sat,sun'))))); ?>
+                        <?php foreach (GASOLINE_WEEKDAYS as $day) { ?>
+                        <label class="day-toggle"><input type="checkbox" name="notify_days[]" value="<?= h($day) ?>" <?= isset($defaultDays[$day]) ? 'checked' : '' ?>><span data-i18n="day_<?= h($day) ?>"><?= h(ucfirst($day)) ?></span></label>
+                        <?php } ?>
+                    </div>
+                </div>
+                <div class="field">
+                    <label for="st-check-tpl" data-i18n="templateCheck">Check notification template</label>
+                    <textarea id="st-check-tpl" name="check_template" rows="3"><?= h($get('check_template')) ?></textarea>
+                </div>
+                <div class="field">
+                    <label for="st-suggest-tpl" data-i18n="templateSuggest">Suggestion notification template</label>
+                    <textarea id="st-suggest-tpl" name="suggest_template" rows="3"><?= h($get('suggest_template')) ?></textarea>
+                </div>
+                <p class="auth-note" data-i18n="templatePlaceholdersHint">Templates use {{placeholder}} syntax with the full gasoline-watch set, e.g. {{station_name}}, {{price}}, {{price_formatted}}, {{fuel}}, {{date}}, {{start_time}}, {{end_time}}, {{distance}}, {{confidence}}, {{count}}, {{cheapest_price}}, {{message}} and *_onchange variants.</p>
+                <button type="submit" class="btn-primary" data-i18n="save">Save</button>
+            </form>
+        </div>
+    </div>
+    <?php
+    renderPageEnd();
+}
+
+// ── Bootstrap: session, schema guard, POST routing, login gate ────────────────
+
+header('X-Content-Type-Options: nosniff');
+gasolineStartSession();
+
+$requestedAction = (string) ($_GET['action'] ?? '');
+$requestedPage = (string) ($_GET['page'] ?? '');
+$isJSONRequest = in_array($requestedAction, ['city_search', 'data'], true);
+
+$authPdo = null;
+$schemaGuardReason = null;
+if ($dbDriver === 'sqlite' && !file_exists($dbPath)) {
+    // Do not connect: PDO would create an empty SQLite file as a side effect.
+    $schemaGuardReason = 'dbNotFound';
+} else {
+    try {
+        $authPdo = gasolineConnect($dbDriver, $dbPath);
+    } catch (Throwable $e) {
+        error_log('gasoline connect error: ' . $e->getMessage());
+        $schemaGuardReason = 'dbConnectFailed';
+    }
+    if ($authPdo !== null && !gasolineSchemaReady($authPdo, $dbDriver)) {
+        $schemaGuardReason = 'schemaOutdated';
+    }
+}
+
+if ($schemaGuardReason !== null) {
+    if ($isJSONRequest) {
+        http_response_code(503);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['errors' => [['key' => 'schemaOutdatedBody', 'params' => [], 'message' => 'Database is not ready. Run `gasoline migrate` on the server.']]]);
+        exit;
+    }
+    renderSchemaGuardPage($schemaGuardReason);
+}
+
+handlePost($authPdo, $dbDriver);
+
+$currentUser = currentUser($authPdo);
+
+if ($isJSONRequest && $currentUser === null) {
+    http_response_code(401);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['errors' => [['key' => 'unauthorized', 'params' => [], 'message' => 'Login required.']]]);
+    exit;
+}
+
+if ($currentUser === null) {
+    if ($requestedPage === 'register') {
+        renderRegisterPage();
+    }
+    if ($requestedPage !== 'login') {
+        redirectTo('?page=login');
+    }
+    renderLoginPage();
+}
+
+switch ($requestedPage) {
+    case 'login':
+    case 'register':
+        redirectTo('');
+        // no break
+    case 'account':
+        renderAccountPage($authPdo, $currentUser);
+        // no break
+    case 'admin_users':
+        if ((int) $currentUser['is_admin'] !== 1) {
+            redirectTo('');
+        }
+        renderAdminUsersPage($authPdo, $currentUser);
+        // no break
+    case 'admin_settings':
+        if ((int) $currentUser['is_admin'] !== 1) {
+            redirectTo('');
+        }
+        renderAdminSettingsPage($authPdo, $dbDriver, $currentUser);
+        // no break
+}
+
+// Fall through: the dashboard (default page) below.
+
 $errors = [];
 $stations = [];
 
@@ -547,13 +1813,17 @@ function stationLabel(array $station): string
     return $suffix !== '' ? "{$name}, {$suffix}" : $name;
 }
 
+// renderDocumentHead emits everything from <!doctype> through </head> —
+// shared by the dashboard and all auth/account/admin pages.
+function renderDocumentHead(string $titleSuffix): void
+{
 ?>
 <!doctype html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Gasoline — Price History</title>
+    <title>Gasoline — <?= h($titleSuffix) ?></title>
     <script>
         (function () {
             const t = localStorage.getItem('theme') ||
@@ -1435,12 +2705,267 @@ function stationLabel(array $station): string
             font-size: 0.72rem;
             margin-top: 2px;
         }
+
+        /* ── Auth, hamburger menu, account & admin pages ── */
+        .header { position: relative; }
+        .menu-toggle svg { width: 18px; height: 18px; }
+        .menu-panel {
+            position: absolute;
+            top: calc(100% + 10px);
+            right: 0;
+            min-width: 230px;
+            background: var(--surface);
+            border: 1px solid var(--border-hi);
+            border-radius: 12px;
+            padding: 8px;
+            z-index: 300;
+            box-shadow: 0 14px 36px rgba(0, 0, 0, 0.4);
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .menu-user {
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            color: var(--muted);
+            padding: 6px 10px 8px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 4px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .menu-item {
+            display: block;
+            width: 100%;
+            text-align: left;
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: none;
+            background: none;
+            color: var(--ink);
+            text-decoration: none;
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            cursor: pointer;
+        }
+        .menu-item:hover { background: var(--amber-dim); color: var(--amber); }
+        .menu-item.active { color: var(--amber); }
+        .menu-sep {
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--muted);
+            padding: 8px 10px 2px;
+            border-top: 1px solid var(--border);
+            margin-top: 4px;
+        }
+        .menu-logout { margin: 0; }
+        .auth-wrap { display: flex; justify-content: center; padding: 3rem 0; }
+        .auth-card {
+            width: 100%;
+            max-width: 430px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 1.6rem;
+        }
+        .auth-card h2, .settings-card h2 {
+            font-family: var(--sans);
+            font-size: 1.05rem;
+            margin: 0 0 1rem;
+        }
+        .auth-card .field, .settings-card .field { margin-bottom: 0.9rem; }
+        .auth-note {
+            font-family: var(--mono);
+            font-size: 0.75rem;
+            color: var(--muted);
+            line-height: 1.5;
+            margin: 0.9rem 0 0.9rem;
+        }
+        .auth-note a { color: var(--amber); }
+        .auth-code {
+            font-family: var(--mono);
+            background: var(--bg);
+            border: 1px solid var(--border-hi);
+            border-radius: 8px;
+            padding: 0.7rem 0.9rem;
+            color: var(--amber);
+            font-size: 0.85rem;
+        }
+        .settings-layout {
+            width: 100%;
+            max-width: 560px;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            gap: 1.2rem;
+            padding-bottom: 3rem;
+        }
+        .settings-layout.wide { max-width: 900px; }
+        .settings-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 1.4rem 1.6rem;
+        }
+        .settings-card.danger { border-color: rgba(248, 113, 113, 0.35); }
+        .settings-card textarea {
+            width: 100%;
+            padding: 0.6rem 0.8rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-hi);
+            background: var(--bg);
+            color: var(--ink);
+            font-family: var(--mono);
+            font-size: 0.8rem;
+            resize: vertical;
+        }
+        .success-box {
+            background: rgba(52, 211, 153, 0.08);
+            border: 1px solid rgba(52, 211, 153, 0.3);
+            border-radius: 10px;
+            padding: 0.85rem 1rem;
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            color: var(--e10);
+            margin-bottom: 0.5rem;
+        }
+        .btn-danger {
+            display: block;
+            width: 100%;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            border: 1px solid rgba(248, 113, 113, 0.5);
+            background: rgba(248, 113, 113, 0.12);
+            color: var(--red);
+            font-family: var(--mono);
+            font-size: 0.85rem;
+            cursor: pointer;
+            letter-spacing: 0.04em;
+        }
+        .btn-danger:hover { background: rgba(248, 113, 113, 0.22); }
+        .btn-small {
+            padding: 0.35rem 0.7rem;
+            border-radius: 6px;
+            border: 1px solid var(--border-hi);
+            background: var(--surface-hi);
+            color: var(--ink);
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            cursor: pointer;
+        }
+        .btn-small:hover { border-color: var(--amber); color: var(--amber); }
+        .btn-small.danger:hover { border-color: var(--red); color: var(--red); }
+        .table-form { display: inline-block; margin: 0 0.15rem 0 0; }
+        .actions-cell { white-space: nowrap; }
+        .table-scroll { overflow-x: auto; }
+        .badge {
+            display: inline-block;
+            padding: 0.1rem 0.5rem;
+            border-radius: 999px;
+            border: 1px solid var(--border-hi);
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            color: var(--muted);
+        }
+        .badge.ok { border-color: rgba(52, 211, 153, 0.4); color: var(--e10); }
+        .badge.warn { border-color: rgba(245, 166, 35, 0.5); color: var(--amber); }
+        .day-toggles { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+        .day-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            font-family: var(--mono);
+            font-size: 0.75rem;
+            color: var(--ink);
+            border: 1px solid var(--border-hi);
+            border-radius: 8px;
+            padding: 0.3rem 0.55rem;
+            cursor: pointer;
+        }
+        .check-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-family: var(--mono);
+            font-size: 0.78rem;
+            color: var(--ink);
+            cursor: pointer;
+        }
+        .row-list { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 0.5rem; }
+        .row-item { display: flex; align-items: center; gap: 0.45rem; }
+        .row-item input[type="time"] {
+            padding: 0.4rem 0.6rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-hi);
+            background: var(--bg);
+            color: var(--ink);
+            font-family: var(--mono);
+            font-size: 0.8rem;
+        }
+        .btn-row-remove {
+            border: 1px solid var(--border-hi);
+            background: none;
+            color: var(--muted);
+            border-radius: 6px;
+            width: 26px;
+            height: 26px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            line-height: 1;
+        }
+        .btn-row-remove:hover { color: var(--red); border-color: var(--red); }
+        .btn-row-add {
+            border: 1px dashed var(--border-hi);
+            background: none;
+            color: var(--muted);
+            border-radius: 8px;
+            padding: 0.35rem 0.7rem;
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            cursor: pointer;
+        }
+        .btn-row-add:hover { color: var(--amber); border-color: var(--amber); }
+        .inline-form { display: flex; gap: 0.5rem; margin-top: 0.8rem; }
+        .inline-form input[type="text"] {
+            flex: 1;
+            padding: 0.5rem 0.7rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-hi);
+            background: var(--bg);
+            color: var(--ink);
+            font-family: var(--mono);
+            font-size: 0.8rem;
+        }
+        .inline-form input[type="number"] {
+            width: 90px;
+            padding: 0.5rem 0.7rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-hi);
+            background: var(--bg);
+            color: var(--ink);
+            font-family: var(--mono);
+            font-size: 0.8rem;
+        }
+        .inline-form .btn-primary { width: auto; display: inline-block; padding: 0.5rem 1rem; }
+        .field-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+            gap: 0.4rem 1rem;
+        }
+        html[data-theme="light"] .menu-panel { box-shadow: 0 14px 36px rgba(0, 0, 0, 0.15); }
     </style>
 </head>
-<body>
-<div id="price-tooltip" role="tooltip" aria-hidden="true"></div>
-<main class="page">
+<?php
+}
 
+// renderHeader emits the shared page header. Signed-in users additionally get
+// the hamburger button and its slide-down menu.
+function renderHeader(?array $user, string $activePage): void
+{
+?>
     <!-- Header -->
     <header class="header">
         <div class="brand">
@@ -1464,8 +2989,539 @@ function stationLabel(array $station): string
             <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" data-i18n-aria-label="toggleTheme">
                 <svg id="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
             </button>
+            <?php if ($user !== null) { ?>
+            <button class="theme-toggle menu-toggle" id="menu-toggle" aria-expanded="false" aria-controls="app-menu" aria-label="Open menu" data-i18n-aria-label="openMenu">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+            </button>
+            <nav class="menu-panel" id="app-menu" hidden>
+                <div class="menu-user"><?= h($user['email']) ?></div>
+                <a class="menu-item<?= $activePage === 'dashboard' ? ' active' : '' ?>" href="?" data-i18n="menuDashboard">Dashboard</a>
+                <a class="menu-item<?= $activePage === 'account' ? ' active' : '' ?>" href="?page=account" data-i18n="menuAccount">My Account</a>
+                <?php if ((int) $user['is_admin'] === 1) { ?>
+                <div class="menu-sep" data-i18n="menuAdminSection">Admin</div>
+                <a class="menu-item<?= $activePage === 'admin_users' ? ' active' : '' ?>" href="?page=admin_users" data-i18n="menuUsers">Users</a>
+                <a class="menu-item<?= $activePage === 'admin_settings' ? ' active' : '' ?>" href="?page=admin_settings" data-i18n="menuSettings">Settings</a>
+                <?php } ?>
+                <div class="menu-sep"></div>
+                <form method="post" action="" class="menu-logout"><?= csrfField() ?><input type="hidden" name="action" value="logout"><button type="submit" class="menu-item" data-i18n="menuLogout">Sign out</button></form>
+            </nav>
+            <?php } ?>
         </div>
     </header>
+<?php
+}
+
+
+// renderCommonScript emits the JS shared by every page: i18n, theme toggle,
+// hamburger menu, confirm dialogs, and the schedule-editor row controls.
+function renderCommonScript(): void
+{
+?>
+<script>
+/* ── Shared: i18n, theme, menu ─────────────────────────────────── */
+let currentLang = 'en';
+
+const translations = {
+    en: {
+        title: 'Price History',
+        filters: 'Filters',
+        city: 'City',
+        enterCity: 'Enter city...',
+        allCities: '— all cities —',
+        radius: 'Radius',
+        from: 'From',
+        to: 'To',
+        quickRange: 'Quick range',
+        fuelType: 'Fuel type',
+        fuelAll: 'All',
+        fuelDiesel: 'Diesel',
+        fuelE5: 'E5',
+        fuelE10: 'E10',
+        stations: 'Stations',
+        stationsHint: '(hold Ctrl to multi-select)',
+        reset: 'Reset',
+        snapshots: 'Snapshots',
+        stationsCount: 'Stations',
+        firstRecorded: 'First recorded',
+        lastRecorded: 'Last recorded',
+        priceTimeline: 'Price timeline',
+        rawSnapshots: 'Raw snapshots',
+        recordedAt: 'Recorded at',
+        station: 'Station',
+        brand: 'Brand',
+        street: 'Street',
+        place: 'Place',
+        cityCol: 'City',
+        open: 'Open',
+        dist: 'Dist',
+        openYes: 'open',
+        openNo: 'closed',
+        noData: 'No data',
+        loading: 'Loading…',
+        showMore: 'Show more',
+        showingRows: 'Showing {shown} of {total}',
+        loadError: 'Could not load data. Please retry.',
+        retry: 'Retry',
+        cityNotFound: 'Selected city not found.',
+        invalidFromDate: 'Invalid from date.',
+        invalidToDate: 'Invalid to date.',
+        noSnapshots: 'No snapshots match the current filters.',
+        cheapestNow: 'Cheapest — current',
+        cheapestNoData: 'No price data available.',
+        cheapestPrefix: 'Cheapest',
+        cheapestRangeNoData: 'No price data available.',
+        highestPrefix: 'Highest',
+        highestNoData: 'No price data available.',
+        rangeAll: 'All',
+        range30d: '30d',
+        range14d: '14d',
+        range7d: '7d',
+        rangeToday: 'Today',
+        toggleTheme: 'Toggle theme',
+        chartAriaLabel: 'Fuel price history chart',
+        openMenu: 'Open menu',
+        menuDashboard: 'Dashboard',
+        menuAccount: 'My Account',
+        menuAdminSection: 'Admin',
+        menuUsers: 'Users',
+        menuSettings: 'Settings',
+        menuLogout: 'Sign out',
+        loginTitle: 'Sign in',
+        registerTitle: 'Create an account',
+        registerHint: 'Your email address is your username. After registration an administrator has to approve your account before you can sign in.',
+        email: 'Email address',
+        password: 'Password',
+        passwordRepeat: 'Repeat password',
+        signIn: 'Sign in',
+        createAccount: 'Create an account',
+        noAccountYet: 'No account yet?',
+        haveAccount: 'Already have an account?',
+        unauthorized: 'Login required.',
+        csrfError: 'The form has expired. Please try again.',
+        invalidCredentials: 'Invalid email address or password.',
+        awaitingApproval: 'Your account is awaiting approval by an administrator.',
+        registerPendingSent: 'Account created. You will receive an email once an administrator approves it.',
+        accountCreated: 'Account created. You can log in now.',
+        invalidEmail: 'Please enter a valid email address.',
+        emailTaken: 'An account with this email address already exists.',
+        passwordTooShort: 'The password must be at least 10 characters long.',
+        passwordMismatch: 'The passwords do not match.',
+        wrongPassword: 'The current password is incorrect.',
+        passwordChanged: 'Password changed.',
+        changePassword: 'Change password',
+        currentPassword: 'Current password',
+        newPassword: 'New password',
+        save: 'Save',
+        notifySettings: 'Notifications',
+        notifyMethod: 'Delivery method',
+        pushoverAppName: 'Application name (notification title)',
+        pushoverUserKey: 'Pushover user key',
+        pushoverToken: 'Pushover API token',
+        notifyDays: 'Days of the week',
+        notifyWindows: 'Time windows',
+        notifySuggestTimes: 'Daily suggestion times',
+        notifyCheckEnabled: 'Send buy-now alerts when prices drop',
+        notifySaved: 'Notification settings saved.',
+        invalidNotifySettings: 'Invalid notification settings. Check days, time windows, and times.',
+        addWindow: 'Add window',
+        addTime: 'Add time',
+        removeRow: 'Remove',
+        day_mon: 'Mon',
+        day_tue: 'Tue',
+        day_wed: 'Wed',
+        day_thu: 'Thu',
+        day_fri: 'Fri',
+        day_sat: 'Sat',
+        day_sun: 'Sun',
+        dangerZone: 'Danger zone',
+        deleteAccount: 'Delete account',
+        deleteAccountConfirmLabel: 'I understand that my account and settings will be permanently deleted.',
+        deleteAccountConfirm: 'Really delete your account? This cannot be undone.',
+        confirmRequired: 'Please confirm the deletion.',
+        lastAdminGuard: 'You are the last administrator and cannot delete this account.',
+        accountDeleted: 'Your account has been deleted.',
+        loggedOut: 'You have been signed out.',
+        adminUsersTitle: 'Users',
+        colEmail: 'Email',
+        colStatus: 'Status',
+        colAdmin: 'Admin',
+        colCreated: 'Registered',
+        colApproved: 'Approved',
+        colActions: 'Actions',
+        statusPending: 'pending',
+        statusApproved: 'approved',
+        adminYes: 'admin',
+        actionApprove: 'Approve',
+        actionDelete: 'Delete',
+        actionPromote: 'Promote',
+        actionDemote: 'Demote',
+        confirmDeleteUser: 'Really delete this user?',
+        userApproved: 'User approved.',
+        userApprovedEmailFailed: 'User approved, but the notification email could not be sent.',
+        userDeleted: 'User deleted.',
+        userPromoted: 'User is now an administrator.',
+        userDemoted: 'User is no longer an administrator.',
+        cannotActOnSelf: 'You cannot perform this action on your own account.',
+        notFound: 'The requested item was not found.',
+        updateTargets: 'Automatic updates',
+        updateTargetsHint: 'These cities are updated automatically by gasoline update (and used by suggest/check/notify) when the CLI is invoked without --city/--radius flags.',
+        targetCity: 'City',
+        targetRadius: 'Radius (km)',
+        addTarget: 'Add',
+        removeTarget: 'Remove',
+        noTargets: 'No update targets configured yet.',
+        targetAdded: 'Update target added.',
+        targetRemoved: 'Update target removed.',
+        invalidTarget: 'Invalid city or radius (1-25 km).',
+        targetExists: 'This city is already an update target.',
+        suggestionSettings: 'Suggestions & checks',
+        settingFuel: 'Fuel',
+        settingRangeKm: 'Range (km)',
+        settingHistoryDays: 'History days',
+        settingPredictDays: 'Prediction days',
+        settingLimitPerDay: 'Suggestions per day',
+        settingCheckLimit: 'Check row limit',
+        settingSuggestTimes: 'Default suggestion times',
+        settingCheckResetTime: 'Check baseline reset',
+        settingNotifyWindows: 'Default notification windows',
+        settingNotifyDays: 'Default notification days',
+        templateCheck: 'Check notification template',
+        templateSuggest: 'Suggestion notification template',
+        templatePlaceholdersHint: 'Templates use {{placeholder}} syntax with the full gasoline-watch set, e.g. {{station_name}}, {{price}}, {{price_formatted}}, {{fuel}}, {{date}}, {{start_time}}, {{end_time}}, {{distance}}, {{confidence}}, {{count}}, {{cheapest_price}}, {{message}} and *_onchange variants.',
+        settingsSaved: 'Settings saved.',
+        invalidSettings: 'Invalid settings. Please check the highlighted values.',
+        schemaOutdatedTitle: 'Database not ready',
+        schemaOutdatedBody: 'The database schema is missing the required tables. Run the following command on the server, then reload this page:',
+        schemaDbNotFound: 'The database was not found.',
+    },
+    de: {
+        title: 'Preisverlauf',
+        filters: 'Filter',
+        city: 'Stadt',
+        enterCity: 'Stadt eingeben...',
+        allCities: '— alle Städte —',
+        radius: 'Radius',
+        from: 'Von',
+        to: 'Bis',
+        quickRange: 'Zeitraum',
+        fuelType: 'Kraftstoffart',
+        fuelAll: 'Alle',
+        fuelDiesel: 'Diesel',
+        fuelE5: 'E5',
+        fuelE10: 'E10',
+        stations: 'Tankstellen',
+        stationsHint: '(Strg für Mehrfachauswahl)',
+        reset: 'Zurücksetzen',
+        snapshots: 'Einträge',
+        stationsCount: 'Tankstellen',
+        firstRecorded: 'Erste Aufzeichnung',
+        lastRecorded: 'Letzte Aufzeichnung',
+        priceTimeline: 'Preisverlauf',
+        rawSnapshots: 'Alle Einträge',
+        recordedAt: 'Aufgezeichnet um',
+        station: 'Tankstelle',
+        brand: 'Marke',
+        street: 'Straße',
+        place: 'Ort',
+        cityCol: 'Stadt',
+        open: 'Geöffnet',
+        dist: 'Entf.',
+        openYes: 'offen',
+        openNo: 'geschlossen',
+        noData: 'Keine Daten',
+        loading: 'Wird geladen…',
+        showMore: 'Mehr anzeigen',
+        showingRows: 'Zeige {shown} von {total}',
+        loadError: 'Daten konnten nicht geladen werden. Bitte erneut versuchen.',
+        retry: 'Erneut versuchen',
+        cityNotFound: 'Ausgewählte Stadt nicht gefunden.',
+        invalidFromDate: 'Ungültiges Von-Datum.',
+        invalidToDate: 'Ungültiges Bis-Datum.',
+        noSnapshots: 'Keine Einträge für die aktuellen Filter.',
+        cheapestNow: 'Günstigster Preis — aktuell',
+        cheapestNoData: 'Keine Preisdaten vorhanden.',
+        cheapestPrefix: 'Günstigster Preis',
+        cheapestRangeNoData: 'Keine Preisdaten vorhanden.',
+        highestPrefix: 'Höchster Preis',
+        highestNoData: 'Keine Preisdaten vorhanden.',
+        rangeAll: 'Alle',
+        range30d: '30d',
+        range14d: '14d',
+        range7d: '7d',
+        rangeToday: 'Heute',
+        toggleTheme: 'Design wechseln',
+        chartAriaLabel: 'Kraftstoffpreis-Verlaufsdiagramm',
+        openMenu: 'Menü öffnen',
+        menuDashboard: 'Dashboard',
+        menuAccount: 'Mein Konto',
+        menuAdminSection: 'Admin',
+        menuUsers: 'Benutzer',
+        menuSettings: 'Einstellungen',
+        menuLogout: 'Abmelden',
+        loginTitle: 'Anmelden',
+        registerTitle: 'Konto erstellen',
+        registerHint: 'Deine E-Mail-Adresse ist dein Benutzername. Nach der Registrierung muss ein Administrator dein Konto freischalten, bevor du dich anmelden kannst.',
+        email: 'E-Mail-Adresse',
+        password: 'Passwort',
+        passwordRepeat: 'Passwort wiederholen',
+        signIn: 'Anmelden',
+        createAccount: 'Konto erstellen',
+        noAccountYet: 'Noch kein Konto?',
+        haveAccount: 'Schon ein Konto?',
+        unauthorized: 'Anmeldung erforderlich.',
+        csrfError: 'Das Formular ist abgelaufen. Bitte erneut versuchen.',
+        invalidCredentials: 'Ungültige E-Mail-Adresse oder falsches Passwort.',
+        awaitingApproval: 'Dein Konto wartet auf die Freischaltung durch einen Administrator.',
+        registerPendingSent: 'Konto erstellt. Du erhältst eine E-Mail, sobald ein Administrator dein Konto freigeschaltet hat.',
+        accountCreated: 'Konto erstellt. Du kannst dich jetzt anmelden.',
+        invalidEmail: 'Bitte eine gültige E-Mail-Adresse eingeben.',
+        emailTaken: 'Ein Konto mit dieser E-Mail-Adresse existiert bereits.',
+        passwordTooShort: 'Das Passwort muss mindestens 10 Zeichen lang sein.',
+        passwordMismatch: 'Die Passwörter stimmen nicht überein.',
+        wrongPassword: 'Das aktuelle Passwort ist falsch.',
+        passwordChanged: 'Passwort geändert.',
+        changePassword: 'Passwort ändern',
+        currentPassword: 'Aktuelles Passwort',
+        newPassword: 'Neues Passwort',
+        save: 'Speichern',
+        notifySettings: 'Benachrichtigungen',
+        notifyMethod: 'Versandweg',
+        pushoverAppName: 'Anwendungsname (Titel der Benachrichtigung)',
+        pushoverUserKey: 'Pushover User-Key',
+        pushoverToken: 'Pushover API-Token',
+        notifyDays: 'Wochentage',
+        notifyWindows: 'Zeitfenster',
+        notifySuggestTimes: 'Tägliche Vorschlagszeiten',
+        notifyCheckEnabled: 'Kaufalarme bei Preistiefs senden',
+        notifySaved: 'Benachrichtigungseinstellungen gespeichert.',
+        invalidNotifySettings: 'Ungültige Benachrichtigungseinstellungen. Bitte Tage, Zeitfenster und Zeiten prüfen.',
+        addWindow: 'Zeitfenster hinzufügen',
+        addTime: 'Zeit hinzufügen',
+        removeRow: 'Entfernen',
+        day_mon: 'Mo',
+        day_tue: 'Di',
+        day_wed: 'Mi',
+        day_thu: 'Do',
+        day_fri: 'Fr',
+        day_sat: 'Sa',
+        day_sun: 'So',
+        dangerZone: 'Gefahrenzone',
+        deleteAccount: 'Konto löschen',
+        deleteAccountConfirmLabel: 'Ich verstehe, dass mein Konto und meine Einstellungen dauerhaft gelöscht werden.',
+        deleteAccountConfirm: 'Konto wirklich löschen? Das kann nicht rückgängig gemacht werden.',
+        confirmRequired: 'Bitte die Löschung bestätigen.',
+        lastAdminGuard: 'Du bist der letzte Administrator und kannst dieses Konto nicht löschen.',
+        accountDeleted: 'Dein Konto wurde gelöscht.',
+        loggedOut: 'Du wurdest abgemeldet.',
+        adminUsersTitle: 'Benutzer',
+        colEmail: 'E-Mail',
+        colStatus: 'Status',
+        colAdmin: 'Admin',
+        colCreated: 'Registriert',
+        colApproved: 'Freigeschaltet',
+        colActions: 'Aktionen',
+        statusPending: 'wartend',
+        statusApproved: 'freigeschaltet',
+        adminYes: 'Admin',
+        actionApprove: 'Freischalten',
+        actionDelete: 'Löschen',
+        actionPromote: 'Zum Admin machen',
+        actionDemote: 'Adminrechte entziehen',
+        confirmDeleteUser: 'Diesen Benutzer wirklich löschen?',
+        userApproved: 'Benutzer freigeschaltet.',
+        userApprovedEmailFailed: 'Benutzer freigeschaltet, aber die Benachrichtigungs-E-Mail konnte nicht gesendet werden.',
+        userDeleted: 'Benutzer gelöscht.',
+        userPromoted: 'Benutzer ist jetzt Administrator.',
+        userDemoted: 'Benutzer ist kein Administrator mehr.',
+        cannotActOnSelf: 'Diese Aktion ist auf dem eigenen Konto nicht möglich.',
+        notFound: 'Der angeforderte Eintrag wurde nicht gefunden.',
+        updateTargets: 'Automatische Updates',
+        updateTargetsHint: 'Diese Städte werden von gasoline update automatisch aktualisiert (und von suggest/check/notify genutzt), wenn die CLI ohne --city/--radius aufgerufen wird.',
+        targetCity: 'Stadt',
+        targetRadius: 'Radius (km)',
+        addTarget: 'Hinzufügen',
+        removeTarget: 'Entfernen',
+        noTargets: 'Noch keine Update-Ziele konfiguriert.',
+        targetAdded: 'Update-Ziel hinzugefügt.',
+        targetRemoved: 'Update-Ziel entfernt.',
+        invalidTarget: 'Ungültige Stadt oder ungültiger Radius (1-25 km).',
+        targetExists: 'Diese Stadt ist bereits ein Update-Ziel.',
+        suggestionSettings: 'Vorschläge & Preisprüfungen',
+        settingFuel: 'Kraftstoff',
+        settingRangeKm: 'Umkreis (km)',
+        settingHistoryDays: 'Historie (Tage)',
+        settingPredictDays: 'Vorhersage (Tage)',
+        settingLimitPerDay: 'Vorschläge pro Tag',
+        settingCheckLimit: 'Zeilenlimit der Preisprüfung',
+        settingSuggestTimes: 'Standard-Vorschlagszeiten',
+        settingCheckResetTime: 'Preis-Baseline zurücksetzen um',
+        settingNotifyWindows: 'Standard-Zeitfenster',
+        settingNotifyDays: 'Standard-Wochentage',
+        templateCheck: 'Vorlage für Kaufalarme',
+        templateSuggest: 'Vorlage für Vorschläge',
+        templatePlaceholdersHint: 'Vorlagen nutzen die {{placeholder}}-Syntax mit dem vollen gasoline-watch-Satz, z. B. {{station_name}}, {{price}}, {{price_formatted}}, {{fuel}}, {{date}}, {{start_time}}, {{end_time}}, {{distance}}, {{confidence}}, {{count}}, {{cheapest_price}}, {{message}} und *_onchange-Varianten.',
+        settingsSaved: 'Einstellungen gespeichert.',
+        invalidSettings: 'Ungültige Einstellungen. Bitte die markierten Werte prüfen.',
+        schemaOutdatedTitle: 'Datenbank nicht bereit',
+        schemaOutdatedBody: 'Im Datenbankschema fehlen die benötigten Tabellen. Führe folgenden Befehl auf dem Server aus und lade die Seite neu:',
+        schemaDbNotFound: 'Die Datenbank wurde nicht gefunden.',
+    },
+};
+
+currentLang = (() => {
+    const stored = localStorage.getItem('lang');
+    if (stored && translations[stored]) return stored;
+    const browser = (navigator.language || 'en').slice(0, 2).toLowerCase();
+    return translations[browser] ? browser : 'en';
+})();
+
+function _tz() { return currentLang === 'de' ? 'Europe/Berlin' : 'UTC'; }
+function _loc() { return currentLang === 'de' ? 'de-DE' : 'en-GB'; }
+
+function formatDateTime(isoString) {
+    const d = new Date(isoString);
+    return d.toLocaleString(_loc(), {
+        timeZone: _tz(),
+        day: '2-digit', month: '2-digit', year: '2-digit',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false,
+    });
+}
+
+function applyLang(lang) {
+    currentLang = lang;
+    localStorage.setItem('lang', lang);
+    const t = translations[lang];
+    document.querySelectorAll('[data-i18n]').forEach((el) => {
+        const key = el.dataset.i18n;
+        if (t[key] !== undefined) el.textContent = t[key];
+    });
+    document.querySelectorAll('[data-i18n-placeholder]').forEach((el) => {
+        const key = el.dataset.i18nPlaceholder;
+        if (t[key] !== undefined) el.setAttribute('placeholder', t[key]);
+    });
+    document.querySelectorAll('[data-i18n-aria-label]').forEach((el) => {
+        const key = el.dataset.i18nAriaLabel;
+        if (t[key] !== undefined) el.setAttribute('aria-label', t[key]);
+    });
+    document.querySelectorAll('.lang-btn').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.lang === lang);
+    });
+    // Re-format all date/time cells
+    document.querySelectorAll('[data-recorded-at]').forEach((el) => {
+        el.textContent = formatDateTime(el.dataset.recordedAt);
+    });
+    // Page-specific re-rendering (e.g. the dashboard chart) hooks in here.
+    if (typeof window.onLangChange === 'function') window.onLangChange();
+}
+
+document.querySelectorAll('.lang-btn').forEach((btn) => {
+    btn.addEventListener('click', () => applyLang(btn.dataset.lang));
+});
+
+applyLang(currentLang);
+
+/* ── Theme toggle ──────────────────────────────────────────────── */
+const moonIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>';
+const sunIcon  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>';
+
+const themeToggle = document.getElementById('theme-toggle');
+
+function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('theme', theme);
+    if (themeToggle) themeToggle.innerHTML = theme === 'light' ? moonIcon : sunIcon;
+    if (typeof window.onThemeChange === 'function') window.onThemeChange();
+}
+
+if (themeToggle) {
+    themeToggle.addEventListener('click', () => {
+        const current = document.documentElement.getAttribute('data-theme') || 'dark';
+        applyTheme(current === 'dark' ? 'light' : 'dark');
+    });
+}
+
+// Sync icon to current theme (set by head script)
+applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+
+/* ── Hamburger menu ────────────────────────────────────────────── */
+const menuToggle = document.getElementById('menu-toggle');
+const menuPanel = document.getElementById('app-menu');
+
+if (menuToggle && menuPanel) {
+    const closeMenu = () => {
+        menuPanel.hidden = true;
+        menuToggle.setAttribute('aria-expanded', 'false');
+    };
+    menuToggle.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const open = menuPanel.hidden;
+        menuPanel.hidden = !open;
+        menuToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    document.addEventListener('click', (e) => {
+        if (!menuPanel.hidden && !menuPanel.contains(e.target)) closeMenu();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeMenu();
+    });
+}
+
+/* ── Confirm dialogs for destructive forms ─────────────────────── */
+document.querySelectorAll('form[data-confirm]').forEach((form) => {
+    form.addEventListener('submit', (e) => {
+        const key = form.dataset.confirm;
+        const message = translations[currentLang][key] || key;
+        if (!window.confirm(message)) e.preventDefault();
+    });
+});
+
+/* ── Schedule editor row controls (account/admin pages) ────────── */
+function scheduleRow(kind) {
+    const row = document.createElement('div');
+    row.className = 'row-item';
+    const removeLabel = translations[currentLang].removeRow || 'Remove';
+    if (kind === 'window') {
+        row.innerHTML = '<input type="time" name="notify_windows_from[]" required> <span>–</span> ' +
+            '<input type="time" name="notify_windows_to[]" required> ' +
+            '<button type="button" class="btn-row-remove" aria-label="' + removeLabel + '">×</button>';
+    } else {
+        row.innerHTML = '<input type="time" name="notify_suggest_times[]" required> ' +
+            '<button type="button" class="btn-row-remove" aria-label="' + removeLabel + '">×</button>';
+    }
+    return row;
+}
+
+document.querySelectorAll('.btn-row-add').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        const list = btn.dataset.addRow === 'window'
+            ? document.getElementById('window-list')
+            : document.getElementById('suggest-time-list');
+        if (list) list.appendChild(scheduleRow(btn.dataset.addRow));
+    });
+});
+
+document.addEventListener('click', (e) => {
+    if (e.target.matches('.btn-row-remove')) {
+        e.target.closest('.row-item')?.remove();
+    }
+});
+</script>
+<?php
+}
+
+// ── Dashboard page (default) ──────────────────────────────────────────────────
+renderDocumentHead('Price History');
+?>
+<body>
+<div id="price-tooltip" role="tooltip" aria-hidden="true"></div>
+<main class="page">
+
+<?php renderHeader($currentUser, 'dashboard'); ?>
+
+    <?php $dashboardFlash = takeFlash(); if ($dashboardFlash !== null) { ?>
+    <div class="<?= $dashboardFlash['type'] === 'error' ? 'error-box' : 'success-box' ?>" data-i18n="<?= h($dashboardFlash['key']) ?>"><?= h(flashText($dashboardFlash['key'])) ?></div>
+    <?php } ?>
 
     <!-- Main layout -->
     <div class="layout">
@@ -1671,20 +3727,7 @@ function stationLabel(array $station): string
 </main>
 
 <script>
-/* ── Locale-aware date/time helpers ────────────────────────────── */
-// These reference `currentLang` which is set up below; safe to call after init.
-function _tz() { return currentLang === 'de' ? 'Europe/Berlin' : 'UTC'; }
-function _loc() { return currentLang === 'de' ? 'de-DE' : 'en-GB'; }
-
-function formatDateTime(isoString) {
-    const d = new Date(isoString);
-    return d.toLocaleString(_loc(), {
-        timeZone: _tz(),
-        day: '2-digit', month: '2-digit', year: '2-digit',
-        hour: '2-digit', minute: '2-digit',
-        hour12: false,
-    });
-}
+/* ── Locale helpers (_tz/_loc/formatDateTime) live in the shared script. ── */
 
 function formatTickDate(isoString) {
     const d = new Date(isoString);
@@ -1803,9 +3846,7 @@ function hideTooltip() {
 
 document.addEventListener('touchend', hideTooltip);
 
-// Declared early so renderChart() (called below) can access it via _tz()/_loc().
-// Properly initialised later once `translations` is available.
-let currentLang = 'en';
+// currentLang is declared in the shared script (renderCommonScript).
 
 let chartRange = 'all';
 
@@ -2094,128 +4135,7 @@ if (!chartEl) {
     // Initial render is triggered by loadData() once the async payload arrives.
 }
 
-/* ── i18n ──────────────────────────────────────────────────────── */
-const translations = {
-    en: {
-        title: 'Price History',
-        filters: 'Filters',
-        city: 'City',
-        enterCity: 'Enter city...',
-        allCities: '— all cities —',
-        radius: 'Radius',
-        from: 'From',
-        to: 'To',
-        quickRange: 'Quick range',
-        fuelType: 'Fuel type',
-        fuelAll: 'All',
-        fuelDiesel: 'Diesel',
-        fuelE5: 'E5',
-        fuelE10: 'E10',
-        stations: 'Stations',
-        stationsHint: '(hold Ctrl to multi-select)',
-        reset: 'Reset',
-        snapshots: 'Snapshots',
-        stationsCount: 'Stations',
-        firstRecorded: 'First recorded',
-        lastRecorded: 'Last recorded',
-        priceTimeline: 'Price timeline',
-        rawSnapshots: 'Raw snapshots',
-        recordedAt: 'Recorded at',
-        station: 'Station',
-        brand: 'Brand',
-        street: 'Street',
-        place: 'Place',
-        cityCol: 'City',
-        open: 'Open',
-        dist: 'Dist',
-        openYes: 'open',
-        openNo: 'closed',
-        noData: 'No data',
-        loading: 'Loading…',
-        showMore: 'Show more',
-        showingRows: 'Showing {shown} of {total}',
-        loadError: 'Could not load data. Please retry.',
-        retry: 'Retry',
-        cityNotFound: 'Selected city not found.',
-        invalidFromDate: 'Invalid from date.',
-        invalidToDate: 'Invalid to date.',
-        noSnapshots: 'No snapshots match the current filters.',
-        cheapestNow: 'Cheapest — current',
-        cheapestNoData: 'No price data available.',
-        cheapestPrefix: 'Cheapest',
-        cheapestRangeNoData: 'No price data available.',
-        highestPrefix: 'Highest',
-        highestNoData: 'No price data available.',
-        rangeAll: 'All',
-        range30d: '30d',
-        range14d: '14d',
-        range7d: '7d',
-        rangeToday: 'Today',
-    },
-    de: {
-        title: 'Preisverlauf',
-        filters: 'Filter',
-        city: 'Stadt',
-        enterCity: 'Stadt eingeben...',
-        allCities: '— alle Städte —',
-        radius: 'Radius',
-        from: 'Von',
-        to: 'Bis',
-        quickRange: 'Zeitraum',
-        fuelType: 'Kraftstoffart',
-        fuelAll: 'Alle',
-        fuelDiesel: 'Diesel',
-        fuelE5: 'E5',
-        fuelE10: 'E10',
-        stations: 'Tankstellen',
-        stationsHint: '(Strg für Mehrfachauswahl)',
-        reset: 'Zurücksetzen',
-        snapshots: 'Einträge',
-        stationsCount: 'Tankstellen',
-        firstRecorded: 'Erste Aufzeichnung',
-        lastRecorded: 'Letzte Aufzeichnung',
-        priceTimeline: 'Preisverlauf',
-        rawSnapshots: 'Alle Einträge',
-        recordedAt: 'Aufgezeichnet um',
-        station: 'Tankstelle',
-        brand: 'Marke',
-        street: 'Straße',
-        place: 'Ort',
-        cityCol: 'Stadt',
-        open: 'Geöffnet',
-        dist: 'Entf.',
-        openYes: 'offen',
-        openNo: 'geschlossen',
-        noData: 'Keine Daten',
-        loading: 'Wird geladen…',
-        showMore: 'Mehr anzeigen',
-        showingRows: 'Zeige {shown} von {total}',
-        loadError: 'Daten konnten nicht geladen werden. Bitte erneut versuchen.',
-        retry: 'Erneut versuchen',
-        cityNotFound: 'Ausgewählte Stadt nicht gefunden.',
-        invalidFromDate: 'Ungültiges Von-Datum.',
-        invalidToDate: 'Ungültiges Bis-Datum.',
-        noSnapshots: 'Keine Einträge für die aktuellen Filter.',
-        cheapestNow: 'Günstigster Preis — aktuell',
-        cheapestNoData: 'Keine Preisdaten vorhanden.',
-        cheapestPrefix: 'Günstigster Preis',
-        cheapestRangeNoData: 'Keine Preisdaten vorhanden.',
-        highestPrefix: 'Höchster Preis',
-        highestNoData: 'Keine Preisdaten vorhanden.',
-        rangeAll: 'Alle',
-        range30d: '30d',
-        range14d: '14d',
-        range7d: '7d',
-        rangeToday: 'Heute',
-    },
-};
-
-currentLang = (() => {
-    const stored = localStorage.getItem('lang');
-    if (stored && translations[stored]) return stored;
-    const browser = (navigator.language || 'en').slice(0, 2).toLowerCase();
-    return translations[browser] ? browser : 'en';
-})();
+/* ── i18n ── (translations + applyLang live in the shared script) ── */
 
 /* ── Price cards (cheapest / highest) ──────────────────────────── */
 const ICON_DOWN = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 16 16 12"/><line x1="12" y1="8" x2="12" y2="16"/></svg>`;
@@ -2304,61 +4224,9 @@ function renderHighest() {
     renderPriceCard(highestCard, getRangeFilteredData(), rangeTitle(t.highestPrefix), (a, b) => a > b, ICON_UP, t.highestNoData);
 }
 
-function applyLang(lang) {
-    currentLang = lang;
-    localStorage.setItem('lang', lang);
-    const t = translations[lang];
-    document.querySelectorAll('[data-i18n]').forEach((el) => {
-        const key = el.dataset.i18n;
-        if (t[key] !== undefined) el.textContent = t[key];
-    });
-    document.querySelectorAll('[data-i18n-placeholder]').forEach((el) => {
-        const key = el.dataset.i18nPlaceholder;
-        if (t[key] !== undefined) el.setAttribute('placeholder', t[key]);
-    });
-    document.querySelectorAll('.lang-btn').forEach((btn) => {
-        btn.classList.toggle('active', btn.dataset.lang === lang);
-    });
-    // Re-format all date/time cells
-    document.querySelectorAll('[data-recorded-at]').forEach((el) => {
-        el.textContent = formatDateTime(el.dataset.recordedAt);
-    });
-    // Data views only exist once the async payload has arrived.
-    if (dataLoaded) {
-        renderCheapest();
-        renderCheapestRange();
-        renderHighest();
-        if (chartEl) renderChart();
-        updateShowMore(); // re-translate the "Show more (N)" button label
-    }
-}
+/* applyLang lives in the shared script (renderCommonScript). */
 
-document.querySelectorAll('.lang-btn').forEach((btn) => {
-    btn.addEventListener('click', () => applyLang(btn.dataset.lang));
-});
-
-applyLang(currentLang);
-
-/* ── Theme toggle ──────────────────────────────────────────────── */
-const moonIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>';
-const sunIcon  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>';
-
-const themeToggle = document.getElementById('theme-toggle');
-
-function applyTheme(theme) {
-    document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('theme', theme);
-    themeToggle.innerHTML = theme === 'light' ? moonIcon : sunIcon;
-    if (chartEl && dataLoaded) renderChart();
-}
-
-themeToggle.addEventListener('click', () => {
-    const current = document.documentElement.getAttribute('data-theme') || 'dark';
-    applyTheme(current === 'dark' ? 'light' : 'dark');
-});
-
-// Sync icon to current theme (set by head script)
-applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+/* ── Theme toggle lives in the shared script (renderCommonScript). ── */
 
 /* ── Quick date-range buttons ──────────────────────────────────── */
 function onDateChange(el) {
@@ -2675,6 +4543,7 @@ async function loadData() {
     url.searchParams.set('action', 'data');
     try {
         const res = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
+        if (res.status === 401) { location.href = '?page=login'; return; }
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const payload = await res.json();
         // Surface application-level errors (invalid date, city not found, …)
@@ -2694,6 +4563,22 @@ const retryWrap = document.getElementById('chart-retry');
 const retryBtn  = document.getElementById('retry-btn');
 if (retryBtn) retryBtn.addEventListener('click', () => { resetLoadingUI(); loadData(); });
 
+/* Shared-script hooks: the dashboard re-renders on language/theme change. */
+window.onLangChange = () => {
+    if (dataLoaded) {
+        renderCheapest();
+        renderCheapestRange();
+        renderHighest();
+        if (chartEl) renderChart();
+        updateShowMore(); // re-translate the "Show more (N)" button label
+    }
+};
+window.onThemeChange = () => {
+    if (chartEl && dataLoaded) renderChart();
+};
+</script>
+<?php renderCommonScript(); ?>
+<script>
 if (hasDataScope) {
     loadData();
 } else {

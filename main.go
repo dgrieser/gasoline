@@ -368,6 +368,8 @@ func run(args []string) error {
 		return runSuggest(args[1:])
 	case "check":
 		return runCheck(args[1:])
+	case "notify":
+		return runNotify(args[1:])
 	case "rename":
 		return runRename(args[1:])
 	case "version", "-v", "--version":
@@ -394,6 +396,7 @@ Commands:
   list history  show historical prices
   suggest       predict cheap fueling windows by day and time
   check         check if latest stored prices are currently low
+  notify        send Pushover notifications to configured web users
   rename        set a persistent display-name override for a station
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
@@ -420,6 +423,7 @@ Examples:
   gasoline list history --fuel diesel
   gasoline suggest --city "Berlin" --range-km 10 --fuel diesel
   gasoline check --city "Berlin" --range-km 10 --fuel diesel
+  gasoline notify --dry-run
   gasoline rename <station-id> "Custom Name"
   gasoline rename --clear <station-id>
   gasoline import cities DE
@@ -579,10 +583,6 @@ func runUpdate(args []string) error {
 	if err != nil {
 		return err
 	}
-	queries := buildCityQueries(events)
-	if err := validateCityQueries(queries); err != nil {
-		return err
-	}
 	if !isValidFuelType(*fuelType) {
 		return errors.New("--fuel must be one of: all, diesel, e5, e10")
 	}
@@ -606,6 +606,22 @@ func runUpdate(args []string) error {
 	defer db.Close()
 
 	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
+		return err
+	}
+
+	queries := buildCityQueries(events)
+	// Without any --city/--radius flags, fall back to the admin-configured
+	// update targets. Explicit flags never mix with DB targets.
+	if len(events) == 0 {
+		targets, err := loadUpdateTargets(ctx, db)
+		if err != nil {
+			return err
+		}
+		for _, tgt := range targets {
+			queries = append(queries, cityQuery{name: tgt.City, radius: tgt.RadiusKM})
+		}
+	}
+	if err := validateCityQueries(queries); err != nil {
 		return err
 	}
 
@@ -1247,9 +1263,6 @@ func runSuggest(args []string) error {
 		Now:         time.Now().UTC(),
 		Location:    time.Local,
 	}
-	if err := validateSuggestOptions(opts); err != nil {
-		return err
-	}
 
 	ctx := context.Background()
 	db, err := openDatabase(ctx, dbCfg)
@@ -1259,6 +1272,13 @@ func runSuggest(args []string) error {
 	defer db.Close()
 
 	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
+		return err
+	}
+
+	if err := applySuggestSettings(ctx, db, fs, &opts); err != nil {
+		return err
+	}
+	if err := validateSuggestOptions(opts); err != nil {
 		return err
 	}
 
@@ -1306,9 +1326,6 @@ func runCheck(args []string) error {
 		Now:         time.Now().UTC(),
 		Location:    time.Local,
 	}
-	if err := validateCheckOptions(opts); err != nil {
-		return err
-	}
 
 	ctx := context.Background()
 	db, err := openDatabase(ctx, dbCfg)
@@ -1318,6 +1335,13 @@ func runCheck(args []string) error {
 	defer db.Close()
 
 	if err := initSchema(ctx, db, dbCfg.Driver); err != nil {
+		return err
+	}
+
+	if err := applyCheckSettings(ctx, db, fs, &opts); err != nil {
+		return err
+	}
+	if err := validateCheckOptions(opts); err != nil {
 		return err
 	}
 
@@ -2330,6 +2354,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 		return migrateResult{}, err
 	}
 	if err := migrateStationsNameOverride(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
+	if err := migrateSeedDefaultSettings(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
 
