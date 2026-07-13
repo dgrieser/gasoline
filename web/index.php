@@ -2591,7 +2591,9 @@ function renderDocumentHead(string $titleSuffix): void
         /* ── Load animation ────────────────────────────────────── */
         @keyframes fade-up {
             from { opacity: 0; transform: translateY(12px); }
-            to   { opacity: 1; transform: translateY(0); }
+            /* End at `none` so the retained fill-mode value doesn't leave a
+               stacking context behind (it would trap dropdowns' z-index). */
+            to   { opacity: 1; transform: none; }
         }
 
         .page > * {
@@ -2707,7 +2709,7 @@ function renderDocumentHead(string $titleSuffix): void
         }
 
         /* ── Auth, hamburger menu, account & admin pages ── */
-        .header { position: relative; }
+        .header { position: relative; z-index: 300; }
         .menu-toggle svg { width: 18px; height: 18px; }
         .menu-panel {
             position: absolute;
