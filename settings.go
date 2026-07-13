@@ -26,6 +26,11 @@ const (
 	settingNotifyWindows   = "notify_windows"
 	settingCheckTemplate   = "check_template"
 	settingSuggestTemplate = "suggest_template"
+
+	// Notification title templates. Empty means: fall back to the user's
+	// pushover_app_name, preserving pre-existing behavior.
+	settingCheckTitleTemplate   = "check_title_template"
+	settingSuggestTitleTemplate = "suggest_title_template"
 )
 
 // Default row templates, identical to gasoline-watch.sh's CHECK_ROW_TEMPLATE
@@ -44,18 +49,20 @@ const (
 // appSettings is the admin configuration that drives update/suggest/check
 // defaults and the notify command.
 type appSettings struct {
-	Fuel            string
-	RangeKM         float64
-	HistoryDays     int
-	PredictDays     int
-	LimitPerDay     int
-	CheckLimit      int
-	SuggestTimes    string
-	CheckResetTime  string
-	NotifyDays      string
-	NotifyWindows   string
-	CheckTemplate   string
-	SuggestTemplate string
+	Fuel                 string
+	RangeKM              float64
+	HistoryDays          int
+	PredictDays          int
+	LimitPerDay          int
+	CheckLimit           int
+	SuggestTimes         string
+	CheckResetTime       string
+	NotifyDays           string
+	NotifyWindows        string
+	CheckTemplate        string
+	SuggestTemplate      string
+	CheckTitleTemplate   string
+	SuggestTitleTemplate string
 }
 
 // defaultAppSettings matches the hardcoded flag defaults of suggest/check.
@@ -93,6 +100,8 @@ func seededSettings() [][2]string {
 		{settingNotifyWindows, d.NotifyWindows},
 		{settingCheckTemplate, d.CheckTemplate},
 		{settingSuggestTemplate, d.SuggestTemplate},
+		{settingCheckTitleTemplate, d.CheckTitleTemplate},
+		{settingSuggestTitleTemplate, d.SuggestTitleTemplate},
 	}
 }
 
@@ -176,6 +185,10 @@ func loadSettings(ctx context.Context, q settingsQuerier) (appSettings, error) {
 			s.CheckTemplate = value
 		case settingSuggestTemplate:
 			s.SuggestTemplate = value
+		case settingCheckTitleTemplate:
+			s.CheckTitleTemplate = value
+		case settingSuggestTitleTemplate:
+			s.SuggestTitleTemplate = value
 		}
 	}
 	return s, rows.Err()
