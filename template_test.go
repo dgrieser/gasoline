@@ -289,3 +289,40 @@ func TestRenderNotifyMessageSuggestDefaultTemplate(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+func TestLocaleDetectionFromEnvironment(t *testing.T) {
+	// German LC_ALL wins and yields comma + German weekday names.
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	t.Setenv("LC_NUMERIC", "")
+	t.Setenv("LC_TIME", "")
+	t.Setenv("LANG", "en_US.UTF-8")
+	withDecimalSeparator(t, "")
+	withWeekdayNames(t, nil, nil)
+	if got := localeDecimalSeparator(); got != "," {
+		t.Fatalf("decimal separator = %q, want , for de locale", got)
+	}
+	long, short := localeWeekdays()
+	if long["Monday"] != "Montag" || short["Monday"] != "Mo" {
+		t.Fatalf("weekdays = %q/%q, want Montag/Mo", long["Monday"], short["Monday"])
+	}
+
+	// A region suffix alone must not trigger German (en_DE stays English).
+	t.Setenv("LC_ALL", "en_DE.UTF-8")
+	withDecimalSeparator(t, "")
+	withWeekdayNames(t, nil, nil)
+	if got := localeDecimalSeparator(); got != "." {
+		t.Fatalf("decimal separator = %q, want . for en_DE", got)
+	}
+	long, _ = localeWeekdays()
+	if long["Monday"] != "Monday" {
+		t.Fatalf("weekday = %q, want Monday for en_DE", long["Monday"])
+	}
+
+	// No locale variables at all: English defaults.
+	t.Setenv("LC_ALL", "")
+	t.Setenv("LANG", "")
+	withDecimalSeparator(t, "")
+	if got := localeDecimalSeparator(); got != "." {
+		t.Fatalf("decimal separator = %q, want . without locale env", got)
+	}
+}

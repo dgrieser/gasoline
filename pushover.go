@@ -29,7 +29,11 @@ type pushoverMessage struct {
 func sendPushover(ctx context.Context, apiURL string, msg pushoverMessage) error {
 	message := msg.Message
 	if len(message) > pushoverMessageLimit {
-		message = message[:pushoverMessageLimit]
+		// The API limit is 1024 characters; truncate by runes so a
+		// multi-byte UTF-8 character is never cut in half.
+		if runes := []rune(message); len(runes) > pushoverMessageLimit {
+			message = string(runes[:pushoverMessageLimit])
+		}
 	}
 	form := url.Values{
 		"token":   {msg.Token},

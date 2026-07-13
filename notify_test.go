@@ -491,3 +491,108 @@ func TestSendPushoverErrorBody(t *testing.T) {
 		t.Fatalf("err = %v, want API error text", err)
 	}
 }
+
+func TestNotifyOnceBaselineResetCatchesUpAfterDowntime(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "in@example.com", UserKey: "user-in", Token: "token-in",
+		SuggestTimes: "08:00", CheckEnabled: true,
+		LastSuggest: "2026-04-26T08:00",
+	})
+	// Reset time is late in the evening; now (15:30) is before it, so the
+	// target reset boundary is yesterday. A marker from three days ago means
+	// the process was down over yesterday's boundary: it must catch up.
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE settings SET value = '23:00' WHERE name = ?`, settingCheckResetTime); err != nil {
+		t.Fatalf("update setting: %v", err)
+	}
+	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline_reset_date", "2026-04-23"); err != nil {
+		t.Fatalf("set state: %v", err)
+	}
+	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline:diesel:Berlin", "1.000"); err != nil {
+		t.Fatalf("set stale baseline: %v", err)
+	}
+
+	stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+	if !result.BaselineReset {
+		t.Fatal("missed reset boundary must be caught up")
+	}
+	// The stale 1.000 baseline would have blocked the 2.000 check row.
+	if len(result.Sent) != 1 || result.Sent[0].Kind != "check" {
+		t.Fatalf("sent = %+v, want one check after catch-up reset", result.Sent)
+	}
+	value, found, err := getNotificationState(context.Background(), db, "check_baseline_reset_date")
+	if err != nil || !found || value != "2026-04-25" {
+		t.Fatalf("reset marker = %q found=%v err=%v, want yesterday 2026-04-25", value, found, err)
+	}
+}
+
+func TestNotifyOnceCheckBaselineNotAdvancedWhenAllSendsFail(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "bad@example.com", UserKey: "user-bad", Token: "token-bad",
+		SuggestTimes: "08:00", CheckEnabled: true,
+		LastSuggest: "2026-04-26T08:00",
+	})
+
+	pushes := stubPushover(t, func(user string) bool { return user == "user-bad" })
+
+	first := runNotifyOnce(t, db, false)
+	if len(first.Failed) != 1 || len(first.Sent) != 0 {
+		t.Fatalf("first run = sent %+v failed %+v, want one failure", first.Sent, first.Failed)
+	}
+	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:diesel:Berlin"); found {
+		t.Fatal("baseline must not advance when every send failed")
+	}
+
+	// Once delivery works again, the same rows are retried and the baseline
+	// advances.
+	*pushes = nil
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{"status":1}`), nil
+	})
+	defer restore()
+	second := runNotifyOnce(t, db, false)
+	if len(second.Sent) != 1 || second.Sent[0].Kind != "check" {
+		t.Fatalf("second run sent = %+v, want retried check", second.Sent)
+	}
+	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:diesel:Berlin"); !found {
+		t.Fatal("baseline must advance after a successful delivery")
+	}
+}
+
+func TestSendPushoverTruncatesByRunes(t *testing.T) {
+	var got string
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, err
+		}
+		got = form.Get("message")
+		return jsonResponse(http.StatusOK, `{"status":1}`), nil
+	})
+	defer restore()
+
+	long := strings.Repeat("ü", pushoverMessageLimit+10)
+	err := sendPushover(context.Background(), pushoverMessagesURL, pushoverMessage{
+		Token: "t", UserKey: "u", Message: long,
+	})
+	if err != nil {
+		t.Fatalf("sendPushover: %v", err)
+	}
+	runes := []rune(got)
+	if len(runes) != pushoverMessageLimit {
+		t.Fatalf("message runes = %d, want %d", len(runes), pushoverMessageLimit)
+	}
+	for _, r := range runes {
+		if r != 'ü' {
+			t.Fatal("truncation corrupted a multi-byte character")
+		}
+	}
+}

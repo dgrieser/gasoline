@@ -2,8 +2,7 @@ package main
 
 import (
 	"fmt"
-	"os/exec"
-	"regexp"
+	"os"
 	"strconv"
 	"strings"
 	"unicode"
@@ -93,25 +92,46 @@ var onchangeDayRef = map[string]string{
 	"best_future_end_time":   "best_future_date",
 }
 
-// --- locale caches (ports of _compute_locale_decimal_separator and
-// _compute_locale_weekdays; resolved lazily, overridable in tests) ---
+// --- locale caches (counterparts of the watcher's decimal-separator and
+// weekday-name lookups, implemented in pure Go for portability; resolved
+// lazily and overridable in tests) ---
+
+// localeLanguage returns the lowercase language code ("de", "en", ...) of the
+// first non-empty environment variable, honoring POSIX precedence (LC_ALL
+// beats the category variable, which beats LANG).
+func localeLanguage(categoryVar string) string {
+	for _, name := range []string{"LC_ALL", categoryVar, "LANG"} {
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			continue
+		}
+		// "de_DE.UTF-8" / "de_DE@euro" / "de" -> "de".
+		lang := strings.ToLower(value)
+		if i := strings.IndexAny(lang, "_.@"); i >= 0 {
+			lang = lang[:i]
+		}
+		return lang
+	}
+	return ""
+}
 
 var localeDecimalSep string
 
 func localeDecimalSeparator() string {
 	if localeDecimalSep == "" {
-		sep := "."
-		if out, err := exec.Command("locale", "-k", "decimal_point").Output(); err == nil {
-			if m := regexp.MustCompile(`decimal_point="([^"]*)"`).FindStringSubmatch(string(out)); m != nil && m[1] != "" {
-				sep = m[1]
-			}
+		// Tankerkönig is a German service: the locales of practical
+		// interest are German (comma) and English (dot).
+		localeDecimalSep = "."
+		if localeLanguage("LC_NUMERIC") == "de" {
+			localeDecimalSep = ","
 		}
-		localeDecimalSep = sep
 	}
 	return localeDecimalSep
 }
 
 var englishWeekdays = []string{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}
+var germanWeekdaysLong = []string{"Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"}
+var germanWeekdaysShort = []string{"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"}
 
 var (
 	localeWeekdayLong  map[string]string
@@ -120,21 +140,15 @@ var (
 
 func localeWeekdays() (map[string]string, map[string]string) {
 	if localeWeekdayLong == nil {
-		refs := []string{"2024-01-07", "2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05", "2024-01-06"}
 		long := make(map[string]string, 7)
 		short := make(map[string]string, 7)
+		german := localeLanguage("LC_TIME") == "de"
 		for i, en := range englishWeekdays {
 			long[en] = en
 			short[en] = en[:3]
-			if out, err := exec.Command("date", "-d", refs[i], "+%A").Output(); err == nil {
-				if s := strings.TrimSpace(string(out)); s != "" {
-					long[en] = s
-				}
-			}
-			if out, err := exec.Command("date", "-d", refs[i], "+%a").Output(); err == nil {
-				if s := strings.TrimSpace(string(out)); s != "" {
-					short[en] = s
-				}
+			if german {
+				long[en] = germanWeekdaysLong[i]
+				short[en] = germanWeekdaysShort[i]
 			}
 		}
 		localeWeekdayLong = long

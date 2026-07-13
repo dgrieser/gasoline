@@ -326,25 +326,31 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 	today := localNow.Format("2006-01-02")
 
 	// Daily baseline reset, mirroring the watcher's --reset-time behavior.
+	// The reset applies once per reset boundary: the target date is today
+	// when the reset time has passed, otherwise yesterday. Comparing dates
+	// (instead of requiring a run between the reset time and midnight)
+	// catches up after downtime instead of keeping a stale baseline.
 	resetMin, err := parseHHMM(settings.CheckResetTime)
 	if err != nil {
 		return result, fmt.Errorf("invalid setting %s: %v", settingCheckResetTime, err)
 	}
 	nowMin := localNow.Hour()*60 + localNow.Minute()
-	if nowMin >= resetMin {
-		lastReset, _, err := getNotificationState(ctx, db, "check_baseline_reset_date")
-		if err != nil {
-			return result, err
-		}
-		if lastReset != today {
-			result.BaselineReset = true
-			if !opts.DryRun {
-				if err := clearCheckBaselines(ctx, db); err != nil {
-					return result, err
-				}
-				if err := setNotificationState(ctx, db, d, "check_baseline_reset_date", today); err != nil {
-					return result, err
-				}
+	targetResetDate := today
+	if nowMin < resetMin {
+		targetResetDate = localNow.AddDate(0, 0, -1).Format("2006-01-02")
+	}
+	lastReset, _, err := getNotificationState(ctx, db, "check_baseline_reset_date")
+	if err != nil {
+		return result, err
+	}
+	if lastReset < targetResetDate {
+		result.BaselineReset = true
+		if !opts.DryRun {
+			if err := clearCheckBaselines(ctx, db); err != nil {
+				return result, err
+			}
+			if err := setNotificationState(ctx, db, d, "check_baseline_reset_date", targetResetDate); err != nil {
+				return result, err
 			}
 		}
 	}
@@ -387,9 +393,12 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 		}
 	}
 
-	// Check phase: compute once, deliver to every eligible user.
+	// Check phase: compute once, deliver to every eligible user. The new
+	// baselines are persisted only once at least one delivery succeeded, so
+	// a run whose sends all fail retries the same rows next time instead of
+	// silently losing the notification.
 	if len(checkUsers) > 0 {
-		checkRows, err := collectCheckRows(ctx, db, d, settings, targets, opts)
+		checkRows, baselines, err := collectCheckRows(ctx, db, settings, targets, opts)
 		if err != nil {
 			return result, err
 		}
@@ -397,6 +406,7 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 		if len(checkRows) > 0 {
 			cheapest := checkRows[0]
 			message := renderNotifyMessage(settings.CheckTemplate, notifyKindCheck, checkRows, &cheapest)
+			delivered := false
 			for _, u := range checkUsers {
 				rec := notifySendRecord{Email: u.Email, Kind: "check"}
 				if opts.DryRun {
@@ -411,7 +421,15 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 					result.Failed = append(result.Failed, rec)
 					continue
 				}
+				delivered = true
 				result.Sent = append(result.Sent, rec)
+			}
+			if delivered {
+				for name, value := range baselines {
+					if err := setNotificationState(ctx, db, d, name, value); err != nil {
+						return result, err
+					}
+				}
 			}
 		}
 	}
@@ -467,12 +485,15 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 	return result, nil
 }
 
-// collectCheckRows runs the check across all update targets, applies the
+// collectCheckRows runs the check across all update targets and applies the
 // watcher's notification filter (buy + medium/high confidence + strictly
-// cheaper than the per-fuel/city baseline), updates the baselines, and
-// returns all surviving rows sorted cheapest-first.
-func collectCheckRows(ctx context.Context, db *sql.DB, d dialect, settings appSettings, targets []updateTarget, opts notifyOptions) ([]notifyRow, error) {
+// cheaper than the per-fuel/city baseline). It returns the surviving rows
+// sorted cheapest-first plus the baseline updates to apply — the caller
+// persists them only after a delivery succeeded, so an all-sends-failed run
+// retries the same rows instead of losing them.
+func collectCheckRows(ctx context.Context, db *sql.DB, settings appSettings, targets []updateTarget, opts notifyOptions) ([]notifyRow, map[string]string, error) {
 	var rows []notifyRow
+	baselines := map[string]string{}
 	for _, target := range targets {
 		checks, err := checkGas(ctx, db, checkOptions{
 			City:        target.City,
@@ -505,7 +526,7 @@ func collectCheckRows(ctx context.Context, db *sql.DB, d dialect, settings appSe
 		baselineKey := "check_baseline:" + settings.Fuel + ":" + target.City
 		baselineValue, hasBaseline, err := getNotificationState(ctx, db, baselineKey)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		baseline := 0.0
 		if hasBaseline {
@@ -523,12 +544,7 @@ func collectCheckRows(ctx context.Context, db *sql.DB, d dialect, settings appSe
 		if len(cheaper) == 0 {
 			continue
 		}
-		newBaseline := cheaper[0].CurrentPrice
-		if !opts.DryRun {
-			if err := setNotificationState(ctx, db, d, baselineKey, strconv.FormatFloat(newBaseline, 'f', -1, 64)); err != nil {
-				return nil, err
-			}
-		}
+		baselines[baselineKey] = strconv.FormatFloat(cheaper[0].CurrentPrice, 'f', -1, 64)
 		for i := range cheaper {
 			row := cheaper[i]
 			rows = append(rows, notifyRow{check: &row})
@@ -537,7 +553,7 @@ func collectCheckRows(ctx context.Context, db *sql.DB, d dialect, settings appSe
 	sort.SliceStable(rows, func(i, j int) bool {
 		return rows[i].check.CurrentPrice < rows[j].check.CurrentPrice
 	})
-	return rows, nil
+	return rows, baselines, nil
 }
 
 // collectSuggestRows runs the suggestion across all update targets, keeps
