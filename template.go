@@ -657,16 +657,25 @@ func defaultRowTemplate(kind notifyKind) string {
 func renderNotifyTitle(template string, kind notifyKind, cheapest *notifyRow, rowCount int) string {
 	result := expandScalars(template, kind, cheapest, rowCount)
 	for _, key := range templatePlaceholders {
+		// There is no per-row change tracking in a single-line title, so
+		// *_onchange variants resolve like their plain counterparts. Resolve
+		// the value only for placeholders the template actually contains.
+		plain := "{{" + key + "}}"
+		onchange := "{{" + key + "_onchange}}"
+		hasPlain := strings.Contains(result, plain)
+		hasOnchange := strings.Contains(result, onchange)
+		if !hasPlain && !hasOnchange {
+			continue
+		}
 		value := ""
 		if cheapest != nil {
 			value = rowValue(kind, *cheapest, key)
 		}
-		// There is no per-row change tracking in a single-line title, so
-		// *_onchange variants resolve like their plain counterparts.
-		for _, token := range []string{"{{" + key + "}}", "{{" + key + "_onchange}}"} {
-			if strings.Contains(result, token) {
-				result = strings.ReplaceAll(result, token, value)
-			}
+		if hasPlain {
+			result = strings.ReplaceAll(result, plain, value)
+		}
+		if hasOnchange {
+			result = strings.ReplaceAll(result, onchange, value)
 		}
 	}
 	return strings.TrimSpace(strings.ReplaceAll(result, "\n", " "))

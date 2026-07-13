@@ -976,9 +976,9 @@ function renderScheduleEditor(string $days, string $windows, string $times): voi
                             $to = h(trim($pair[1] ?? ''));
                         ?>
                         <div class="row-item">
-                            <input type="text" class="time-input" name="notify_windows_from[]" value="<?= $from ?>" required inputmode="numeric" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
+                            <input type="text" class="time-input" name="notify_windows_from[]" value="<?= $from ?>" required maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
                             <span>–</span>
-                            <input type="text" class="time-input" name="notify_windows_to[]" value="<?= $to ?>" required inputmode="numeric" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
+                            <input type="text" class="time-input" name="notify_windows_to[]" value="<?= $to ?>" required maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
                             <button type="button" class="btn-row-remove" data-i18n-aria-label="removeRow" aria-label="Remove">×</button>
                         </div>
                         <?php } ?>
@@ -990,7 +990,7 @@ function renderScheduleEditor(string $days, string $windows, string $times): voi
                     <div class="row-list" id="suggest-time-list">
                         <?php foreach ($timeRows as $time) { ?>
                         <div class="row-item">
-                            <input type="text" class="time-input" name="notify_suggest_times[]" value="<?= h($time) ?>" required inputmode="numeric" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
+                            <input type="text" class="time-input" name="notify_suggest_times[]" value="<?= h($time) ?>" required maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
                             <button type="button" class="btn-row-remove" data-i18n-aria-label="removeRow" aria-label="Remove">×</button>
                         </div>
                         <?php } ?>
@@ -1210,7 +1210,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                     </div>
                     <div class="field">
                         <label for="st-reset" data-i18n="settingCheckResetTime">Check baseline reset</label>
-                        <input type="text" id="st-reset" name="check_reset_time" value="<?= h($get('check_reset_time', '00:00')) ?>" inputmode="numeric" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
+                        <input type="text" id="st-reset" name="check_reset_time" value="<?= h($get('check_reset_time', '00:00')) ?>" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
                     </div>
                 </div>
                 <div class="field">
@@ -3628,7 +3628,7 @@ function scheduleRow(kind) {
     row.className = 'row-item';
     const removeLabel = translations[currentLang].removeRow || 'Remove';
     const timeInput = (name) => '<input type="text" class="time-input" name="' + name + '" required ' +
-        'inputmode="numeric" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">';
+        'maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">';
     if (kind === 'window') {
         row.innerHTML = timeInput('notify_windows_from[]') + ' <span>–</span> ' +
             timeInput('notify_windows_to[]') + ' ' +
