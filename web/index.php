@@ -1333,6 +1333,61 @@ switch ($requestedPage) {
 
 // Fall through: the dashboard (default page) below.
 
+// ── Filter persistence ────────────────────────────────────────────────────────
+// The last submitted dashboard filters are kept in a cookie so revisiting the
+// bare URL restores them. Requests with explicit filter params refresh the
+// cookie; requests without any are populated from it before validation below.
+$filterCookieName = 'gasoline_filters';
+$filterParamKeys = ['city', 'radius_km', 'range', 'from', 'to', 'fuel', 'station_ids'];
+$cookieSecure = (($_SERVER['HTTPS'] ?? '') !== '' && strtolower((string) $_SERVER['HTTPS']) !== 'off')
+    || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
+
+if (isset($_GET['reset'])) {
+    setcookie($filterCookieName, '', ['expires' => time() - 3600, 'path' => '/', 'secure' => $cookieSecure, 'httponly' => true, 'samesite' => 'Lax']);
+    redirectTo('');
+}
+
+$hasFilterParams = false;
+foreach ($filterParamKeys as $filterKey) {
+    if (array_key_exists($filterKey, $_GET)) {
+        $hasFilterParams = true;
+        break;
+    }
+}
+
+if ($hasFilterParams) {
+    // The async ?action=data fetch copies the page URL, so only page loads
+    // need to refresh the cookie.
+    if (!isset($_GET['action'])) {
+        $filtersToSave = [];
+        foreach ($filterParamKeys as $filterKey) {
+            if (array_key_exists($filterKey, $_GET)) {
+                $filtersToSave[$filterKey] = $_GET[$filterKey];
+            }
+        }
+        setcookie($filterCookieName, json_encode($filtersToSave), ['expires' => time() + 60 * 60 * 24 * 365, 'path' => '/', 'secure' => $cookieSecure, 'httponly' => true, 'samesite' => 'Lax']);
+    }
+} else {
+    $savedFilters = json_decode((string) ($_COOKIE[$filterCookieName] ?? ''), true);
+    if (is_array($savedFilters)) {
+        foreach ($filterParamKeys as $filterKey) {
+            if (!array_key_exists($filterKey, $savedFilters)) {
+                continue;
+            }
+            $savedValue = $savedFilters[$filterKey];
+            if ($filterKey === 'station_ids') {
+                if (is_array($savedValue)) {
+                    $_GET[$filterKey] = array_values(array_filter($savedValue, 'is_string'));
+                }
+            } elseif (is_string($savedValue)) {
+                $_GET[$filterKey] = $savedValue;
+            }
+        }
+    }
+}
+
+$filtersCollapsed = (($_COOKIE['gasoline_filters_collapsed'] ?? '') === '1');
+
 $errors = [];
 $stations = [];
 
@@ -2005,6 +2060,16 @@ function renderDocumentHead(string $titleSuffix): void
             font-family: var(--mono);
         }
 
+        /* Collapse affordance, only shown in the mobile layout */
+        .sidebar-chevron {
+            display: none;
+            margin-left: auto;
+            color: var(--muted);
+            line-height: 0;
+        }
+
+        .sidebar-chevron svg { transition: transform 0.2s; }
+
         .sidebar form {
             background: var(--surface);
             padding: 1.25rem;
@@ -2636,6 +2701,11 @@ function renderDocumentHead(string $titleSuffix): void
         @media (max-width: 900px) {
             .layout { grid-template-columns: 1fr; }
             .sidebar { position: static; }
+            .sidebar-head { cursor: pointer; }
+            .sidebar-chevron { display: inline-flex; }
+            .sidebar:not(.collapsed) .sidebar-chevron svg { transform: rotate(180deg); }
+            .sidebar.collapsed form,
+            .sidebar.collapsed .sidebar-actions { display: none; }
             .stats { grid-template-columns: repeat(2, 1fr); }
         }
 
@@ -3677,10 +3747,11 @@ renderDocumentHead('Price History');
     <div class="layout">
 
         <!-- Sidebar / filters -->
-        <aside class="sidebar">
-            <div class="sidebar-head">
+        <aside class="sidebar<?= $filtersCollapsed ? ' collapsed' : '' ?>" id="filters-sidebar">
+            <div class="sidebar-head" id="filters-toggle" role="button" tabindex="0" aria-expanded="<?= $filtersCollapsed ? 'false' : 'true' ?>">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--muted)"><line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="16" y2="12"/><line x1="11" y1="18" x2="13" y2="18"/></svg>
                 <h2 data-i18n="filters">Filters</h2>
+                <span class="sidebar-chevron" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
             </div>
 
             <form method="get">
@@ -3770,7 +3841,7 @@ renderDocumentHead('Price History');
             </form>
 
             <div class="sidebar-actions">
-                <a class="btn-reset" href="<?= h(strtok($_SERVER['REQUEST_URI'] ?? '/web/index.php', '?') ?: '/web/index.php') ?>" data-i18n="reset">Reset</a>
+                <a class="btn-reset" href="<?= h((strtok($_SERVER['REQUEST_URI'] ?? '/web/index.php', '?') ?: '/web/index.php') . '?reset=1') ?>" data-i18n="reset">Reset</a>
             </div>
         </aside>
 
@@ -3784,26 +3855,6 @@ renderDocumentHead('Price History');
                     <?= !empty($error['params']['path']) ? 'data-error-path="' . h((string) $error['params']['path']) . '"' : '' ?>
                 ><?= h((string) $error['message']) ?></div>
             <?php endforeach; ?>
-
-            <!-- Stats -->
-            <div class="stats" aria-live="polite">
-                <div class="stat">
-                    <div class="stat-label" data-i18n="snapshots">Snapshots</div>
-                    <div class="stat-value skeleton" id="stat-points" aria-busy="true">&nbsp;</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label" data-i18n="stationsCount">Stations</div>
-                    <div class="stat-value skeleton" id="stat-stations" aria-busy="true">&nbsp;</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label" data-i18n="firstRecorded">First recorded</div>
-                    <div class="stat-value skeleton" id="stat-first" style="font-size:1rem" aria-busy="true">&nbsp;</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label" data-i18n="lastRecorded">Last recorded</div>
-                    <div class="stat-value skeleton" id="stat-last" style="font-size:1rem" aria-busy="true">&nbsp;</div>
-                </div>
-            </div>
 
             <!-- Cheapest now -->
             <div class="cheapest-card" id="cheapest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
@@ -3842,6 +3893,26 @@ renderDocumentHead('Price History');
                 </div>
             </div>
 
+            <!-- Stats -->
+            <div class="stats" aria-live="polite">
+                <div class="stat">
+                    <div class="stat-label" data-i18n="snapshots">Snapshots</div>
+                    <div class="stat-value skeleton" id="stat-points" aria-busy="true">&nbsp;</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label" data-i18n="stationsCount">Stations</div>
+                    <div class="stat-value skeleton" id="stat-stations" aria-busy="true">&nbsp;</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label" data-i18n="firstRecorded">First recorded</div>
+                    <div class="stat-value skeleton" id="stat-first" style="font-size:1rem" aria-busy="true">&nbsp;</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label" data-i18n="lastRecorded">Last recorded</div>
+                    <div class="stat-value skeleton" id="stat-last" style="font-size:1rem" aria-busy="true">&nbsp;</div>
+                </div>
+            </div>
+
             <!-- Table -->
             <div class="table-card">
                 <div class="table-card-header">
@@ -3877,6 +3948,25 @@ renderDocumentHead('Price History');
 </main>
 
 <script>
+/* ── Mobile filter collapse ─────────────────────────────────────── */
+(() => {
+    const sidebar = document.getElementById('filters-sidebar');
+    const toggle = document.getElementById('filters-toggle');
+    if (!sidebar || !toggle) return;
+    const mobileLayout = window.matchMedia('(max-width: 900px)');
+    const toggleFilters = () => {
+        if (!mobileLayout.matches) return;
+        const collapsed = sidebar.classList.toggle('collapsed');
+        toggle.setAttribute('aria-expanded', String(!collapsed));
+        document.cookie = 'gasoline_filters_collapsed=' + (collapsed ? '1' : '0')
+            + '; path=/; max-age=31536000; samesite=Lax';
+    };
+    toggle.addEventListener('click', toggleFilters);
+    toggle.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleFilters(); }
+    });
+})();
+
 /* ── Locale helpers (_tz/_loc/formatDateTime) live in the shared script. ── */
 
 function formatTickDate(isoString) {
