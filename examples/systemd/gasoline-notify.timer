@@ -1,0 +1,15 @@
+[Unit]
+Description=Run gasoline notify every 5 minutes
+
+[Timer]
+# First run 2 min after boot, then every 5 minutes after the last run finishes.
+# Each run decides per user whether anything is due (schedule windows, daily
+# suggestion slots, cheaper-than-baseline checks), so frequent runs are cheap.
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Catch up on a missed run if the machine was asleep/off at the scheduled time.
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

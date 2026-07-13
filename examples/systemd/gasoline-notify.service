@@ -1,0 +1,11 @@
+[Unit]
+Description=Gasoline Pushover notifications for configured web users
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Storage settings live here (see examples/systemd/gasoline.env). The notify
+# command only reads the database, so no Tankerkönig API key is required.
+EnvironmentFile=/etc/gasoline/gasoline.env
+ExecStart=/usr/local/bin/gasoline notify

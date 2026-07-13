@@ -1,6 +1,6 @@
 # gasoline
 
-Small Go CLI that stores Tankerkönig gas station prices historically in SQLite or an external MySQL server and ships with a lightweight PHP viewer for browsing the collected data.
+Small Go CLI that stores Tankerkönig gas station prices historically in SQLite or an external MySQL server and ships with a lightweight, login-protected PHP viewer for browsing the collected data, managing users, and configuring per-user Pushover notifications.
 
 ## Requirements
 
@@ -51,6 +51,20 @@ GASOLINE_MYSQL_PASSWORD=secret
 GASOLINE_MYSQL_DATABASE=gasoline
 # GASOLINE_MYSQL_TLS=skip-verify   # uncomment when the server requires SSL
 ```
+
+### Web UI & notification settings
+
+The PHP viewer requires a login (see [Web viewer & user accounts](#web-viewer--user-accounts)) and reads these additional variables from the web server's environment:
+
+| Environment | Purpose |
+| --- | --- |
+| `GASOLINE_ADMIN_EMAIL` | Initial administrator: registering with exactly this email creates an approved admin account immediately. |
+| `GASOLINE_BASE_URL` | Absolute base URL of the viewer, used for links in emails (derived from the request when unset). |
+| `GASOLINE_SMTP_HOST` | SMTP relay for registration/approval emails. When unset, emails are skipped (logged) and the flows still work. |
+| `GASOLINE_SMTP_PORT` | SMTP port (default `587`). |
+| `GASOLINE_SMTP_USER` / `GASOLINE_SMTP_PASSWORD` | SMTP credentials (AUTH LOGIN/PLAIN); leave the user empty for an unauthenticated relay. |
+| `GASOLINE_SMTP_FROM` | Sender address. |
+| `GASOLINE_SMTP_TLS` | `starttls` (default for port 587), `implicit` (SMTPS, default for 465), or `none`. |
 
 ### Migrating an existing SQLite database to MySQL
 
@@ -179,6 +193,33 @@ gasoline check --city "Berlin" --range-km 10 --fuel diesel --history-days 21 --p
 
 The check command uses the same historical model as `suggest`, compares each open station's latest stored price with recent station history, and scans the coming forecast window for a lower expected price. It prints the station, current price, low/typical/high verdict, buy/wait/hold recommendation, confidence, and best lower future window when one is expected. Run `gasoline update` first when you need fresh current prices.
 
+### Server-stored configuration (admin settings)
+
+Administrators can store the operational configuration in the database via the web UI (hamburger menu → Settings): a list of update targets (city + radius pairs) plus the suggestion/check parameters (fuel, range, history/prediction days, limits, notification templates, schedule defaults). The CLI uses those values as its defaults:
+
+- `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius. Passing explicit flags ignores the targets entirely.
+- `gasoline suggest` and `gasoline check` take `--fuel`, `--range-km`, `--history-days`, `--predict-days`, and `--limit-per-day`/`--limit` from the settings table when the corresponding flag is not set, and default `--city` to the first update target.
+- Explicit CLI flags always override the stored settings; with an empty settings table everything behaves exactly as before.
+
+Run `gasoline migrate` once to create the tables and seed the settings with the built-in defaults.
+
+Send Pushover notifications to the web UI's users:
+
+```bash
+gasoline notify            # from cron or a systemd timer, e.g. every 5 minutes
+gasoline notify --dry-run  # render and report what would be sent, write nothing
+```
+
+`notify` reads the admin settings and update targets, runs the check/suggest models, and delivers Pushover messages to every approved user who has configured a Pushover user key and API token in the web UI (My Account → Notifications). It needs no Tankerkönig API key — it only reads the database, so run `gasoline update` on a timer next to it. Per user it honors:
+
+- the **notification schedule**: enabled weekdays and one or more time windows (default: every day, 07:00–21:00). Outside the schedule nothing is delivered.
+- the **daily suggestion times** (default 08:00 and 13:00): each slot fires one suggestion notification per day; missed slots collapse into one on the next run instead of bursting.
+- the **buy-now alerts** opt-in: check notifications fire only for buy recommendations with medium/high confidence that are strictly cheaper than the day's running baseline (reset daily at the admin-configured reset time), mirroring `gasoline-watch.sh`.
+
+The notification texts come from the admin-configured templates and support the full `gasoline-watch.sh` placeholder language — per-row placeholders such as `{{station_name}}`, `{{price}}`, `{{date}}`, `{{start_time}}`, all `*_formatted` variants (locale-aware decimal separator and weekday names), all `*_onchange` variants with day-aware time reprinting and line skipping, plus `{{count}}`, `{{cheapest_<field>}}`, and `{{message}}`. The only difference: the template renders directly into the Pushover message text instead of a shell command, so no quoting is involved. Message titles use each user's configured application name.
+
+Ready-to-use scheduling examples: `examples/systemd/gasoline-notify.service` + `gasoline-notify.timer` and `examples/cron/gasoline-notify.cron`.
+
 Set a persistent display-name override for a station — useful when the Tankerkönig name is uninformative. Subsequent `update` runs keep the canonical name in sync but never touch the override, and every output path (CLI, JSON, PHP viewer, watcher notifications) prefers the override when set:
 
 ```bash
@@ -283,10 +324,26 @@ Features:
 Serve it locally from the repo root:
 
 ```bash
-php -S 127.0.0.1:8080 -t web
+GASOLINE_ADMIN_EMAIL=you@example.com php -S 127.0.0.1:8080 -t web
 ```
 
 Then open `http://127.0.0.1:8080/`.
+
+### Web viewer & user accounts
+
+The viewer requires a login. Accounts are registered with an email address (which is the username) and a self-chosen password:
+
+1. Run `gasoline migrate` once so the database has the `users`/`settings`/`update_targets` tables — the viewer shows a hint page until then.
+2. Set `GASOLINE_ADMIN_EMAIL` in the web server's environment and register with that exact address: the account is approved immediately and has administrator rights.
+3. Everyone else who registers starts out **pending**: they receive a "waiting for approval" email (when SMTP is configured), cannot log in yet, and appear in the admin's Users page. Approving them sends an "account approved" email and unlocks the login.
+
+The hamburger menu in the header opens:
+
+- **My Account** — change the password, configure Pushover (application name, user key, API token), define the notification schedule (weekdays, time windows, daily suggestion times, buy-now alerts), or delete the account. The last remaining administrator cannot delete their own account.
+- **Users** (admins) — approve pending registrations, promote/demote administrators (never yourself, so one admin always remains), and delete accounts.
+- **Settings** (admins) — manage the update targets (cities + radii updated automatically by the CLI), the suggestion/check parameters, the notification templates, and the schedule defaults. These are the values the CLI picks up as described in [Server-stored configuration](#server-stored-configuration-admin-settings); notification templates are admin-only and never editable by regular users.
+
+The dashboard itself is unchanged — same filters, chart, and tables as before, now behind the login.
 
 ## Releases
 

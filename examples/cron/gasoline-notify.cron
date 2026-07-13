@@ -1,0 +1,11 @@
+# Gasoline notify via cron — sends Pushover notifications to the web users
+# configured in the database (per-user schedule, keys, and tokens).
+#
+# Each run decides per user whether anything is due (schedule windows, daily
+# suggestion slots, cheaper-than-baseline checks), so a 5-minute cadence is
+# cheap. The command only reads the database — no Tankerkönig API key needed.
+#
+# Cron starts with an empty environment: source the env file first (`set -a`
+# exports the storage settings). Everything below is ONE physical line.
+
+*/5 * * * * set -a; . /etc/gasoline/gasoline.env; set +a; /usr/local/bin/gasoline notify
