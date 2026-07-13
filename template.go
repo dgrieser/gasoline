@@ -514,10 +514,16 @@ func containsRowPlaceholder(template string) bool {
 // row (line by line, with onchange collapse and line skipping) and joins the
 // surviving row blocks with newlines.
 func buildMessage(kind notifyKind, rowTemplate string, rows []notifyRow) string {
+	// Pre-scan the template once so the per-line loops below only touch
+	// placeholders that actually occur in it.
 	var onchangeKeys []string
+	var activePlaceholders []string
 	for _, key := range templatePlaceholders {
 		if strings.Contains(rowTemplate, "{{"+key+"_onchange}}") {
 			onchangeKeys = append(onchangeKeys, key)
+		}
+		if strings.Contains(rowTemplate, "{{"+key+"}}") {
+			activePlaceholders = append(activePlaceholders, key)
 		}
 	}
 
@@ -569,7 +575,7 @@ func buildMessage(kind notifyKind, rowTemplate string, rows []notifyRow) string 
 				}
 			}
 
-			for _, key := range templatePlaceholders {
+			for _, key := range activePlaceholders {
 				token := "{{" + key + "}}"
 				if strings.Contains(line, token) {
 					value := rowValue(kind, row, key)

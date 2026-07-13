@@ -393,44 +393,49 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 		}
 	}
 
-	// Check phase: compute once, deliver to every eligible user. The new
-	// baselines are persisted only once at least one delivery succeeded, so
-	// a run whose sends all fail retries the same rows next time instead of
-	// silently losing the notification.
+	// Check phase: the price data is computed once per target, but the
+	// cheaper-than-baseline filter runs per user against per-user baseline
+	// keys, and a user's baselines advance only after their own delivery
+	// succeeded. One user's schedule or a partial send failure therefore
+	// never suppresses another user's notification, and failed sends are
+	// retried on the next run.
 	if len(checkUsers) > 0 {
-		checkRows, baselines, err := collectCheckRows(ctx, db, settings, targets, opts)
+		targetChecks, err := collectTargetChecks(ctx, db, settings, targets, opts)
 		if err != nil {
 			return result, err
 		}
-		result.CheckRows = len(checkRows)
-		if len(checkRows) > 0 {
-			cheapest := checkRows[0]
-			message := renderNotifyMessage(settings.CheckTemplate, notifyKindCheck, checkRows, &cheapest)
-			delivered := false
-			for _, u := range checkUsers {
-				rec := notifySendRecord{Email: u.Email, Kind: "check"}
-				if opts.DryRun {
-					result.Sent = append(result.Sent, rec)
-					continue
-				}
-				if err := sendPushover(ctx, apiURL, pushoverMessage{
-					Token: u.PushoverToken, UserKey: u.PushoverUserKey,
-					Title: u.PushoverAppName, Message: message,
-				}); err != nil {
-					rec.Error = err.Error()
-					result.Failed = append(result.Failed, rec)
-					continue
-				}
-				delivered = true
+		for _, u := range checkUsers {
+			userRows, userBaselines, err := userCheckRows(ctx, db, settings, targetChecks, u.ID)
+			if err != nil {
+				return result, err
+			}
+			if len(userRows) == 0 {
+				continue
+			}
+			result.CheckRows += len(userRows)
+			cheapest := userRows[0]
+			message := renderNotifyMessage(settings.CheckTemplate, notifyKindCheck, userRows, &cheapest)
+			rec := notifySendRecord{Email: u.Email, Kind: "check"}
+			if opts.DryRun {
 				result.Sent = append(result.Sent, rec)
+				continue
 			}
-			if delivered {
-				for name, value := range baselines {
-					if err := setNotificationState(ctx, db, d, name, value); err != nil {
-						return result, err
-					}
+			if err := sendPushover(ctx, apiURL, pushoverMessage{
+				Token: u.PushoverToken, UserKey: u.PushoverUserKey,
+				Title: u.PushoverAppName, Message: message,
+			}); err != nil {
+				// Leave this user's baselines untouched so the next run
+				// retries them.
+				rec.Error = err.Error()
+				result.Failed = append(result.Failed, rec)
+				continue
+			}
+			for name, value := range userBaselines {
+				if err := setNotificationState(ctx, db, d, name, value); err != nil {
+					return result, err
 				}
 			}
+			result.Sent = append(result.Sent, rec)
 		}
 	}
 
@@ -485,15 +490,18 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 	return result, nil
 }
 
-// collectCheckRows runs the check across all update targets and applies the
-// watcher's notification filter (buy + medium/high confidence + strictly
-// cheaper than the per-fuel/city baseline). It returns the surviving rows
-// sorted cheapest-first plus the baseline updates to apply — the caller
-// persists them only after a delivery succeeded, so an all-sends-failed run
-// retries the same rows instead of losing them.
-func collectCheckRows(ctx context.Context, db *sql.DB, settings appSettings, targets []updateTarget, opts notifyOptions) ([]notifyRow, map[string]string, error) {
-	var rows []notifyRow
-	baselines := map[string]string{}
+// targetCheckRows is the pre-filtered result of one update target's price
+// check: buy recommendations with medium/high confidence, sorted cheapest
+// first. It is computed once per run and shared by all users.
+type targetCheckRows struct {
+	target updateTarget
+	rows   []priceCheckRow
+}
+
+// collectTargetChecks runs the check across all update targets and applies
+// the user-independent part of the watcher's notification filter.
+func collectTargetChecks(ctx context.Context, db *sql.DB, settings appSettings, targets []updateTarget, opts notifyOptions) ([]targetCheckRows, error) {
+	var all []targetCheckRows
 	for _, target := range targets {
 		checks, err := checkGas(ctx, db, checkOptions{
 			City:        target.City,
@@ -522,8 +530,20 @@ func collectCheckRows(ctx context.Context, db *sql.DB, settings appSettings, tar
 		sort.SliceStable(matching, func(i, j int) bool {
 			return matching[i].CurrentPrice < matching[j].CurrentPrice
 		})
+		all = append(all, targetCheckRows{target: target, rows: matching})
+	}
+	return all, nil
+}
 
-		baselineKey := "check_baseline:" + settings.Fuel + ":" + target.City
+// userCheckRows filters the shared target rows against one user's baselines
+// (check_baseline:<user_id>:<fuel>:<city>) and returns the rows strictly
+// cheaper than that user's running minimum, sorted cheapest-first, plus the
+// baseline updates to persist after a successful delivery to that user.
+func userCheckRows(ctx context.Context, db *sql.DB, settings appSettings, targetChecks []targetCheckRows, userID int64) ([]notifyRow, map[string]string, error) {
+	var rows []notifyRow
+	baselines := map[string]string{}
+	for _, tc := range targetChecks {
+		baselineKey := fmt.Sprintf("check_baseline:%d:%s:%s", userID, settings.Fuel, tc.target.City)
 		baselineValue, hasBaseline, err := getNotificationState(ctx, db, baselineKey)
 		if err != nil {
 			return nil, nil, err
@@ -536,9 +556,9 @@ func collectCheckRows(ctx context.Context, db *sql.DB, settings appSettings, tar
 			}
 		}
 		var cheaper []priceCheckRow
-		for _, row := range matching {
-			if !hasBaseline || row.CurrentPrice < baseline {
-				cheaper = append(cheaper, row)
+		for i := range tc.rows {
+			if !hasBaseline || tc.rows[i].CurrentPrice < baseline {
+				cheaper = append(cheaper, tc.rows[i])
 			}
 		}
 		if len(cheaper) == 0 {
@@ -546,8 +566,7 @@ func collectCheckRows(ctx context.Context, db *sql.DB, settings appSettings, tar
 		}
 		baselines[baselineKey] = strconv.FormatFloat(cheaper[0].CurrentPrice, 'f', -1, 64)
 		for i := range cheaper {
-			row := cheaper[i]
-			rows = append(rows, notifyRow{check: &row})
+			rows = append(rows, notifyRow{check: &cheaper[i]})
 		}
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
@@ -577,9 +596,8 @@ func collectSuggestRows(ctx context.Context, db *sql.DB, settings appSettings, t
 			continue
 		}
 		for i := range suggestions {
-			row := suggestions[i]
-			if row.Confidence == "medium" || row.Confidence == "high" {
-				rows = append(rows, notifyRow{suggest: &row})
+			if suggestions[i].Confidence == "medium" || suggestions[i].Confidence == "high" {
+				rows = append(rows, notifyRow{suggest: &suggestions[i]})
 			}
 		}
 	}

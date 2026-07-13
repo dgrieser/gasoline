@@ -511,7 +511,7 @@ func TestNotifyOnceBaselineResetCatchesUpAfterDowntime(t *testing.T) {
 	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline_reset_date", "2026-04-23"); err != nil {
 		t.Fatalf("set state: %v", err)
 	}
-	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline:diesel:Berlin", "1.000"); err != nil {
+	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline:1:diesel:Berlin", "1.000"); err != nil {
 		t.Fatalf("set stale baseline: %v", err)
 	}
 
@@ -546,7 +546,7 @@ func TestNotifyOnceCheckBaselineNotAdvancedWhenAllSendsFail(t *testing.T) {
 	if len(first.Failed) != 1 || len(first.Sent) != 0 {
 		t.Fatalf("first run = sent %+v failed %+v, want one failure", first.Sent, first.Failed)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:diesel:Berlin"); found {
+	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel:Berlin"); found {
 		t.Fatal("baseline must not advance when every send failed")
 	}
 
@@ -561,7 +561,7 @@ func TestNotifyOnceCheckBaselineNotAdvancedWhenAllSendsFail(t *testing.T) {
 	if len(second.Sent) != 1 || second.Sent[0].Kind != "check" {
 		t.Fatalf("second run sent = %+v, want retried check", second.Sent)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:diesel:Berlin"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel:Berlin"); !found {
 		t.Fatal("baseline must advance after a successful delivery")
 	}
 }
@@ -594,5 +594,53 @@ func TestSendPushoverTruncatesByRunes(t *testing.T) {
 		if r != 'ü' {
 			t.Fatal("truncation corrupted a multi-byte character")
 		}
+	}
+}
+
+func TestNotifyOnceCheckBaselinesArePerUser(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	// Both users are schedule-active with checks enabled; deliveries to the
+	// second user fail on the first run.
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "a@example.com", UserKey: "user-a", Token: "token-a",
+		SuggestTimes: "08:00", CheckEnabled: true, LastSuggest: "2026-04-26T08:00",
+	})
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "b@example.com", UserKey: "user-b", Token: "token-b",
+		SuggestTimes: "08:00", CheckEnabled: true, LastSuggest: "2026-04-26T08:00",
+	})
+
+	stubPushover(t, func(user string) bool { return user == "user-b" })
+	first := runNotifyOnce(t, db, false)
+	if len(first.Sent) != 1 || first.Sent[0].Email != "a@example.com" {
+		t.Fatalf("first run sent = %+v, want only a@example.com", first.Sent)
+	}
+	if len(first.Failed) != 1 || first.Failed[0].Email != "b@example.com" {
+		t.Fatalf("first run failed = %+v, want b@example.com", first.Failed)
+	}
+	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel:Berlin"); !found {
+		t.Fatal("user A's baseline must advance after their delivery")
+	}
+	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:diesel:Berlin"); found {
+		t.Fatal("user B's baseline must not advance while their sends fail")
+	}
+
+	// Delivery recovers: user A's advanced baseline blocks a repeat for A,
+	// while user B is retried and now receives the notification.
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{"status":1}`), nil
+	})
+	defer restore()
+	second := runNotifyOnce(t, db, false)
+	if len(second.Sent) != 1 || second.Sent[0].Email != "b@example.com" {
+		t.Fatalf("second run sent = %+v, want only the retried b@example.com", second.Sent)
+	}
+	if len(second.Failed) != 0 {
+		t.Fatalf("second run failed = %+v, want none", second.Failed)
+	}
+	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:diesel:Berlin"); !found {
+		t.Fatal("user B's baseline must advance after their successful retry")
 	}
 }
