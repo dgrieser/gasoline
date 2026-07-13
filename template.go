@@ -678,6 +678,7 @@ func renderNotifyTitle(template string, kind notifyKind, cheapest *notifyRow, ro
 			result = strings.ReplaceAll(result, onchange, value)
 		}
 	}
+	result = strings.ReplaceAll(result, "\r", "")
 	return strings.TrimSpace(strings.ReplaceAll(result, "\n", " "))
 }
 

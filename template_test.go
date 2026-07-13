@@ -186,6 +186,12 @@ func TestRenderNotifyTitle(t *testing.T) {
 		t.Fatalf("title = %q", got)
 	}
 
+	// Windows-style line endings leave no stray carriage returns behind.
+	got = renderNotifyTitle("{{station_name}}\r\n({{count}})", notifyKindCheck, &rows[0], len(rows))
+	if got != "Station 1 (2)" {
+		t.Fatalf("CRLF title = %q", got)
+	}
+
 	// A title that renders to nothing (all placeholders empty) is reported
 	// as empty so callers can fall back to the app name.
 	suggest := suggestRowFixture("S", "2026-04-28", "Tuesday", "10:00", 1.5)

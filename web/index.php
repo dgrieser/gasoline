@@ -2958,7 +2958,9 @@ function renderDocumentHead(string $titleSuffix): void
                 padding-bottom: 0.45rem;
                 border-bottom: 1px solid var(--border);
                 margin-bottom: 0.2rem;
-                word-break: break-word;
+                /* `anywhere` (unlike break-word) also affects min-content
+                   sizing, so a long unbroken email cannot widen the card. */
+                overflow-wrap: anywhere;
             }
             .stack-table td.actions-cell {
                 white-space: normal;
