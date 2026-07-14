@@ -1990,7 +1990,7 @@ function renderDocumentHead(string $titleSuffix): void
             transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
         }
 
-        .brand-icon img { width: 54px; height: 54px; display: block; }
+        .brand-icon img { width: 54px; height: 54px; object-fit: contain; display: block; }
 
         html[data-theme="light"] .logo-dark { display: none; }
         html:not([data-theme="light"]) .logo-light { display: none; }
@@ -3213,7 +3213,7 @@ function renderHeader(?array $user, string $activePage): void
     <header class="header">
         <a class="brand" href="?" aria-label="Gasoline — Dashboard" data-i18n-aria-label="brandAriaLabel">
             <span class="brand-icon" aria-hidden="true">
-                <img class="logo-light" src="logo-light.png" alt="">
+                <img class="logo-light" src="logo-light.svg" alt="">
                 <img class="logo-dark" src="logo-dark.png" alt="">
             </span>
             <h1>Gas<em><span>o</span></em>line</h1>
