@@ -3214,7 +3214,7 @@ function renderHeader(?array $user, string $activePage): void
         <a class="brand" href="?" aria-label="Gasoline — Dashboard" data-i18n-aria-label="brandAriaLabel">
             <span class="brand-icon" aria-hidden="true">
                 <img class="logo-light" src="logo-light.svg" alt="">
-                <img class="logo-dark" src="logo-dark.png" alt="">
+                <img class="logo-dark" src="logo-dark.svg" alt="">
             </span>
             <h1>Gas<em><span>o</span></em>line</h1>
         </a>
