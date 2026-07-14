@@ -1925,6 +1925,8 @@ function renderDocumentHead(string $titleSuffix): void
             --mono:        'DM Mono', 'Fira Mono', monospace;
             --sans:        'Space Grotesk', system-ui, sans-serif;
             --wm-shadow:   rgba(0,0,0,0.6);
+            --wm-shadow-x: 2.1px;
+            --wm-shadow-y: 2.5px;
         }
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; }
@@ -1997,7 +1999,7 @@ function renderDocumentHead(string $titleSuffix): void
             object-fit: contain;
             display: block;
             /* same sharp offset shadow as the wordmark, traced along the artwork */
-            filter: drop-shadow(2.1px 2.5px 0 var(--wm-shadow));
+            filter: drop-shadow(var(--wm-shadow-x) var(--wm-shadow-y) 0 var(--wm-shadow));
         }
 
         html[data-theme="light"] .logo-dark { display: none; }
@@ -2021,7 +2023,7 @@ function renderDocumentHead(string $titleSuffix): void
             color: var(--ink);
             /* sharp offset shadow; the gradient clip lives on the inner
                .wm span so the filter never touches clipped text directly */
-            filter: drop-shadow(0.055em 0.065em 0 var(--wm-shadow));
+            filter: drop-shadow(var(--wm-shadow-x) var(--wm-shadow-y) 0 var(--wm-shadow));
         }
 
         h1 .wm {
