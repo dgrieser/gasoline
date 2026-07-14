@@ -1991,7 +1991,14 @@ function renderDocumentHead(string $titleSuffix): void
             transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
         }
 
-        .brand-icon img { width: 54px; height: 54px; object-fit: contain; display: block; }
+        .brand-icon img {
+            width: 54px;
+            height: 54px;
+            object-fit: contain;
+            display: block;
+            /* same sharp offset shadow as the wordmark, traced along the artwork */
+            filter: drop-shadow(2.1px 2.5px 0 var(--wm-shadow));
+        }
 
         html[data-theme="light"] .logo-dark { display: none; }
         html:not([data-theme="light"]) .logo-light { display: none; }
