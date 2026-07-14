@@ -1925,8 +1925,8 @@ function renderDocumentHead(string $titleSuffix): void
             --mono:        'DM Mono', 'Fira Mono', monospace;
             --sans:        'Space Grotesk', system-ui, sans-serif;
             --wm-shadow:   rgba(0,0,0,0.6);
-            --wm-shadow-x: 2.1px;
-            --wm-shadow-y: 2.5px;
+            --wm-shadow-x: 1.3px;
+            --wm-shadow-y: 1.6px;
         }
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; }
