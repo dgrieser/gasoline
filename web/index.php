@@ -3216,7 +3216,7 @@ function renderHeader(?array $user, string $activePage): void
                 <img class="logo-light" src="logo-light.svg" alt="">
                 <img class="logo-dark" src="logo-dark.svg" alt="">
             </span>
-            <h1>Gas<em><span>o</span></em>line</h1>
+            <h1>gas<em><span>o</span></em>line</h1>
         </a>
         <div class="header-controls">
             <div class="lang-picker">
