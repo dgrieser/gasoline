@@ -1905,7 +1905,7 @@ function renderDocumentHead(string $titleSuffix): void
     </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Fredoka:wght@600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Quicksand:wght@700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         :root {
             --bg:          #0d0e11;
@@ -2005,9 +2005,11 @@ function renderDocumentHead(string $titleSuffix): void
         }
 
         h1 {
-            font-family: 'Fredoka', var(--sans);
+            font-family: 'Quicksand', var(--sans);
             font-size: clamp(1.6rem, 3vw, 2.4rem);
-            font-weight: 600;
+            font-weight: 700;
+            /* Quicksand tops out at 700; the color-matched stroke fattens it */
+            -webkit-text-stroke: 0.6px var(--ink);
             letter-spacing: -0.015em;
             line-height: 1;
             background: linear-gradient(180deg, var(--ink) 55%, var(--muted) 145%);
@@ -2030,6 +2032,7 @@ function renderDocumentHead(string $titleSuffix): void
             -webkit-background-clip: text;
             background-clip: text;
             -webkit-text-fill-color: transparent;
+            -webkit-text-stroke: 0.6px var(--amber);
             color: var(--amber);
         }
 
