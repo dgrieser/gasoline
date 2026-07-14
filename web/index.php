@@ -1893,6 +1893,9 @@ function renderDocumentHead(string $titleSuffix): void
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Gasoline — <?= h($titleSuffix) ?></title>
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="favicon-192.png">
+    <link rel="apple-touch-icon" href="apple-touch-icon.png">
     <script>
         (function () {
             const t = localStorage.getItem('theme') ||
@@ -1902,7 +1905,7 @@ function renderDocumentHead(string $titleSuffix): void
     </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Quicksand:wght@700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         :root {
             --bg:          #0d0e11;
@@ -1920,7 +1923,10 @@ function renderDocumentHead(string $titleSuffix): void
             --diesel:      #60a5fa;
             --red:         #f87171;
             --mono:        'DM Mono', 'Fira Mono', monospace;
-            --sans:        'Syne', system-ui, sans-serif;
+            --sans:        'Space Grotesk', system-ui, sans-serif;
+            --wm-shadow:   rgba(0,0,0,0.6);
+            --wm-shadow-x: 1.3px;
+            --wm-shadow-y: 1.6px;
         }
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; }
@@ -1964,36 +1970,87 @@ function renderDocumentHead(string $titleSuffix): void
             border-bottom: 1px solid var(--border);
         }
 
-        .brand {
+        a.brand {
             display: flex;
             align-items: center;
-            gap: 1rem;
+            gap: 0.6rem;
+            text-decoration: none;
+            color: inherit;
+            border-radius: 16px;
+        }
+
+        a.brand:focus-visible {
+            outline: 2px solid var(--amber);
+            outline-offset: 5px;
         }
 
         .brand-icon {
-            width: 48px;
-            height: 48px;
-            border-radius: 14px;
-            background: var(--amber-dim);
-            border: 1px solid var(--amber-glow);
+            width: 54px;
+            height: 54px;
             display: grid;
             place-items: center;
             flex-shrink: 0;
+            transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
         }
 
-        .brand-icon svg { width: 24px; height: 24px; }
+        .brand-icon img {
+            width: 54px;
+            height: 54px;
+            object-fit: contain;
+            display: block;
+            /* same sharp offset shadow as the wordmark, traced along the artwork */
+            filter: drop-shadow(var(--wm-shadow-x) var(--wm-shadow-y) 0 var(--wm-shadow));
+        }
+
+        html[data-theme="light"] .logo-dark { display: none; }
+        html:not([data-theme="light"]) .logo-light { display: none; }
+
+        .brand:hover .brand-icon {
+            transform: translateY(-2px) rotate(-4deg) scale(1.05);
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .brand-icon { transition: none; }
+            .brand:hover .brand-icon { transform: none; }
+        }
 
         h1 {
+            font-family: 'Quicksand', var(--sans);
             font-size: clamp(1.6rem, 3vw, 2.4rem);
-            font-weight: 800;
-            letter-spacing: -0.03em;
+            font-weight: 700;
+            letter-spacing: -0.015em;
             line-height: 1;
             color: var(--ink);
+            /* sharp offset shadow; the gradient clip lives on the inner
+               .wm span so the filter never touches clipped text directly */
+            filter: drop-shadow(var(--wm-shadow-x) var(--wm-shadow-y) 0 var(--wm-shadow));
         }
 
+        h1 .wm {
+            background: linear-gradient(180deg, var(--ink) 55%, var(--muted) 145%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        /* The hover drop-shadow lives on the em while the gradient clip lives
+           on a nested span: combining filter with background-clip:text on the
+           same element breaks rendering in WebKit/Blink. */
         h1 em {
             font-style: normal;
+            transition: filter 0.3s ease;
+        }
+
+        h1 em span {
+            background: linear-gradient(180deg, #ffd27a 0%, var(--amber) 55%, #dd8a06 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
             color: var(--amber);
+        }
+
+        .brand:hover h1 em {
+            filter: drop-shadow(0 0 10px rgba(245,166,35,0.55));
         }
 
         .tagline {
@@ -2741,6 +2798,7 @@ function renderDocumentHead(string $titleSuffix): void
             --muted:      #6e6e73;
             --amber-dim:  rgba(194,120,10,0.08);
             --amber-glow: rgba(194,120,10,0.2);
+            --wm-shadow:  rgba(28,28,30,0.12);
         }
 
         html[data-theme="light"] body {
@@ -3171,19 +3229,13 @@ function renderHeader(?array $user, string $activePage): void
 ?>
     <!-- Header -->
     <header class="header">
-        <div class="brand">
-            <div class="brand-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="#f5a623" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M3 22V8l6-6h6l6 6v14"/>
-                    <path d="M3 13h18"/>
-                    <path d="M9 22v-4a3 3 0 0 1 6 0v4"/>
-                    <path d="M19 7l2 2v4"/>
-                </svg>
-            </div>
-            <div>
-                <h1>Gas<em>o</em>line</h1>
-            </div>
-        </div>
+        <a class="brand" href="?" aria-label="Gasoline — Dashboard" data-i18n-aria-label="brandAriaLabel">
+            <span class="brand-icon" aria-hidden="true">
+                <img class="logo-light" src="logo-light.svg" alt="">
+                <img class="logo-dark" src="logo-dark.svg" alt="">
+            </span>
+            <h1><span class="wm">gas<em><span>o</span></em>line</span></h1>
+        </a>
         <div class="header-controls">
             <div class="lang-picker">
                 <button class="lang-btn" data-lang="en">EN</button>
@@ -3282,6 +3334,7 @@ const translations = {
         rangeToday: 'Today',
         toggleTheme: 'Toggle theme',
         chartAriaLabel: 'Fuel price history chart',
+        brandAriaLabel: 'Gasoline — Dashboard',
         openMenu: 'Open menu',
         menuDashboard: 'Dashboard',
         menuAccount: 'My Account',
@@ -3459,6 +3512,7 @@ const translations = {
         rangeToday: 'Heute',
         toggleTheme: 'Design wechseln',
         chartAriaLabel: 'Kraftstoffpreis-Verlaufsdiagramm',
+        brandAriaLabel: 'Gasoline — Dashboard',
         openMenu: 'Menü öffnen',
         menuDashboard: 'Dashboard',
         menuAccount: 'Mein Konto',
