@@ -1893,7 +1893,7 @@ function renderDocumentHead(string $titleSuffix): void
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Gasoline — <?= h($titleSuffix) ?></title>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='10' y1='6' x2='30' y2='42' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0' stop-color='%23ffc75e'/%3E%3Cstop offset='1' stop-color='%23ef9812'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='48' height='48' rx='11' fill='%231a1409'/%3E%3Crect x='8' y='39.4' width='24' height='3.6' rx='1.8' fill='%23d97f06'/%3E%3Crect x='10' y='6' width='19' height='34' rx='4.4' fill='url(%23b)'/%3E%3Crect x='13.6' y='11' width='11.6' height='8.6' rx='2.1' fill='%23181206'/%3E%3Crect x='15.6' y='13.2' width='7.4' height='1.7' rx='.85' fill='%23ffc75e'/%3E%3Crect x='15.6' y='16.2' width='4.4' height='1.7' rx='.85' fill='%23ffc75e' opacity='.5'/%3E%3Cpath d='M29 18h2.4a3.8 3.8 0 0 1 3.8 3.8v7.4a3 3 0 0 0 6 0V16.9a3.4 3.4 0 0 0-1-2.4l-2.6-2.6' stroke='%23f5a623' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3Cpath d='M35.6 3.2c1.4 1.9 2.4 3.3 2.4 4.6a2.4 2.4 0 1 1-4.8 0c0-1.3 1-2.7 2.4-4.6z' fill='url(%23b)'/%3E%3C/svg%3E">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='10' y1='6' x2='30' y2='42' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0' stop-color='%23ffc75e'/%3E%3Cstop offset='1' stop-color='%23ef9812'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='48' height='48' rx='11' fill='%231a1409'/%3E%3Crect x='12.4' y='3.8' width='14.2' height='5.6' rx='2.8' fill='%23d97f06'/%3E%3Crect x='8' y='39.4' width='24' height='3.6' rx='1.8' fill='%23d97f06'/%3E%3Crect x='10' y='6' width='19' height='34' rx='4.4' fill='url(%23b)'/%3E%3Crect x='13.6' y='11' width='11.6' height='8.6' rx='2.1' fill='%23181206'/%3E%3Crect x='15.6' y='13.2' width='7.4' height='1.7' rx='.85' fill='%23ffc75e'/%3E%3Crect x='15.6' y='16.2' width='4.4' height='1.7' rx='.85' fill='%23ffc75e' opacity='.5'/%3E%3Cpath d='M29 18h2.4a3.8 3.8 0 0 1 3.8 3.8v7.4a3 3 0 0 0 6 0V16.9a3.4 3.4 0 0 0-1-2.4l-2.6-2.6' stroke='%23f5a623' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3Cpath d='M35.6 3.2c1.4 1.9 2.4 3.3 2.4 4.6a2.4 2.4 0 1 1-4.8 0c0-1.3 1-2.7 2.4-4.6z' fill='url(%23b)'/%3E%3C/svg%3E">
     <script>
         (function () {
             const t = localStorage.getItem('theme') ||
@@ -1903,7 +1903,7 @@ function renderDocumentHead(string $titleSuffix): void
     </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         :root {
             --bg:          #0d0e11;
@@ -1921,7 +1921,7 @@ function renderDocumentHead(string $titleSuffix): void
             --diesel:      #60a5fa;
             --red:         #f87171;
             --mono:        'DM Mono', 'Fira Mono', monospace;
-            --sans:        'Syne', system-ui, sans-serif;
+            --sans:        'Space Grotesk', system-ui, sans-serif;
         }
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; }
@@ -2023,8 +2023,8 @@ function renderDocumentHead(string $titleSuffix): void
 
         h1 {
             font-size: clamp(1.6rem, 3vw, 2.4rem);
-            font-weight: 800;
-            letter-spacing: -0.03em;
+            font-weight: 700;
+            letter-spacing: -0.035em;
             line-height: 1;
             background: linear-gradient(180deg, var(--ink) 55%, var(--muted) 145%);
             -webkit-background-clip: text;
@@ -3234,24 +3234,39 @@ function renderHeader(?array $user, string $activePage): void
                             <stop offset="0" stop-color="#f5a623"/>
                             <stop offset="1" stop-color="#d97f06"/>
                         </linearGradient>
+                        <clipPath id="logo-clip"><rect x="7" y="4" width="20" height="37" rx="4.5"/></clipPath>
+                        <filter id="logo-glow" x="-60%" y="-60%" width="220%" height="220%">
+                            <feGaussianBlur stdDeviation="1.1"/>
+                        </filter>
                     </defs>
+                    <!-- crown cap -->
+                    <rect x="9.5" y="1.8" width="15" height="6" rx="3" fill="url(#logo-hose)"/>
                     <!-- base plate -->
                     <rect x="4" y="41" width="26" height="4" rx="2" fill="url(#logo-hose)"/>
                     <!-- pump body -->
                     <rect x="7" y="4" width="20" height="37" rx="4.5" fill="url(#logo-body)"/>
+                    <!-- right-edge depth shade -->
+                    <rect x="22" y="4" width="5" height="37" fill="#8a5203" opacity="0.22" clip-path="url(#logo-clip)"/>
                     <!-- glass highlight -->
-                    <rect x="10" y="7" width="2.6" height="9" rx="1.3" fill="#fff" opacity="0.35"/>
+                    <rect x="10" y="7" width="2.6" height="9" rx="1.3" fill="#fff" opacity="0.38"/>
                     <!-- price display -->
                     <rect x="11" y="9.5" width="12" height="9" rx="2.2" fill="#181206"/>
-                    <rect x="13.2" y="11.9" width="7.6" height="1.7" rx="0.85" fill="#ffc75e" opacity="0.95"/>
-                    <rect x="13.2" y="15" width="4.6" height="1.7" rx="0.85" fill="#ffc75e" opacity="0.5"/>
+                    <rect x="13.2" y="11.9" width="7.6" height="1.7" rx="0.85" fill="#ffc75e" opacity="0.8" filter="url(#logo-glow)"/>
+                    <rect x="13.2" y="11.9" width="7.6" height="1.7" rx="0.85" fill="#ffd88f"/>
+                    <rect x="13.2" y="15" width="4.6" height="1.7" rx="0.85" fill="#ffc75e" opacity="0.55"/>
                     <!-- nozzle holster -->
-                    <rect x="12" y="23" width="10" height="12" rx="2" fill="#181206" opacity="0.14"/>
+                    <rect x="12" y="23" width="10" height="12" rx="2" fill="#181206" opacity="0.16"/>
+                    <rect x="12" y="23" width="10" height="12" rx="2" stroke="#fff" stroke-opacity="0.14" stroke-width="1"/>
+                    <!-- inner rim light -->
+                    <rect x="8" y="5" width="18" height="35" rx="3.6" stroke="#fff" stroke-opacity="0.16" stroke-width="1"/>
                     <!-- hose to vent pipe -->
                     <path d="M27 17h3a4 4 0 0 1 4 4v8.5a3.25 3.25 0 0 0 6.5 0V15.4a3.6 3.6 0 0 0-1.05-2.55L37.9 11.3"
                           stroke="url(#logo-hose)" stroke-width="3.2" stroke-linecap="round"/>
                     <!-- fuel droplet -->
-                    <path class="logo-drop" d="M35.5 1.2c1.6 2.1 2.75 3.7 2.75 5.2a2.75 2.75 0 1 1-5.5 0c0-1.5 1.15-3.1 2.75-5.2z" fill="url(#logo-body)"/>
+                    <g class="logo-drop">
+                        <path d="M35.5 1.2c1.6 2.1 2.75 3.7 2.75 5.2a2.75 2.75 0 1 1-5.5 0c0-1.5 1.15-3.1 2.75-5.2z" fill="url(#logo-body)"/>
+                        <circle cx="34.4" cy="6.7" r="0.85" fill="#fff" opacity="0.6"/>
+                    </g>
                 </svg>
             </span>
             <h1>Gas<em>o</em>line</h1>
