@@ -711,6 +711,22 @@ test_build_message_suppresses_time_on_same_day() {
     fail "time suppressed on same day: expected single time line, got [$out]"
 }
 
+test_build_message_reprints_time_on_window_change() {
+  configure_defaults
+
+  # Same day, same start time, different end time: both window boundaries must
+  # reprint, otherwise the second row renders a dangling " 10:00".
+  local r1='{"date":"2026-04-28","start_time":"09:00","end_time":"12:00","station_name":"S1"}'
+  local r2='{"date":"2026-04-28","start_time":"09:00","end_time":"10:00","station_name":"S2"}'
+  local out
+  out=$(build_message suggest \
+    $'{{start_time_onchange}} {{end_time_onchange}}\n{{station_name}}' \
+    "$r1" "$r2")
+
+  [[ "$out" == $'09:00 12:00\nS1\n09:00 10:00\nS2' ]] || \
+    fail "time reprint on window change: expected both boundaries on both rows, got [$out]"
+}
+
 test_compute_sleep() {
   configure_defaults
   CHECK_MINUTES=10
@@ -773,5 +789,6 @@ test_build_message_keeps_static_line
 test_build_message_mixed_line_still_prints
 test_build_message_reprints_time_on_day_change
 test_build_message_suppresses_time_on_same_day
+test_build_message_reprints_time_on_window_change
 
 printf 'gasoline-watch_test: ok\n'

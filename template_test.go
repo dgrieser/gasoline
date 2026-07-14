@@ -294,6 +294,35 @@ func TestBuildMessageOnchangeDayScopedTimeReprints(t *testing.T) {
 	}
 }
 
+func TestBuildMessageOnchangeWindowScopedTimeReprints(t *testing.T) {
+	// Same day, same start time, different end time: both window boundaries
+	// must reprint, otherwise the second row renders a dangling " 10:00".
+	rows := []notifyRow{
+		suggestRowFixture("Tankstelle Blasheim", "2026-04-28", "Tuesday", "09:00", 1.869),
+		suggestRowFixture("Tankstelle Schmale Blasheim", "2026-04-28", "Tuesday", "09:00", 1.869),
+	}
+	rows[1].suggest.EndTime = "10:00"
+	got := buildMessage(notifyKindSuggest, "{{start_time_onchange}} {{end_time_onchange}}\n{{station_name}}", rows)
+	want := "09:00 12:00\nTankstelle Blasheim\n09:00 10:00\nTankstelle Schmale Blasheim"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestBuildMessageOnchangeSameWindowSameDayStaysSuppressed(t *testing.T) {
+	// Two rows on the same day with an identical window: the time line must
+	// still collapse (regression guard for the window-scoped signature).
+	rows := []notifyRow{
+		suggestRowFixture("Station 1", "2026-04-27", "Monday", "11:00", 1.599),
+		suggestRowFixture("Station 2", "2026-04-27", "Monday", "11:00", 1.649),
+	}
+	got := buildMessage(notifyKindSuggest, "{{date_onchange}}\n{{start_time_onchange}} {{end_time_onchange}}\n{{station_name}}", rows)
+	want := "2026-04-27\n11:00 12:00\nStation 1\nStation 2"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestBuildMessageLineSkipRules(t *testing.T) {
 	rows := []notifyRow{
 		suggestRowFixture("Station 1", "2026-04-27", "Monday", "10:00", 1.599),
