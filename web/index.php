@@ -1893,6 +1893,7 @@ function renderDocumentHead(string $titleSuffix): void
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Gasoline — <?= h($titleSuffix) ?></title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='10' y1='6' x2='30' y2='42' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0' stop-color='%23ffc75e'/%3E%3Cstop offset='1' stop-color='%23ef9812'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='48' height='48' rx='11' fill='%231a1409'/%3E%3Crect x='8' y='39.4' width='24' height='3.6' rx='1.8' fill='%23d97f06'/%3E%3Crect x='10' y='6' width='19' height='34' rx='4.4' fill='url(%23b)'/%3E%3Crect x='13.6' y='11' width='11.6' height='8.6' rx='2.1' fill='%23181206'/%3E%3Crect x='15.6' y='13.2' width='7.4' height='1.7' rx='.85' fill='%23ffc75e'/%3E%3Crect x='15.6' y='16.2' width='4.4' height='1.7' rx='.85' fill='%23ffc75e' opacity='.5'/%3E%3Cpath d='M29 18h2.4a3.8 3.8 0 0 1 3.8 3.8v7.4a3 3 0 0 0 6 0V16.9a3.4 3.4 0 0 0-1-2.4l-2.6-2.6' stroke='%23f5a623' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3Cpath d='M35.6 3.2c1.4 1.9 2.4 3.3 2.4 4.6a2.4 2.4 0 1 1-4.8 0c0-1.3 1-2.7 2.4-4.6z' fill='url(%23b)'/%3E%3C/svg%3E">
     <script>
         (function () {
             const t = localStorage.getItem('theme') ||
@@ -1964,36 +1965,86 @@ function renderDocumentHead(string $titleSuffix): void
             border-bottom: 1px solid var(--border);
         }
 
-        .brand {
+        a.brand {
             display: flex;
             align-items: center;
             gap: 1rem;
+            text-decoration: none;
+            color: inherit;
+            border-radius: 16px;
+        }
+
+        a.brand:focus-visible {
+            outline: 2px solid var(--amber);
+            outline-offset: 5px;
         }
 
         .brand-icon {
-            width: 48px;
-            height: 48px;
-            border-radius: 14px;
-            background: var(--amber-dim);
+            width: 52px;
+            height: 52px;
+            border-radius: 16px;
+            background:
+                radial-gradient(120% 120% at 20% 0%, rgba(255,214,130,0.28) 0%, rgba(245,166,35,0.10) 45%, rgba(245,166,35,0.16) 100%),
+                var(--surface);
             border: 1px solid var(--amber-glow);
+            box-shadow:
+                0 8px 22px -8px rgba(245,166,35,0.45),
+                inset 0 1px 0 rgba(255,255,255,0.12);
             display: grid;
             place-items: center;
             flex-shrink: 0;
+            transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.3s ease;
         }
 
-        .brand-icon svg { width: 24px; height: 24px; }
+        .brand-icon svg { width: 32px; height: 32px; display: block; }
+
+        .brand:hover .brand-icon {
+            transform: translateY(-2px) rotate(-4deg) scale(1.04);
+            box-shadow:
+                0 12px 28px -8px rgba(245,166,35,0.6),
+                inset 0 1px 0 rgba(255,255,255,0.16);
+        }
+
+        /* fuel droplet drips while hovering the brand */
+        .logo-drop { transform-box: fill-box; transform-origin: center; }
+        .brand:hover .logo-drop { animation: logo-drip 1.1s ease-in-out infinite; }
+
+        @keyframes logo-drip {
+            0%   { transform: translateY(0)     scale(1);          opacity: 1; }
+            55%  { transform: translateY(3px)   scale(0.92, 1.08); opacity: 0.85; }
+            100% { transform: translateY(0)     scale(1);          opacity: 1; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .brand-icon { transition: none; }
+            .brand:hover .brand-icon { transform: none; }
+            .brand:hover .logo-drop { animation: none; }
+        }
 
         h1 {
             font-size: clamp(1.6rem, 3vw, 2.4rem);
             font-weight: 800;
             letter-spacing: -0.03em;
             line-height: 1;
+            background: linear-gradient(180deg, var(--ink) 55%, var(--muted) 145%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
             color: var(--ink);
         }
 
         h1 em {
             font-style: normal;
+            background: linear-gradient(180deg, #ffd27a 0%, var(--amber) 55%, #dd8a06 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
             color: var(--amber);
+            transition: filter 0.3s ease;
+        }
+
+        .brand:hover h1 em {
+            filter: drop-shadow(0 0 10px rgba(245,166,35,0.55));
         }
 
         .tagline {
@@ -3171,19 +3222,40 @@ function renderHeader(?array $user, string $activePage): void
 ?>
     <!-- Header -->
     <header class="header">
-        <div class="brand">
-            <div class="brand-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="#f5a623" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M3 22V8l6-6h6l6 6v14"/>
-                    <path d="M3 13h18"/>
-                    <path d="M9 22v-4a3 3 0 0 1 6 0v4"/>
-                    <path d="M19 7l2 2v4"/>
+        <a class="brand" href="?" aria-label="Gasoline — Dashboard">
+            <span class="brand-icon" aria-hidden="true">
+                <svg viewBox="0 0 48 48" fill="none">
+                    <defs>
+                        <linearGradient id="logo-body" x1="7" y1="4" x2="30" y2="44" gradientUnits="userSpaceOnUse">
+                            <stop offset="0" stop-color="#ffc75e"/>
+                            <stop offset="1" stop-color="#ef9812"/>
+                        </linearGradient>
+                        <linearGradient id="logo-hose" x1="27" y1="10" x2="41" y2="33" gradientUnits="userSpaceOnUse">
+                            <stop offset="0" stop-color="#f5a623"/>
+                            <stop offset="1" stop-color="#d97f06"/>
+                        </linearGradient>
+                    </defs>
+                    <!-- base plate -->
+                    <rect x="4" y="41" width="26" height="4" rx="2" fill="url(#logo-hose)"/>
+                    <!-- pump body -->
+                    <rect x="7" y="4" width="20" height="37" rx="4.5" fill="url(#logo-body)"/>
+                    <!-- glass highlight -->
+                    <rect x="10" y="7" width="2.6" height="9" rx="1.3" fill="#fff" opacity="0.35"/>
+                    <!-- price display -->
+                    <rect x="11" y="9.5" width="12" height="9" rx="2.2" fill="#181206"/>
+                    <rect x="13.2" y="11.9" width="7.6" height="1.7" rx="0.85" fill="#ffc75e" opacity="0.95"/>
+                    <rect x="13.2" y="15" width="4.6" height="1.7" rx="0.85" fill="#ffc75e" opacity="0.5"/>
+                    <!-- nozzle holster -->
+                    <rect x="12" y="23" width="10" height="12" rx="2" fill="#181206" opacity="0.14"/>
+                    <!-- hose to vent pipe -->
+                    <path d="M27 17h3a4 4 0 0 1 4 4v8.5a3.25 3.25 0 0 0 6.5 0V15.4a3.6 3.6 0 0 0-1.05-2.55L37.9 11.3"
+                          stroke="url(#logo-hose)" stroke-width="3.2" stroke-linecap="round"/>
+                    <!-- fuel droplet -->
+                    <path class="logo-drop" d="M35.5 1.2c1.6 2.1 2.75 3.7 2.75 5.2a2.75 2.75 0 1 1-5.5 0c0-1.5 1.15-3.1 2.75-5.2z" fill="url(#logo-body)"/>
                 </svg>
-            </div>
-            <div>
-                <h1>Gas<em>o</em>line</h1>
-            </div>
-        </div>
+            </span>
+            <h1>Gas<em>o</em>line</h1>
+        </a>
         <div class="header-controls">
             <div class="lang-picker">
                 <button class="lang-btn" data-lang="en">EN</button>
