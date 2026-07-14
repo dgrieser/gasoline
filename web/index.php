@@ -1999,7 +1999,7 @@ function renderDocumentHead(string $titleSuffix): void
             transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.3s ease;
         }
 
-        .brand-icon svg { width: 32px; height: 32px; display: block; }
+        .brand-icon svg { width: 36px; height: 36px; display: block; }
 
         .brand:hover .brand-icon {
             transform: translateY(-2px) rotate(-4deg) scale(1.04);
@@ -2008,20 +2008,9 @@ function renderDocumentHead(string $titleSuffix): void
                 inset 0 1px 0 rgba(255,255,255,0.16);
         }
 
-        /* fuel droplet drips while hovering the brand */
-        .logo-drop { transform-box: fill-box; transform-origin: center; }
-        .brand:hover .logo-drop { animation: logo-drip 1.1s ease-in-out infinite; }
-
-        @keyframes logo-drip {
-            0%   { transform: translateY(0)     scale(1);          opacity: 1; }
-            55%  { transform: translateY(3px)   scale(0.92, 1.08); opacity: 0.85; }
-            100% { transform: translateY(0)     scale(1);          opacity: 1; }
-        }
-
         @media (prefers-reduced-motion: reduce) {
             .brand-icon { transition: none; }
             .brand:hover .brand-icon { transform: none; }
-            .brand:hover .logo-drop { animation: none; }
         }
 
         h1 {
@@ -3228,25 +3217,25 @@ function renderHeader(?array $user, string $activePage): void
         <a class="brand" href="?" aria-label="Gasoline — Dashboard">
             <span class="brand-icon" aria-hidden="true">
                 <svg viewBox="0 0 48 48" fill="none">
-                    <!-- crown cap -->
-                    <rect x="10" y="2" width="14" height="6" rx="3" fill="#d97f06"/>
-                    <!-- base plate -->
-                    <rect x="4" y="41" width="26" height="4.5" rx="2.25" fill="#d97f06"/>
-                    <!-- pump body -->
-                    <rect x="7" y="5" width="20" height="36" rx="4" fill="#f5a623"/>
-                    <!-- price display -->
-                    <rect x="11" y="10" width="12" height="9" rx="2.2" fill="#181206"/>
-                    <rect x="13.2" y="12.4" width="7.6" height="1.7" rx="0.85" fill="#ffd88f"/>
-                    <rect x="13.2" y="15.5" width="4.6" height="1.7" rx="0.85" fill="#ffd88f" opacity="0.55"/>
-                    <!-- hose -->
-                    <path d="M27 13h4a8.5 8.5 0 0 1 8.5 8.5V23" stroke="#d97f06" stroke-width="3" stroke-linecap="round"/>
-                    <!-- Zapfhahn (nozzle) -->
-                    <g transform="rotate(14 39.5 22)">
-                        <rect x="35.9" y="21.5" width="7.2" height="9.5" rx="2.2" fill="#d97f06"/>
-                        <path d="M38 31h3l-.55 4.4a0.95 0.95 0 0 1-1.9 0z" fill="#d97f06"/>
-                    </g>
-                    <!-- fuel droplet -->
-                    <path class="logo-drop" d="M35.9 39.2c1.35 1.75 2.3 3.1 2.3 4.3a2.3 2.3 0 1 1-4.6 0c0-1.2.95-2.55 2.3-4.3z" fill="#f5a623"/>
+                    <defs>
+                        <clipPath id="brand-c2"><path d="M5.8 27.5 A16.5 9.5 0 0 1 38.8 27.5 L38.8 32 A16.5 9.5 0 0 1 5.8 32 Z"/></clipPath>
+                        <clipPath id="brand-c3"><path d="M8.5 32 A16.5 9.5 0 0 1 41.5 32 L41.5 36.5 A16.5 9.5 0 0 1 8.5 36.5 Z"/></clipPath>
+                        <mask id="brand-mask">
+                            <!-- coin stack, bottom to top -->
+                            <path fill="#fff" d="M8.5 32 A16.5 9.5 0 0 1 41.5 32 L41.5 36.5 A16.5 9.5 0 0 1 8.5 36.5 Z"/>
+                            <path fill="#fff" d="M5.8 27.5 A16.5 9.5 0 0 1 38.8 27.5 L38.8 32 A16.5 9.5 0 0 1 5.8 32 Z"/>
+                            <path fill="#fff" d="M7.5 18 A16.5 9.5 0 0 1 40.5 18 L40.5 23 A16.5 9.5 0 0 1 7.5 23 Z"/>
+                            <!-- seams between coins, clipped to the coin below -->
+                            <path fill="none" stroke="#000" stroke-width="1.5" clip-path="url(#brand-c2)" d="M7.5 23 A16.5 9.5 0 0 0 40.5 23"/>
+                            <path fill="none" stroke="#000" stroke-width="1.5" clip-path="url(#brand-c3)" d="M5.8 32 A16.5 9.5 0 0 0 38.8 32"/>
+                            <!-- Zapfhahn emblem embossed on the top coin face -->
+                            <g transform="translate(24 17.8) scale(0.78) scale(1 0.7) rotate(-22) translate(-23.3 -21.1)">
+                                <path fill="#000" d="M8.5 23.2 L16.5 23.2 L16.5 19.6 Q16.5 18.8 17.3 18.8 L27.4 18.2 L35.3 12.7 Q36.8 11.6 37.9 13.1 L39.3 15.0 Q40.3 16.4 38.9 17.4 L30.0 23.6 Q29.2 24.2 29.2 25.2 L29.2 29.4 Q29.2 30.6 28.0 30.6 L17.7 30.6 Q16.5 30.6 16.5 29.4 L16.5 27.6 L8.5 27.6 Q6.3 27.6 6.3 25.4 Q6.3 23.2 8.5 23.2 Z"/>
+                                <circle cx="31" cy="23" r="2.8" fill="#fff"/>
+                            </g>
+                        </mask>
+                    </defs>
+                    <rect width="48" height="48" fill="#f5a623" mask="url(#brand-mask)"/>
                 </svg>
             </span>
             <h1>Gas<em>o</em>line</h1>
