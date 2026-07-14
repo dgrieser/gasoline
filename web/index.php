@@ -1893,7 +1893,10 @@ function renderDocumentHead(string $titleSuffix): void
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Gasoline — <?= h($titleSuffix) ?></title>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='10' y1='6' x2='30' y2='42' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0' stop-color='%23ffc75e'/%3E%3Cstop offset='1' stop-color='%23ef9812'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='48' height='48' rx='11' fill='%231a1409'/%3E%3Crect x='12.4' y='3.8' width='14.2' height='5.6' rx='2.8' fill='%23d97f06'/%3E%3Crect x='8' y='39.4' width='24' height='3.6' rx='1.8' fill='%23d97f06'/%3E%3Crect x='10' y='6' width='19' height='34' rx='4.4' fill='url(%23b)'/%3E%3Crect x='13.6' y='11' width='11.6' height='8.6' rx='2.1' fill='%23181206'/%3E%3Crect x='15.6' y='13.2' width='7.4' height='1.7' rx='.85' fill='%23ffc75e'/%3E%3Crect x='15.6' y='16.2' width='4.4' height='1.7' rx='.85' fill='%23ffc75e' opacity='.5'/%3E%3Cpath d='M29 18h2.4a3.8 3.8 0 0 1 3.8 3.8v7.4a3 3 0 0 0 6 0V16.9a3.4 3.4 0 0 0-1-2.4l-2.6-2.6' stroke='%23f5a623' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3Cpath d='M35.6 3.2c1.4 1.9 2.4 3.3 2.4 4.6a2.4 2.4 0 1 1-4.8 0c0-1.3 1-2.7 2.4-4.6z' fill='url(%23b)'/%3E%3C/svg%3E">
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="favicon-192.png">
+    <link rel="apple-touch-icon" href="apple-touch-icon.png">
     <script>
         (function () {
             const t = localStorage.getItem('theme') ||
@@ -3225,48 +3228,25 @@ function renderHeader(?array $user, string $activePage): void
         <a class="brand" href="?" aria-label="Gasoline — Dashboard">
             <span class="brand-icon" aria-hidden="true">
                 <svg viewBox="0 0 48 48" fill="none">
-                    <defs>
-                        <linearGradient id="logo-body" x1="7" y1="4" x2="30" y2="44" gradientUnits="userSpaceOnUse">
-                            <stop offset="0" stop-color="#ffc75e"/>
-                            <stop offset="1" stop-color="#ef9812"/>
-                        </linearGradient>
-                        <linearGradient id="logo-hose" x1="27" y1="10" x2="41" y2="33" gradientUnits="userSpaceOnUse">
-                            <stop offset="0" stop-color="#f5a623"/>
-                            <stop offset="1" stop-color="#d97f06"/>
-                        </linearGradient>
-                        <clipPath id="logo-clip"><rect x="7" y="4" width="20" height="37" rx="4.5"/></clipPath>
-                        <filter id="logo-glow" x="-60%" y="-60%" width="220%" height="220%">
-                            <feGaussianBlur stdDeviation="1.1"/>
-                        </filter>
-                    </defs>
                     <!-- crown cap -->
-                    <rect x="9.5" y="1.8" width="15" height="6" rx="3" fill="url(#logo-hose)"/>
+                    <rect x="10" y="2" width="14" height="6" rx="3" fill="#d97f06"/>
                     <!-- base plate -->
-                    <rect x="4" y="41" width="26" height="4" rx="2" fill="url(#logo-hose)"/>
+                    <rect x="4" y="41" width="26" height="4.5" rx="2.25" fill="#d97f06"/>
                     <!-- pump body -->
-                    <rect x="7" y="4" width="20" height="37" rx="4.5" fill="url(#logo-body)"/>
-                    <!-- right-edge depth shade -->
-                    <rect x="22" y="4" width="5" height="37" fill="#8a5203" opacity="0.22" clip-path="url(#logo-clip)"/>
-                    <!-- glass highlight -->
-                    <rect x="10" y="7" width="2.6" height="9" rx="1.3" fill="#fff" opacity="0.38"/>
+                    <rect x="7" y="5" width="20" height="36" rx="4" fill="#f5a623"/>
                     <!-- price display -->
-                    <rect x="11" y="9.5" width="12" height="9" rx="2.2" fill="#181206"/>
-                    <rect x="13.2" y="11.9" width="7.6" height="1.7" rx="0.85" fill="#ffc75e" opacity="0.8" filter="url(#logo-glow)"/>
-                    <rect x="13.2" y="11.9" width="7.6" height="1.7" rx="0.85" fill="#ffd88f"/>
-                    <rect x="13.2" y="15" width="4.6" height="1.7" rx="0.85" fill="#ffc75e" opacity="0.55"/>
-                    <!-- nozzle holster -->
-                    <rect x="12" y="23" width="10" height="12" rx="2" fill="#181206" opacity="0.16"/>
-                    <rect x="12" y="23" width="10" height="12" rx="2" stroke="#fff" stroke-opacity="0.14" stroke-width="1"/>
-                    <!-- inner rim light -->
-                    <rect x="8" y="5" width="18" height="35" rx="3.6" stroke="#fff" stroke-opacity="0.16" stroke-width="1"/>
-                    <!-- hose to vent pipe -->
-                    <path d="M27 17h3a4 4 0 0 1 4 4v8.5a3.25 3.25 0 0 0 6.5 0V15.4a3.6 3.6 0 0 0-1.05-2.55L37.9 11.3"
-                          stroke="url(#logo-hose)" stroke-width="3.2" stroke-linecap="round"/>
-                    <!-- fuel droplet -->
-                    <g class="logo-drop">
-                        <path d="M35.5 1.2c1.6 2.1 2.75 3.7 2.75 5.2a2.75 2.75 0 1 1-5.5 0c0-1.5 1.15-3.1 2.75-5.2z" fill="url(#logo-body)"/>
-                        <circle cx="34.4" cy="6.7" r="0.85" fill="#fff" opacity="0.6"/>
+                    <rect x="11" y="10" width="12" height="9" rx="2.2" fill="#181206"/>
+                    <rect x="13.2" y="12.4" width="7.6" height="1.7" rx="0.85" fill="#ffd88f"/>
+                    <rect x="13.2" y="15.5" width="4.6" height="1.7" rx="0.85" fill="#ffd88f" opacity="0.55"/>
+                    <!-- hose -->
+                    <path d="M27 13h4a8.5 8.5 0 0 1 8.5 8.5V23" stroke="#d97f06" stroke-width="3" stroke-linecap="round"/>
+                    <!-- Zapfhahn (nozzle) -->
+                    <g transform="rotate(14 39.5 22)">
+                        <rect x="35.9" y="21.5" width="7.2" height="9.5" rx="2.2" fill="#d97f06"/>
+                        <path d="M38 31h3l-.55 4.4a0.95 0.95 0 0 1-1.9 0z" fill="#d97f06"/>
                     </g>
+                    <!-- fuel droplet -->
+                    <path class="logo-drop" d="M35.9 39.2c1.35 1.75 2.3 3.1 2.3 4.3a2.3 2.3 0 1 1-4.6 0c0-1.2.95-2.55 2.3-4.3z" fill="#f5a623"/>
                 </svg>
             </span>
             <h1>Gas<em>o</em>line</h1>
