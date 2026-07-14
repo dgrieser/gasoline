@@ -1925,6 +1925,9 @@ function renderDocumentHead(string $titleSuffix): void
             --red:         #f87171;
             --mono:        'DM Mono', 'Fira Mono', monospace;
             --sans:        'Space Grotesk', system-ui, sans-serif;
+            /* brand logo: white nozzle without outline on dark */
+            --logo-nozzle:  #ffffff;
+            --logo-outline: transparent;
         }
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; }
@@ -1999,7 +2002,11 @@ function renderDocumentHead(string $titleSuffix): void
             transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.3s ease;
         }
 
-        .brand-icon svg { width: 36px; height: 36px; display: block; }
+        .brand-icon svg { width: 38px; height: 38px; display: block; }
+
+        .logo-nozzle-fill   { fill: var(--logo-nozzle); }
+        .logo-nozzle-stroke { stroke: var(--logo-nozzle); }
+        .logo-outline       { stroke: var(--logo-outline); }
 
         .brand:hover .brand-icon {
             transform: translateY(-2px) rotate(-4deg) scale(1.04);
@@ -2784,6 +2791,9 @@ function renderDocumentHead(string $titleSuffix): void
             --muted:      #6e6e73;
             --amber-dim:  rgba(194,120,10,0.08);
             --amber-glow: rgba(194,120,10,0.2);
+            /* brand logo: navy nozzle with white outline on light */
+            --logo-nozzle:  #2e3947;
+            --logo-outline: #ffffff;
         }
 
         html[data-theme="light"] body {
@@ -3218,24 +3228,33 @@ function renderHeader(?array $user, string $activePage): void
             <span class="brand-icon" aria-hidden="true">
                 <svg viewBox="0 0 48 48" fill="none">
                     <defs>
-                        <clipPath id="brand-c2"><path d="M5.8 27.5 A16.5 9.5 0 0 1 38.8 27.5 L38.8 32 A16.5 9.5 0 0 1 5.8 32 Z"/></clipPath>
-                        <clipPath id="brand-c3"><path d="M8.5 32 A16.5 9.5 0 0 1 41.5 32 L41.5 36.5 A16.5 9.5 0 0 1 8.5 36.5 Z"/></clipPath>
-                        <mask id="brand-mask">
-                            <!-- coin stack, bottom to top -->
-                            <path fill="#fff" d="M8.5 32 A16.5 9.5 0 0 1 41.5 32 L41.5 36.5 A16.5 9.5 0 0 1 8.5 36.5 Z"/>
-                            <path fill="#fff" d="M5.8 27.5 A16.5 9.5 0 0 1 38.8 27.5 L38.8 32 A16.5 9.5 0 0 1 5.8 32 Z"/>
-                            <path fill="#fff" d="M7.5 18 A16.5 9.5 0 0 1 40.5 18 L40.5 23 A16.5 9.5 0 0 1 7.5 23 Z"/>
-                            <!-- seams between coins, clipped to the coin below -->
-                            <path fill="none" stroke="#000" stroke-width="1.5" clip-path="url(#brand-c2)" d="M7.5 23 A16.5 9.5 0 0 0 40.5 23"/>
-                            <path fill="none" stroke="#000" stroke-width="1.5" clip-path="url(#brand-c3)" d="M5.8 32 A16.5 9.5 0 0 0 38.8 32"/>
-                            <!-- Zapfhahn emblem embossed on the top coin face -->
-                            <g transform="translate(24 17.8) scale(0.78) scale(1 0.7) rotate(-22) translate(-23.3 -21.1)">
-                                <path fill="#000" d="M8.5 23.2 L16.5 23.2 L16.5 19.6 Q16.5 18.8 17.3 18.8 L27.4 18.2 L35.3 12.7 Q36.8 11.6 37.9 13.1 L39.3 15.0 Q40.3 16.4 38.9 17.4 L30.0 23.6 Q29.2 24.2 29.2 25.2 L29.2 29.4 Q29.2 30.6 28.0 30.6 L17.7 30.6 Q16.5 30.6 16.5 29.4 L16.5 27.6 L8.5 27.6 Q6.3 27.6 6.3 25.4 Q6.3 23.2 8.5 23.2 Z"/>
-                                <circle cx="31" cy="23" r="2.8" fill="#fff"/>
-                            </g>
-                        </mask>
+                        <linearGradient id="brand-g" x1="24" y1="6" x2="24" y2="44" gradientUnits="userSpaceOnUse">
+                            <stop offset="0" stop-color="#ffc027"/>
+                            <stop offset="1" stop-color="#ed7d09"/>
+                        </linearGradient>
+                        <clipPath id="brand-ku2"><path d="M10.6 15.8 A12 3.8 0 0 1 34.6 15.8 L34.6 20.4 A12 3.8 0 0 1 10.6 20.4 Z"/></clipPath>
+                        <clipPath id="brand-kb1"><path d="M7.5 21.6 A16.2 5 0 0 1 39.9 21.6 L39.9 27.8 A16.2 5 0 0 1 7.5 27.8 Z"/></clipPath>
+                        <clipPath id="brand-kb2"><path d="M8.3 27.8 A16.2 5 0 0 1 40.7 27.8 L40.7 34 A16.2 5 0 0 1 8.3 34 Z"/></clipPath>
                     </defs>
-                    <rect width="48" height="48" fill="#f5a623" mask="url(#brand-mask)"/>
+                    <!-- coin pile: bottom stack (2 big), then upper stack (2 small) -->
+                    <path fill="url(#brand-g)" d="M8.3 27.8 A16.2 5 0 0 1 40.7 27.8 L40.7 34 A16.2 5 0 0 1 8.3 34 Z"/>
+                    <path fill="url(#brand-g)" d="M7.5 21.6 A16.2 5 0 0 1 39.9 21.6 L39.9 27.8 A16.2 5 0 0 1 7.5 27.8 Z"/>
+                    <path fill="none" stroke="#fff" stroke-width="1.1" clip-path="url(#brand-kb2)" d="M7.5 27.8 A16.2 5 0 0 0 39.9 27.8"/>
+                    <path fill="url(#brand-g)" d="M10.6 15.8 A12 3.8 0 0 1 34.6 15.8 L34.6 20.4 A12 3.8 0 0 1 10.6 20.4 Z"/>
+                    <path fill="none" stroke="#fff" stroke-width="1.1" clip-path="url(#brand-kb1)" d="M10.6 20.4 A12 3.8 0 0 0 34.6 20.4"/>
+                    <path fill="url(#brand-g)" d="M10 11.2 A12 3.8 0 0 1 34 11.2 L34 15.8 A12 3.8 0 0 1 10 15.8 Z"/>
+                    <path fill="none" stroke="#fff" stroke-width="1.1" clip-path="url(#brand-ku2)" d="M10 15.8 A12 3.8 0 0 0 34 15.8"/>
+                    <!-- lower hose sweep -->
+                    <path fill="none" class="logo-outline" stroke-width="3.8" stroke-linecap="round" d="M28.5 22.5 C 26.5 27.5, 22 31.5, 16.5 33.2 C 12.3 34.5, 9.2 33.3, 8.5 30.9"/>
+                    <path fill="none" class="logo-nozzle-stroke" stroke-width="2.2" stroke-linecap="round" d="M28.5 22.5 C 26.5 27.5, 22 31.5, 16.5 33.2 C 12.3 34.5, 9.2 33.3, 8.5 30.9"/>
+                    <!-- Zapfhahn with trigger hole, outlined in light mode -->
+                    <g transform="translate(24 20) rotate(-45) scale(0.62) translate(-23.3 -21.1)">
+                        <path class="logo-nozzle-fill logo-outline" stroke-width="2.4" fill-rule="evenodd"
+                              d="M8.5 23.2 L16.5 23.2 L16.5 19.6 Q16.5 18.8 17.3 18.8 L27.4 18.2 L35.3 12.7 Q36.8 11.6 37.9 13.1 L39.3 15.0 Q40.3 16.4 38.9 17.4 L30.0 23.6 Q29.2 24.2 29.2 25.2 L29.2 29.4 Q29.2 30.6 28.0 30.6 L17.7 30.6 Q16.5 30.6 16.5 29.4 L16.5 27.6 L8.5 27.6 Q6.3 27.6 6.3 25.4 Q6.3 23.2 8.5 23.2 Z M29.8 19.9 L33.8 17.6 L30.2 23.2 Z"/>
+                    </g>
+                    <!-- hose to the pump, exiting top right -->
+                    <path fill="none" class="logo-outline" stroke-width="3.8" stroke-linecap="round" d="M28.2 10.5 C 29.5 8.8, 31.5 7.9, 33.8 8.1 C 37 8.4, 40.2 8.3, 43.2 7.7"/>
+                    <path fill="none" class="logo-nozzle-stroke" stroke-width="2.2" stroke-linecap="round" d="M28.2 10.5 C 29.5 8.8, 31.5 7.9, 33.8 8.1 C 37 8.4, 40.2 8.3, 43.2 7.7"/>
                 </svg>
             </span>
             <h1>Gas<em>o</em>line</h1>
