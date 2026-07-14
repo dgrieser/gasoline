@@ -1973,7 +1973,7 @@ function renderDocumentHead(string $titleSuffix): void
         a.brand {
             display: flex;
             align-items: center;
-            gap: 1rem;
+            gap: 0.6rem;
             text-decoration: none;
             color: inherit;
             border-radius: 16px;
