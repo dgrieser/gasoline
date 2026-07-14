@@ -2016,14 +2016,20 @@ function renderDocumentHead(string $titleSuffix): void
             color: var(--ink);
         }
 
+        /* The hover drop-shadow lives on the em while the gradient clip lives
+           on a nested span: combining filter with background-clip:text on the
+           same element breaks rendering in WebKit/Blink. */
         h1 em {
             font-style: normal;
+            transition: filter 0.3s ease;
+        }
+
+        h1 em span {
             background: linear-gradient(180deg, #ffd27a 0%, var(--amber) 55%, #dd8a06 100%);
             -webkit-background-clip: text;
             background-clip: text;
             -webkit-text-fill-color: transparent;
             color: var(--amber);
-            transition: filter 0.3s ease;
         }
 
         .brand:hover h1 em {
@@ -3205,12 +3211,12 @@ function renderHeader(?array $user, string $activePage): void
 ?>
     <!-- Header -->
     <header class="header">
-        <a class="brand" href="?" aria-label="Gasoline — Dashboard">
+        <a class="brand" href="?" aria-label="Gasoline — Dashboard" data-i18n-aria-label="brandAriaLabel">
             <span class="brand-icon" aria-hidden="true">
                 <img class="logo-light" src="logo-light.png" alt="">
                 <img class="logo-dark" src="logo-dark.png" alt="">
             </span>
-            <h1>Gas<em>o</em>line</h1>
+            <h1>Gas<em><span>o</span></em>line</h1>
         </a>
         <div class="header-controls">
             <div class="lang-picker">
@@ -3310,6 +3316,7 @@ const translations = {
         rangeToday: 'Today',
         toggleTheme: 'Toggle theme',
         chartAriaLabel: 'Fuel price history chart',
+        brandAriaLabel: 'Gasoline — Dashboard',
         openMenu: 'Open menu',
         menuDashboard: 'Dashboard',
         menuAccount: 'My Account',
@@ -3487,6 +3494,7 @@ const translations = {
         rangeToday: 'Heute',
         toggleTheme: 'Design wechseln',
         chartAriaLabel: 'Kraftstoffpreis-Verlaufsdiagramm',
+        brandAriaLabel: 'Gasoline — Dashboard',
         openMenu: 'Menü öffnen',
         menuDashboard: 'Dashboard',
         menuAccount: 'Mein Konto',
