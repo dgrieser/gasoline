@@ -12,7 +12,7 @@ import (
 // This file is a Go port of the gasoline-watch.sh template engine
 // (PLACEHOLDERS, row_value, build_message, expand_scalar_placeholders,
 // build_notification_command). The notify command renders the same
-// {{placeholder}} language — including *_onchange variants, day-scoped
+// {{placeholder}} language — including *_onchange variants, window-scoped
 // change detection, line skipping, {{message}}, {{cheapest_*}} and
 // {{count}} — except that the result is the Pushover message text itself
 // rather than a shell command, so no shell quoting is applied.
@@ -82,14 +82,19 @@ var templatePlaceholders = []string{
 	"weekday_short_formatted",
 }
 
-// onchangeDayRef mirrors ONCHANGE_DAY_REF: time-of-day keys whose onchange
-// signature also carries the referenced day, so a repeated time still counts
-// as changed when the day it refers to changed.
-var onchangeDayRef = map[string]string{
-	"start_time":             "date",
-	"end_time":               "date",
-	"best_future_start_time": "best_future_date",
-	"best_future_end_time":   "best_future_date",
+// onchangeSigRef mirrors ONCHANGE_SIG_REF: time-of-day keys whose onchange
+// signature also carries the referenced day and the paired window boundary,
+// so a repeated time still counts as changed when the window it belongs to
+// changed — a new day, or a same-day window with a different start or end.
+// Without the paired boundary, "09:00-12:00" followed by "09:00-10:00" on the
+// same day would blank the repeated start and render a dangling " 10:00".
+// The referenced values only feed change detection; they never leak into the
+// rendered output.
+var onchangeSigRef = map[string][]string{
+	"start_time":             {"date", "end_time"},
+	"end_time":               {"date", "start_time"},
+	"best_future_start_time": {"best_future_date", "best_future_end_time"},
+	"best_future_end_time":   {"best_future_date", "best_future_start_time"},
 }
 
 // --- locale caches (counterparts of the watcher's decimal-separator and
@@ -568,17 +573,17 @@ func buildMessage(kind notifyKind, rowTemplate string, rows []notifyRow) string 
 		// Resolve onchange values once per row so change tracking stays
 		// correct regardless of which physical lines end up skipped.
 		onchangeEffective := map[string]string{}
-		dayCache := map[string]string{}
+		refCache := map[string]string{}
 		for _, key := range onchangeKeys {
 			value := rowValue(kind, row, key)
 			sig := value
-			if dayref, ok := onchangeDayRef[key]; ok {
-				dayval, cached := dayCache[dayref]
+			for _, ref := range onchangeSigRef[key] {
+				refValue, cached := refCache[ref]
 				if !cached {
-					dayval = rowValue(kind, row, dayref)
-					dayCache[dayref] = dayval
+					refValue = rowValue(kind, row, ref)
+					refCache[ref] = refValue
 				}
-				sig = dayval + "\x1f" + value
+				sig = refValue + "\x1f" + sig
 			}
 			if havePrev && prevSig[key] == sig {
 				onchangeEffective[key] = ""

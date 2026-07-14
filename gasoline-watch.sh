@@ -53,15 +53,18 @@ PLACEHOLDERS=(
   weekday_short_formatted
 )
 
-# Onchange keys whose change detection is scoped by a reference day: a time-of-day
-# value that repeats is still "changed" when the day it refers to changed. The
-# value maps to another resolver key whose resolved value forms part of the
-# change-detection signature (it does NOT affect the rendered output).
-declare -A ONCHANGE_DAY_REF=(
-  [start_time]=date
-  [end_time]=date
-  [best_future_start_time]=best_future_date
-  [best_future_end_time]=best_future_date
+# Onchange keys whose change detection is scoped by reference keys: a
+# time-of-day value that repeats is still "changed" when the window it belongs
+# to changed — the day it refers to, or the paired boundary of the same window.
+# Without the paired boundary, "09:00-12:00" followed by "09:00-10:00" on the
+# same day would blank the repeated start and render a dangling " 10:00". Each
+# value maps to space-separated resolver keys whose resolved values form part
+# of the change-detection signature (they do NOT affect the rendered output).
+declare -A ONCHANGE_SIG_REF=(
+  [start_time]="date end_time"
+  [end_time]="date start_time"
+  [best_future_start_time]="best_future_date best_future_end_time"
+  [best_future_end_time]="best_future_date best_future_start_time"
 )
 
 CHECK_ROW_TEMPLATE='Buy {{fuel}} at {{station_name}} ({{distance}} km): {{current_price}} EUR, confidence {{confidence}}, verdict {{verdict}}'
@@ -584,9 +587,9 @@ build_message() {
   local message="" row value line rendered
   local line_has_onchange line_has_value
   local -A prev_sig=()
-  local -A day_cache=()
+  local -A ref_cache=()
   local -A onchange_effective=()
-  local dayref dayval sig
+  local refs ref sig
   local have_prev=0 first_emitted=0
 
   # Scalar placeholders ({{count}}, {{cheapest_*}}) are already expanded earlier
@@ -596,27 +599,26 @@ build_message() {
     # Resolve onchange values once per row for every onchange key, so the
     # per-row change tracking below stays correct regardless of which physical
     # lines a key appears on (or whether those lines end up skipped).
-    day_cache=()
+    ref_cache=()
     onchange_effective=()
     if ((${#onchange_keys[@]})); then
       for key in "${onchange_keys[@]}"; do
         value=$(row_value "$kind" "$row" "$key")
 
-        # Build the change-detection signature. For day-scoped time keys the
-        # signature also carries the referenced day's value, so a repeated time
-        # string still counts as changed when the day it belongs to changed. The
-        # day value is memoized per row so time keys sharing a dayref resolve it
-        # only once. \x1f (unit separator) never appears in dates/times.
-        dayref=${ONCHANGE_DAY_REF[$key]-}
-        if [[ -n "$dayref" ]]; then
-          if [[ -z "${day_cache[$dayref]+x}" ]]; then
-            day_cache[$dayref]=$(row_value "$kind" "$row" "$dayref")
+        # Build the change-detection signature. For window-scoped time keys
+        # the signature also carries the referenced day and the paired window
+        # boundary, so a repeated time string still counts as changed when the
+        # window it belongs to changed. Reference values are memoized per row
+        # so keys sharing a reference resolve it only once. \x1f (unit
+        # separator) never appears in dates/times.
+        sig=$value
+        refs=${ONCHANGE_SIG_REF[$key]-}
+        for ref in $refs; do
+          if [[ -z "${ref_cache[$ref]+x}" ]]; then
+            ref_cache[$ref]=$(row_value "$kind" "$row" "$ref")
           fi
-          dayval=${day_cache[$dayref]}
-          sig="${dayval}"$'\x1f'"${value}"
-        else
-          sig=$value
-        fi
+          sig="${ref_cache[$ref]}"$'\x1f'"${sig}"
+        done
 
         if ((have_prev)) && [[ "${prev_sig[$key]-}" == "$sig" ]]; then
           onchange_effective[$key]=""
