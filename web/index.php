@@ -2798,7 +2798,7 @@ function renderDocumentHead(string $titleSuffix): void
             --muted:      #6e6e73;
             --amber-dim:  rgba(194,120,10,0.08);
             --amber-glow: rgba(194,120,10,0.2);
-            --wm-shadow:  rgba(28,28,30,0.2);
+            --wm-shadow:  rgba(28,28,30,0.12);
         }
 
         html[data-theme="light"] body {
