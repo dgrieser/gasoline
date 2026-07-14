@@ -1924,6 +1924,7 @@ function renderDocumentHead(string $titleSuffix): void
             --red:         #f87171;
             --mono:        'DM Mono', 'Fira Mono', monospace;
             --sans:        'Space Grotesk', system-ui, sans-serif;
+            --wm-shadow:   rgba(0,0,0,0.6);
         }
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; }
@@ -2010,27 +2011,17 @@ function renderDocumentHead(string $titleSuffix): void
             font-weight: 700;
             letter-spacing: -0.015em;
             line-height: 1;
+            color: var(--ink);
+            /* sharp offset shadow; the gradient clip lives on the inner
+               .wm span so the filter never touches clipped text directly */
+            filter: drop-shadow(0.055em 0.065em 0 var(--wm-shadow));
+        }
+
+        h1 .wm {
             background: linear-gradient(180deg, var(--ink) 55%, var(--muted) 145%);
             -webkit-background-clip: text;
             background-clip: text;
             -webkit-text-fill-color: transparent;
-            color: var(--ink);
-            position: relative;
-            isolation: isolate;
-        }
-
-        /* Outline drawn by a duplicate text layer BEHIND the wordmark: only
-           the stroke's outer rim shows, so it can't collide with the
-           gradient fill the way text-stroke + background-clip:text does. */
-        h1::after {
-            content: attr(data-text);
-            content: attr(data-text) / "";
-            position: absolute;
-            inset: 0;
-            z-index: -1;
-            background: none;
-            -webkit-text-fill-color: transparent;
-            -webkit-text-stroke: 0.08em var(--ink);
         }
 
         /* The hover drop-shadow lives on the em while the gradient clip lives
@@ -2798,6 +2789,7 @@ function renderDocumentHead(string $titleSuffix): void
             --muted:      #6e6e73;
             --amber-dim:  rgba(194,120,10,0.08);
             --amber-glow: rgba(194,120,10,0.2);
+            --wm-shadow:  rgba(28,28,30,0.2);
         }
 
         html[data-theme="light"] body {
@@ -3233,7 +3225,7 @@ function renderHeader(?array $user, string $activePage): void
                 <img class="logo-light" src="logo-light.svg" alt="">
                 <img class="logo-dark" src="logo-dark.svg" alt="">
             </span>
-            <h1 data-text="gasoline">gas<em><span>o</span></em>line</h1>
+            <h1><span class="wm">gas<em><span>o</span></em>line</span></h1>
         </a>
         <div class="header-controls">
             <div class="lang-picker">
