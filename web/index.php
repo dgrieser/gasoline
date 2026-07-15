@@ -4449,7 +4449,13 @@ if (!chartEl) {
             }
         }
 
-        const distinctTs = [...new Set(visibleRows.map((r) => r._ts))].sort((a, b) => a - b);
+        // visibleRows is sorted by _ts ASC, so one linear pass dedups in order.
+        const distinctTs = [];
+        for (const r of visibleRows) {
+            if (distinctTs.length === 0 || distinctTs[distinctTs.length - 1] !== r._ts) {
+                distinctTs.push(r._ts);
+            }
+        }
 
         const crossLine = mk('line', {
             x1: 0, x2: 0, y1: margin.top, y2: H - margin.bottom,
