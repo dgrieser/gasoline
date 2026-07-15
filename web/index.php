@@ -134,6 +134,9 @@ function flashText(string $key): string
         'targetRemoved' => 'Update target removed.',
         'invalidTarget' => 'Invalid city or radius (1-25 km).',
         'targetExists' => 'This city is already an update target.',
+        'stationRenamed' => 'Station renamed.',
+        'renameCleared' => 'Rename removed. The original name is used again.',
+        'invalidRename' => 'Select a station and enter a non-empty new name.',
         'notFound' => 'The requested item was not found.',
         'loggedOut' => 'You have been signed out.',
     ];
@@ -832,6 +835,40 @@ function handlePost(PDO $pdo, string $driver): void
             setFlash($stmt->rowCount() > 0 ? 'success' : 'error', $stmt->rowCount() > 0 ? 'targetRemoved' : 'notFound');
             redirectTo('?page=admin_settings');
             // no break
+
+        case 'rename_station':
+            $stationId = trim((string) ($_POST['station_id'] ?? ''));
+            $newName = trim((string) ($_POST['new_name'] ?? ''));
+            if ($stationId === '' || $newName === '') {
+                setFlash('error', 'invalidRename');
+                redirectTo('?page=admin_stations');
+            }
+            if (!stationExists($pdo, $stationId)) {
+                setFlash('error', 'notFound');
+                redirectTo('?page=admin_stations');
+            }
+            // Same override the CLI's `gasoline rename` sets; `update` keeps
+            // the canonical name in sync but never touches the override.
+            $stmt = $pdo->prepare('UPDATE stations SET name_override = :name WHERE id = :id');
+            $stmt->bindValue(':name', $newName);
+            $stmt->bindValue(':id', $stationId);
+            $stmt->execute();
+            setFlash('success', 'stationRenamed');
+            redirectTo('?page=admin_stations');
+            // no break
+
+        case 'clear_station_rename':
+            $stationId = trim((string) ($_POST['station_id'] ?? ''));
+            if ($stationId === '' || !stationExists($pdo, $stationId)) {
+                setFlash('error', 'notFound');
+                redirectTo('?page=admin_stations');
+            }
+            $stmt = $pdo->prepare('UPDATE stations SET name_override = NULL WHERE id = :id');
+            $stmt->bindValue(':id', $stationId);
+            $stmt->execute();
+            setFlash('success', 'renameCleared');
+            redirectTo('?page=admin_stations');
+            // no break
     }
 
     // Unknown action: back to the dashboard.
@@ -1128,6 +1165,220 @@ function renderAdminUsersPage(PDO $pdo, array $user): never
     renderPageEnd();
 }
 
+function renderAdminStationsPage(PDO $pdo, array $user): never
+{
+    $renamed = $pdo->query(
+        <<<'SQL'
+        SELECT id, name, name_override, street, house_number, post_code, place
+        FROM stations
+        WHERE name_override IS NOT NULL
+        ORDER BY name_override ASC, id ASC
+        SQL
+    )->fetchAll();
+    renderPageStart('Stations', $user, 'admin_stations');
+    ?>
+    <div class="settings-layout wide">
+        <?php renderFlash(); ?>
+
+        <div class="settings-card">
+            <h2 data-i18n="renameStation">Rename a station</h2>
+            <p class="auth-note" data-i18n="renameStationHint">The new name replaces the Tankerkönig name everywhere — dashboard, CLI output, and notifications. The original name is kept and can be restored at any time.</p>
+            <form method="post" action="" id="rename-form">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="rename_station">
+                <div class="field">
+                    <label for="st-search" data-i18n="station">Station</label>
+                    <div class="city-ac" id="station-ac">
+                        <input
+                            type="text"
+                            id="st-search"
+                            class="city-ac-input"
+                            data-i18n-placeholder="stationSearchPlaceholder"
+                            placeholder="Search by name or address..."
+                            autocomplete="off"
+                            spellcheck="false"
+                            aria-autocomplete="list"
+                            aria-controls="station-ac-list"
+                            aria-expanded="false"
+                        >
+                        <input type="hidden" name="station_id" id="st-station-id" value="">
+                        <ul class="city-ac-list" id="station-ac-list" role="listbox" hidden></ul>
+                    </div>
+                </div>
+                <div class="field">
+                    <label for="st-new-name" data-i18n="newStationName">New name</label>
+                    <input type="text" id="st-new-name" name="new_name" required maxlength="200" autocomplete="off">
+                </div>
+                <button type="submit" class="btn-primary" id="st-apply" data-i18n="applyRename" disabled>Apply</button>
+            </form>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="renamedStations">Renamed stations</h2>
+            <div class="table-scroll">
+            <table class="stack-table">
+                <thead>
+                    <tr><th data-i18n="station">Station</th><th data-i18n="colNewName">New name</th><th data-i18n="colActions">Actions</th></tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($renamed as $row) { ?>
+                    <tr>
+                        <td class="stack-primary"><?= h((string) $row['name']) ?><span class="station-sub"><?= h(stationAddress($row)) ?></span></td>
+                        <td class="rename-cell" data-label="New name" data-i18n-label="colNewName">
+                            <form method="post" action="" class="rename-form"><?= csrfField() ?><input type="hidden" name="action" value="rename_station"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><input type="text" name="new_name" value="<?= h((string) $row['name_override']) ?>" required maxlength="200"><button type="submit" class="btn-small" data-i18n="save">Save</button></form>
+                        </td>
+                        <td class="actions-cell">
+                            <form method="post" action="" class="table-form" data-confirm="confirmRemoveRename"><?= csrfField() ?><input type="hidden" name="action" value="clear_station_rename"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><button type="submit" class="btn-small danger" data-i18n="removeRename">Remove</button></form>
+                        </td>
+                    </tr>
+                    <?php } ?>
+                    <?php if ($renamed === []) { ?>
+                    <tr><td colspan="3" data-i18n="noRenames">No stations have been renamed yet.</td></tr>
+                    <?php } ?>
+                </tbody>
+            </table>
+            </div>
+        </div>
+    </div>
+    <script>
+    /* ── Station autocomplete (rename form) ────────────────────────── */
+    (function () {
+        const wrap    = document.getElementById('station-ac');
+        const input   = document.getElementById('st-search');
+        const hidden  = document.getElementById('st-station-id');
+        const list    = document.getElementById('station-ac-list');
+        const newName = document.getElementById('st-new-name');
+        const apply   = document.getElementById('st-apply');
+        const form    = document.getElementById('rename-form');
+
+        if (!wrap || !input || !hidden || !list || !newName || !apply || !form) return;
+
+        let controller = null;
+        let activeIdx  = -1;
+        let debounceTimer = null;
+
+        function showList() {
+            list.hidden = false;
+            input.setAttribute('aria-expanded', 'true');
+        }
+
+        function hideList() {
+            list.hidden = true;
+            input.setAttribute('aria-expanded', 'false');
+            activeIdx = -1;
+        }
+
+        function setActive(idx) {
+            const items = list.querySelectorAll('.city-ac-item');
+            items.forEach((el, i) => el.setAttribute('aria-selected', String(i === idx)));
+            activeIdx = idx;
+        }
+
+        function selectStation(station) {
+            input.value  = station.address ? station.name + ' — ' + station.address : station.name;
+            hidden.value = station.id;
+            newName.value = station.name;
+            apply.disabled = false;
+            hideList();
+            newName.focus();
+            newName.select();
+        }
+
+        async function fetchMatches(q) {
+            if (controller) controller.abort();
+            controller = new AbortController();
+            try {
+                const url = new URL(location.href);
+                url.search = '';
+                url.searchParams.set('action', 'station_search');
+                url.searchParams.set('q', q);
+                const res = await fetch(url.toString(), { signal: controller.signal });
+                return await res.json();
+            } catch {
+                return null;
+            }
+        }
+
+        input.addEventListener('input', () => {
+            hidden.value = '';
+            apply.disabled = true;
+            clearTimeout(debounceTimer);
+            const q = input.value.trim();
+            if (q.length < 2) { hideList(); return; }
+
+            debounceTimer = setTimeout(async () => {
+                const results = await fetchMatches(q);
+                if (!Array.isArray(results)) return;
+
+                list.innerHTML = '';
+                if (results.length === 0) {
+                    const empty = document.createElement('li');
+                    empty.className = 'city-ac-empty';
+                    empty.textContent = '— no matches —';
+                    list.appendChild(empty);
+                } else {
+                    results.forEach((station) => {
+                        const li = document.createElement('li');
+                        li.className = 'city-ac-item station-ac-item';
+                        li.role      = 'option';
+                        li.setAttribute('aria-selected', 'false');
+                        const name = document.createElement('span');
+                        name.className   = 'ac-name';
+                        name.textContent = station.name;
+                        li.appendChild(name);
+                        const subText = [station.brand, station.address].filter(Boolean).join(' · ');
+                        if (subText !== '') {
+                            const sub = document.createElement('span');
+                            sub.className   = 'ac-sub';
+                            sub.textContent = subText;
+                            li.appendChild(sub);
+                        }
+                        li.addEventListener('mousedown', (e) => {
+                            e.preventDefault();
+                            selectStation(station);
+                        });
+                        list.appendChild(li);
+                    });
+                }
+                showList();
+                activeIdx = -1;
+            }, 200);
+        });
+
+        input.addEventListener('keydown', (e) => {
+            const items = [...list.querySelectorAll('.city-ac-item')];
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setActive(Math.min(activeIdx + 1, items.length - 1));
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setActive(Math.max(activeIdx - 1, 0));
+            } else if (e.key === 'Enter' && !list.hidden && activeIdx >= 0 && items[activeIdx]) {
+                e.preventDefault();
+                items[activeIdx].dispatchEvent(new MouseEvent('mousedown'));
+            } else if (e.key === 'Escape') {
+                hideList();
+            }
+        });
+
+        input.addEventListener('blur', () => setTimeout(hideList, 150));
+
+        document.addEventListener('click', (e) => {
+            if (!wrap.contains(e.target)) hideList();
+        });
+
+        form.addEventListener('submit', (e) => {
+            if (hidden.value === '') {
+                e.preventDefault();
+                input.focus();
+            }
+        });
+    })();
+    </script>
+    <?php
+    renderPageEnd();
+}
+
 function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
 {
     $settings = settingsAll($pdo);
@@ -1259,7 +1510,7 @@ gasolineStartSession();
 
 $requestedAction = (string) ($_GET['action'] ?? '');
 $requestedPage = (string) ($_GET['page'] ?? '');
-$isJSONRequest = in_array($requestedAction, ['city_search', 'data'], true);
+$isJSONRequest = in_array($requestedAction, ['city_search', 'station_search', 'data'], true);
 
 $authPdo = null;
 $schemaGuardReason = null;
@@ -1322,6 +1573,12 @@ switch ($requestedPage) {
             redirectTo('');
         }
         renderAdminUsersPage($authPdo, $currentUser);
+        // no break
+    case 'admin_stations':
+        if ((int) $currentUser['is_admin'] !== 1) {
+            redirectTo('');
+        }
+        renderAdminStationsPage($authPdo, $currentUser);
         // no break
     case 'admin_settings':
         if ((int) $currentUser['is_admin'] !== 1) {
@@ -1466,6 +1723,70 @@ if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
         $searchStmt->execute();
         echo json_encode($searchStmt->fetchAll(), JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
     } catch (Throwable $e) {
+        echo '[]';
+    }
+    exit;
+}
+
+// ── AJAX: station search (admin station rename) ───────────────────────────────
+if (isset($_GET['action']) && $_GET['action'] === 'station_search') {
+    header('Content-Type: application/json; charset=utf-8');
+    if ((int) $currentUser['is_admin'] !== 1) {
+        http_response_code(403);
+        echo json_encode(['errors' => [['key' => 'notFound', 'params' => [], 'message' => 'Administrator access required.']]]);
+        exit;
+    }
+    $q = trim((string) ($_GET['q'] ?? ''));
+    $terms = preg_split('/\s+/', strtolower($q), 8, PREG_SPLIT_NO_EMPTY) ?: [];
+    if (strlen($q) < 2 || $terms === []) {
+        echo '[]';
+        exit;
+    }
+    try {
+        // Every whitespace-separated term must match the effective name, the
+        // canonical name, the brand, or one of the address fields.
+        $haystacks = [
+            'COALESCE(s.name_override, s.name)',
+            's.name',
+            "COALESCE(s.brand, '')",
+            "COALESCE(s.street, '')",
+            "COALESCE(s.post_code, '')",
+            "COALESCE(s.place, '')",
+        ];
+        $where = [];
+        $params = [];
+        foreach ($terms as $termIndex => $term) {
+            $group = [];
+            foreach ($haystacks as $haystackIndex => $haystack) {
+                $placeholder = ':t' . $termIndex . '_' . $haystackIndex;
+                $group[] = 'LOWER(' . $haystack . ') LIKE ' . $placeholder;
+                $params[$placeholder] = '%' . $term . '%';
+            }
+            $where[] = '(' . implode(' OR ', $group) . ')';
+        }
+        $searchStmt = $authPdo->prepare(
+            'SELECT s.id, s.name, s.name_override, s.brand, s.street, s.house_number, s.post_code, s.place
+             FROM stations s
+             WHERE ' . implode(' AND ', $where) . '
+             ORDER BY COALESCE(s.name_override, s.name) ASC, s.id ASC
+             LIMIT 20'
+        );
+        foreach ($params as $key => $value) {
+            $searchStmt->bindValue($key, $value);
+        }
+        $searchStmt->execute();
+        $results = [];
+        foreach ($searchStmt->fetchAll() as $row) {
+            $results[] = [
+                'id' => (string) $row['id'],
+                'name' => $row['name_override'] !== null ? (string) $row['name_override'] : (string) $row['name'],
+                'brand' => trim((string) ($row['brand'] ?? '')),
+                'address' => stationAddress($row),
+            ];
+        }
+        echo json_encode($results, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+    } catch (Throwable $e) {
+        error_log('gasoline station_search error: ' . $e->getMessage());
         echo '[]';
     }
     exit;
@@ -1880,6 +2201,29 @@ function stationLabel(array $station): string
     $suffix = implode(' ', array_filter([$place, $dist !== '' ? "({$dist})" : '']));
 
     return $suffix !== '' ? "{$name}, {$suffix}" : $name;
+}
+
+function stationExists(PDO $pdo, string $stationId): bool
+{
+    $stmt = $pdo->prepare('SELECT 1 FROM stations WHERE id = :id');
+    $stmt->bindValue(':id', $stationId);
+    $stmt->execute();
+    return $stmt->fetch() !== false;
+}
+
+/** "Street 5, 12345 Place" from a stations row; empty parts are dropped. */
+function stationAddress(array $station): string
+{
+    $street = trim(implode(' ', array_filter([
+        trim((string) ($station['street'] ?? '')),
+        trim((string) ($station['house_number'] ?? '')),
+    ])));
+    $town = trim(implode(' ', array_filter([
+        trim((string) ($station['post_code'] ?? '')),
+        trim((string) ($station['place'] ?? '')),
+    ])));
+
+    return implode(', ', array_filter([$street, $town]));
 }
 
 // renderDocumentHead emits everything from <!doctype> through </head> —
@@ -3127,6 +3471,37 @@ function renderDocumentHead(string $titleSuffix): void
         .table-form { display: inline-block; margin: 0 0.15rem 0 0; }
         .actions-cell { white-space: nowrap; }
         .table-scroll { overflow-x: auto; }
+        .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
+        /* Address line under a station name (admin stations table) */
+        .station-sub {
+            display: block;
+            font-family: var(--mono);
+            font-size: 0.7rem;
+            color: var(--muted);
+            margin-top: 0.15rem;
+        }
+        /* Inline edit form inside the renamed-stations table */
+        .rename-form { display: flex; align-items: center; gap: 0.4rem; }
+        .rename-form input[type="text"] {
+            flex: 1;
+            min-width: 8rem;
+            padding: 0.45rem 0.6rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-hi);
+            background: var(--bg);
+            color: var(--ink);
+            font-family: var(--mono);
+            font-size: 0.8rem;
+        }
+        /* Two-line station suggestions in the autocomplete dropdown */
+        .station-ac-item .ac-name { display: block; overflow: hidden; text-overflow: ellipsis; }
+        .station-ac-item .ac-sub {
+            display: block;
+            font-size: 0.7rem;
+            color: var(--muted);
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
         /* Stack admin tables into label/value cards on small screens instead
            of forcing a horizontal scroll. */
         @media (max-width: 640px) {
@@ -3175,6 +3550,11 @@ function renderDocumentHead(string $titleSuffix): void
                 padding-top: 0.5rem;
             }
             .stack-table td:empty { display: none; }
+            /* The inline rename form gets its own full-width line below the
+               label so the input stays comfortably tappable. */
+            .stack-table td.rename-cell { flex-wrap: wrap; }
+            .stack-table td.rename-cell .rename-form { flex: 1 1 100%; }
+            .stack-table td.stack-primary .station-sub { flex-basis: 100%; margin-top: 0; }
         }
         .badge {
             display: inline-block;
@@ -3332,6 +3712,7 @@ function renderHeader(?array $user, string $activePage): void
                 <?php if ((int) $user['is_admin'] === 1) { ?>
                 <div class="menu-sep" data-i18n="menuAdminSection">Admin</div>
                 <a class="menu-item<?= $activePage === 'admin_users' ? ' active' : '' ?>" href="?page=admin_users" data-i18n="menuUsers">Users</a>
+                <a class="menu-item<?= $activePage === 'admin_stations' ? ' active' : '' ?>" href="?page=admin_stations" data-i18n="menuStations">Stations</a>
                 <a class="menu-item<?= $activePage === 'admin_settings' ? ' active' : '' ?>" href="?page=admin_settings" data-i18n="menuSettings">Settings</a>
                 <?php } ?>
                 <div class="menu-sep"></div>
@@ -3418,6 +3799,7 @@ const translations = {
         menuAccount: 'My Account',
         menuAdminSection: 'Admin',
         menuUsers: 'Users',
+        menuStations: 'Stations',
         menuSettings: 'Settings',
         menuLogout: 'Sign out',
         loginTitle: 'Sign in',
@@ -3509,6 +3891,19 @@ const translations = {
         targetRemoved: 'Update target removed.',
         invalidTarget: 'Invalid city or radius (1-25 km).',
         targetExists: 'This city is already an update target.',
+        renameStation: 'Rename a station',
+        renameStationHint: 'The new name replaces the Tankerkönig name everywhere — dashboard, CLI output, and notifications. The original name is kept and can be restored at any time.',
+        stationSearchPlaceholder: 'Search by name or address...',
+        newStationName: 'New name',
+        applyRename: 'Apply',
+        renamedStations: 'Renamed stations',
+        colNewName: 'New name',
+        noRenames: 'No stations have been renamed yet.',
+        removeRename: 'Remove',
+        confirmRemoveRename: 'Really remove this rename and restore the original name?',
+        stationRenamed: 'Station renamed.',
+        renameCleared: 'Rename removed. The original name is used again.',
+        invalidRename: 'Select a station and enter a non-empty new name.',
         suggestionSettings: 'Suggestions & checks',
         settingFuel: 'Fuel',
         settingRangeKm: 'Range (km)',
@@ -3597,6 +3992,7 @@ const translations = {
         menuAccount: 'Mein Konto',
         menuAdminSection: 'Admin',
         menuUsers: 'Benutzer',
+        menuStations: 'Tankstellen',
         menuSettings: 'Einstellungen',
         menuLogout: 'Abmelden',
         loginTitle: 'Anmelden',
@@ -3688,6 +4084,19 @@ const translations = {
         targetRemoved: 'Update-Ziel entfernt.',
         invalidTarget: 'Ungültige Stadt oder ungültiger Radius (1-25 km).',
         targetExists: 'Diese Stadt ist bereits ein Update-Ziel.',
+        renameStation: 'Tankstelle umbenennen',
+        renameStationHint: 'Der neue Name ersetzt den Tankerkönig-Namen überall — Dashboard, CLI-Ausgabe und Benachrichtigungen. Der Originalname bleibt erhalten und kann jederzeit wiederhergestellt werden.',
+        stationSearchPlaceholder: 'Nach Name oder Adresse suchen...',
+        newStationName: 'Neuer Name',
+        applyRename: 'Übernehmen',
+        renamedStations: 'Umbenannte Tankstellen',
+        colNewName: 'Neuer Name',
+        noRenames: 'Noch keine Tankstellen umbenannt.',
+        removeRename: 'Entfernen',
+        confirmRemoveRename: 'Diese Umbenennung wirklich entfernen und den Originalnamen wiederherstellen?',
+        stationRenamed: 'Tankstelle umbenannt.',
+        renameCleared: 'Umbenennung entfernt. Der Originalname wird wieder verwendet.',
+        invalidRename: 'Bitte eine Tankstelle auswählen und einen neuen Namen eingeben.',
         suggestionSettings: 'Vorschläge & Preisprüfungen',
         settingFuel: 'Kraftstoff',
         settingRangeKm: 'Umkreis (km)',
