@@ -2492,6 +2492,45 @@ function renderDocumentHead(string $titleSuffix): void
             text-align: center;
         }
 
+        /* Runners-up (ranks 2-5) inside the top-5 cheapest card */
+        .top5-list {
+            margin-top: 0.8rem;
+            padding-top: 0.7rem;
+            border-top: 1px solid var(--border);
+            display: grid;
+            gap: 0.45rem;
+        }
+
+        .top5-row {
+            display: flex;
+            align-items: baseline;
+            gap: 0.5rem;
+            font-family: var(--mono);
+            font-size: 0.75rem;
+            min-width: 0;
+        }
+
+        .top5-rank {
+            color: var(--muted);
+            font-size: 0.68rem;
+            width: 1ch;
+            flex-shrink: 0;
+        }
+
+        .top5-price {
+            font-weight: 500;
+            flex-shrink: 0;
+        }
+
+        .top5-station {
+            flex: 1;
+            min-width: 0;
+            color: var(--ink);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
         @media (max-width: 560px) {
             .cheapest-grid,
             .cheapest-grid.two-col { grid-template-columns: 1fr; }
@@ -2756,7 +2795,15 @@ function renderDocumentHead(string $titleSuffix): void
 
         /* ── Responsive ────────────────────────────────────────── */
         @media (max-width: 900px) {
-            .layout { grid-template-columns: 1fr; }
+            /* Single column: promote the content cards to layout children so
+               the top-5 card can sit above the filters (order: -1) while the
+               rest keeps its DOM order below them. */
+            /* align-items: stretch overrides the desktop grid's `start`, which
+               would let wide cards (the snapshot table) blow out the viewport. */
+            .layout { display: flex; flex-direction: column; gap: 1.25rem; align-items: stretch; }
+            .content { display: contents; }
+            .content > .error-box { order: -2; }
+            #cheapest-card { order: -1; }
             .sidebar { position: static; }
             .sidebar-head { cursor: pointer; }
             .sidebar-chevron { display: inline-flex; }
@@ -2769,7 +2816,11 @@ function renderDocumentHead(string $titleSuffix): void
         @media (max-width: 560px) {
             .page { width: 100vw; padding: 1rem 0.75rem 3rem; }
             .stats { grid-template-columns: 1fr 1fr; }
-            .header { flex-direction: column; align-items: flex-start; }
+            /* Keep the controls on the same row as the logo. */
+            .header { align-items: center; gap: 0.75rem; padding-bottom: 1rem; }
+            .brand-icon,
+            .brand-icon img { width: 40px; height: 40px; }
+            h1 { font-size: 1.4rem; }
         }
 
         /* ── Load animation ────────────────────────────────────── */
@@ -2878,19 +2929,45 @@ function renderDocumentHead(string $titleSuffix): void
             box-shadow: 0 6px 28px rgba(0,0,0,0.35), 0 1px 6px rgba(0,0,0,0.2);
             display: none;
             min-width: 130px;
-            max-width: 240px;
-        }
-
-        #price-tooltip .tt-price {
-            font-size: 1rem;
-            font-weight: 500;
-            letter-spacing: 0.03em;
+            max-width: min(320px, calc(100vw - 16px));
+            max-height: calc(100vh - 16px);
+            overflow: hidden;
         }
 
         #price-tooltip .tt-meta {
             color: var(--muted);
             font-size: 0.72rem;
-            margin-top: 2px;
+        }
+
+        #price-tooltip .tt-row {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            margin-top: 4px;
+        }
+
+        #price-tooltip .tt-name {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 0.72rem;
+            color: var(--ink);
+        }
+
+        #price-tooltip .tt-fuel {
+            color: var(--muted);
+            font-size: 0.62rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            flex-shrink: 0;
+        }
+
+        #price-tooltip .tt-val {
+            font-size: 0.78rem;
+            font-weight: 500;
+            flex-shrink: 0;
         }
 
         /* ── Auth, hamburger menu, account & admin pages ── */
@@ -3321,7 +3398,7 @@ const translations = {
         invalidFromDate: 'Invalid from date.',
         invalidToDate: 'Invalid to date.',
         noSnapshots: 'No snapshots match the current filters.',
-        cheapestNow: 'Cheapest — current',
+        cheapestNow: 'Top 5 cheapest — current',
         cheapestNoData: 'No price data available.',
         cheapestPrefix: 'Cheapest',
         cheapestRangeNoData: 'No price data available.',
@@ -3331,6 +3408,7 @@ const translations = {
         range30d: '30d',
         range14d: '14d',
         range7d: '7d',
+        range3d: '3d',
         rangeToday: 'Today',
         toggleTheme: 'Toggle theme',
         chartAriaLabel: 'Fuel price history chart',
@@ -3499,7 +3577,7 @@ const translations = {
         invalidFromDate: 'Ungültiges Von-Datum.',
         invalidToDate: 'Ungültiges Bis-Datum.',
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
-        cheapestNow: 'Günstigster Preis — aktuell',
+        cheapestNow: 'Top 5 günstigste Preise — aktuell',
         cheapestNoData: 'Keine Preisdaten vorhanden.',
         cheapestPrefix: 'Günstigster Preis',
         cheapestRangeNoData: 'Keine Preisdaten vorhanden.',
@@ -3509,6 +3587,7 @@ const translations = {
         range30d: '30d',
         range14d: '14d',
         range7d: '7d',
+        range3d: '3d',
         rangeToday: 'Heute',
         toggleTheme: 'Design wechseln',
         chartAriaLabel: 'Kraftstoffpreis-Verlaufsdiagramm',
@@ -3910,14 +3989,8 @@ renderDocumentHead('Price History');
                 ><?= h((string) $error['message']) ?></div>
             <?php endforeach; ?>
 
-            <!-- Cheapest now -->
+            <!-- Top 5 cheapest now -->
             <div class="cheapest-card" id="cheapest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
-
-            <!-- Cheapest in selected range -->
-            <div class="cheapest-card" id="cheapest-range-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
-
-            <!-- Highest in selected range -->
-            <div class="cheapest-card" id="highest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Chart -->
             <div class="chart-card">
@@ -3928,6 +4001,7 @@ renderDocumentHead('Price History');
                         <button type="button" class="range-toggle"        data-range="30d"   data-i18n="range30d">30d</button>
                         <button type="button" class="range-toggle"        data-range="14d"   data-i18n="range14d">14d</button>
                         <button type="button" class="range-toggle"        data-range="7d"    data-i18n="range7d">7d</button>
+                        <button type="button" class="range-toggle"        data-range="3d"    data-i18n="range3d">3d</button>
                         <button type="button" class="range-toggle"        data-range="today" data-i18n="rangeToday">Today</button>
                     </div>
                     <div class="fuel-toggles">
@@ -3946,6 +4020,12 @@ renderDocumentHead('Price History');
                     <button type="button" class="btn-reset" id="retry-btn" data-i18n="retry">Retry</button>
                 </div>
             </div>
+
+            <!-- Cheapest in selected range -->
+            <div class="cheapest-card" id="cheapest-range-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
+
+            <!-- Highest in selected range -->
+            <div class="cheapest-card" id="highest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Stats -->
             <div class="stats" aria-live="polite">
@@ -4117,28 +4197,25 @@ function positionTooltip(e) {
     // Clamp to viewport after paint
     requestAnimationFrame(() => {
         const r = tooltip.getBoundingClientRect();
-        if (r.right  > window.innerWidth  - 8) tooltip.style.left = (x - r.width  - 14) + 'px';
-        if (r.bottom > window.innerHeight - 8) tooltip.style.top  = (y - r.height - 14) + 'px';
+        if (r.right  > window.innerWidth  - 8) tooltip.style.left = Math.max(8, window.innerWidth  - r.width  - 8) + 'px';
+        if (r.bottom > window.innerHeight - 8) tooltip.style.top  = Math.max(8, window.innerHeight - r.height - 8) + 'px';
     });
 }
 
-function showTooltip(e, row, fuel, cfg) {
-    const color = stationFuelColor(row.station_name, fuel);
-    tooltip.innerHTML =
-        `<div class="tt-price" style="color:${color}">${cfg.label} &nbsp;${row[fuel].toFixed(3)} €</div>` +
-        `<div class="tt-meta">${h(row.station_name)}</div>` +
-        `<div class="tt-meta">${h(formatDateTime(row.recorded_at))}</div>`;
-    tooltip.style.display = 'block';
-    positionTooltip(e);
-}
+// Re-assigned by renderChart so hideTooltip can also drop the crosshair line.
+let hideCrosshair = () => {};
 
-let _activeDot = null;
 function hideTooltip() {
     tooltip.style.display = 'none';
-    if (_activeDot) { _activeDot.setAttribute('opacity', 0); _activeDot = null; }
+    hideCrosshair();
 }
 
-document.addEventListener('touchend', hideTooltip);
+// Lifting the finger on the chart keeps the crosshair readable; touching
+// anywhere else dismisses it.
+document.addEventListener('touchend', (e) => {
+    if (e.target instanceof Element && e.target.closest('#chart')) return;
+    hideTooltip();
+});
 
 // currentLang is declared in the shared script (renderCommonScript).
 
@@ -4153,7 +4230,7 @@ function getRangeFilteredData() {
         startOfToday.setHours(0, 0, 0, 0);
         cutoffTs = startOfToday.getTime();
     } else {
-        const days = chartRange === '30d' ? 30 : chartRange === '14d' ? 14 : 7;
+        const days = chartRange === '30d' ? 30 : chartRange === '14d' ? 14 : chartRange === '7d' ? 7 : 3;
         cutoffTs = Date.now() - days * 24 * 60 * 60 * 1000;
     }
 
@@ -4293,7 +4370,6 @@ if (!chartEl) {
         const gridStroke = light ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.05)';
         const tickStroke = light ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.04)';
         const axisStroke = light ? 'rgba(0,0,0,0.15)' : 'rgba(255,255,255,0.12)';
-        const dotFill    = chartBg;
 
         // Background
         mk('rect', { x: 0, y: 0, width: W, height: H, fill: chartBg });
@@ -4363,41 +4439,93 @@ if (!chartEl) {
             }
         }
 
-        // Dots on top — per-station colour, per-fuel tint
-        for (const fuel of activeFuels) {
-            const cfg = fuelConfig[fuel];
-            for (const stationRows of byStation.values()) {
-                const series = stationRows.filter((r) => r[fuel] !== null);
-                for (const row of series) {
-                    if (row._synthetic) continue;
-                    const xp = px(row._ts);
-                    const yp = py(row[fuel]);
-                    const color = stationFuelColor(row.station_name, fuel);
-                    const g = mk('g', { style: 'cursor:pointer' });
-                    // Hit area (invisible, generous for touch)
-                    mk('circle', { cx: xp, cy: yp, r: 12, fill: 'transparent' }, g);
-                    // Visible dot — hidden until hover/tap
-                    const dot = mk('circle', { cx: xp, cy: yp, r: 4.5, fill: dotFill, stroke: color, 'stroke-width': 1.5, opacity: 0 }, g);
-                    const _row = row, _cfg = cfg, _fuel = fuel;
-                    g.addEventListener('mouseenter', (e) => {
-                        if (_activeDot) _activeDot.setAttribute('opacity', 0);
-                        _activeDot = dot;
-                        dot.setAttribute('opacity', 1);
-                        showTooltip(e, _row, _fuel, _cfg);
-                    });
-                    g.addEventListener('mousemove',  positionTooltip);
-                    g.addEventListener('mouseleave', hideTooltip);
-                    g.addEventListener('touchstart', (e) => {
-                        e.preventDefault();
-                        if (_activeDot) _activeDot.setAttribute('opacity', 0);
-                        _activeDot = dot;
-                        dot.setAttribute('opacity', 1);
-                        showTooltip(e.touches[0], _row, _fuel, _cfg);
-                    }, { passive: false });
-                    chartEl.appendChild(g);
-                }
+        // Crosshair: a thin vertical line follows the pointer/finger and the
+        // tooltip lists every station's price in effect at that timestamp.
+        const crossSeries = [];
+        for (const stationRows of byStation.values()) {
+            for (const fuel of activeFuels) {
+                const rows = stationRows.filter((r) => r[fuel] !== null);
+                if (rows.length) crossSeries.push({ name: rows[0].station_name, fuel, rows });
             }
         }
+
+        const distinctTs = [...new Set(visibleRows.map((r) => r._ts))].sort((a, b) => a - b);
+
+        const crossLine = mk('line', {
+            x1: 0, x2: 0, y1: margin.top, y2: H - margin.bottom,
+            stroke: light ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.5)',
+            'stroke-width': 1, 'stroke-dasharray': '4 3',
+            opacity: 0, 'pointer-events': 'none',
+        });
+
+        // Last row of a series recorded at or before ts (series is _ts-sorted).
+        const lastAtOrBefore = (rows, ts) => {
+            let lo = 0, hi = rows.length - 1, best = null;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                if (rows[mid]._ts <= ts) { best = rows[mid]; lo = mid + 1; } else { hi = mid - 1; }
+            }
+            return best;
+        };
+
+        const showCrosshair = (clientX, clientY) => {
+            const rect = chartEl.getBoundingClientRect();
+            let sx = ((clientX - rect.left) / rect.width) * W;
+            sx = Math.max(margin.left, Math.min(W - margin.right, sx));
+            const t = minX + ((sx - margin.left) / iW) * (maxX - minX);
+
+            // Snap to the nearest recorded timestamp so the line sits on data.
+            let lo = 0, hi = distinctTs.length - 1;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (distinctTs[mid] < t) lo = mid + 1; else hi = mid;
+            }
+            const ts = (lo > 0 && t - distinctTs[lo - 1] < distinctTs[lo] - t) ? distinctTs[lo - 1] : distinctTs[lo];
+
+            const xp = px(ts);
+            crossLine.setAttribute('x1', xp);
+            crossLine.setAttribute('x2', xp);
+            crossLine.setAttribute('opacity', 1);
+
+            const entries = [];
+            for (const s of crossSeries) {
+                const row = lastAtOrBefore(s.rows, ts);
+                if (row) entries.push({ name: s.name, fuel: s.fuel, price: row[s.fuel] });
+            }
+            if (entries.length === 0) { hideTooltip(); return; }
+            entries.sort((a, b) => a.price - b.price);
+
+            const showFuel = activeFuels.size > 1;
+            tooltip.innerHTML =
+                `<div class="tt-meta">${h(formatDateTime(new Date(ts).toISOString()))}</div>` +
+                entries.map((en) => {
+                    const color = stationFuelColor(en.name, en.fuel);
+                    return `<div class="tt-row">` +
+                        `<span class="legend-dot" style="background:${color}"></span>` +
+                        `<span class="tt-name">${h(en.name)}</span>` +
+                        (showFuel ? `<span class="tt-fuel">${fuelConfig[en.fuel].label}</span>` : '') +
+                        `<span class="tt-val" style="color:${color}">${en.price.toFixed(3)} €</span>` +
+                    `</div>`;
+                }).join('');
+            tooltip.style.display = 'block';
+            positionTooltip({ clientX, clientY });
+        };
+
+        hideCrosshair = () => crossLine.setAttribute('opacity', 0);
+
+        const overlay = mk('rect', {
+            x: margin.left, y: margin.top, width: iW, height: iH,
+            fill: 'transparent', style: 'cursor:crosshair',
+        });
+        overlay.addEventListener('mousemove', (e) => showCrosshair(e.clientX, e.clientY));
+        overlay.addEventListener('mouseleave', hideTooltip);
+        const onTouch = (e) => {
+            e.preventDefault();
+            const touch = e.touches[0];
+            if (touch) showCrosshair(touch.clientX, touch.clientY);
+        };
+        overlay.addEventListener('touchstart', onTouch, { passive: false });
+        overlay.addEventListener('touchmove', onTouch, { passive: false });
 
         // Legend — one entry per station; dots show each active fuel tint
         for (const stationRows of byStation.values()) {
@@ -4503,9 +4631,58 @@ function latestRows() {
     return [...byStation.values()];
 }
 
+// Top 5 cheapest stations right now, per fuel: the best price rendered like
+// the other cards, followed by a compact ranked list of the runners-up.
 function renderCheapest() {
     const t = translations[currentLang];
-    renderPriceCard(cheapestCard, latestRows(), t.cheapestNow, (a, b) => a < b, ICON_DOWN, t.cheapestNoData);
+    if (!cheapestCard) return;
+    const fuels      = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
+    const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
+    const rows = latestRows();
+
+    const results = [];
+    for (const fuel of fuels) {
+        const top = rows.filter((r) => r[fuel] !== null)
+            .sort((a, b) => a[fuel] - b[fuel])
+            .slice(0, 5);
+        if (top.length) results.push({ fuel, top });
+    }
+
+    const distSuffix = (row) => {
+        const dist = stationDistancesById[row.station_id] ?? null;
+        return dist !== null ? ` (${dist.toFixed(1)} km)` : '';
+    };
+
+    const colClass = results.length === 1 ? ' single' : results.length === 2 ? ' two-col' : '';
+
+    cheapestCard.innerHTML =
+        `<div class="cheapest-header">${ICON_DOWN}<span class="cheapest-title">${t.cheapestNow}</span></div>` +
+        (results.length === 0
+            ? `<div class="cheapest-empty">${t.cheapestNoData}</div>`
+            : `<div class="cheapest-grid${colClass}">` +
+                results.map(({ fuel, top }) => {
+                    const best = top[0];
+                    const addressParts = [best.street, best.place].filter(Boolean);
+                    const bestDist = stationDistancesById[best.station_id] ?? null;
+                    if (bestDist !== null) addressParts.push(`${bestDist.toFixed(1)} km`);
+                    const runnersUp = top.slice(1).map((row, i) =>
+                        `<div class="top5-row" title="${h(formatDateTime(row.recorded_at))}">` +
+                            `<span class="top5-rank">${i + 2}</span>` +
+                            `<span class="top5-price" style="color:${fuelColors[fuel]}">${row[fuel].toFixed(3)}</span>` +
+                            `<span class="top5-station"><span class="legend-dot" style="background:${stationFuelColor(row.station_name, fuel)};display:inline-block;margin-right:0.4rem"></span>${h(row.station_name + distSuffix(row))}</span>` +
+                        `</div>`
+                    ).join('');
+                    return `<div class="cheapest-cell">` +
+                        `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
+                        `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${best[fuel].toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(best.station_name, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(best.station_name)}</div>` +
+                        (addressParts.length ? `<div class="cheapest-station" style="opacity:0.6">${h(addressParts.join(', '))}</div>` : '') +
+                        `<div class="cheapest-time">${h(formatDateTime(best.recorded_at))}</div>` +
+                        (runnersUp ? `<div class="top5-list">${runnersUp}</div>` : '') +
+                    `</div>`;
+                }).join('') +
+              `</div>`
+        );
 }
 
 function renderCheapestRange() {
