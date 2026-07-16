@@ -839,7 +839,7 @@ function handlePost(PDO $pdo, string $driver): void
         case 'rename_station':
             $stationId = trim((string) ($_POST['station_id'] ?? ''));
             $newName = trim((string) ($_POST['new_name'] ?? ''));
-            if ($stationId === '' || $newName === '') {
+            if ($stationId === '' || $newName === '' || mb_strlen($newName, 'UTF-8') > 200) {
                 setFlash('error', 'invalidRename');
                 redirectTo('?page=admin_stations');
             }
@@ -1737,7 +1737,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'station_search') {
         exit;
     }
     $q = trim((string) ($_GET['q'] ?? ''));
-    $terms = preg_split('/\s+/', strtolower($q), 8, PREG_SPLIT_NO_EMPTY) ?: [];
+    $terms = preg_split('/\s+/', mb_strtolower($q, 'UTF-8'), 8, PREG_SPLIT_NO_EMPTY) ?: [];
     if (strlen($q) < 2 || $terms === []) {
         echo '[]';
         exit;
@@ -2214,16 +2214,19 @@ function stationExists(PDO $pdo, string $stationId): bool
 /** "Street 5, 12345 Place" from a stations row; empty parts are dropped. */
 function stationAddress(array $station): string
 {
+    // Explicit callback: array_filter's default would also drop "0",
+    // discarding e.g. a legitimate house number 0.
+    $nonEmpty = static fn (string $value): bool => $value !== '';
     $street = trim(implode(' ', array_filter([
         trim((string) ($station['street'] ?? '')),
         trim((string) ($station['house_number'] ?? '')),
-    ])));
+    ], $nonEmpty)));
     $town = trim(implode(' ', array_filter([
         trim((string) ($station['post_code'] ?? '')),
         trim((string) ($station['place'] ?? '')),
-    ])));
+    ], $nonEmpty)));
 
-    return implode(', ', array_filter([$street, $town]));
+    return implode(', ', array_filter([$street, $town], $nonEmpty));
 }
 
 // renderDocumentHead emits everything from <!doctype> through </head> —
