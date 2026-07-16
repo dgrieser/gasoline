@@ -1225,10 +1225,10 @@ function renderAdminStationsPage(PDO $pdo, array $user): never
                     <tr>
                         <td class="stack-primary"><?= h((string) $row['name']) ?><span class="station-sub"><?= h(stationAddress($row)) ?></span></td>
                         <td class="rename-cell" data-label="New name" data-i18n-label="colNewName">
-                            <form method="post" action="" class="rename-form"><?= csrfField() ?><input type="hidden" name="action" value="rename_station"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><input type="text" name="new_name" value="<?= h((string) $row['name_override']) ?>" required maxlength="200"><button type="submit" class="btn-small" data-i18n="save">Save</button></form>
+                            <form method="post" action="" class="rename-form"><?= csrfField() ?><input type="hidden" name="action" value="rename_station"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><input type="text" name="new_name" value="<?= h((string) $row['name_override']) ?>" required maxlength="200"><button type="submit" class="btn-small btn-icon" aria-label="Save" title="Save" data-i18n-aria-label="save" data-i18n-title="save"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></button></form>
                         </td>
                         <td class="actions-cell">
-                            <form method="post" action="" class="table-form" data-confirm="confirmRemoveRename"><?= csrfField() ?><input type="hidden" name="action" value="clear_station_rename"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><button type="submit" class="btn-small danger" data-i18n="removeRename">Remove</button></form>
+                            <form method="post" action="" class="table-form" data-confirm="confirmRemoveRename"><?= csrfField() ?><input type="hidden" name="action" value="clear_station_rename"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><button type="submit" class="btn-small btn-icon danger" aria-label="Remove" title="Remove" data-i18n-aria-label="removeRename" data-i18n-title="removeRename"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></button></form>
                         </td>
                     </tr>
                     <?php } ?>
@@ -3468,6 +3468,16 @@ function renderDocumentHead(string $titleSuffix): void
         }
         .btn-small:hover { border-color: var(--amber); color: var(--amber); }
         .btn-small.danger:hover { border-color: var(--red); color: var(--red); }
+        .btn-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            padding: 0;
+            flex-shrink: 0;
+        }
+        .btn-icon svg { width: 14px; height: 14px; }
         .table-form { display: inline-block; margin: 0 0.15rem 0 0; }
         .actions-cell { white-space: nowrap; }
         .table-scroll { overflow-x: auto; }
@@ -4158,6 +4168,10 @@ function applyLang(lang) {
     document.querySelectorAll('[data-i18n-aria-label]').forEach((el) => {
         const key = el.dataset.i18nAriaLabel;
         if (t[key] !== undefined) el.setAttribute('aria-label', t[key]);
+    });
+    document.querySelectorAll('[data-i18n-title]').forEach((el) => {
+        const key = el.dataset.i18nTitle;
+        if (t[key] !== undefined) el.setAttribute('title', t[key]);
     });
     // Stacked-table row labels (mobile card layout).
     document.querySelectorAll('[data-i18n-label]').forEach((el) => {
