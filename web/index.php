@@ -1218,22 +1218,22 @@ function renderAdminStationsPage(PDO $pdo, array $user): never
             <div class="table-scroll">
             <table class="stack-table">
                 <thead>
-                    <tr><th data-i18n="station">Station</th><th data-i18n="colNewName">New name</th><th data-i18n="colActions">Actions</th></tr>
+                    <tr><th data-i18n="station">Station</th><th data-i18n="colNewName">New name</th></tr>
                 </thead>
                 <tbody>
                     <?php foreach ($renamed as $row) { ?>
                     <tr>
                         <td class="stack-primary"><?= h((string) $row['name']) ?><span class="station-sub"><?= h(stationAddress($row)) ?></span></td>
                         <td class="rename-cell" data-label="New name" data-i18n-label="colNewName">
-                            <form method="post" action="" class="rename-form"><?= csrfField() ?><input type="hidden" name="action" value="rename_station"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><input type="text" name="new_name" value="<?= h((string) $row['name_override']) ?>" required maxlength="200"><button type="submit" class="btn-small btn-icon" aria-label="Save" title="Save" data-i18n-aria-label="save" data-i18n-title="save"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></button></form>
-                        </td>
-                        <td class="actions-cell">
-                            <form method="post" action="" class="table-form" data-confirm="confirmRemoveRename"><?= csrfField() ?><input type="hidden" name="action" value="clear_station_rename"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><button type="submit" class="btn-small btn-icon danger" aria-label="Remove" title="Remove" data-i18n-aria-label="removeRename" data-i18n-title="removeRename"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></button></form>
+                            <div class="rename-controls">
+                                <form method="post" action="" class="rename-form"><?= csrfField() ?><input type="hidden" name="action" value="rename_station"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><input type="text" name="new_name" value="<?= h((string) $row['name_override']) ?>" required maxlength="200"><button type="submit" class="btn-icon" aria-label="Save" title="Save" data-i18n-aria-label="save" data-i18n-title="save"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></button></form>
+                                <form method="post" action="" class="rename-remove" data-confirm="confirmRemoveRename"><?= csrfField() ?><input type="hidden" name="action" value="clear_station_rename"><input type="hidden" name="station_id" value="<?= h((string) $row['id']) ?>"><button type="submit" class="btn-icon danger" aria-label="Remove" title="Remove" data-i18n-aria-label="removeRename" data-i18n-title="removeRename"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></button></form>
+                            </div>
                         </td>
                     </tr>
                     <?php } ?>
                     <?php if ($renamed === []) { ?>
-                    <tr><td colspan="3" data-i18n="noRenames">No stations have been renamed yet.</td></tr>
+                    <tr><td colspan="2" data-i18n="noRenames">No stations have been renamed yet.</td></tr>
                     <?php } ?>
                 </tbody>
             </table>
@@ -3472,12 +3472,21 @@ function renderDocumentHead(string $titleSuffix): void
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            width: 28px;
-            height: 28px;
+            width: 30px;
+            height: 30px;
             padding: 0;
             flex-shrink: 0;
+            border: none;
+            border-radius: 6px;
+            background: none;
+            color: var(--amber);
+            cursor: pointer;
+            transition: background 0.15s;
         }
-        .btn-icon svg { width: 14px; height: 14px; }
+        .btn-icon:hover { background: var(--amber-dim); }
+        .btn-icon.danger { color: var(--red); }
+        .btn-icon.danger:hover { background: rgba(248, 113, 113, 0.12); }
+        .btn-icon svg { width: 16px; height: 16px; }
         .table-form { display: inline-block; margin: 0 0.15rem 0 0; }
         .actions-cell { white-space: nowrap; }
         .table-scroll { overflow-x: auto; }
@@ -3490,8 +3499,11 @@ function renderDocumentHead(string $titleSuffix): void
             color: var(--muted);
             margin-top: 0.15rem;
         }
-        /* Inline edit form inside the renamed-stations table */
-        .rename-form { display: flex; align-items: center; gap: 0.4rem; }
+        /* Inline edit controls inside the renamed-stations table: input,
+           save, and remove share one compact line. */
+        .rename-controls { display: flex; align-items: center; gap: 0.15rem; }
+        .rename-form { display: flex; align-items: center; gap: 0.15rem; flex: 1; min-width: 0; }
+        .rename-remove { display: flex; flex-shrink: 0; }
         .rename-form input[type="text"] {
             flex: 1;
             min-width: 8rem;
@@ -3560,10 +3572,10 @@ function renderDocumentHead(string $titleSuffix): void
                 padding-top: 0.5rem;
             }
             .stack-table td:empty { display: none; }
-            /* The inline rename form gets its own full-width line below the
-               label so the input stays comfortably tappable. */
+            /* The inline rename controls get their own full-width line below
+               the label; input, save, and remove stay on that one line. */
             .stack-table td.rename-cell { flex-wrap: wrap; }
-            .stack-table td.rename-cell .rename-form { flex: 1 1 100%; }
+            .stack-table td.rename-cell .rename-controls { flex: 1 1 100%; }
             .stack-table td.stack-primary .station-sub { flex-basis: 100%; margin-top: 0; }
         }
         .badge {
