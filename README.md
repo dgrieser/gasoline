@@ -227,6 +227,8 @@ gasoline rename 474e5046-deaf-4f9b-9a32-9797b778f047 "Pumpe Ecke Bäckerstraße"
 gasoline rename --clear 474e5046-deaf-4f9b-9a32-9797b778f047
 ```
 
+Administrators can manage the same overrides in the web UI (hamburger menu → Stations).
+
 Run continuous buy/suggestion notifications:
 
 ```bash
@@ -341,6 +343,7 @@ The hamburger menu in the header opens:
 
 - **My Account** — change the password, configure Pushover (application name, user key, API token), define the notification schedule (weekdays, time windows, daily suggestion times, buy-now alerts), or delete the account. The last remaining administrator cannot delete their own account.
 - **Users** (admins) — approve pending registrations, promote/demote administrators (never yourself, so one admin always remains), and delete accounts.
+- **Stations** (admins) — set the same persistent display-name overrides as `gasoline rename`: search a station by name or address, enter a new name, and apply. All existing renames are listed with their original name and address, editable inline or removable to restore the Tankerkönig name.
 - **Settings** (admins) — manage the update targets (cities + radii updated automatically by the CLI), the suggestion/check parameters, the notification templates, and the schedule defaults. These are the values the CLI picks up as described in [Server-stored configuration](#server-stored-configuration-admin-settings); notification templates are admin-only and never editable by regular users.
 
 The dashboard itself is unchanged — same filters, chart, and tables as before, now behind the login.
