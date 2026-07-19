@@ -2348,3 +2348,292 @@ func buildZipBytes(t *testing.T, files map[string]string) []byte {
 	}
 	return buf.Bytes()
 }
+
+// sawtoothIntervals builds the regulated daily price shape: cheap overnight
+// and morning, a single big raise at 12:00, then stepwise decay. The
+// duration-weighted median of one day is base-0.05, so intraday offsets range
+// from -0.07 (late morning) to +0.30 (right after the jump).
+func sawtoothIntervals(stationID string, firstDay time.Time, days int, baseFor func(day int) float64) []priceInterval {
+	segments := []struct {
+		startHour int
+		offset    float64
+	}{
+		{0, -0.05}, {8, -0.10}, {11, -0.12}, {12, 0.25}, {14, 0.10}, {18, 0.02}, {22, -0.05},
+	}
+	var intervals []priceInterval
+	for day := 0; day < days; day++ {
+		dayStart := firstDay.AddDate(0, 0, day)
+		base := baseFor(day)
+		for i, segment := range segments {
+			end := dayStart.AddDate(0, 0, 1)
+			if i+1 < len(segments) {
+				end = dayStart.Add(time.Duration(segments[i+1].startHour) * time.Hour)
+			}
+			intervals = append(intervals, priceInterval{
+				StationID:   stationID,
+				StationName: stationID,
+				Start:       dayStart.Add(time.Duration(segment.startHour) * time.Hour),
+				End:         end,
+				Price:       base + segment.offset,
+			})
+		}
+	}
+	return intervals
+}
+
+func TestInferJumpAnchorHourDetectsNoonJump(t *testing.T) {
+	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	intervals := sawtoothIntervals("s1", firstDay, 10, func(int) float64 { return 2.00 })
+	if anchor := inferJumpAnchorHour(intervals, time.UTC); anchor != 12 {
+		t.Fatalf("anchor = %d, want 12", anchor)
+	}
+
+	var flat []priceInterval
+	for day := 0; day < 10; day++ {
+		flat = append(flat, priceInterval{
+			StationID: "s1",
+			Start:     firstDay.AddDate(0, 0, day),
+			End:       firstDay.AddDate(0, 0, day+1),
+			Price:     2.00,
+		})
+	}
+	if anchor := inferJumpAnchorHour(flat, time.UTC); anchor != 0 {
+		t.Fatalf("anchor for flat prices = %d, want 0", anchor)
+	}
+}
+
+func TestBuildForecastModelFollowsBaselineShift(t *testing.T) {
+	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	// One week at 1.95, then one week at 2.10: the forecast must track the new
+	// level instead of the smeared median of both regimes.
+	intervals := sawtoothIntervals("s1", firstDay, 14, func(day int) float64 {
+		if day < 7 {
+			return 1.95
+		}
+		return 2.10
+	})
+	now := time.Date(2026, 4, 24, 0, 30, 0, 0, time.UTC)
+
+	model := buildForecastModel(intervals, now, time.UTC)
+	if model.JumpAnchorHour != 12 {
+		t.Fatalf("jump anchor = %d, want 12", model.JumpAnchorHour)
+	}
+	station := model.Stations["s1"]
+	if !station.OffsetMode {
+		t.Fatal("station not in offset mode despite two weeks of data")
+	}
+	if station.BaselineForecast < 2.04 || station.BaselineForecast > 2.06 {
+		t.Fatalf("baseline forecast = %.4f, want ~2.05 (current regime), not the old 1.90 level", station.BaselineForecast)
+	}
+
+	score, ok := scoreForecast(model, "s1", time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC).Weekday(), 11)
+	if !ok {
+		t.Fatal("scoreForecast returned !ok")
+	}
+	if score.PredictedPrice < 1.97 || score.PredictedPrice > 2.02 {
+		t.Fatalf("predicted 11:00 price = %.4f, want ~1.98 on the new regime (old regime would be ~1.83)", score.PredictedPrice)
+	}
+}
+
+func TestBuildForecastModelSparseHistoryFallsBackToAbsolute(t *testing.T) {
+	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	intervals := sawtoothIntervals("s1", firstDay, 2, func(int) float64 { return 2.00 })
+	now := time.Date(2026, 4, 12, 0, 30, 0, 0, time.UTC)
+
+	model := buildForecastModel(intervals, now, time.UTC)
+	station := model.Stations["s1"]
+	if station.OffsetMode {
+		t.Fatal("station in offset mode with only two days of data")
+	}
+	score, ok := scoreForecast(model, "s1", now.Weekday(), 11)
+	if !ok {
+		t.Fatal("scoreForecast returned !ok in absolute fallback mode")
+	}
+	if score.PredictedPrice < 1.80 || score.PredictedPrice > 2.40 {
+		t.Fatalf("absolute-mode prediction = %.4f, want a plausible absolute price", score.PredictedPrice)
+	}
+}
+
+func TestPricingDayAnchorsAtJumpHour(t *testing.T) {
+	early := time.Date(2026, 4, 11, 5, 0, 0, 0, time.UTC)
+	if day := pricingDay(early, 12); day != "2026-04-10" {
+		t.Fatalf("pricingDay(05:00, anchor 12) = %s, want 2026-04-10", day)
+	}
+	if day := pricingDay(early, 0); day != "2026-04-11" {
+		t.Fatalf("pricingDay(05:00, anchor 0) = %s, want 2026-04-11", day)
+	}
+}
+
+func TestComputeDailyBaselinesSkipsSparseAndOpenDays(t *testing.T) {
+	dayOne := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	var buckets []hourBucket
+	for hour := 0; hour < 23; hour++ {
+		buckets = append(buckets, hourBucket{StationID: "s1", Start: dayOne.Add(time.Duration(hour) * time.Hour), Minutes: 60, Price: 2.30})
+	}
+	buckets = append(buckets, hourBucket{StationID: "s1", Start: dayOne.Add(23 * time.Hour), Minutes: 60, Price: 2.20})
+	// Day two has only three hours of coverage and must be skipped.
+	dayTwo := dayOne.AddDate(0, 0, 1)
+	for hour := 0; hour < 3; hour++ {
+		buckets = append(buckets, hourBucket{StationID: "s1", Start: dayTwo.Add(time.Duration(hour) * time.Hour), Minutes: 60, Price: 1.00})
+	}
+	// The open current day never yields a baseline.
+	nowLocal := time.Date(2026, 4, 12, 12, 30, 0, 0, time.UTC)
+	buckets = append(buckets, hourBucket{StationID: "s1", Start: nowLocal.Add(-time.Hour), Minutes: 600, Price: 1.00})
+
+	baselines := computeDailyBaselines(buckets, 0, nowLocal)
+	stationDays := baselines["s1"]
+	if len(stationDays) != 1 {
+		t.Fatalf("baseline days = %d, want 1: %+v", len(stationDays), stationDays)
+	}
+	baseline, ok := stationDays["2026-04-10"]
+	if !ok {
+		t.Fatalf("missing baseline for 2026-04-10: %+v", stationDays)
+	}
+	if baseline.Value != 2.30 {
+		t.Fatalf("baseline = %.3f, want duration-weighted median 2.300", baseline.Value)
+	}
+	if baseline.CoverageMinutes != 1440 {
+		t.Fatalf("coverage = %.0f, want 1440", baseline.CoverageMinutes)
+	}
+}
+
+func TestEstimateCurrentBaselineDeShapesPartialRegime(t *testing.T) {
+	model := forecastModel{
+		Hour: map[stationHourKey][]priceSample{
+			{StationID: "s1", Hour: 12}: {{Price: 0.30, Weight: 60}},
+			{StationID: "s1", Hour: 14}: {{Price: 0.15, Weight: 60}},
+		},
+	}
+	day := time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC)
+	buckets := []hourBucket{
+		{StationID: "s1", Start: day.Add(12 * time.Hour), Minutes: 60, Price: 2.30},
+		{StationID: "s1", Start: day.Add(14 * time.Hour), Minutes: 60, Price: 2.15},
+	}
+	estimate, ok := estimateCurrentBaseline(model, "s1", buckets)
+	if !ok {
+		t.Fatal("estimateCurrentBaseline returned !ok")
+	}
+	if estimate < 1.999 || estimate > 2.001 {
+		t.Fatalf("estimate = %.4f, want 2.00 after de-shaping", estimate)
+	}
+
+	short := []hourBucket{{StationID: "s1", Start: day.Add(12 * time.Hour), Minutes: 30, Price: 2.30}}
+	if _, ok := estimateCurrentBaseline(model, "s1", short); ok {
+		t.Fatal("estimateCurrentBaseline accepted 30 minutes of coverage")
+	}
+}
+
+func insertSawtoothDay(t *testing.T, db *sql.DB, stationID, cityName string, day time.Time, base float64) {
+	t.Helper()
+	for _, segment := range []struct {
+		hour   int
+		offset float64
+	}{
+		{0, -0.05}, {8, -0.10}, {11, -0.12}, {12, 0.25}, {14, 0.10}, {18, 0.02}, {22, -0.05},
+	} {
+		insertSuggestSnapshot(t, db, stationID, cityName, day.Add(time.Duration(segment.hour)*time.Hour), base+segment.offset, true)
+	}
+}
+
+func TestSuggestGasPrefersPreJumpWindowWithNoonJump(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	city := cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131}
+	insertSuggestCity(t, db, city)
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+	for day := 10; day <= 24; day++ {
+		insertSawtoothDay(t, db, "station-1", "Berlin", time.Date(2026, 4, day, 0, 0, 0, 0, time.UTC), 2.00)
+	}
+
+	suggestions, err := suggestGas(ctx, db, suggestOptions{
+		City:        "Berlin",
+		RangeKM:     5,
+		Fuel:        "diesel",
+		HistoryDays: 30,
+		PredictDays: 1,
+		LimitPerDay: 1,
+		Now:         time.Date(2026, 4, 25, 9, 30, 0, 0, time.UTC),
+		Location:    time.UTC,
+	})
+	if err != nil {
+		t.Fatalf("suggestGas: %v", err)
+	}
+	if len(suggestions) != 1 {
+		t.Fatalf("len(suggestions) = %d, want 1: %+v", len(suggestions), suggestions)
+	}
+	suggestion := suggestions[0]
+	if suggestion.StartTime != "11:00" || suggestion.EndTime != "12:00" {
+		t.Fatalf("window = %s-%s, want the cheap 11:00-12:00 pre-jump hour", suggestion.StartTime, suggestion.EndTime)
+	}
+	if suggestion.PredictedPrice < 1.86 || suggestion.PredictedPrice > 1.90 {
+		t.Fatalf("predicted = %.3f, want ~1.88", suggestion.PredictedPrice)
+	}
+}
+
+func TestCheckGasStaysRegimeRelativeAfterMarketWideJump(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	city := cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131}
+	insertSuggestCity(t, db, city)
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+	for day := 10; day <= 24; day++ {
+		insertSawtoothDay(t, db, "station-1", "Berlin", time.Date(2026, 4, day, 0, 0, 0, 0, time.UTC), 1.90)
+	}
+	// Today the noon raise lands the market on a new, 15 cent higher level.
+	today := time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC)
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", today, 1.85, true)
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", today.Add(8*time.Hour), 1.80, true)
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", today.Add(11*time.Hour), 1.78, true)
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", today.Add(12*time.Hour), 2.30, true)
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", today.Add(14*time.Hour), 2.15, true)
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", today.Add(18*time.Hour), 2.07, true)
+
+	checks, err := checkGas(ctx, db, checkOptions{
+		City:        "Berlin",
+		RangeKM:     5,
+		Fuel:        "diesel",
+		HistoryDays: 30,
+		PredictDays: 1,
+		Limit:       5,
+		Now:         time.Date(2026, 4, 25, 18, 30, 0, 0, time.UTC),
+		Location:    time.UTC,
+	})
+	if err != nil {
+		t.Fatalf("checkGas: %v", err)
+	}
+	if len(checks) != 1 {
+		t.Fatalf("len(checks) = %d, want 1: %+v", len(checks), checks)
+	}
+	check := checks[0]
+	// 2.07 sits far above every absolute price of the last two weeks, so the
+	// old absolute-percentile model would read "high". Relative to the fresh
+	// post-jump level it is a typical evening price.
+	if check.Verdict != "typical" {
+		t.Fatalf("verdict = %s (percentile %.1f), want typical despite the market-wide jump", check.Verdict, check.HistoryPercentile)
+	}
+	if check.Recommendation != "wait" || !check.ExpectedLower {
+		t.Fatalf("recommendation/expected_lower = %s/%t, want wait/true (late-evening dip ahead)", check.Recommendation, check.ExpectedLower)
+	}
+	if check.BestFutureStartTime != "22:00" {
+		t.Fatalf("best future start = %s, want 22:00", check.BestFutureStartTime)
+	}
+}
+
+func TestInferJumpAnchorHourIgnoresRisesAcrossGaps(t *testing.T) {
+	day := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	var intervals []priceInterval
+	// Station closed overnight: each day is one open interval, and the price
+	// rise materializes across the closed gap. It must not be attributed to
+	// the 06:00 reopening hour.
+	for d := 0; d < 10; d++ {
+		intervals = append(intervals, priceInterval{
+			StationID: "s1",
+			Start:     day.AddDate(0, 0, d).Add(6 * time.Hour),
+			End:       day.AddDate(0, 0, d).Add(20 * time.Hour),
+			Price:     2.00 + float64(d)*0.01,
+		})
+	}
+	if anchor := inferJumpAnchorHour(intervals, time.UTC); anchor != 0 {
+		t.Fatalf("anchor = %d, want 0 (rises across closure gaps must not count)", anchor)
+	}
+}

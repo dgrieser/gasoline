@@ -26,7 +26,7 @@ func TestInitSchemaCreatesAuthAndSettingsTables(t *testing.T) {
 	want := map[string]string{
 		settingFuel:            "diesel",
 		settingRangeKM:         "5",
-		settingHistoryDays:     "21",
+		settingHistoryDays:     "30",
 		settingPredictDays:     "3",
 		settingLimitPerDay:     "3",
 		settingCheckLimit:      "5",

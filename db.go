@@ -385,6 +385,39 @@ func schemaStatements(d dialect) []string {
 				value TEXT NOT NULL,
 				updated_at VARCHAR(64) NOT NULL
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS prediction_runs (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				run_at VARCHAR(64) NOT NULL,
+				city_name VARCHAR(255) NOT NULL,
+				fuel VARCHAR(16) NOT NULL,
+				range_km DOUBLE NOT NULL,
+				history_days INTEGER NOT NULL,
+				predict_days INTEGER NOT NULL,
+				jump_anchor_hour INTEGER NOT NULL DEFAULT 0,
+				station_count INTEGER NOT NULL DEFAULT 0,
+				INDEX idx_prediction_runs_city_fuel_run (city_name, fuel, run_at DESC)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS price_predictions (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				run_id BIGINT NOT NULL,
+				station_id VARCHAR(64) NOT NULL,
+				fuel VARCHAR(16) NOT NULL,
+				target_start VARCHAR(64) NOT NULL,
+				target_end VARCHAR(64) NOT NULL,
+				predicted_price DOUBLE NOT NULL,
+				baseline DOUBLE,
+				confidence VARCHAR(16) NOT NULL,
+				sample_count INTEGER NOT NULL DEFAULT 0,
+				is_suggestion TINYINT NOT NULL DEFAULT 0,
+				lead_minutes INTEGER NOT NULL DEFAULT 0,
+				actual_price DOUBLE,
+				error DOUBLE,
+				evaluated_at VARCHAR(64),
+				INDEX idx_price_predictions_station_fuel_target (station_id, fuel, target_start DESC),
+				INDEX idx_price_predictions_due (fuel, evaluated_at, target_end),
+				FOREIGN KEY (run_id) REFERENCES prediction_runs(id),
+				FOREIGN KEY (station_id) REFERENCES stations(id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 		}
 	}
 	return []string{
@@ -462,6 +495,44 @@ func schemaStatements(d dialect) []string {
 			value TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS prediction_runs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_at TEXT NOT NULL,
+			city_name TEXT NOT NULL,
+			fuel TEXT NOT NULL,
+			range_km REAL NOT NULL,
+			history_days INTEGER NOT NULL,
+			predict_days INTEGER NOT NULL,
+			jump_anchor_hour INTEGER NOT NULL DEFAULT 0,
+			station_count INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_prediction_runs_city_fuel_run
+			ON prediction_runs(city_name, fuel, run_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS price_predictions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id INTEGER NOT NULL,
+			station_id TEXT NOT NULL,
+			fuel TEXT NOT NULL,
+			target_start TEXT NOT NULL,
+			target_end TEXT NOT NULL,
+			predicted_price REAL NOT NULL,
+			baseline REAL,
+			confidence TEXT NOT NULL,
+			sample_count INTEGER NOT NULL DEFAULT 0,
+			is_suggestion INTEGER NOT NULL DEFAULT 0,
+			lead_minutes INTEGER NOT NULL DEFAULT 0,
+			actual_price REAL,
+			error REAL,
+			evaluated_at TEXT,
+			FOREIGN KEY (run_id) REFERENCES prediction_runs(id),
+			FOREIGN KEY (station_id) REFERENCES stations(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_price_predictions_station_fuel_target
+			ON price_predictions(station_id, fuel, target_start DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_price_predictions_due
+			ON price_predictions(fuel, evaluated_at, target_end)`,
+		`CREATE INDEX IF NOT EXISTS idx_price_predictions_run
+			ON price_predictions(run_id)`,
 	}
 }
 
