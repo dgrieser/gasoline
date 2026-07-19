@@ -2960,10 +2960,12 @@ function renderDocumentHead(string $titleSuffix): void
             padding: 1rem 1.25rem;
         }
 
+        /* Height comes from the viewBox aspect ratio, which renderChart()
+           keeps 1:1 with CSS pixels so axis text is never stretched. */
         #chart {
             width: 100%;
             display: block;
-            min-height: 380px;
+            height: auto;
         }
 
         .chart-legend {
@@ -3168,6 +3170,10 @@ function renderDocumentHead(string $titleSuffix): void
             .brand-icon,
             .brand-icon img { width: 40px; height: 40px; }
             h1 { font-size: 1.4rem; }
+            /* Give the plot itself more width on phones. */
+            .chart-body { padding: 0.75rem 0.5rem; }
+            .chart-legend { padding: 0.75rem; gap: 0.5rem 0.85rem; }
+            .chart-loading { min-height: 300px; }
         }
 
         /* ── Load animation ────────────────────────────────────── */
@@ -4450,7 +4456,7 @@ renderDocumentHead('Price History');
                 </div>
                 <div class="chart-body" id="chart-body">
                     <div class="chart-loading" id="chart-loading" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div>
-                    <svg id="chart" viewBox="0 0 960 380" preserveAspectRatio="none" aria-label="Fuel price history chart" data-i18n-aria-label="chartAriaLabel" hidden></svg>
+                    <svg id="chart" viewBox="0 0 960 380" aria-label="Fuel price history chart" data-i18n-aria-label="chartAriaLabel" hidden></svg>
                 </div>
                 <div class="chart-legend" id="legend" hidden></div>
                 <div class="chart-empty" id="chart-empty" data-i18n="noSnapshots" role="status" hidden>No snapshots match the current filters.</div>
@@ -4747,6 +4753,21 @@ if (!chartEl) {
         legendEl.hidden = isEmpty;
     }
 
+    // The chart is drawn in CSS pixels (see renderChart), so a container
+    // resize — rotation, sidebar toggle, window resize — needs a re-render
+    // at the new width. Observe the always-visible parent, debounced.
+    let lastChartWidth = 0;
+    let chartResizeTimer = null;
+    if (typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(() => {
+            if (!dataLoaded || chartEl.hasAttribute('hidden')) return;
+            const w = Math.round(chartEl.getBoundingClientRect().width);
+            if (w === 0 || Math.abs(w - lastChartWidth) < 2) return;
+            clearTimeout(chartResizeTimer);
+            chartResizeTimer = setTimeout(renderChart, 100);
+        }).observe(chartEl.parentElement);
+    }
+
     function renderChart() {
         chartEl.innerHTML = '';
         legendEl.innerHTML = '';
@@ -4757,10 +4778,6 @@ if (!chartEl) {
         const visibleRows = rangeData.filter((row) => [...activeFuels].some((f) => row[f] !== null));
         if (visibleRows.length === 0) { setChartVisibility(true); return; }
 
-        const margin = { top: 24, right: 24, bottom: 60, left: 68 };
-        const W = 960, H = 380;
-        const iW = W - margin.left - margin.right;
-        const iH = H - margin.top - margin.bottom;
         const ns = 'http://www.w3.org/2000/svg';
 
         const mk = (tag, attrs = {}, parent = chartEl) => {
@@ -4795,6 +4812,21 @@ if (!chartEl) {
         if (valCount === 0) { setChartVisibility(true); return; }
         setChartVisibility(false);
 
+        // Draw in a coordinate system that is 1:1 with on-screen CSS pixels,
+        // so text keeps its true proportions at any container width. (The old
+        // fixed 960-wide viewBox with preserveAspectRatio="none" squashed the
+        // labels into tall, narrow glyphs on small screens.)
+        const W = Math.max(280, Math.round(chartEl.getBoundingClientRect().width) || 960);
+        const compact = W < 560;
+        const H = compact ? 300 : 380;
+        const margin = compact
+            ? { top: 18, right: 10, bottom: 48, left: 46 }
+            : { top: 24, right: 24, bottom: 60, left: 68 };
+        const iW = W - margin.left - margin.right;
+        const iH = H - margin.top - margin.bottom;
+        chartEl.setAttribute('viewBox', `0 0 ${W} ${H}`);
+        lastChartWidth = W;
+
         if (minX === maxX) maxX += 3_600_000;
 
         const padY = Math.max((maxY - minY) * 0.15, 0.02);
@@ -4818,13 +4850,14 @@ if (!chartEl) {
             const yp = py(val);
             mk('line', { x1: margin.left, y1: yp, x2: W - margin.right, y2: yp,
                 stroke: gridStroke, 'stroke-width': 1 });
-            mk('text', { x: margin.left - 10, y: yp + 4, 'text-anchor': 'end',
+            mk('text', { x: margin.left - (compact ? 6 : 10), y: yp + 4, 'text-anchor': 'end',
                 'font-size': 11, 'font-family': "'DM Mono', monospace", fill: '#6b7280' },
             ).textContent = val.toFixed(3);
         }
 
-        // X ticks — two-line: date + time
-        const tickCount = Math.min(7, visibleRows.length);
+        // X ticks — two-line: date + time; fewer on narrow screens so the
+        // labels keep breathing room instead of overlapping.
+        const tickCount = Math.min(compact ? 4 : 7, visibleRows.length);
         const tickColor = light ? 'rgba(0,0,0,0.4)' : 'rgba(255,255,255,0.38)';
         for (let i = 0; i < tickCount; i++) {
             const idx = tickCount === 1 ? 0 : Math.round((visibleRows.length - 1) * (i / (tickCount - 1)));
@@ -4832,15 +4865,17 @@ if (!chartEl) {
             const xp = px(row._ts);
             mk('line', { x1: xp, y1: margin.top, x2: xp, y2: H - margin.bottom,
                 stroke: tickStroke, 'stroke-width': 1 });
-            const txt = mk('text', { x: xp, y: H - margin.bottom + 14, 'text-anchor': 'middle',
+            // Clamp so edge labels don't get clipped by the SVG bounds.
+            const lx = Math.min(Math.max(xp, 22), W - 22);
+            const txt = mk('text', { x: lx, y: H - margin.bottom + 14, 'text-anchor': 'middle',
                 'font-size': 10, 'font-family': "'DM Mono', monospace", fill: tickColor });
             const tDate = document.createElementNS(ns, 'tspan');
-            tDate.setAttribute('x', xp);
+            tDate.setAttribute('x', lx);
             tDate.setAttribute('dy', '0');
             tDate.textContent = formatTickDate(row.recorded_at);
             txt.appendChild(tDate);
             const tTime = document.createElementNS(ns, 'tspan');
-            tTime.setAttribute('x', xp);
+            tTime.setAttribute('x', lx);
             tTime.setAttribute('dy', '14');
             tTime.textContent = formatTickTime(row.recorded_at);
             txt.appendChild(tTime);
