@@ -31,8 +31,10 @@ const (
 	// evaluateBatchLimit bounds how many due predictions one run settles, so
 	// a run after long downtime stays cheap.
 	evaluateBatchLimit = 5000
-	// persistInsertBatch rows per multi-row INSERT.
-	persistInsertBatch = 200
+	// persistInsertBatch rows per multi-row INSERT. At 11 placeholders per
+	// row this stays under SQLite's historical 999-variable limit, so the
+	// insert also works against builds without the modern 32766 default.
+	persistInsertBatch = 80
 )
 
 // evaluateDuePredictions fills actual_price and error for stored predictions

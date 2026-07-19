@@ -277,12 +277,16 @@ func TestRunSuggestPersistEndToEnd(t *testing.T) {
 	}
 	city := cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131}
 	insertSuggestCity(t, db, city)
+	// Two stations and three predict days push the grid past one insert
+	// batch, so the flush boundary is exercised too.
 	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+	insertSuggestStation(t, db, "station-2", "Station 2", 52.518000, 13.396000)
 
 	nowLocal := time.Now().In(time.Local)
 	for daysAgo := 15; daysAgo >= 1; daysAgo-- {
 		day := localDayStart(nowLocal).AddDate(0, 0, -daysAgo)
 		insertSawtoothDay(t, db, "station-1", "Berlin", day.In(time.UTC), 2.00)
+		insertSawtoothDay(t, db, "station-2", "Berlin", day.In(time.UTC), 2.10)
 	}
 	// A prediction from a past run that is due for evaluation now.
 	pastRun := insertPredictionRunRow(t, db, nowLocal.Add(-3*time.Hour))
@@ -292,7 +296,7 @@ func TestRunSuggestPersistEndToEnd(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() error {
-		return run([]string{"suggest", "--db", dbPath, "--persist", "--city", "Berlin", "--fuel", "diesel", "--history-days", "30", "--predict-days", "2", "--limit-per-day", "2", "--output", "json"})
+		return run([]string{"suggest", "--db", dbPath, "--persist", "--city", "Berlin", "--fuel", "diesel", "--history-days", "30", "--predict-days", "3", "--limit-per-day", "2", "--output", "json"})
 	})
 	var suggestions []suggestionRow
 	if err := json.Unmarshal([]byte(output), &suggestions); err != nil {
@@ -319,8 +323,8 @@ func TestRunSuggestPersistEndToEnd(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(is_suggestion), 0) FROM price_predictions WHERE evaluated_at IS NULL`).Scan(&futureRows, &flagged); err != nil {
 		t.Fatalf("count grid rows: %v", err)
 	}
-	if futureRows == 0 {
-		t.Fatal("no future grid rows persisted")
+	if futureRows <= persistInsertBatch {
+		t.Fatalf("future grid rows = %d, want more than one insert batch (%d)", futureRows, persistInsertBatch)
 	}
 	if flagged == 0 {
 		t.Fatal("no persisted rows flagged as suggestions")
