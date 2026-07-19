@@ -2618,3 +2618,22 @@ func TestCheckGasStaysRegimeRelativeAfterMarketWideJump(t *testing.T) {
 		t.Fatalf("best future start = %s, want 22:00", check.BestFutureStartTime)
 	}
 }
+
+func TestInferJumpAnchorHourIgnoresRisesAcrossGaps(t *testing.T) {
+	day := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	var intervals []priceInterval
+	// Station closed overnight: each day is one open interval, and the price
+	// rise materializes across the closed gap. It must not be attributed to
+	// the 06:00 reopening hour.
+	for d := 0; d < 10; d++ {
+		intervals = append(intervals, priceInterval{
+			StationID: "s1",
+			Start:     day.AddDate(0, 0, d).Add(6 * time.Hour),
+			End:       day.AddDate(0, 0, d).Add(20 * time.Hour),
+			Price:     2.00 + float64(d)*0.01,
+		})
+	}
+	if anchor := inferJumpAnchorHour(intervals, time.UTC); anchor != 0 {
+		t.Fatalf("anchor = %d, want 0 (rises across closure gaps must not count)", anchor)
+	}
+}

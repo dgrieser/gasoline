@@ -1981,7 +1981,10 @@ func inferJumpAnchorHour(intervals []priceInterval, location *time.Location) int
 	for i := 1; i < len(intervals); i++ {
 		previous := intervals[i-1]
 		current := intervals[i]
-		if previous.StationID != current.StationID {
+		// Only contiguous intervals count: across a gap (closed or invalid
+		// snapshots were skipped) the price change accumulated over the whole
+		// gap and would be misattributed to the reopening hour.
+		if previous.StationID != current.StationID || !current.Start.Equal(previous.End) {
 			continue
 		}
 		delta := current.Price - previous.Price

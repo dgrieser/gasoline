@@ -531,6 +531,8 @@ func schemaStatements(d dialect) []string {
 			ON price_predictions(station_id, fuel, target_start DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_price_predictions_due
 			ON price_predictions(fuel, evaluated_at, target_end)`,
+		`CREATE INDEX IF NOT EXISTS idx_price_predictions_run
+			ON price_predictions(run_id)`,
 	}
 }
 

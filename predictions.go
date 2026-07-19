@@ -48,7 +48,15 @@ func evaluateDuePredictions(ctx context.Context, db *sql.DB, fuel string, now ti
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	rows, err := db.QueryContext(ctx, `
+	// The whole evaluation runs in one transaction so a concurrent run cannot
+	// pick up the same due rows between select and update.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
 		SELECT id, station_id, target_start, target_end, predicted_price
 		FROM price_predictions
 		WHERE fuel = ?
@@ -101,19 +109,26 @@ func evaluateDuePredictions(ctx context.Context, db *sql.DB, fuel string, now ti
 		return 0, nil
 	}
 
-	snapshotQuery := fmt.Sprintf(`
+	snapshotStmt, err := tx.PrepareContext(ctx, fmt.Sprintf(`
 		SELECT is_open, %s
 		FROM price_snapshots
 		WHERE station_id = ? AND recorded_at <= ?
 		ORDER BY recorded_at DESC, id DESC
 		LIMIT 1
-	`, column)
-
-	tx, err := db.BeginTx(ctx, nil)
+	`, column))
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer snapshotStmt.Close()
+	updateStmt, err := tx.PrepareContext(ctx, `
+		UPDATE price_predictions
+		SET actual_price = ?, error = ?, evaluated_at = ?
+		WHERE id = ? AND evaluated_at IS NULL
+	`)
+	if err != nil {
+		return 0, err
+	}
+	defer updateStmt.Close()
 
 	evaluatedAt := now.UTC().Format(time.RFC3339)
 	measured := 0
@@ -122,7 +137,7 @@ func evaluateDuePredictions(ctx context.Context, db *sql.DB, fuel string, now ti
 			isOpen bool
 			price  sql.NullFloat64
 		)
-		err := tx.QueryRowContext(ctx, snapshotQuery,
+		err := snapshotStmt.QueryRowContext(ctx,
 			prediction.StationID, prediction.Midpoint.UTC().Format(time.RFC3339)).Scan(&isOpen, &price)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return 0, err
@@ -134,11 +149,7 @@ func evaluateDuePredictions(ctx context.Context, db *sql.DB, fuel string, now ti
 			predictionError = sql.NullFloat64{Float64: price.Float64 - prediction.Predicted, Valid: true}
 			measured++
 		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE price_predictions
-			SET actual_price = ?, error = ?, evaluated_at = ?
-			WHERE id = ?
-		`, actual, predictionError, evaluatedAt, prediction.ID); err != nil {
+		if _, err := updateStmt.ExecContext(ctx, actual, predictionError, evaluatedAt, prediction.ID); err != nil {
 			return 0, err
 		}
 	}
