@@ -337,3 +337,53 @@ func TestRunSuggestPersistEndToEnd(t *testing.T) {
 		t.Fatal("due prediction from the past run was not evaluated")
 	}
 }
+
+func TestRunSuggestPersistQuiet(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "quiet.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ctx := context.Background()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	city := cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131}
+	insertSuggestCity(t, db, city)
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+
+	nowLocal := time.Now().In(time.Local)
+	for daysAgo := 15; daysAgo >= 1; daysAgo-- {
+		day := localDayStart(nowLocal).AddDate(0, 0, -daysAgo)
+		insertSawtoothDay(t, db, "station-1", "Berlin", day.In(time.UTC), 2.00)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	if err := run([]string{"suggest", "--db", dbPath, "--quiet", "--city", "Berlin", "--fuel", "diesel"}); err == nil {
+		t.Fatal("suggest --quiet without --persist succeeded, want error")
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"suggest", "--db", dbPath, "--persist", "--quiet", "--city", "Berlin", "--fuel", "diesel", "--history-days", "30", "--predict-days", "2", "--limit-per-day", "2"})
+	})
+	if output != "" {
+		t.Fatalf("suggest --persist --quiet printed output: %q", output)
+	}
+
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer db.Close()
+
+	var predictions int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM price_predictions`).Scan(&predictions); err != nil {
+		t.Fatalf("count predictions: %v", err)
+	}
+	if predictions == 0 {
+		t.Fatal("no predictions stored despite --persist --quiet")
+	}
+}
