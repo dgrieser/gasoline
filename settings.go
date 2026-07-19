@@ -70,7 +70,7 @@ func defaultAppSettings() appSettings {
 	return appSettings{
 		Fuel:            "diesel",
 		RangeKM:         5,
-		HistoryDays:     21,
+		HistoryDays:     30,
 		PredictDays:     3,
 		LimitPerDay:     3,
 		CheckLimit:      5,

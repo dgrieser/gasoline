@@ -22,15 +22,20 @@ var migrationTables = []struct {
 	// id is copied so ties in recorded_at keep their original order
 	// (compaction and latest-snapshot queries break ties by id).
 	{"price_snapshots", []string{"id", "station_id", "city_name", "recorded_at", "search_radius_km", "is_open", "e5", "e10", "diesel"}},
+	// ids are copied so price_predictions.run_id keeps pointing at its run.
+	{"prediction_runs", []string{"id", "run_at", "city_name", "fuel", "range_km", "history_days", "predict_days", "jump_anchor_hour", "station_count"}},
+	{"price_predictions", []string{"id", "run_id", "station_id", "fuel", "target_start", "target_end", "predicted_price", "baseline", "confidence", "sample_count", "is_suggestion", "lead_minutes", "actual_price", "error", "evaluated_at"}},
 }
 
 type mysqlMigrationResult struct {
-	Source         string `json:"source"`
-	Target         string `json:"target"`
-	Cities         int    `json:"cities"`
-	Stations       int    `json:"stations"`
-	PriceSnapshots int    `json:"price_snapshots"`
-	Overwritten    bool   `json:"overwritten"`
+	Source           string `json:"source"`
+	Target           string `json:"target"`
+	Cities           int    `json:"cities"`
+	Stations         int    `json:"stations"`
+	PriceSnapshots   int    `json:"price_snapshots"`
+	PredictionRuns   int    `json:"prediction_runs"`
+	PricePredictions int    `json:"price_predictions"`
+	Overwritten      bool   `json:"overwritten"`
 }
 
 func runMigrateToMySQL(args []string) error {
@@ -99,6 +104,8 @@ func runMigrateToMySQL(args []string) error {
 	fmt.Fprintf(stdout, "cities: %d\n", result.Cities)
 	fmt.Fprintf(stdout, "stations: %d\n", result.Stations)
 	fmt.Fprintf(stdout, "price snapshots: %d\n", result.PriceSnapshots)
+	fmt.Fprintf(stdout, "prediction runs: %d\n", result.PredictionRuns)
+	fmt.Fprintf(stdout, "price predictions: %d\n", result.PricePredictions)
 	return nil
 }
 
@@ -147,10 +154,12 @@ func copySQLiteToMySQL(ctx context.Context, src, dst *sql.DB, overwrite bool) (m
 		return mysqlMigrationResult{}, err
 	}
 	return mysqlMigrationResult{
-		Cities:         counts["cities"],
-		Stations:       counts["stations"],
-		PriceSnapshots: counts["price_snapshots"],
-		Overwritten:    overwritten,
+		Cities:           counts["cities"],
+		Stations:         counts["stations"],
+		PriceSnapshots:   counts["price_snapshots"],
+		PredictionRuns:   counts["prediction_runs"],
+		PricePredictions: counts["price_predictions"],
+		Overwritten:      overwritten,
 	}, nil
 }
 

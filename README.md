@@ -68,7 +68,7 @@ The PHP viewer requires a login (see [Web viewer & user accounts](#web-viewer--u
 
 ### Migrating an existing SQLite database to MySQL
 
-`migrate-to-mysql` copies all cities, stations, and price snapshots from a SQLite file into a MySQL server (creating the tables if needed). Snapshot ids are preserved, so history ordering stays identical:
+`migrate-to-mysql` copies all cities, stations, price snapshots, and persisted predictions from a SQLite file into a MySQL server (creating the tables if needed). Snapshot and prediction ids are preserved, so history ordering and run references stay identical:
 
 ```bash
 gasoline migrate-to-mysql --db gasoline.db \
@@ -169,10 +169,15 @@ gasoline list history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel d
 Suggest cheap fueling windows for the coming days:
 
 ```bash
-gasoline suggest --city "Berlin" --range-km 10 --fuel diesel --history-days 21 --predict-days 3 --limit-per-day 3
+gasoline suggest --city "Berlin" --range-km 10 --fuel diesel --history-days 30 --predict-days 3 --limit-per-day 3
 ```
 
-The suggestion algorithm uses open historical prices within the range, reconstructs compacted price intervals, buckets them by local weekday and hour, and ranks future day/time windows with a recency-weighted median forecast.
+The suggestion algorithm uses open historical prices within the range, reconstructs compacted price intervals, and decomposes each station's history into a per-day price level plus an intraday pattern:
+
+- It first infers the **daily jump hour** — the local hour where upward price moves concentrate across all stations (with the current German once-per-day-raise regulation that is typically 12:00). Nothing is hardcoded: if the regulation changes or disappears, the inferred anchor and the learned pattern follow the data.
+- Each 24h window between jumps ("pricing day") gets a duration-weighted median **baseline**; the samples bucketed by local weekday and hour are stored as **offsets** from that baseline, so the once-per-day sawtooth is learned independently of the absolute price level.
+- Future hours are ranked with a recency-weighted median forecast of those offsets, added on top of the **current level**, which is estimated from the data recorded since the last jump (de-shaped by the learned hourly pattern) — so a market-wide price shift (market moves, temporary tax cuts) is picked up within hours instead of being averaged away over weeks.
+- Stations with fewer than three usable pricing days fall back to the previous absolute-price behavior.
 
 Useful `suggest` flags:
 
@@ -181,6 +186,7 @@ Useful `suggest` flags:
 - `--history-days` amount of historic data to use
 - `--predict-days` amount of calendar days to suggest, including today when future hours remain
 - `--limit-per-day` maximum suggestions per day
+- `--persist` store the full prediction grid, evaluate past predictions, and learn from the errors (see below)
 - `--output json` or `-o json`
 
 Suggestion output includes the day, time window, predicted price, confidence, distance, and full persisted station metadata. JSON output keeps the existing top-level station fields and also includes a nested `station` object with address, brand, street, house number, post code, place, coordinates, and first/last seen timestamps.
@@ -188,10 +194,23 @@ Suggestion output includes the day, time window, predicted price, confidence, di
 Check whether the latest stored prices are low right now:
 
 ```bash
-gasoline check --city "Berlin" --range-km 10 --fuel diesel --history-days 21 --predict-days 3 --limit 5
+gasoline check --city "Berlin" --range-km 10 --fuel diesel --history-days 30 --predict-days 3 --limit 5
 ```
 
 The check command uses the same historical model as `suggest`, compares each open station's latest stored price with recent station history, and scans the coming forecast window for a lower expected price. It prints the station, current price, low/typical/high verdict, buy/wait/hold recommendation, confidence, and best lower future window when one is expected. Run `gasoline update` first when you need fresh current prices.
+
+The reported `history_percentile` is regime-relative for stations with enough history: it ranks the current price within the station's intraday pattern (its position in the daily sawtooth), not among raw absolute prices — so a market-wide jump at the daily raise does not make every station read "high" for weeks.
+
+### Persistent predictions and learning (`suggest --persist`)
+
+`gasoline suggest --persist` additionally stores the **full forecast grid** — every station and future hour it can score, with the printed suggestions flagged — in two tables (`prediction_runs`, `price_predictions`, created automatically on first use). Run it on a timer (e.g. hourly, next to `gasoline update`); each run:
+
+1. **Evaluates** stored predictions whose target hour has passed, filling in the actual price (the price in effect at the window midpoint) and the prediction error.
+2. **Learns** a per-station bias correction from recent short-lead errors (recency-weighted median over the last 14 days, at least 5 evaluated samples, capped at ±3 ct) and applies it to all new predictions — `suggest`, `check`, and `notify` all pick it up automatically, also without `--persist`.
+3. **Persists** the new grid; newer runs supersede older ones for the same target hour, older rows remain as learning history.
+4. **Prunes** predictions older than 30 days.
+
+The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Nothing is shown in the web UI yet — the data accrues for analysis and for the bias learning.
 
 ### Server-stored configuration (admin settings)
 
@@ -201,7 +220,7 @@ Administrators can store the operational configuration in the database via the w
 - `gasoline suggest` and `gasoline check` take `--fuel`, `--range-km`, `--history-days`, `--predict-days`, and `--limit-per-day`/`--limit` from the settings table when the corresponding flag is not set, and default `--city` to the first update target.
 - Explicit CLI flags always override the stored settings; with an empty settings table everything behaves exactly as before.
 
-Run `gasoline migrate` once to create the tables and seed the settings with the built-in defaults.
+Run `gasoline migrate` once to create the tables and seed the settings with the built-in defaults. Seeding never overwrites existing rows, so an install that already stores `history_days = 21` keeps it until an admin changes it (the built-in default is now 30 days).
 
 Send Pushover notifications to the web UI's users:
 
@@ -236,7 +255,7 @@ Run continuous buy/suggestion notifications:
   --city "Berlin" \
   --radius-km 10 \
   --fuel diesel \
-  --history-days 21 \
+  --history-days 30 \
   --predict-days 3 \
   --check-minutes 15 \
   --suggest-time 07:30 \

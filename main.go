@@ -259,13 +259,60 @@ type priceInterval struct {
 
 type forecastStation struct {
 	Station suggestionStationRow
+	// OffsetMode marks stations whose samples in WeekdayHour/Hour/Recent are
+	// offsets from their pricing-day baseline instead of absolute prices. The
+	// zero value keeps the legacy absolute-price behavior.
+	OffsetMode bool
+	// BaselineForecast is the estimated current price level, added back to the
+	// blended offset medians when OffsetMode is set. It is held flat across the
+	// prediction window: future baseline shifts are unknowable from history.
+	BaselineForecast float64
+	// BiasCorrection is a learned correction from persisted predicted-vs-actual
+	// errors (see loadPredictionBias). Zero when no evaluation data exists.
+	BiasCorrection float64
 }
 
+// priceSample carries either an absolute price or, for stations in offset
+// mode, the difference to the pricing-day baseline.
 type priceSample struct {
 	Price  float64
 	Weight float64
 	Date   string
 }
+
+// hourBucket is one local-time hour slice of a priceInterval.
+type hourBucket struct {
+	StationID string
+	Start     time.Time // local, hour-truncated
+	Minutes   float64
+	AgeDays   float64
+	Price     float64
+}
+
+type dayBaseline struct {
+	Value           float64
+	CoverageMinutes float64
+}
+
+// Structural robustness thresholds of the forecast model. These are not user
+// settings: they gate when the baseline/offset decomposition is trustworthy.
+const (
+	// minBaselineCoverageMinutes is the minimum recorded coverage a pricing
+	// day needs before its weighted median counts as a baseline.
+	minBaselineCoverageMinutes = 360
+	// minBaselineDays is the minimum number of usable pricing-day baselines a
+	// station needs before it switches from absolute prices to offsets.
+	minBaselineDays = 3
+	// minCurrentRegimeCoverageMinutes is the minimum de-shaped coverage since
+	// the last jump-anchor crossing needed to trust the current-level estimate.
+	minCurrentRegimeCoverageMinutes = 60
+	// minJumpDetectionEuro is the smallest median upward move that lets an
+	// hour qualify as the market-wide daily jump anchor.
+	minJumpDetectionEuro = 0.01
+	// jumpDominanceRatio is how clearly the anchor hour's total upward
+	// movement must beat the runner-up hour before it is trusted.
+	jumpDominanceRatio = 1.5
+)
 
 type stationWeekdayHourKey struct {
 	StationID string
@@ -283,6 +330,10 @@ type forecastModel struct {
 	WeekdayHour map[stationWeekdayHourKey][]priceSample
 	Hour        map[stationHourKey][]priceSample
 	Recent      map[string][]priceSample
+	// JumpAnchorHour is the inferred local hour at which the market-wide
+	// once-per-day price raise happens (0 when no dominant jump was found, in
+	// which case pricing days are plain calendar days).
+	JumpAnchorHour int
 }
 
 type forecastScore struct {
@@ -1238,9 +1289,10 @@ func runSuggest(args []string) error {
 	city := fs.String("city", "", "Cached city to use as the range center")
 	rangeKM := fs.Float64("range-km", 5, "Maximum station distance from the city center in km")
 	fuel := fs.String("fuel", "diesel", "Fuel type: diesel, e5, e10")
-	historyDays := fs.Int("history-days", 21, "Historical days to use for prediction")
+	historyDays := fs.Int("history-days", 30, "Historical days to use for prediction")
 	predictDays := fs.Int("predict-days", 3, "Calendar days to suggest, including today when future hours remain")
 	limitPerDay := fs.Int("limit-per-day", 3, "Maximum suggestions per day")
+	persist := fs.Bool("persist", false, "Store the full prediction grid in the database, evaluate past predictions against actual prices, and learn from the errors")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1283,15 +1335,45 @@ func runSuggest(args []string) error {
 		return err
 	}
 
-	suggestions, err := suggestGas(ctx, db, opts)
+	// Evaluate before computing so freshly measured errors feed this run's
+	// bias correction.
+	var evaluated int
+	if *persist {
+		evaluated, err = evaluateDuePredictions(ctx, db, opts.Fuel, opts.Now)
+		if err != nil {
+			return err
+		}
+	}
+
+	computation, err := computeSuggestions(ctx, db, opts)
 	if err != nil {
 		return err
 	}
-	if output == outputJSON {
-		return writeJSON(suggestions)
+
+	if *persist {
+		persisted, err := persistPredictionRun(ctx, db, computation, opts)
+		if err != nil {
+			return err
+		}
+		pruned, err := prunePredictions(ctx, db, opts.Now)
+		if err != nil {
+			return err
+		}
+		biased := 0
+		for _, station := range computation.Model.Stations {
+			if station.BiasCorrection != 0 {
+				biased++
+			}
+		}
+		fmt.Fprintf(os.Stderr, "persist: stored %d predictions, evaluated %d, bias-corrected %d stations, pruned %d\n",
+			persisted, evaluated, biased, pruned)
 	}
 
-	printSuggestionsText(suggestions)
+	if output == outputJSON {
+		return writeJSON(computation.Suggestions)
+	}
+
+	printSuggestionsText(computation.Suggestions)
 	return nil
 }
 
@@ -1301,7 +1383,7 @@ func runCheck(args []string) error {
 	city := fs.String("city", "", "Cached city to use as the range center")
 	rangeKM := fs.Float64("range-km", 5, "Maximum station distance from the city center in km")
 	fuel := fs.String("fuel", "diesel", "Fuel type: diesel, e5, e10")
-	historyDays := fs.Int("history-days", 21, "Historical days to use for prediction")
+	historyDays := fs.Int("history-days", 30, "Historical days to use for prediction")
 	predictDays := fs.Int("predict-days", 3, "Calendar days to check for lower future prices, including today when future hours remain")
 	limit := fs.Int("limit", 5, "Maximum rows to print; 0 for no limit")
 	outputLong, outputShort := addOutputFlags(fs)
@@ -1506,7 +1588,26 @@ func validateCheckOptions(opts checkOptions) error {
 	return nil
 }
 
+// suggestComputation carries the full state of one suggest run so the
+// persistent mode can store the complete forecast grid, not just the printed
+// suggestions.
+type suggestComputation struct {
+	CityName    string
+	Now         time.Time
+	Location    *time.Location
+	Model       forecastModel
+	Suggestions []suggestionRow
+}
+
 func suggestGas(ctx context.Context, db *sql.DB, opts suggestOptions) ([]suggestionRow, error) {
+	computation, err := computeSuggestions(ctx, db, opts)
+	if err != nil {
+		return nil, err
+	}
+	return computation.Suggestions, nil
+}
+
+func computeSuggestions(ctx context.Context, db *sql.DB, opts suggestOptions) (*suggestComputation, error) {
 	if err := validateSuggestOptions(opts); err != nil {
 		return nil, err
 	}
@@ -1535,11 +1636,20 @@ func suggestGas(ctx context.Context, db *sql.DB, opts suggestOptions) ([]suggest
 	}
 
 	model := buildForecastModel(intervals, now, location)
+	if err := applyPredictionBias(ctx, db, &model, opts.Fuel, now); err != nil {
+		return nil, err
+	}
 	suggestions := mergeSuggestions(generateSuggestions(model, opts.Fuel, now, location, opts.PredictDays, opts.LimitPerDay))
 	if len(suggestions) == 0 {
 		return nil, errors.New("not enough historical price patterns for suggestions")
 	}
-	return suggestions, nil
+	return &suggestComputation{
+		CityName:    city.Name,
+		Now:         now,
+		Location:    location,
+		Model:       model,
+		Suggestions: suggestions,
+	}, nil
 }
 
 func checkGas(ctx context.Context, db *sql.DB, opts checkOptions) ([]priceCheckRow, error) {
@@ -1571,6 +1681,9 @@ func checkGas(ctx context.Context, db *sql.DB, opts checkOptions) ([]priceCheckR
 	}
 
 	model := buildForecastModel(intervals, now, location)
+	if err := applyPredictionBias(ctx, db, &model, opts.Fuel, now); err != nil {
+		return nil, err
+	}
 	checks := generatePriceChecks(model, snapshots, opts.Fuel, now, location, opts.PredictDays, opts.Limit)
 	if len(checks) == 0 {
 		return nil, errors.New("not enough current open-price data for checks")
@@ -1736,6 +1849,11 @@ func reconstructPriceIntervals(snapshots []suggestSnapshot, historyStart, now ti
 	return intervals
 }
 
+// buildForecastModel decomposes each station's history into a per-pricing-day
+// baseline plus intraday offsets. The pricing day is anchored at the inferred
+// daily jump hour, so every pricing day sits inside a single price regime even
+// when the market level shifts day to day. Stations without enough complete
+// pricing days keep the legacy absolute-price behavior.
 func buildForecastModel(intervals []priceInterval, now time.Time, location *time.Location) forecastModel {
 	model := forecastModel{
 		Stations:    make(map[string]forecastStation),
@@ -1744,11 +1862,67 @@ func buildForecastModel(intervals []priceInterval, now time.Time, location *time
 		Recent:      make(map[string][]priceSample),
 	}
 	nowLocal := now.In(location)
+	model.JumpAnchorHour = inferJumpAnchorHour(intervals, location)
+	buckets := collectHourBuckets(intervals, now, location)
+	baselines := computeDailyBaselines(buckets, model.JumpAnchorHour, nowLocal)
+	currentDay := pricingDay(nowLocal, model.JumpAnchorHour)
+
 	for _, interval := range intervals {
 		model.Stations[interval.StationID] = forecastStation{
 			Station: interval.Station,
 		}
+	}
 
+	currentBuckets := make(map[string][]hourBucket)
+	for _, bucket := range buckets {
+		if len(baselines[bucket.StationID]) < minBaselineDays {
+			model.addSample(bucket, bucket.Price)
+			continue
+		}
+		day := pricingDay(bucket.Start, model.JumpAnchorHour)
+		if day == currentDay {
+			// The open pricing day has no settled baseline yet; convert these
+			// buckets once the current level estimate exists (below).
+			currentBuckets[bucket.StationID] = append(currentBuckets[bucket.StationID], bucket)
+			continue
+		}
+		baseline, ok := baselines[bucket.StationID][day]
+		if !ok {
+			// Sparse historical day without a trustworthy baseline: mixing its
+			// absolute level into the offsets would smear regimes, so drop it.
+			continue
+		}
+		model.addSample(bucket, bucket.Price-baseline.Value)
+	}
+
+	for stationID, station := range model.Stations {
+		stationBaselines := baselines[stationID]
+		if len(stationBaselines) < minBaselineDays {
+			continue
+		}
+		station.OffsetMode = true
+		// Data since the last jump crossing lies entirely in the current price
+		// regime and is the freshest level signal; fall back to the most
+		// recent complete pricing day when there is not enough of it yet.
+		estimate, ok := estimateCurrentBaseline(model, stationID, currentBuckets[stationID])
+		if !ok {
+			estimate = latestBaselineValue(stationBaselines)
+		}
+		station.BaselineForecast = estimate
+		for _, bucket := range currentBuckets[stationID] {
+			model.addSample(bucket, bucket.Price-estimate)
+		}
+		model.Stations[stationID] = station
+	}
+	return model
+}
+
+// collectHourBuckets splits price intervals into local-time hour slices,
+// keeping the overlap duration and the recency age of each slice.
+func collectHourBuckets(intervals []priceInterval, now time.Time, location *time.Location) []hourBucket {
+	nowLocal := now.In(location)
+	var buckets []hourBucket
+	for _, interval := range intervals {
 		localStart := interval.Start.In(location)
 		localEnd := interval.End.In(location)
 		for bucketStart := localHourStart(localStart); bucketStart.Before(localEnd); bucketStart = bucketStart.Add(time.Hour) {
@@ -1765,31 +1939,184 @@ func buildForecastModel(intervals []priceInterval, now time.Time, location *time
 			if ageDays < 0 {
 				ageDays = 0
 			}
-			sample := priceSample{
-				Price:  interval.Price,
-				Weight: minutes * math.Exp(-ageDays/10),
-				Date:   bucketStart.Format("2006-01-02"),
-			}
-			model.WeekdayHour[stationWeekdayHourKey{
+			buckets = append(buckets, hourBucket{
 				StationID: interval.StationID,
-				Weekday:   bucketStart.Weekday(),
-				Hour:      bucketStart.Hour(),
-			}] = append(model.WeekdayHour[stationWeekdayHourKey{
-				StationID: interval.StationID,
-				Weekday:   bucketStart.Weekday(),
-				Hour:      bucketStart.Hour(),
-			}], sample)
-			model.Hour[stationHourKey{
-				StationID: interval.StationID,
-				Hour:      bucketStart.Hour(),
-			}] = append(model.Hour[stationHourKey{
-				StationID: interval.StationID,
-				Hour:      bucketStart.Hour(),
-			}], sample)
-			model.Recent[interval.StationID] = append(model.Recent[interval.StationID], sample)
+				Start:     bucketStart,
+				Minutes:   minutes,
+				AgeDays:   ageDays,
+				Price:     interval.Price,
+			})
 		}
 	}
-	return model
+	return buckets
+}
+
+func (m *forecastModel) addSample(bucket hourBucket, price float64) {
+	sample := priceSample{
+		Price:  price,
+		Weight: bucket.Minutes * math.Exp(-bucket.AgeDays/10),
+		Date:   bucket.Start.Format("2006-01-02"),
+	}
+	weekdayKey := stationWeekdayHourKey{
+		StationID: bucket.StationID,
+		Weekday:   bucket.Start.Weekday(),
+		Hour:      bucket.Start.Hour(),
+	}
+	m.WeekdayHour[weekdayKey] = append(m.WeekdayHour[weekdayKey], sample)
+	hourKey := stationHourKey{
+		StationID: bucket.StationID,
+		Hour:      bucket.Start.Hour(),
+	}
+	m.Hour[hourKey] = append(m.Hour[hourKey], sample)
+	m.Recent[bucket.StationID] = append(m.Recent[bucket.StationID], sample)
+}
+
+// inferJumpAnchorHour finds the local hour where upward price moves
+// concentrate across all stations — the market-wide once-per-day raise (the
+// regulation currently puts it at noon, but nothing here assumes that; if the
+// rule changes the inferred anchor follows the data). Returns 0 (calendar-day
+// pricing) when no hour dominates clearly.
+func inferJumpAnchorHour(intervals []priceInterval, location *time.Location) int {
+	risesByHour := make(map[int][]float64)
+	for i := 1; i < len(intervals); i++ {
+		previous := intervals[i-1]
+		current := intervals[i]
+		if previous.StationID != current.StationID {
+			continue
+		}
+		delta := current.Price - previous.Price
+		if delta <= 0 {
+			continue
+		}
+		hour := current.Start.In(location).Hour()
+		risesByHour[hour] = append(risesByHour[hour], delta)
+	}
+
+	bestHour, bestTotal, runnerUpTotal := 0, 0.0, 0.0
+	for hour, deltas := range risesByHour {
+		var total float64
+		for _, delta := range deltas {
+			total += delta
+		}
+		switch {
+		case total > bestTotal:
+			runnerUpTotal = bestTotal
+			bestTotal = total
+			bestHour = hour
+		case total > runnerUpTotal:
+			runnerUpTotal = total
+		}
+	}
+	if bestTotal <= 0 || medianFloat(risesByHour[bestHour]) < minJumpDetectionEuro {
+		return 0
+	}
+	if runnerUpTotal > 0 && bestTotal < jumpDominanceRatio*runnerUpTotal {
+		return 0
+	}
+	return bestHour
+}
+
+func medianFloat(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	ordered := append([]float64(nil), values...)
+	sort.Float64s(ordered)
+	middle := len(ordered) / 2
+	if len(ordered)%2 == 0 {
+		return (ordered[middle-1] + ordered[middle]) / 2
+	}
+	return ordered[middle]
+}
+
+// pricingDay maps a local time onto the 24h window anchored at the daily jump
+// hour, so a day-over-day baseline shift never lands inside one pricing day.
+func pricingDay(local time.Time, anchorHour int) string {
+	return local.Add(-time.Duration(anchorHour) * time.Hour).Format("2006-01-02")
+}
+
+// computeDailyBaselines returns the duration-weighted median price per station
+// and complete pricing day. The still-open current pricing day is excluded,
+// as are days with too little recorded coverage: a partial day's median is
+// biased by whichever side of the daily sawtooth it happens to cover.
+func computeDailyBaselines(buckets []hourBucket, anchorHour int, nowLocal time.Time) map[string]map[string]dayBaseline {
+	currentDay := pricingDay(nowLocal, anchorHour)
+	grouped := make(map[string]map[string][]priceSample)
+	for _, bucket := range buckets {
+		day := pricingDay(bucket.Start, anchorHour)
+		if day >= currentDay {
+			continue
+		}
+		days := grouped[bucket.StationID]
+		if days == nil {
+			days = make(map[string][]priceSample)
+			grouped[bucket.StationID] = days
+		}
+		// Weight by duration only: within one pricing day recency is
+		// irrelevant, the day is a single price regime.
+		days[day] = append(days[day], priceSample{Price: bucket.Price, Weight: bucket.Minutes, Date: day})
+	}
+
+	baselines := make(map[string]map[string]dayBaseline)
+	for stationID, days := range grouped {
+		for day, samples := range days {
+			var coverage float64
+			for _, sample := range samples {
+				coverage += sample.Weight
+			}
+			if coverage < minBaselineCoverageMinutes {
+				continue
+			}
+			value, ok := weightedMedianPrice(samples)
+			if !ok {
+				continue
+			}
+			stationBaselines := baselines[stationID]
+			if stationBaselines == nil {
+				stationBaselines = make(map[string]dayBaseline)
+				baselines[stationID] = stationBaselines
+			}
+			stationBaselines[day] = dayBaseline{Value: value, CoverageMinutes: coverage}
+		}
+	}
+	return baselines
+}
+
+// estimateCurrentBaseline de-shapes the open pricing day's buckets by
+// subtracting the learned per-hour offsets (built from complete days only) and
+// takes their duration-weighted median. This removes the time-of-day bias, so
+// even one or two hours of post-jump data yield a usable level estimate.
+func estimateCurrentBaseline(model forecastModel, stationID string, buckets []hourBucket) (float64, bool) {
+	var (
+		samples  []priceSample
+		coverage float64
+	)
+	for _, bucket := range buckets {
+		hourOffset, ok := weightedMedianPrice(model.Hour[stationHourKey{StationID: stationID, Hour: bucket.Start.Hour()}])
+		if !ok {
+			continue
+		}
+		samples = append(samples, priceSample{Price: bucket.Price - hourOffset, Weight: bucket.Minutes})
+		coverage += bucket.Minutes
+	}
+	if coverage < minCurrentRegimeCoverageMinutes {
+		return 0, false
+	}
+	return weightedMedianPrice(samples)
+}
+
+func latestBaselineValue(baselines map[string]dayBaseline) float64 {
+	var (
+		latestDay string
+		value     float64
+	)
+	for day, baseline := range baselines {
+		if day > latestDay {
+			latestDay = day
+			value = baseline.Value
+		}
+	}
+	return value
 }
 
 func generateSuggestions(model forecastModel, fuel string, now time.Time, location *time.Location, predictDays, limitPerDay int) []suggestionRow {
@@ -1905,7 +2232,14 @@ func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel 
 		if !ok {
 			continue
 		}
-		percentile, ok := weightedPricePercentile(model.Recent[stationID], snapshot.Price.Float64)
+		// In offset mode the percentile compares the price's position within
+		// the daily sawtooth, not its absolute level — a market-wide baseline
+		// jump must not make every station read "high".
+		comparePrice := snapshot.Price.Float64
+		if station := model.Stations[stationID]; station.OffsetMode {
+			comparePrice -= station.BaselineForecast
+		}
+		percentile, ok := weightedPricePercentile(model.Recent[stationID], comparePrice)
 		if !ok {
 			continue
 		}
@@ -2050,6 +2384,12 @@ func scoreForecast(model forecastModel, stationID string, weekday time.Weekday, 
 		sampleCount = len(sameHour)
 		confidence = "low"
 	}
+
+	station := model.Stations[stationID]
+	if station.OffsetMode {
+		predicted += station.BaselineForecast
+	}
+	predicted += station.BiasCorrection
 
 	return forecastScore{
 		PredictedPrice: predicted,
