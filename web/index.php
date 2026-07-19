@@ -4759,9 +4759,13 @@ if (!chartEl) {
     let lastChartWidth = 0;
     let chartResizeTimer = null;
     if (typeof ResizeObserver !== 'undefined') {
-        new ResizeObserver(() => {
+        new ResizeObserver((entries) => {
             if (!dataLoaded || chartEl.hasAttribute('hidden')) return;
-            const w = Math.round(chartEl.getBoundingClientRect().width);
+            const entry = entries[0];
+            if (!entry) return;
+            // contentRect is the parent's content box (padding excluded),
+            // which the width:100% SVG fills exactly — no reflow needed.
+            const w = Math.round(entry.contentRect.width);
             if (w === 0 || Math.abs(w - lastChartWidth) < 2) return;
             clearTimeout(chartResizeTimer);
             chartResizeTimer = setTimeout(renderChart, 100);
