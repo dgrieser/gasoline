@@ -1293,8 +1293,9 @@ func runSuggest(args []string) error {
 	predictDays := fs.Int("predict-days", 3, "Calendar days to suggest, including today when future hours remain")
 	limitPerDay := fs.Int("limit-per-day", 3, "Maximum suggestions per day")
 	persist := fs.Bool("persist", false, "Store the full prediction grid in the database, evaluate past predictions against actual prices, and learn from the errors")
-	quietLong := fs.Bool("quiet", false, "Suppress the suggestion output; requires --persist (store only)")
-	quietShort := fs.Bool("q", false, "Suppress the suggestion output; requires --persist (store only)")
+	var quiet bool
+	fs.BoolVar(&quiet, "quiet", false, "Suppress the suggestion output; requires --persist (store only)")
+	fs.BoolVar(&quiet, "q", false, "Suppress the suggestion output; requires --persist (store only)")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1307,7 +1308,6 @@ func runSuggest(args []string) error {
 	if err != nil {
 		return err
 	}
-	quiet := *quietLong || *quietShort
 	if quiet && !*persist {
 		return errors.New("--quiet requires --persist")
 	}
