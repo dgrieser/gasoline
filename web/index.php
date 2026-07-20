@@ -1173,7 +1173,7 @@ function renderAccountPage(PDO $pdo, array $user): never
                     <label data-i18n="notifyCities">Cities</label>
                     <div class="day-toggles">
                         <?php foreach ($targetCities as $city) { ?>
-                        <label class="day-toggle"><input type="checkbox" name="notify_cities[]" value="<?= h($city) ?>" <?= ($selectedCities === [] || isset($selectedCities[$city])) ? 'checked' : '' ?>><span><?= h($city) ?></span></label>
+                        <label class="day-toggle"><input type="checkbox" name="notify_cities[]" value="<?= h($city) ?>" <?= isset($selectedCities[$city]) ? 'checked' : '' ?>><span><?= h($city) ?></span></label>
                         <?php } ?>
                     </div>
                     <p class="field-hint" data-i18n="notifyCitiesHint">Notifications cover only the selected cities. Selecting none means every city, including ones added later.</p>
