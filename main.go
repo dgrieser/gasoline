@@ -1341,8 +1341,26 @@ func runSuggest(args []string) error {
 		return err
 	}
 
+	// Without an explicit --city, run against every configured update target,
+	// like `gasoline update` (applySuggestSettings already filled opts.City
+	// with the first one, so a single target keeps the original behavior).
+	cities := []string{opts.City}
+	if !flagWasSet(fs, "city") && strings.TrimSpace(*city) == "" {
+		targets, err := loadUpdateTargets(ctx, db)
+		if err != nil {
+			return err
+		}
+		if len(targets) > 0 {
+			cities = cities[:0]
+			for _, target := range targets {
+				cities = append(cities, target.City)
+			}
+		}
+	}
+
 	// Evaluate before computing so freshly measured errors feed this run's
-	// bias correction.
+	// bias correction. Evaluation is fuel-scoped, not city-scoped, so one
+	// pass covers every city.
 	var evaluated int
 	if *persist {
 		evaluated, err = evaluateDuePredictions(ctx, db, opts.Fuel, opts.Now)
@@ -1351,39 +1369,79 @@ func runSuggest(args []string) error {
 		}
 	}
 
-	computation, err := computeSuggestions(ctx, db, opts)
-	if err != nil {
-		return err
+	// Multiple cities: best-effort like `update` — compute all, persist
+	// successes, report failures at the end.
+	results := make([]citySuggestResult, 0, len(cities))
+	failures := 0
+	persisted, biased := 0, 0
+	for _, cityName := range cities {
+		cityOpts := opts
+		cityOpts.City = cityName
+		computation, err := computeSuggestions(ctx, db, cityOpts)
+		if err != nil {
+			if len(cities) == 1 {
+				return err
+			}
+			failures++
+			results = append(results, citySuggestResult{City: cityName, Error: err.Error()})
+			continue
+		}
+		if *persist {
+			stored, err := persistPredictionRun(ctx, db, computation, cityOpts)
+			if err != nil {
+				return err
+			}
+			persisted += stored
+			for _, station := range computation.Model.Stations {
+				if station.BiasCorrection != 0 {
+					biased++
+				}
+			}
+		}
+		results = append(results, citySuggestResult{City: computation.CityName, Suggestions: computation.Suggestions})
 	}
 
 	if *persist {
-		persisted, err := persistPredictionRun(ctx, db, computation, opts)
-		if err != nil {
-			return err
-		}
 		pruned, err := prunePredictions(ctx, db, opts.Now)
 		if err != nil {
 			return err
-		}
-		biased := 0
-		for _, station := range computation.Model.Stations {
-			if station.BiasCorrection != 0 {
-				biased++
-			}
 		}
 		fmt.Fprintf(os.Stderr, "persist: stored %d predictions, evaluated %d, bias-corrected %d stations, pruned %d\n",
 			persisted, evaluated, biased, pruned)
 	}
 
-	if quiet {
-		return nil
+	if !quiet {
+		if len(cities) == 1 {
+			// Single city: preserve the original output shape.
+			if output == outputJSON {
+				if err := writeJSON(results[0].Suggestions); err != nil {
+					return err
+				}
+			} else {
+				printSuggestionsText(results[0].Suggestions)
+			}
+		} else if output == outputJSON {
+			if err := writeJSON(results); err != nil {
+				return err
+			}
+		} else {
+			for i, res := range results {
+				if i > 0 {
+					fmt.Fprintln(stdout)
+				}
+				fmt.Fprintf(stdout, "city: %s\n", res.City)
+				if res.Error != "" {
+					fmt.Fprintf(stdout, "  error: %s\n", res.Error)
+					continue
+				}
+				printSuggestionsText(res.Suggestions)
+			}
+		}
 	}
 
-	if output == outputJSON {
-		return writeJSON(computation.Suggestions)
+	if failures > 0 {
+		return fmt.Errorf("%d of %d cities failed", failures, len(cities))
 	}
-
-	printSuggestionsText(computation.Suggestions)
 	return nil
 }
 
@@ -1438,15 +1496,70 @@ func runCheck(args []string) error {
 		return err
 	}
 
-	checks, err := checkGas(ctx, db, opts)
-	if err != nil {
-		return err
-	}
-	if output == outputJSON {
-		return writeJSON(checks)
+	// Without an explicit --city, run against every configured update target,
+	// like `gasoline suggest` (applyCheckSettings already filled opts.City
+	// with the first one, so a single target keeps the original behavior).
+	cities := []string{opts.City}
+	if !flagWasSet(fs, "city") && strings.TrimSpace(*city) == "" {
+		targets, err := loadUpdateTargets(ctx, db)
+		if err != nil {
+			return err
+		}
+		if len(targets) > 0 {
+			cities = cities[:0]
+			for _, target := range targets {
+				cities = append(cities, target.City)
+			}
+		}
 	}
 
-	printPriceChecksText(checks)
+	// Multiple cities: best-effort — check all, report failures at the end.
+	results := make([]cityCheckResult, 0, len(cities))
+	failures := 0
+	for _, cityName := range cities {
+		cityOpts := opts
+		cityOpts.City = cityName
+		checks, err := checkGas(ctx, db, cityOpts)
+		if err != nil {
+			if len(cities) == 1 {
+				return err
+			}
+			failures++
+			results = append(results, cityCheckResult{City: cityName, Error: err.Error()})
+			continue
+		}
+		results = append(results, cityCheckResult{City: cityName, Checks: checks})
+	}
+
+	if len(cities) == 1 {
+		// Single city: preserve the original output shape.
+		if output == outputJSON {
+			return writeJSON(results[0].Checks)
+		}
+		printPriceChecksText(results[0].Checks)
+		return nil
+	}
+
+	if output == outputJSON {
+		if err := writeJSON(results); err != nil {
+			return err
+		}
+	} else {
+		for i, res := range results {
+			if i > 0 {
+				fmt.Fprintln(stdout)
+			}
+			fmt.Fprintf(stdout, "city: %s\n", res.City)
+			if res.Error != "" {
+				fmt.Fprintf(stdout, "  error: %s\n", res.Error)
+				continue
+			}
+			printPriceChecksText(res.Checks)
+		}
+	}
+	if failures > 0 {
+		return fmt.Errorf("%d of %d cities failed", failures, len(cities))
+	}
 	return nil
 }
 
@@ -1596,6 +1709,22 @@ func validateCheckOptions(opts checkOptions) error {
 		return errors.New("--limit must be >= 0")
 	}
 	return nil
+}
+
+// citySuggestResult is one city's outcome in a multi-city suggest run.
+// Single-city runs keep the original flat []suggestionRow output shape.
+type citySuggestResult struct {
+	City        string          `json:"city"`
+	Suggestions []suggestionRow `json:"suggestions,omitempty"`
+	Error       string          `json:"error,omitempty"`
+}
+
+// cityCheckResult is one city's outcome in a multi-city check run.
+// Single-city runs keep the original flat []priceCheckRow output shape.
+type cityCheckResult struct {
+	City   string          `json:"city"`
+	Checks []priceCheckRow `json:"checks,omitempty"`
+	Error  string          `json:"error,omitempty"`
 }
 
 // suggestComputation carries the full state of one suggest run so the
