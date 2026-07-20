@@ -49,6 +49,11 @@ function gasolineConnect(string $driver, string $sqlitePath): PDO
     }
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    if ($driver !== 'mysql') {
+        // SQLite enforces foreign keys (incl. the ON DELETE CASCADE cleanup of
+        // user_notify_cities) only when enabled per connection.
+        $pdo->exec('PRAGMA foreign_keys = ON');
+    }
 
     return $pdo;
 }
@@ -118,7 +123,7 @@ function flashText(string $key): string
         'wrongPassword' => 'The current password is incorrect.',
         'passwordChanged' => 'Password changed.',
         'notifySaved' => 'Notification settings saved.',
-        'invalidNotifySettings' => 'Invalid notification settings. Check days, time windows, and times.',
+        'invalidNotifySettings' => 'Invalid notification settings. Check days, time windows, times, and cities.',
         'lastAdminGuard' => 'You are the last administrator and cannot delete this account.',
         'accountDeleted' => 'Your account has been deleted.',
         'confirmRequired' => 'Please confirm the deletion.',
@@ -483,6 +488,72 @@ function normalizeTimeList(array $times): ?string
     return implode(',', $list);
 }
 
+/**
+ * Normalizes submitted notification-city checkboxes against the configured
+ * update targets. Returns the canonical city names in target order; an empty
+ * selection returns [] (meaning: all cities, including ones added later).
+ * Null when a submitted city is not a configured target (tampered form or
+ * stale page).
+ */
+function normalizeCityList(array $cities, array $targets): ?array
+{
+    $canonical = [];
+    foreach ($targets as $target) {
+        $target = trim((string) $target);
+        if ($target !== '') {
+            $canonical[strtolower($target)] = $target;
+        }
+    }
+    $selected = [];
+    foreach ($cities as $city) {
+        $key = strtolower(trim((string) $city));
+        if ($key === '' || !isset($canonical[$key])) {
+            return null;
+        }
+        $selected[$key] = true;
+    }
+    $ordered = [];
+    foreach ($canonical as $key => $name) {
+        if (isset($selected[$key])) {
+            $ordered[] = $name;
+        }
+    }
+    return $ordered;
+}
+
+/** The configured update-target cities, in admin-defined order. */
+function updateTargetCities(PDO $pdo): array
+{
+    return $pdo->query('SELECT city FROM update_targets ORDER BY id ASC')->fetchAll(PDO::FETCH_COLUMN);
+}
+
+/** One user's notification city selection; [] means all cities. */
+function userNotifyCities(PDO $pdo, int $userId): array
+{
+    $stmt = $pdo->prepare('SELECT city FROM user_notify_cities WHERE user_id = :id');
+    $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
+    $stmt->execute();
+    return $stmt->fetchAll(PDO::FETCH_COLUMN);
+}
+
+/** Replaces one user's notification city selection. */
+function saveUserNotifyCities(PDO $pdo, int $userId, array $cities): void
+{
+    $stmt = $pdo->prepare('DELETE FROM user_notify_cities WHERE user_id = :id');
+    $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
+    $stmt->execute();
+    if ($cities === []) {
+        return;
+    }
+    $stmt = $pdo->prepare('INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (:id, :city, :now)');
+    foreach ($cities as $city) {
+        $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
+        $stmt->bindValue(':city', (string) $city);
+        $stmt->bindValue(':now', nowUTC());
+        $stmt->execute();
+    }
+}
+
 /** Validates an already comma-separated windows string (admin text input). */
 function validWindowListString(string $value): bool
 {
@@ -655,10 +726,12 @@ function handlePost(PDO $pdo, string $driver): void
                 (array) ($_POST['notify_windows_to'] ?? [])
             );
             $times = normalizeTimeList((array) ($_POST['notify_suggest_times'] ?? []));
-            if ($method !== 'pushover' || $days === null || $windows === null || $times === null) {
+            $cities = normalizeCityList((array) ($_POST['notify_cities'] ?? []), updateTargetCities($pdo));
+            if ($method !== 'pushover' || $days === null || $windows === null || $times === null || $cities === null) {
                 setFlash('error', 'invalidNotifySettings');
                 redirectTo('?page=account');
             }
+            $pdo->beginTransaction();
             $stmt = $pdo->prepare(
                 'UPDATE users SET notify_method = :method, pushover_app_name = :app,
                     pushover_user_key = :user_key, pushover_token = :token,
@@ -676,6 +749,8 @@ function handlePost(PDO $pdo, string $driver): void
             $stmt->bindValue(':check_enabled', isset($_POST['notify_check_enabled']) ? 1 : 0, PDO::PARAM_INT);
             $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
             $stmt->execute();
+            saveUserNotifyCities($pdo, (int) $user['id'], $cities);
+            $pdo->commit();
             setFlash('success', 'notifySaved');
             redirectTo('?page=account');
             // no break
@@ -1089,6 +1164,21 @@ function renderAccountPage(PDO $pdo, array $user): never
                     <input type="text" id="nf-token" name="pushover_token" value="<?= h($user['pushover_token']) ?>" autocomplete="off">
                 </div>
                 <?php renderScheduleEditor((string) $user['notify_days'], (string) $user['notify_windows'], (string) $user['notify_suggest_times']); ?>
+                <?php
+                $targetCities = updateTargetCities($pdo);
+                if ($targetCities !== []) {
+                    $selectedCities = array_flip(userNotifyCities($pdo, (int) $user['id']));
+                ?>
+                <div class="field">
+                    <label data-i18n="notifyCities">Cities</label>
+                    <div class="day-toggles">
+                        <?php foreach ($targetCities as $city) { ?>
+                        <label class="day-toggle"><input type="checkbox" name="notify_cities[]" value="<?= h($city) ?>" <?= isset($selectedCities[$city]) ? 'checked' : '' ?>><span><?= h($city) ?></span></label>
+                        <?php } ?>
+                    </div>
+                    <p class="field-hint" data-i18n="notifyCitiesHint">Notifications cover only the selected cities. Selecting none means every city, including ones added later.</p>
+                </div>
+                <?php } ?>
                 <div class="field">
                     <label class="check-toggle"><input type="checkbox" name="notify_check_enabled" <?= (int) $user['notify_check_enabled'] === 1 ? 'checked' : '' ?>><span data-i18n="notifyCheckEnabled">Send buy-now alerts when prices drop</span></label>
                 </div>
@@ -3869,8 +3959,10 @@ const translations = {
         notifyWindows: 'Time windows',
         notifySuggestTimes: 'Daily suggestion times',
         notifyCheckEnabled: 'Send buy-now alerts when prices drop',
+        notifyCities: 'Cities',
+        notifyCitiesHint: 'Notifications cover only the selected cities. Selecting none means every city, including ones added later.',
         notifySaved: 'Notification settings saved.',
-        invalidNotifySettings: 'Invalid notification settings. Check days, time windows, and times.',
+        invalidNotifySettings: 'Invalid notification settings. Check days, time windows, times, and cities.',
         addWindow: 'Add window',
         addTime: 'Add time',
         removeRow: 'Remove',
@@ -4062,8 +4154,10 @@ const translations = {
         notifyWindows: 'Zeitfenster',
         notifySuggestTimes: 'Tägliche Vorschlagszeiten',
         notifyCheckEnabled: 'Kaufalarme bei Preistiefs senden',
+        notifyCities: 'Städte',
+        notifyCitiesHint: 'Benachrichtigungen gelten nur für die ausgewählten Städte. Keine Auswahl bedeutet alle Städte, auch später hinzugefügte.',
         notifySaved: 'Benachrichtigungseinstellungen gespeichert.',
-        invalidNotifySettings: 'Ungültige Benachrichtigungseinstellungen. Bitte Tage, Zeitfenster und Zeiten prüfen.',
+        invalidNotifySettings: 'Ungültige Benachrichtigungseinstellungen. Bitte Tage, Zeitfenster, Zeiten und Städte prüfen.',
         addWindow: 'Zeitfenster hinzufügen',
         addTime: 'Zeit hinzufügen',
         removeRow: 'Entfernen',

@@ -380,6 +380,14 @@ func schemaStatements(d dialect) []string {
 				radius_km DOUBLE NOT NULL DEFAULT 5,
 				created_at VARCHAR(64) NOT NULL
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS user_notify_cities (
+				user_id BIGINT NOT NULL,
+				city VARCHAR(255) NOT NULL,
+				created_at VARCHAR(64) NOT NULL,
+				PRIMARY KEY (user_id, city),
+				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+				FOREIGN KEY (city) REFERENCES update_targets(city) ON DELETE CASCADE
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 			`CREATE TABLE IF NOT EXISTS notification_state (
 				name VARCHAR(191) PRIMARY KEY,
 				value TEXT NOT NULL,
@@ -489,6 +497,14 @@ func schemaStatements(d dialect) []string {
 			city TEXT NOT NULL UNIQUE,
 			radius_km REAL NOT NULL DEFAULT 5,
 			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS user_notify_cities (
+			user_id INTEGER NOT NULL,
+			city TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (user_id, city),
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY (city) REFERENCES update_targets(city) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS notification_state (
 			name TEXT PRIMARY KEY,

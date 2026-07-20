@@ -235,6 +235,7 @@ gasoline notify --dry-run  # render and report what would be sent, write nothing
 `notify` reads the admin settings and update targets, runs the check/suggest models, and delivers Pushover messages to every approved user who has configured a Pushover user key and API token in the web UI (My Account → Notifications). It needs no Tankerkönig API key — it only reads the database, so run `gasoline update` on a timer next to it. Per user it honors:
 
 - the **notification schedule**: enabled weekdays and one or more time windows (default: every day, 07:00–21:00). Outside the schedule nothing is delivered.
+- the **city selection**: notifications cover only the update-target cities the user selected (multi-select in My Account → Notifications, stored in `user_notify_cities`). An empty selection means all configured cities, including ones added later. Deleting an update target also removes it from every user's selection.
 - the **daily suggestion times** (default 08:00 and 13:00): each slot fires one suggestion notification per day; missed slots collapse into one on the next run instead of bursting.
 - the **buy-now alerts** opt-in: check notifications fire only for buy recommendations with medium/high confidence that are strictly cheaper than the day's running baseline (reset daily at the admin-configured reset time), mirroring `gasoline-watch.sh`.
 
