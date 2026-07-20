@@ -192,7 +192,7 @@ Useful `suggest` flags:
 
 Suggestion output includes the day, time window, predicted price, confidence, distance, and full persisted station metadata. JSON output keeps the existing top-level station fields and also includes a nested `station` object with address, brand, street, house number, post code, place, coordinates, and first/last seen timestamps.
 
-Without `--city`, `suggest` and `check` run against every configured update target (see [Server-stored configuration](#server-stored-configuration-admin-settings)). The single-city output shape is unchanged; with multiple targets the text output gains per-city `city: <name>` sections and the JSON output becomes an array of `{city, suggestions, error}` (`{city, checks, error}` for check) objects.
+Without `--city`, `suggest` and `check` run against every configured update target (see [Server-stored configuration](#server-stored-configuration-admin-settings)). The single-city output shape is unchanged; with multiple targets the text output gains per-city `city: <name>` sections and the JSON output becomes an array of `{city, suggestions}` (`{city, checks}` for check) objects, where `city` is the configured target name and failed cities carry an `error` string instead of results.
 
 Check whether the latest stored prices are low right now:
 
@@ -213,7 +213,7 @@ The reported `history_percentile` is regime-relative for stations with enough hi
 3. **Persists** the new grid; newer runs supersede older ones for the same target hour, older rows remain as learning history.
 4. **Prunes** predictions older than 30 days.
 
-The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. A timer run without `--city` covers every configured update target in one invocation, so stations in all cities accrue evaluation data for the bias learning. Nothing is shown in the web UI yet — the data accrues for analysis and for the bias learning.
+The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. A timer run without `--city` covers every configured update target in one invocation, so stations in all cities accrue evaluation data for the bias learning; per-city failures are reported on stderr and via the exit code. Nothing is shown in the web UI yet — the data accrues for analysis and for the bias learning.
 
 ### Server-stored configuration (admin settings)
 

@@ -186,8 +186,11 @@ func TestApplySuggestSettingsPrecedence(t *testing.T) {
 	if err := applySuggestSettings(ctx, db, fs, &opts); err != nil {
 		t.Fatalf("applySuggestSettings: %v", err)
 	}
-	if opts.Fuel != "e5" || opts.RangeKM != 12 || opts.City != "Berlin" {
-		t.Fatalf("opts = %+v, want fuel=e5 range=12 city=Berlin", opts)
+	if opts.Fuel != "e5" || opts.RangeKM != 12 {
+		t.Fatalf("opts = %+v, want fuel=e5 range=12", opts)
+	}
+	if opts.City != "" {
+		t.Fatalf("city = %q, want empty: city resolution belongs to resolveCities, not settings", opts.City)
 	}
 
 	// Explicit flags beat the DB.

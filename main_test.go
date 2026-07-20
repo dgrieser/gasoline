@@ -703,6 +703,60 @@ func TestRunCheckAllConfiguredCities(t *testing.T) {
 	}
 }
 
+func TestRunCheckAllConfiguredCitiesBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "check-besteffort.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ctx := context.Background()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestStation(t, db, "station-b", "Station B", 52.517389, 13.395131)
+	nowLocal := time.Now().In(time.Local)
+	for daysAgo := 6; daysAgo >= 1; daysAgo-- {
+		dayStart := localDayStart(nowLocal).AddDate(0, 0, -daysAgo)
+		for hour := 0; hour < 24; hour++ {
+			at := dayStart.Add(time.Duration(hour) * time.Hour).In(time.UTC)
+			insertSuggestSnapshot(t, db, "station-b", "Berlin", at, 2.100, true)
+		}
+	}
+	insertSuggestSnapshot(t, db, "station-b", "Berlin", time.Now().UTC(), 2.000, true)
+	insertUpdateTargetRow(t, db, "Berlin", 5)
+	insertUpdateTargetRow(t, db, "Nowhere", 5)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	old := stdout
+	var buf bytes.Buffer
+	stdout = &buf
+	runErr := run([]string{"check", "--db", dbPath, "--fuel", "diesel", "--history-days", "10", "--predict-days", "1", "--output", "json"})
+	stdout = old
+	if runErr == nil || !strings.Contains(runErr.Error(), "1 of 2 cities failed") {
+		t.Fatalf("run error = %v, want '1 of 2 cities failed'", runErr)
+	}
+	var results []cityCheckResult
+	if err := json.Unmarshal(buf.Bytes(), &results); err != nil {
+		t.Fatalf("unmarshal best-effort check output: %v\noutput=%s", err, buf.String())
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d city results, want 2", len(results))
+	}
+	if results[0].City != "Berlin" || results[0].Error != "" || len(results[0].Checks) != 1 {
+		t.Fatalf("results[0] = %+v, want one Berlin row without error", results[0])
+	}
+	if results[1].City != "Nowhere" || results[1].Error == "" {
+		t.Fatalf("results[1] = %+v, want Nowhere with error", results[1])
+	}
+	if results[1].Checks != nil {
+		t.Fatalf("results[1].Checks = %+v, want null for failed city", results[1].Checks)
+	}
+}
+
 func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

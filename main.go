@@ -1337,25 +1337,15 @@ func runSuggest(args []string) error {
 	if err := applySuggestSettings(ctx, db, fs, &opts); err != nil {
 		return err
 	}
-	if err := validateSuggestOptions(opts); err != nil {
+	cities, err := resolveCities(ctx, db, fs, opts.City)
+	if err != nil {
 		return err
 	}
-
-	// Without an explicit --city, run against every configured update target,
-	// like `gasoline update` (applySuggestSettings already filled opts.City
-	// with the first one, so a single target keeps the original behavior).
-	cities := []string{opts.City}
-	if !flagWasSet(fs, "city") && strings.TrimSpace(*city) == "" {
-		targets, err := loadUpdateTargets(ctx, db)
-		if err != nil {
-			return err
-		}
-		if len(targets) > 0 {
-			cities = cities[:0]
-			for _, target := range targets {
-				cities = append(cities, target.City)
-			}
-		}
+	// The non-city options are identical across cities, so validating the
+	// first is validating them all.
+	opts.City = cities[0]
+	if err := validateSuggestOptions(opts); err != nil {
+		return err
 	}
 
 	// Evaluate before computing so freshly measured errors feed this run's
@@ -1369,36 +1359,36 @@ func runSuggest(args []string) error {
 		}
 	}
 
-	// Multiple cities: best-effort like `update` — compute all, persist
-	// successes, report failures at the end.
+	// Multiple cities: best-effort like `update` — compute and persist each
+	// city independently, report failures at the end.
 	results := make([]citySuggestResult, 0, len(cities))
 	failures := 0
 	persisted, biased := 0, 0
 	for _, cityName := range cities {
 		cityOpts := opts
 		cityOpts.City = cityName
-		computation, err := computeSuggestions(ctx, db, cityOpts)
+		suggestions, stored, biasedStations, err := suggestOneCity(ctx, db, cityOpts, *persist)
 		if err != nil {
 			if len(cities) == 1 {
 				return err
 			}
 			failures++
+			if quiet {
+				// Quiet suppresses the per-city sections, so this is the
+				// only place the failure detail can surface.
+				fmt.Fprintf(os.Stderr, "suggest %s: %v\n", cityName, err)
+			}
 			results = append(results, citySuggestResult{City: cityName, Error: err.Error()})
 			continue
 		}
-		if *persist {
-			stored, err := persistPredictionRun(ctx, db, computation, cityOpts)
-			if err != nil {
-				return err
-			}
-			persisted += stored
-			for _, station := range computation.Model.Stations {
-				if station.BiasCorrection != 0 {
-					biased++
-				}
-			}
+		persisted += stored
+		biased += biasedStations
+		if len(cities) > 1 && suggestions == nil {
+			// Multi-city JSON: a success always carries an array; only
+			// failed cities have null suggestions.
+			suggestions = []suggestionRow{}
 		}
-		results = append(results, citySuggestResult{City: computation.CityName, Suggestions: computation.Suggestions})
+		results = append(results, citySuggestResult{City: cityName, Suggestions: suggestions})
 	}
 
 	if *persist {
@@ -1425,17 +1415,9 @@ func runSuggest(args []string) error {
 				return err
 			}
 		} else {
-			for i, res := range results {
-				if i > 0 {
-					fmt.Fprintln(stdout)
-				}
-				fmt.Fprintf(stdout, "city: %s\n", res.City)
-				if res.Error != "" {
-					fmt.Fprintf(stdout, "  error: %s\n", res.Error)
-					continue
-				}
+			printCityResults(results, func(res citySuggestResult) {
 				printSuggestionsText(res.Suggestions)
-			}
+			})
 		}
 	}
 
@@ -1492,25 +1474,15 @@ func runCheck(args []string) error {
 	if err := applyCheckSettings(ctx, db, fs, &opts); err != nil {
 		return err
 	}
-	if err := validateCheckOptions(opts); err != nil {
+	cities, err := resolveCities(ctx, db, fs, opts.City)
+	if err != nil {
 		return err
 	}
-
-	// Without an explicit --city, run against every configured update target,
-	// like `gasoline suggest` (applyCheckSettings already filled opts.City
-	// with the first one, so a single target keeps the original behavior).
-	cities := []string{opts.City}
-	if !flagWasSet(fs, "city") && strings.TrimSpace(*city) == "" {
-		targets, err := loadUpdateTargets(ctx, db)
-		if err != nil {
-			return err
-		}
-		if len(targets) > 0 {
-			cities = cities[:0]
-			for _, target := range targets {
-				cities = append(cities, target.City)
-			}
-		}
+	// The non-city options are identical across cities, so validating the
+	// first is validating them all.
+	opts.City = cities[0]
+	if err := validateCheckOptions(opts); err != nil {
+		return err
 	}
 
 	// Multiple cities: best-effort — check all, report failures at the end.
@@ -1527,6 +1499,11 @@ func runCheck(args []string) error {
 			failures++
 			results = append(results, cityCheckResult{City: cityName, Error: err.Error()})
 			continue
+		}
+		if len(cities) > 1 && checks == nil {
+			// Multi-city JSON: a success always carries an array; only
+			// failed cities have null checks.
+			checks = []priceCheckRow{}
 		}
 		results = append(results, cityCheckResult{City: cityName, Checks: checks})
 	}
@@ -1545,17 +1522,9 @@ func runCheck(args []string) error {
 			return err
 		}
 	} else {
-		for i, res := range results {
-			if i > 0 {
-				fmt.Fprintln(stdout)
-			}
-			fmt.Fprintf(stdout, "city: %s\n", res.City)
-			if res.Error != "" {
-				fmt.Fprintf(stdout, "  error: %s\n", res.Error)
-				continue
-			}
+		printCityResults(results, func(res cityCheckResult) {
 			printPriceChecksText(res.Checks)
-		}
+		})
 	}
 	if failures > 0 {
 		return fmt.Errorf("%d of %d cities failed", failures, len(cities))
@@ -1711,20 +1680,92 @@ func validateCheckOptions(opts checkOptions) error {
 	return nil
 }
 
+// resolveCities returns the cities one suggest/check invocation covers: the
+// explicit --city when given, otherwise every configured update target in
+// configured order (the update_targets.city UNIQUE constraint rules out
+// duplicates). With no targets it falls back to the flag value so an empty
+// city hits the usual validation error.
+func resolveCities(ctx context.Context, db *sql.DB, fs *flag.FlagSet, flagCity string) ([]string, error) {
+	if flagWasSet(fs, "city") {
+		return []string{flagCity}, nil
+	}
+	targets, err := loadUpdateTargets(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
+		return []string{flagCity}, nil
+	}
+	cities := make([]string, 0, len(targets))
+	for _, target := range targets {
+		cities = append(cities, target.City)
+	}
+	return cities, nil
+}
+
+// suggestOneCity computes one city's suggestions and, when persist is set,
+// stores the prediction run. Returns the suggestions plus the number of
+// stored predictions and bias-corrected stations for the persist summary.
+func suggestOneCity(ctx context.Context, db *sql.DB, opts suggestOptions, persist bool) ([]suggestionRow, int, int, error) {
+	computation, err := computeSuggestions(ctx, db, opts)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if !persist {
+		return computation.Suggestions, 0, 0, nil
+	}
+	stored, err := persistPredictionRun(ctx, db, computation, opts)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	biased := 0
+	for _, station := range computation.Model.Stations {
+		if station.BiasCorrection != 0 {
+			biased++
+		}
+	}
+	return computation.Suggestions, stored, biased, nil
+}
+
 // citySuggestResult is one city's outcome in a multi-city suggest run.
 // Single-city runs keep the original flat []suggestionRow output shape.
+// City is always the configured target name, so consumers can match results
+// against their configuration. Suggestions is null only for failed cities.
 type citySuggestResult struct {
 	City        string          `json:"city"`
-	Suggestions []suggestionRow `json:"suggestions,omitempty"`
+	Suggestions []suggestionRow `json:"suggestions"`
 	Error       string          `json:"error,omitempty"`
 }
 
 // cityCheckResult is one city's outcome in a multi-city check run.
 // Single-city runs keep the original flat []priceCheckRow output shape.
+// City is always the configured target name; Checks is null only for failed
+// cities.
 type cityCheckResult struct {
 	City   string          `json:"city"`
-	Checks []priceCheckRow `json:"checks,omitempty"`
+	Checks []priceCheckRow `json:"checks"`
 	Error  string          `json:"error,omitempty"`
+}
+
+func (r citySuggestResult) header() (string, string) { return r.City, r.Error }
+func (r cityCheckResult) header() (string, string)   { return r.City, r.Error }
+
+// printCityResults renders the text output of a multi-city run: one
+// `city: <name>` section per result, blank line between sections, an
+// indented error line for failed cities.
+func printCityResults[T interface{ header() (string, string) }](results []T, printBody func(T)) {
+	for i, res := range results {
+		if i > 0 {
+			fmt.Fprintln(stdout)
+		}
+		city, errMsg := res.header()
+		fmt.Fprintf(stdout, "city: %s\n", city)
+		if errMsg != "" {
+			fmt.Fprintf(stdout, "  error: %s\n", errMsg)
+			continue
+		}
+		printBody(res)
+	}
 }
 
 // suggestComputation carries the full state of one suggest run so the
