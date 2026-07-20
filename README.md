@@ -187,6 +187,7 @@ Useful `suggest` flags:
 - `--predict-days` amount of calendar days to suggest, including today when future hours remain
 - `--limit-per-day` maximum suggestions per day
 - `--persist` store the full prediction grid, evaluate past predictions, and learn from the errors (see below)
+- `--quiet` or `-q` suppress the suggestion output — store only; requires `--persist`
 - `--output json` or `-o json`
 
 Suggestion output includes the day, time window, predicted price, confidence, distance, and full persisted station metadata. JSON output keeps the existing top-level station fields and also includes a nested `station` object with address, brand, street, house number, post code, place, coordinates, and first/last seen timestamps.
@@ -210,7 +211,7 @@ The reported `history_percentile` is regime-relative for stations with enough hi
 3. **Persists** the new grid; newer runs supersede older ones for the same target hour, older rows remain as learning history.
 4. **Prunes** predictions older than 30 days.
 
-The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Nothing is shown in the web UI yet — the data accrues for analysis and for the bias learning.
+The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. Nothing is shown in the web UI yet — the data accrues for analysis and for the bias learning.
 
 ### Server-stored configuration (admin settings)
 
