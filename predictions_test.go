@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -385,5 +387,131 @@ func TestRunSuggestPersistQuiet(t *testing.T) {
 	}
 	if predictions == 0 {
 		t.Fatal("no predictions stored despite --persist --quiet")
+	}
+}
+
+func insertUpdateTargetRow(t *testing.T, db *sql.DB, city string, radiusKM float64) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, ?, ?)`,
+		city, radiusKM, "2026-04-20T00:00:00Z"); err != nil {
+		t.Fatalf("insert update target %q: %v", city, err)
+	}
+}
+
+func TestRunSuggestAllConfiguredCities(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "multi.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ctx := context.Background()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Hamburg", Name: "Hamburg", DisplayName: "Hamburg", Lat: 53.550556, Lng: 9.993333})
+	insertSuggestStation(t, db, "station-b", "Station B", 52.517389, 13.395131)
+	insertSuggestStation(t, db, "station-h", "Station H", 53.550556, 9.993333)
+	nowLocal := time.Now().In(time.Local)
+	for daysAgo := 15; daysAgo >= 1; daysAgo-- {
+		day := localDayStart(nowLocal).AddDate(0, 0, -daysAgo)
+		insertSawtoothDay(t, db, "station-b", "Berlin", day.In(time.UTC), 2.00)
+		insertSawtoothDay(t, db, "station-h", "Hamburg", day.In(time.UTC), 1.90)
+	}
+	insertUpdateTargetRow(t, db, "Berlin", 5)
+	insertUpdateTargetRow(t, db, "Hamburg", 5)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"suggest", "--db", dbPath, "--persist", "--fuel", "diesel", "--history-days", "30", "--predict-days", "2", "--limit-per-day", "2", "--output", "json"})
+	})
+	var results []citySuggestResult
+	if err := json.Unmarshal([]byte(output), &results); err != nil {
+		t.Fatalf("unmarshal multi-city output: %v\noutput=%s", err, output)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d city results, want 2", len(results))
+	}
+	for i, want := range []string{"Berlin", "Hamburg"} {
+		if results[i].City != want {
+			t.Fatalf("results[%d].City = %q, want %q", i, results[i].City, want)
+		}
+		if results[i].Error != "" {
+			t.Fatalf("results[%d] unexpected error: %s", i, results[i].Error)
+		}
+		if len(results[i].Suggestions) == 0 {
+			t.Fatalf("results[%d] has no suggestions", i)
+		}
+	}
+
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer db.Close()
+	var runs, cities int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COUNT(DISTINCT city_name) FROM prediction_runs`).Scan(&runs, &cities); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if runs != 2 || cities != 2 {
+		t.Fatalf("prediction_runs = %d over %d cities, want 2 over 2", runs, cities)
+	}
+}
+
+func TestRunSuggestAllConfiguredCitiesBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "besteffort.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ctx := context.Background()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestStation(t, db, "station-b", "Station B", 52.517389, 13.395131)
+	nowLocal := time.Now().In(time.Local)
+	for daysAgo := 15; daysAgo >= 1; daysAgo-- {
+		day := localDayStart(nowLocal).AddDate(0, 0, -daysAgo)
+		insertSawtoothDay(t, db, "station-b", "Berlin", day.In(time.UTC), 2.00)
+	}
+	insertUpdateTargetRow(t, db, "Berlin", 5)
+	insertUpdateTargetRow(t, db, "Nowhere", 5)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	old := stdout
+	var buf bytes.Buffer
+	stdout = &buf
+	runErr := run([]string{"suggest", "--db", dbPath, "--persist", "--fuel", "diesel", "--history-days", "30", "--predict-days", "2", "--limit-per-day", "2"})
+	stdout = old
+	if runErr == nil || !strings.Contains(runErr.Error(), "1 of 2 cities failed") {
+		t.Fatalf("run error = %v, want '1 of 2 cities failed'", runErr)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "city: Berlin") || !strings.Contains(output, "city: Nowhere") {
+		t.Fatalf("output missing city sections:\n%s", output)
+	}
+	if !strings.Contains(output, "error:") {
+		t.Fatalf("output missing error line for failed city:\n%s", output)
+	}
+
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer db.Close()
+	var runs int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM prediction_runs WHERE city_name = 'Berlin'`).Scan(&runs); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if runs != 1 {
+		t.Fatalf("prediction_runs for Berlin = %d, want 1 (good city persisted despite failure)", runs)
 	}
 }

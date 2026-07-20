@@ -247,6 +247,8 @@ func clearCheckBaselines(ctx context.Context, db *sql.DB) error {
 
 // applySuggestSettings overlays DB-configured defaults onto suggest options
 // for every flag the user did not set explicitly. Explicit flags always win.
+// The city is resolved separately (see resolveCities): without --city the
+// command covers every configured update target, not a single default.
 func applySuggestSettings(ctx context.Context, db *sql.DB, fs *flag.FlagSet, opts *suggestOptions) error {
 	s, err := loadSettings(ctx, db)
 	if err != nil {
@@ -266,15 +268,6 @@ func applySuggestSettings(ctx context.Context, db *sql.DB, fs *flag.FlagSet, opt
 	}
 	if !flagWasSet(fs, "limit-per-day") {
 		opts.LimitPerDay = s.LimitPerDay
-	}
-	if !flagWasSet(fs, "city") && strings.TrimSpace(opts.City) == "" {
-		targets, err := loadUpdateTargets(ctx, db)
-		if err != nil {
-			return err
-		}
-		if len(targets) > 0 {
-			opts.City = targets[0].City
-		}
 	}
 	return nil
 }
@@ -299,15 +292,6 @@ func applyCheckSettings(ctx context.Context, db *sql.DB, fs *flag.FlagSet, opts 
 	}
 	if !flagWasSet(fs, "limit") {
 		opts.Limit = s.CheckLimit
-	}
-	if !flagWasSet(fs, "city") && strings.TrimSpace(opts.City) == "" {
-		targets, err := loadUpdateTargets(ctx, db)
-		if err != nil {
-			return err
-		}
-		if len(targets) > 0 {
-			opts.City = targets[0].City
-		}
 	}
 	return nil
 }

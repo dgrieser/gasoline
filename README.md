@@ -192,6 +192,8 @@ Useful `suggest` flags:
 
 Suggestion output includes the day, time window, predicted price, confidence, distance, and full persisted station metadata. JSON output keeps the existing top-level station fields and also includes a nested `station` object with address, brand, street, house number, post code, place, coordinates, and first/last seen timestamps.
 
+Without `--city`, `suggest` and `check` run against every configured update target (see [Server-stored configuration](#server-stored-configuration-admin-settings)). The single-city output shape is unchanged; with multiple targets the text output gains per-city `city: <name>` sections and the JSON output becomes an array of `{city, suggestions}` (`{city, checks}` for check) objects, where `city` is the configured target name and failed cities carry an `error` string instead of results.
+
 Check whether the latest stored prices are low right now:
 
 ```bash
@@ -211,14 +213,14 @@ The reported `history_percentile` is regime-relative for stations with enough hi
 3. **Persists** the new grid; newer runs supersede older ones for the same target hour, older rows remain as learning history.
 4. **Prunes** predictions older than 30 days.
 
-The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. Nothing is shown in the web UI yet — the data accrues for analysis and for the bias learning.
+The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. A timer run without `--city` covers every configured update target in one invocation, so stations in all cities accrue evaluation data for the bias learning; per-city failures are reported on stderr and via the exit code. Nothing is shown in the web UI yet — the data accrues for analysis and for the bias learning.
 
 ### Server-stored configuration (admin settings)
 
 Administrators can store the operational configuration in the database via the web UI (hamburger menu → Settings): a list of update targets (city + radius pairs) plus the suggestion/check parameters (fuel, range, history/prediction days, limits, notification templates, schedule defaults). The CLI uses those values as its defaults:
 
 - `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius. Passing explicit flags ignores the targets entirely.
-- `gasoline suggest` and `gasoline check` take `--fuel`, `--range-km`, `--history-days`, `--predict-days`, and `--limit-per-day`/`--limit` from the settings table when the corresponding flag is not set, and default `--city` to the first update target.
+- `gasoline suggest` and `gasoline check` take `--fuel`, `--range-km`, `--history-days`, `--predict-days`, and `--limit-per-day`/`--limit` from the settings table when the corresponding flag is not set. Without `--city`, both run against **every** configured update target (best-effort: one failing city does not stop the others; the exit code reports failures).
 - Explicit CLI flags always override the stored settings; with an empty settings table everything behaves exactly as before.
 
 Run `gasoline migrate` once to create the tables and seed the settings with the built-in defaults. Seeding never overwrites existing rows, so an install that already stores `history_days = 21` keeps it until an admin changes it (the built-in default is now 30 days).
