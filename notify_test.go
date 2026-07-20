@@ -45,6 +45,19 @@ func TestParseWindowsAndDaysAndTimes(t *testing.T) {
 	}
 }
 
+func TestCitySelected(t *testing.T) {
+	set := map[string]bool{"Berlin": true}
+	if !citySelected(set, "Berlin") {
+		t.Fatal("selected city must match")
+	}
+	if citySelected(set, "Hamburg") {
+		t.Fatal("unselected city must not match")
+	}
+	if !citySelected(nil, "anything") {
+		t.Fatal("nil set (empty selection) must match every city")
+	}
+}
+
 func TestScheduleActive(t *testing.T) {
 	// 2026-04-27 is a Monday.
 	monday10 := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
@@ -156,6 +169,34 @@ func seedNotifyFixture(t *testing.T, db *sql.DB) {
 	}
 }
 
+// seedNotifySecondCity adds a second update target (Hamburg) with its own
+// station, four weeks of hourly history, and a fresh low snapshot, so
+// notifyOnce produces check and suggest rows for two cities.
+func seedNotifySecondCity(t *testing.T, db *sql.DB) {
+	t.Helper()
+	insertSuggestCity(t, db, cachedCity{
+		QueryName:   "Hamburg",
+		Name:        "Hamburg",
+		DisplayName: "Hamburg",
+		Lat:         53.550556,
+		Lng:         9.993333,
+	})
+	insertSuggestStation(t, db, "station-2", "Station 2", 53.550556, 9.993333)
+	for daysAgo := 28; daysAgo >= 1; daysAgo-- {
+		dayStart := notifyFixtureNow.Truncate(24*time.Hour).AddDate(0, 0, -daysAgo)
+		for hour := 0; hour < 24; hour++ {
+			insertSuggestSnapshot(t, db, "station-2", "Hamburg", dayStart.Add(time.Duration(hour)*time.Hour), 2.100, true)
+		}
+	}
+	insertSuggestSnapshot(t, db, "station-2", "Hamburg", notifyFixtureNow.Add(-10*time.Minute), 1.900, true)
+
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, ?, ?)`,
+		"Hamburg", 5.0, "2026-04-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert target: %v", err)
+	}
+}
+
 type notifyUserFixture struct {
 	Email        string
 	UserKey      string
@@ -167,6 +208,7 @@ type notifyUserFixture struct {
 	LastSuggest  string
 	Status       string
 	Method       string
+	Cities       []string // notification city selection; empty = all cities
 }
 
 func seedNotifyUser(t *testing.T, db *sql.DB, u notifyUserFixture) {
@@ -177,7 +219,8 @@ func seedNotifyUser(t *testing.T, db *sql.DB, u notifyUserFixture) {
 	if u.Method == "" {
 		u.Method = "pushover"
 	}
-	_, err := db.ExecContext(context.Background(), `
+	ctx := context.Background()
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO users (
 			email, password_hash, is_admin, status, created_at, approved_at,
 			notify_method, pushover_app_name, pushover_user_key, pushover_token,
@@ -188,6 +231,17 @@ func seedNotifyUser(t *testing.T, db *sql.DB, u notifyUserFixture) {
 		u.Days, u.Windows, u.SuggestTimes, boolToInt(u.CheckEnabled), u.LastSuggest)
 	if err != nil {
 		t.Fatalf("insert user %s: %v", u.Email, err)
+	}
+	var userID int64
+	if err := db.QueryRowContext(ctx, `SELECT id FROM users WHERE email = ?`, u.Email).Scan(&userID); err != nil {
+		t.Fatalf("read user id %s: %v", u.Email, err)
+	}
+	for _, city := range u.Cities {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (?, ?, ?)`,
+			userID, city, "2026-04-01T00:00:00Z"); err != nil {
+			t.Fatalf("insert city selection %s/%s: %v", u.Email, city, err)
+		}
 	}
 }
 
@@ -306,6 +360,103 @@ func TestNotifyOnceSendsCheckAndSuggestPerSchedule(t *testing.T) {
 	}
 	if lastSuggest != "2026-04-26T13:00" {
 		t.Fatalf("notify_last_suggest = %q, want 2026-04-26T13:00", lastSuggest)
+	}
+}
+
+func TestNotifyOnceFiltersByUserCitySelection(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifySecondCity(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "berlin@example.com", UserKey: "user-berlin", Token: "token-b",
+		SuggestTimes: "08:00,13:00", CheckEnabled: true, Cities: []string{"Berlin"},
+	})
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "hamburg@example.com", UserKey: "user-hamburg", Token: "token-h",
+		SuggestTimes: "08:00,13:00", CheckEnabled: true, Cities: []string{"Hamburg"},
+	})
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "all@example.com", UserKey: "user-all", Token: "token-a",
+		SuggestTimes: "08:00,13:00", CheckEnabled: true, // no selection rows = all cities
+	})
+
+	pushes := stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+	if len(result.Failed) != 0 {
+		t.Fatalf("failed sends: %+v", result.Failed)
+	}
+
+	messages := map[string][]string{}
+	for _, push := range *pushes {
+		messages[push.User] = append(messages[push.User], push.Message)
+	}
+	assertOnlyCity := func(user, wantStation, filteredStation string) {
+		t.Helper()
+		if len(messages[user]) != 2 {
+			t.Fatalf("%s got %d messages, want check+suggest: %v", user, len(messages[user]), messages[user])
+		}
+		for _, msg := range messages[user] {
+			if !strings.Contains(msg, wantStation) {
+				t.Fatalf("%s message %q misses %s", user, msg, wantStation)
+			}
+			if filteredStation != "" && strings.Contains(msg, filteredStation) {
+				t.Fatalf("%s message %q contains filtered-out %s", user, msg, filteredStation)
+			}
+		}
+	}
+	assertOnlyCity("user-berlin", "Station 1", "Station 2")
+	assertOnlyCity("user-hamburg", "Station 2", "Station 1")
+	assertOnlyCity("user-all", "Station 1", "")
+	for _, msg := range messages["user-all"] {
+		if !strings.Contains(msg, "Station 2") {
+			t.Fatalf("all-cities message %q misses Station 2", msg)
+		}
+	}
+}
+
+func TestUserNotifyCitiesForeignKeys(t *testing.T) {
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifySecondCity(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "a@example.com", UserKey: "user-a", Token: "token-a",
+		Cities: []string{"Berlin", "Hamburg"},
+	})
+	ctx := context.Background()
+
+	// A city that is not a configured update target is rejected.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (1, 'Ghosttown', '2026-04-01T00:00:00Z')`); err == nil {
+		t.Fatal("selection for an unknown city must violate the foreign key")
+	}
+
+	countSelections := func() int {
+		t.Helper()
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_notify_cities`).Scan(&n); err != nil {
+			t.Fatalf("count selections: %v", err)
+		}
+		return n
+	}
+	if countSelections() != 2 {
+		t.Fatalf("selections = %d, want 2", countSelections())
+	}
+
+	// Deleting an update target cascades away the matching selections.
+	if _, err := db.ExecContext(ctx, `DELETE FROM update_targets WHERE city = 'Hamburg'`); err != nil {
+		t.Fatalf("delete target: %v", err)
+	}
+	if countSelections() != 1 {
+		t.Fatalf("selections after target delete = %d, want 1", countSelections())
+	}
+
+	// Deleting the user cascades away the rest.
+	if _, err := db.ExecContext(ctx, `DELETE FROM users WHERE email = 'a@example.com'`); err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+	if countSelections() != 0 {
+		t.Fatalf("selections after user delete = %d, want 0", countSelections())
 	}
 }
 

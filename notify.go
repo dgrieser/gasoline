@@ -238,6 +238,38 @@ func parseTimesList(s string) ([]string, error) {
 	return times, nil
 }
 
+// loadUserCitySelections returns each user's notification city selection from
+// user_notify_cities. Users without rows are absent from the map: a nil set
+// means "all cities" (see citySelected). The foreign key onto
+// update_targets(city) guarantees stored values match target cities verbatim
+// and removes selections when a target is deleted.
+func loadUserCitySelections(ctx context.Context, db *sql.DB) (map[int64]map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT user_id, city FROM user_notify_cities`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	selections := map[int64]map[string]bool{}
+	for rows.Next() {
+		var userID int64
+		var city string
+		if err := rows.Scan(&userID, &city); err != nil {
+			return nil, err
+		}
+		if selections[userID] == nil {
+			selections[userID] = map[string]bool{}
+		}
+		selections[userID][city] = true
+	}
+	return selections, rows.Err()
+}
+
+// citySelected reports whether a user's selection covers the city. A nil set
+// (no rows for that user) selects every city, including targets added later.
+func citySelected(set map[string]bool, city string) bool {
+	return set == nil || set[city]
+}
+
 var weekdayNames = map[string]time.Weekday{
 	"sun": time.Sunday, "mon": time.Monday, "tue": time.Tuesday, "wed": time.Wednesday,
 	"thu": time.Thursday, "fri": time.Friday, "sat": time.Saturday,
@@ -355,6 +387,10 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 	if err != nil {
 		return result, err
 	}
+	citySelections, err := loadUserCitySelections(ctx, db)
+	if err != nil {
+		return result, err
+	}
 	result.Targets = len(targets)
 	result.Users = len(users)
 	if len(targets) == 0 || len(users) == 0 {
@@ -444,7 +480,7 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 			return result, err
 		}
 		for _, u := range checkUsers {
-			userRows, userBaselines, err := userCheckRows(ctx, db, settings, targetChecks, u.ID)
+			userRows, userBaselines, err := userCheckRows(ctx, db, settings, targetChecks, u.ID, citySelections[u.ID])
 			if err != nil {
 				return result, err
 			}
@@ -479,24 +515,21 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 		}
 	}
 
-	// Suggest phase: compute lazily once (identical options for all users),
-	// deliver per user, and advance each user's slot marker.
+	// Suggest phase: compute lazily once per target (identical options for
+	// all users), assemble the rows per user from their city selection,
+	// deliver, and advance each user's slot marker.
 	if len(suggestUsers) > 0 {
-		suggestRows, err := collectSuggestRows(ctx, db, settings, targets, opts)
+		targetSuggests, err := collectTargetSuggestions(ctx, db, settings, targets, opts)
 		if err != nil {
 			return result, err
 		}
-		result.SuggestRows = len(suggestRows)
-		message := ""
-		var cheapest *notifyRow
-		if len(suggestRows) > 0 {
-			c := cheapestSuggestRow(suggestRows)
-			cheapest = &c
-			message = renderNotifyMessage(settings.SuggestTemplate, notifyKindSuggest, suggestRows, cheapest)
+		for _, ts := range targetSuggests {
+			result.SuggestRows += len(ts.rows)
 		}
 		for _, u := range suggestUsers {
 			marker := today + "T" + suggestSlots[u.ID]
-			if len(suggestRows) == 0 {
+			userRows := userSuggestRows(targetSuggests, citySelections[u.ID])
+			if len(userRows) == 0 {
 				// Nothing to say: still advance the marker so the empty
 				// result is not retried until the next slot.
 				if !opts.DryRun {
@@ -506,6 +539,8 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 				}
 				continue
 			}
+			cheapest := cheapestSuggestRow(userRows)
+			message := renderNotifyMessage(settings.SuggestTemplate, notifyKindSuggest, userRows, &cheapest)
 			rec := notifySendRecord{Email: u.Email, Kind: "suggest"}
 			if opts.DryRun {
 				result.Sent = append(result.Sent, rec)
@@ -513,7 +548,7 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 			}
 			if err := sendPushover(ctx, apiURL, pushoverMessage{
 				Token: u.PushoverToken, UserKey: u.PushoverUserKey,
-				Title:   notifyTitle(settings.SuggestTitleTemplate, notifyKindSuggest, cheapest, len(suggestRows), u.PushoverAppName),
+				Title:   notifyTitle(settings.SuggestTitleTemplate, notifyKindSuggest, &cheapest, len(userRows), u.PushoverAppName),
 				Message: message,
 				URL:     opts.BaseURL,
 			}); err != nil {
@@ -577,14 +612,18 @@ func collectTargetChecks(ctx context.Context, db *sql.DB, settings appSettings, 
 	return all, nil
 }
 
-// userCheckRows filters the shared target rows against one user's baselines
-// (check_baseline:<user_id>:<fuel>:<city>) and returns the rows strictly
-// cheaper than that user's running minimum, sorted cheapest-first, plus the
-// baseline updates to persist after a successful delivery to that user.
-func userCheckRows(ctx context.Context, db *sql.DB, settings appSettings, targetChecks []targetCheckRows, userID int64) ([]notifyRow, map[string]string, error) {
+// userCheckRows filters the shared target rows against one user's city
+// selection and baselines (check_baseline:<user_id>:<fuel>:<city>) and
+// returns the rows strictly cheaper than that user's running minimum, sorted
+// cheapest-first, plus the baseline updates to persist after a successful
+// delivery to that user.
+func userCheckRows(ctx context.Context, db *sql.DB, settings appSettings, targetChecks []targetCheckRows, userID int64, cities map[string]bool) ([]notifyRow, map[string]string, error) {
 	var rows []notifyRow
 	baselines := map[string]string{}
 	for _, tc := range targetChecks {
+		if !citySelected(cities, tc.target.City) {
+			continue
+		}
 		baselineKey := fmt.Sprintf("check_baseline:%d:%s:%s", userID, settings.Fuel, tc.target.City)
 		baselineValue, hasBaseline, err := getNotificationState(ctx, db, baselineKey)
 		if err != nil {
@@ -617,11 +656,19 @@ func userCheckRows(ctx context.Context, db *sql.DB, settings appSettings, target
 	return rows, baselines, nil
 }
 
-// collectSuggestRows runs the suggestion across all update targets, keeps
-// medium/high confidence rows, and sorts them by date, start time, and
-// station name like the watcher does.
-func collectSuggestRows(ctx context.Context, db *sql.DB, settings appSettings, targets []updateTarget, opts notifyOptions) ([]notifyRow, error) {
-	var rows []notifyRow
+// targetSuggestRows is the pre-filtered result of one update target's
+// suggestion run: forecast rows with medium/high confidence. It is computed
+// once per run and shared by all users.
+type targetSuggestRows struct {
+	target updateTarget
+	rows   []notifyRow
+}
+
+// collectTargetSuggestions runs the suggestion across all update targets and
+// keeps medium/high confidence rows, grouped per target so each user's city
+// selection can be applied afterwards.
+func collectTargetSuggestions(ctx context.Context, db *sql.DB, settings appSettings, targets []updateTarget, opts notifyOptions) ([]targetSuggestRows, error) {
+	var all []targetSuggestRows
 	for _, target := range targets {
 		suggestions, err := suggestGas(ctx, db, suggestOptions{
 			City:        target.City,
@@ -637,11 +684,30 @@ func collectSuggestRows(ctx context.Context, db *sql.DB, settings appSettings, t
 			fmt.Fprintf(os.Stderr, "warning: suggest for %s failed: %v\n", target.City, err)
 			continue
 		}
+		var rows []notifyRow
 		for i := range suggestions {
 			if suggestions[i].Confidence == "medium" || suggestions[i].Confidence == "high" {
 				rows = append(rows, notifyRow{suggest: &suggestions[i]})
 			}
 		}
+		if len(rows) == 0 {
+			continue
+		}
+		all = append(all, targetSuggestRows{target: target, rows: rows})
+	}
+	return all, nil
+}
+
+// userSuggestRows flattens the shared target rows down to one user's city
+// selection, sorted by date, start time, and station name like the watcher
+// does.
+func userSuggestRows(targetSuggests []targetSuggestRows, cities map[string]bool) []notifyRow {
+	var rows []notifyRow
+	for _, ts := range targetSuggests {
+		if !citySelected(cities, ts.target.City) {
+			continue
+		}
+		rows = append(rows, ts.rows...)
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		a, b := rows[i].suggest, rows[j].suggest
@@ -653,7 +719,7 @@ func collectSuggestRows(ctx context.Context, db *sql.DB, settings appSettings, t
 		}
 		return a.StationName < b.StationName
 	})
-	return rows, nil
+	return rows
 }
 
 func cheapestSuggestRow(rows []notifyRow) notifyRow {
