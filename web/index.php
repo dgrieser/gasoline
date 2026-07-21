@@ -3073,6 +3073,16 @@ function renderDocumentHead(string $titleSuffix): void
             font-family: var(--mono);
             font-size: 0.75rem;
             color: var(--muted);
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .legend-item.off {
+            opacity: 0.35;
+        }
+
+        .legend-item.off .legend-dot {
+            filter: grayscale(1);
         }
 
         .legend-dot {
@@ -4300,6 +4310,10 @@ function applyLang(lang) {
     document.querySelectorAll('[data-recorded-at]').forEach((el) => {
         el.textContent = formatDateTime(el.dataset.recordedAt);
     });
+    // Re-format date-only stat cells (first/last recorded)
+    document.querySelectorAll('[data-date-only]').forEach((el) => {
+        el.textContent = formatDateOnly(el.dataset.dateOnly);
+    });
     // Page-specific re-rendering (e.g. the dashboard chart) hooks in here.
     if (typeof window.onLangChange === 'function') window.onLangChange();
 }
@@ -4658,6 +4672,16 @@ function formatTickTime(isoString) {
     });
 }
 
+// Locale-aware date-only string (day + month + year, no time) for the stat cards.
+function formatDateOnly(isoString) {
+    const d = new Date(isoString);
+    if (isNaN(d)) return '—';
+    return d.toLocaleDateString(_loc(), {
+        timeZone: _tz(),
+        day: '2-digit', month: '2-digit', year: 'numeric',
+    });
+}
+
 /* ── Station colour helpers ────────────────────────────────────── */
 // DJB2-style hash → hue 0-359, stable per station name
 function nameToHue(name) {
@@ -4689,6 +4713,9 @@ function h(str) {
 let chartData = [];
 let stationDistancesById = {};
 let dataLoaded = false;
+// In-memory, non-persistent chart-only filter: null = all stations shown,
+// otherwise a Set of visible station_ids (strings). Reset on fresh data.
+let stationFilter = null;
 
 // Evenly-spread hues for all stations in this view using golden-angle spacing.
 // Stations sorted alphabetically → deterministic within a place. Recomputed
@@ -4873,8 +4900,63 @@ if (!chartEl) {
         const rangeData = getRangeFilteredData();
         if (rangeData.length === 0) { setChartVisibility(true); return; }
 
-        const visibleRows = rangeData.filter((row) => [...activeFuels].some((f) => row[f] !== null));
+        let visibleRows = rangeData.filter((row) => [...activeFuels].some((f) => row[f] !== null));
         if (visibleRows.length === 0) { setChartVisibility(true); return; }
+
+        // Full station roster for the legend, captured BEFORE the isolate filter so
+        // hidden stations stay listed and clickable to toggle back on.
+        const legendStations = [];
+        const seenLegend = new Set();
+        for (const r of visibleRows) {
+            const id = String(r.station_id);
+            if (!seenLegend.has(id)) { seenLegend.add(id); legendStations.push(r); }
+        }
+        // Legend renderer — one entry per station (ALL stations, even hidden ones);
+        // click a station (name or dot — one element) to isolate it. Clicking the
+        // sole isolated station restores all; from a partial selection clicks toggle
+        // individual stations. Chart-only, in-memory, non-persistent. Defined here
+        // (before the filter) so it can also be drawn on the empty-filter path.
+        const drawLegend = () => {
+            const allIds = legendStations.map((s) => String(s.station_id));
+            for (const sample of legendStations) {
+                const id = String(sample.station_id);
+                const off = stationFilter && !stationFilter.has(id);
+                const item = document.createElement('div');
+                item.className = 'legend-item' + (off ? ' off' : '');
+                const swatches = [...activeFuels].map((fuel) => {
+                    const color = stationFuelColor(sample.station_name, fuel);
+                    const label = fuelConfig[fuel].label;
+                    return `<span class="legend-dot" title="${label}" style="background:${color}"></span>`;
+                }).join('');
+                item.innerHTML = `${swatches}${h(sample.station_name)}`;
+                item.addEventListener('click', () => {
+                    if (stationFilter && stationFilter.size === 1 && stationFilter.has(id)) {
+                        stationFilter = null;                          // sole station clicked again → show all
+                    } else if (!stationFilter) {
+                        stationFilter = new Set([id]);                 // all shown → isolate this one
+                    } else {
+                        stationFilter.has(id) ? stationFilter.delete(id) : stationFilter.add(id); // partial → plain toggle
+                        if (stationFilter.size === 0 || stationFilter.size >= allIds.length) stationFilter = null;
+                    }
+                    renderChart();
+                });
+                legendEl.appendChild(item);
+            }
+        };
+
+        // Apply the in-memory isolate filter unconditionally so an isolation with no
+        // data in the current fuel/range shows the empty state rather than silently
+        // reverting to all stations. The legend stays visible in that case so the
+        // user can still toggle stations back on.
+        if (stationFilter) {
+            visibleRows = visibleRows.filter((r) => stationFilter.has(String(r.station_id)));
+        }
+        if (visibleRows.length === 0) {
+            setChartVisibility(true);
+            legendEl.hidden = false;
+            drawLegend();
+            return;
+        }
 
         const ns = 'http://www.w3.org/2000/svg';
 
@@ -5104,19 +5186,7 @@ if (!chartEl) {
         overlay.addEventListener('touchstart', onTouch, { passive: false });
         overlay.addEventListener('touchmove', onTouch, { passive: false });
 
-        // Legend — one entry per station; dots show each active fuel tint
-        for (const stationRows of byStation.values()) {
-            const sample = stationRows[0];
-            const item = document.createElement('div');
-            item.className = 'legend-item';
-            const swatches = [...activeFuels].map((fuel) => {
-                const color = stationFuelColor(sample.station_name, fuel);
-                const label = fuelConfig[fuel].label;
-                return `<span class="legend-dot" title="${label}" style="background:${color}"></span>`;
-            }).join('');
-            item.innerHTML = `${swatches}${h(sample.station_name)}`;
-            legendEl.appendChild(item);
-        }
+        drawLegend();
     }
 
     if (selectedFuel === 'all') {
@@ -5504,6 +5574,15 @@ function setStat(id, value) {
     el.removeAttribute('aria-busy');
 }
 
+// Like setStat, but formats a raw date-time string locale-aware and stashes the
+// raw value so applyLang() can re-format it when the language changes.
+function setStatDate(id, isoValue) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (isoValue) el.dataset.dateOnly = isoValue; else el.removeAttribute('data-date-only');
+    setStat(id, isoValue ? formatDateOnly(isoValue) : '—');
+}
+
 function applyData(payload) {
     if (retryWrap) retryWrap.hidden = true;
     const meta = payload.stations || {};
@@ -5530,13 +5609,14 @@ function applyData(payload) {
         if (s.dist !== null && s.dist !== undefined) stationDistancesById[id] = s.dist;
     }
     _stationHues = computeStationHues();
+    stationFilter = null;
     dataLoaded = true;
 
     const sum = payload.summary || {};
     setStat('stat-points',   sum.points   ?? 0);
     setStat('stat-stations', sum.stations ?? 0);
-    setStat('stat-first', sum.first_recorded_at ? String(sum.first_recorded_at).slice(0, 10) : '—');
-    setStat('stat-last',  sum.last_recorded_at  ? String(sum.last_recorded_at).slice(0, 10)  : '—');
+    setStatDate('stat-first', sum.first_recorded_at || '');
+    setStatDate('stat-last',  sum.last_recorded_at  || '');
 
     renderCheapest();
     renderCheapestRange();
