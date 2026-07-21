@@ -4911,11 +4911,51 @@ if (!chartEl) {
             const id = String(r.station_id);
             if (!seenLegend.has(id)) { seenLegend.add(id); legendStations.push(r); }
         }
-        // Apply the in-memory isolate filter to everything the chart *draws*
-        // (scaling, ticks, lines, crosshair all read visibleRows).
+        // Legend renderer — one entry per station (ALL stations, even hidden ones);
+        // click a station (name or dot — one element) to isolate it. Clicking the
+        // sole isolated station restores all; from a partial selection clicks toggle
+        // individual stations. Chart-only, in-memory, non-persistent. Defined here
+        // (before the filter) so it can also be drawn on the empty-filter path.
+        const drawLegend = () => {
+            const allIds = legendStations.map((s) => String(s.station_id));
+            for (const sample of legendStations) {
+                const id = String(sample.station_id);
+                const off = stationFilter && !stationFilter.has(id);
+                const item = document.createElement('div');
+                item.className = 'legend-item' + (off ? ' off' : '');
+                const swatches = [...activeFuels].map((fuel) => {
+                    const color = stationFuelColor(sample.station_name, fuel);
+                    const label = fuelConfig[fuel].label;
+                    return `<span class="legend-dot" title="${label}" style="background:${color}"></span>`;
+                }).join('');
+                item.innerHTML = `${swatches}${h(sample.station_name)}`;
+                item.addEventListener('click', () => {
+                    if (stationFilter && stationFilter.size === 1 && stationFilter.has(id)) {
+                        stationFilter = null;                          // sole station clicked again → show all
+                    } else if (!stationFilter) {
+                        stationFilter = new Set([id]);                 // all shown → isolate this one
+                    } else {
+                        stationFilter.has(id) ? stationFilter.delete(id) : stationFilter.add(id); // partial → plain toggle
+                        if (stationFilter.size === 0 || stationFilter.size >= allIds.length) stationFilter = null;
+                    }
+                    renderChart();
+                });
+                legendEl.appendChild(item);
+            }
+        };
+
+        // Apply the in-memory isolate filter unconditionally so an isolation with no
+        // data in the current fuel/range shows the empty state rather than silently
+        // reverting to all stations. The legend stays visible in that case so the
+        // user can still toggle stations back on.
         if (stationFilter) {
-            const filtered = visibleRows.filter((r) => stationFilter.has(String(r.station_id)));
-            if (filtered.length) visibleRows = filtered;
+            visibleRows = visibleRows.filter((r) => stationFilter.has(String(r.station_id)));
+        }
+        if (visibleRows.length === 0) {
+            setChartVisibility(true);
+            legendEl.hidden = false;
+            drawLegend();
+            return;
         }
 
         const ns = 'http://www.w3.org/2000/svg';
@@ -5146,35 +5186,7 @@ if (!chartEl) {
         overlay.addEventListener('touchstart', onTouch, { passive: false });
         overlay.addEventListener('touchmove', onTouch, { passive: false });
 
-        // Legend — one entry per station (ALL stations, even hidden ones); click a
-        // station (name or dot — one element) to isolate it. Clicking the sole
-        // isolated station restores all; from a partial selection clicks toggle
-        // individual stations. Chart-only, in-memory, non-persistent.
-        const allIds = legendStations.map((s) => String(s.station_id));
-        for (const sample of legendStations) {
-            const id = String(sample.station_id);
-            const off = stationFilter && !stationFilter.has(id);
-            const item = document.createElement('div');
-            item.className = 'legend-item' + (off ? ' off' : '');
-            const swatches = [...activeFuels].map((fuel) => {
-                const color = stationFuelColor(sample.station_name, fuel);
-                const label = fuelConfig[fuel].label;
-                return `<span class="legend-dot" title="${label}" style="background:${color}"></span>`;
-            }).join('');
-            item.innerHTML = `${swatches}${h(sample.station_name)}`;
-            item.addEventListener('click', () => {
-                if (stationFilter && stationFilter.size === 1 && stationFilter.has(id)) {
-                    stationFilter = null;                          // sole station clicked again → show all
-                } else if (!stationFilter) {
-                    stationFilter = new Set([id]);                 // all shown → isolate this one
-                } else {
-                    stationFilter.has(id) ? stationFilter.delete(id) : stationFilter.add(id); // partial → plain toggle
-                    if (stationFilter.size === 0 || stationFilter.size >= allIds.length) stationFilter = null;
-                }
-                renderChart();
-            });
-            legendEl.appendChild(item);
-        }
+        drawLegend();
     }
 
     if (selectedFuel === 'all') {
