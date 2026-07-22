@@ -5602,6 +5602,7 @@ function renderPredictions() {
 
                     const days = [...byDay.values()].map((dayWindows) => {
                         dayWindows.sort((a, b) => (a.price - b.price) || a.start.localeCompare(b.start));
+                        dayWindows = dayWindows.slice(0, 5); // cap: cheapest 5 per day
                         const best = dayWindows[0];
                         const bestName = nameById(best.s) + distSuffix(best.s);
                         const runners = dayWindows.slice(1).map((p) => {
