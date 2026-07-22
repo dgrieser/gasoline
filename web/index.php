@@ -3115,29 +3115,33 @@ function renderDocumentHead(string $titleSuffix): void
         }
 
         /* ── Predictions card ──────────────────────────────────── */
-        /* Reuses the .cheapest-* / .top5-* structure; these add the window
-           time column, the confidence badge, and the "as of" run note. */
+        /* Reuses the .cheapest-* / .top5-* structure; these add the per-day
+           header, the window time column, and the "as of" run note. */
+        .pred-day {
+            margin-top: 1rem;
+            padding-top: 0.7rem;
+            border-top: 1px solid var(--border);
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            color: var(--muted);
+            letter-spacing: 0.04em;
+        }
+
+        /* The first day sits flush under the fuel label (no divider). */
+        .cheapest-fuel-label + .pred-day {
+            margin-top: 0.5rem;
+            padding-top: 0;
+            border-top: none;
+        }
+
         .pred-time {
             color: var(--muted);
             flex-shrink: 0;
             white-space: nowrap;
         }
 
-        .pred-conf {
-            flex-shrink: 0;
-            font-size: 0.6rem;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            padding: 0.05rem 0.4rem;
-            border-radius: 999px;
-            background: var(--surface-hi);
-            color: var(--muted);
-        }
-
-        .pred-conf--high { color: var(--amber); }
-
         .pred-asof {
-            margin-top: 0.6rem;
+            margin-top: 0.8rem;
             font-family: var(--mono);
             font-size: 0.66rem;
             color: var(--muted);
@@ -4097,8 +4101,6 @@ const translations = {
         predictionsTitle: 'Upcoming buy windows',
         predictionsNoData: 'No upcoming predictions in the database for these stations.',
         predictionsAsOf: 'as of {time}',
-        confidenceMedium: 'medium',
-        confidenceHigh: 'high',
         rangeAll: 'All',
         range30d: '30d',
         range14d: '14d',
@@ -4297,8 +4299,6 @@ const translations = {
         predictionsTitle: 'Kommende Tankfenster',
         predictionsNoData: 'Keine kommenden Vorhersagen für diese Tankstellen in der Datenbank.',
         predictionsAsOf: 'Stand {time}',
-        confidenceMedium: 'mittel',
-        confidenceHigh: 'hoch',
         rangeAll: 'Alle',
         range30d: '30d',
         range14d: '14d',
@@ -5552,8 +5552,9 @@ const ICON_CLOCK = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" 
 
 // Upcoming predictions the notifier would send: for the in-scope stations, the
 // stored future suggestion windows with medium/high confidence, grouped per
-// fuel and listed chronologically. Data comes from ?action=data (predictionData
-// / predictionAsOf); the page never triggers a suggest run.
+// fuel then per day. Within a day the cheapest window is shown large and the
+// rest follow as a compact price-ranked list. Data comes from ?action=data
+// (predictionData / predictionAsOf); the page never triggers a suggest run.
 function renderPredictions() {
     const t = translations[currentLang];
     if (!predictionsCard) return;
@@ -5565,7 +5566,15 @@ function renderPredictions() {
         const dist = stationDistancesById[id] ?? null;
         return dist !== null ? ` (${dist.toFixed(1)} km)` : '';
     };
-    const confLabel = (conf) => conf === 'high' ? t.confidenceHigh : t.confidenceMedium;
+    // Day bucket key + header in the displayed timezone/locale so grouping
+    // matches the visible date (recomputed on language change).
+    const dayKey = (iso) => new Date(iso).toLocaleDateString(_loc(), {
+        timeZone: _tz(), year: 'numeric', month: '2-digit', day: '2-digit',
+    });
+    const dayLabel = (iso) => new Date(iso).toLocaleDateString(_loc(), {
+        timeZone: _tz(), weekday: 'long', day: '2-digit', month: '2-digit', year: '2-digit',
+    });
+    const windowLabel = (p) => `${formatTimeOnly(p.start)}–${formatTimeOnly(p.end)}`;
 
     const results = [];
     for (const fuel of fuels) {
@@ -5582,19 +5591,37 @@ function renderPredictions() {
             : `<div class="cheapest-grid${colClass}">` +
                 results.map(({ fuel, windows }) => {
                     const asOf = predictionAsOf[fuel] || null;
-                    const rows = windows.map((p) => {
-                        const confClass = p.conf === 'high' ? ' pred-conf--high' : '';
-                        const name = nameById(p.s) + distSuffix(p.s);
-                        return `<div class="top5-row">` +
-                            `<span class="pred-time">${h(formatDateTime(p.start))}–${h(formatTimeOnly(p.end))}</span>` +
-                            `<span class="top5-price" style="color:${fuelColors[fuel]}">${p.price.toFixed(3)}</span>` +
-                            `<span class="top5-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(p.s), fuel)};display:inline-block;margin-right:0.4rem"></span>${h(name)}</span>` +
-                            `<span class="pred-conf${confClass}">${confLabel(p.conf)}</span>` +
-                        `</div>`;
+                    // Group by day; predictionData is already sorted by start
+                    // ascending, so first-seen day order is chronological.
+                    const byDay = new Map();
+                    for (const p of windows) {
+                        const key = dayKey(p.start);
+                        if (!byDay.has(key)) byDay.set(key, []);
+                        byDay.get(key).push(p);
+                    }
+
+                    const days = [...byDay.values()].map((dayWindows) => {
+                        dayWindows.sort((a, b) => (a.price - b.price) || a.start.localeCompare(b.start));
+                        const best = dayWindows[0];
+                        const bestName = nameById(best.s) + distSuffix(best.s);
+                        const runners = dayWindows.slice(1).map((p) => {
+                            const name = nameById(p.s) + distSuffix(p.s);
+                            return `<div class="top5-row">` +
+                                `<span class="top5-price" style="color:${fuelColors[fuel]}">${p.price.toFixed(3)}</span>` +
+                                `<span class="top5-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(p.s), fuel)};display:inline-block;margin-right:0.4rem"></span>${h(name)}</span>` +
+                                `<span class="pred-time">${h(windowLabel(p))}</span>` +
+                            `</div>`;
+                        }).join('');
+                        return `<div class="pred-day">${h(dayLabel(best.start))}</div>` +
+                            `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${best.price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                            `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(best.s), fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(bestName)}</div>` +
+                            `<div class="cheapest-time">${h(windowLabel(best))}</div>` +
+                            (runners ? `<div class="top5-list">${runners}</div>` : '');
                     }).join('');
+
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
-                        `<div class="top5-list" style="margin-top:0;border-top:none;padding-top:0">${rows}</div>` +
+                        days +
                         (asOf ? `<div class="pred-asof">${h(t.predictionsAsOf.replace('{time}', formatDateTime(asOf)))}</div>` : '') +
                     `</div>`;
                 }).join('') +
