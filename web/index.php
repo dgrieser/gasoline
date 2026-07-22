@@ -421,6 +421,49 @@ function validHHMM(string $value): bool
 
 const GASOLINE_WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 
+/** The suggest/check fuel types, in canonical display order. */
+const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
+
+/**
+ * Normalizes submitted fuel checkboxes into a canonical, deduplicated CSV
+ * (subset of GASOLINE_FUELS in canonical order). Null when a value is invalid
+ * or the selection is empty (at least one fuel must stay enabled).
+ */
+function normalizeFuelList(array $fuels): ?string
+{
+    $selected = [];
+    foreach ($fuels as $fuel) {
+        $fuel = strtolower(trim((string) $fuel));
+        if (!in_array($fuel, GASOLINE_FUELS, true)) {
+            return null;
+        }
+        $selected[$fuel] = true;
+    }
+    if ($selected === []) {
+        return null;
+    }
+    $ordered = array_values(array_filter(GASOLINE_FUELS, static fn (string $f): bool => isset($selected[$f])));
+    return implode(',', $ordered);
+}
+
+/**
+ * Parses the stored comma-separated admin fuel setting into a canonical list.
+ * Empty or fully invalid input falls back to all fuels, mirroring the Go
+ * appSettings.Fuels() behavior so the UI and notifier agree.
+ */
+function enabledFuels(string $stored): array
+{
+    $selected = [];
+    foreach (explode(',', $stored) as $fuel) {
+        $fuel = strtolower(trim($fuel));
+        if (in_array($fuel, GASOLINE_FUELS, true)) {
+            $selected[$fuel] = true;
+        }
+    }
+    $ordered = array_values(array_filter(GASOLINE_FUELS, static fn (string $f): bool => isset($selected[$f])));
+    return $ordered === [] ? GASOLINE_FUELS : $ordered;
+}
+
 /** Normalizes a submitted weekday list to canonical order; null when invalid/empty. */
 function normalizeDayList(array $days): ?string
 {
@@ -727,7 +770,10 @@ function handlePost(PDO $pdo, string $driver): void
             );
             $times = normalizeTimeList((array) ($_POST['notify_suggest_times'] ?? []));
             $cities = normalizeCityList((array) ($_POST['notify_cities'] ?? []), updateTargetCities($pdo));
-            if ($method !== 'pushover' || $days === null || $windows === null || $times === null || $cities === null) {
+            $allowedFuels = enabledFuels((string) (settingsAll($pdo)['fuel'] ?? ''));
+            $fuel = strtolower(trim((string) ($_POST['notify_fuel'] ?? '')));
+            if ($method !== 'pushover' || $days === null || $windows === null || $times === null || $cities === null
+                || !in_array($fuel, $allowedFuels, true)) {
                 setFlash('error', 'invalidNotifySettings');
                 redirectTo('?page=account');
             }
@@ -736,7 +782,8 @@ function handlePost(PDO $pdo, string $driver): void
                 'UPDATE users SET notify_method = :method, pushover_app_name = :app,
                     pushover_user_key = :user_key, pushover_token = :token,
                     notify_days = :days, notify_windows = :windows,
-                    notify_suggest_times = :times, notify_check_enabled = :check_enabled
+                    notify_suggest_times = :times, notify_check_enabled = :check_enabled,
+                    notify_fuel = :fuel
                  WHERE id = :id'
             );
             $stmt->bindValue(':method', 'pushover');
@@ -747,6 +794,7 @@ function handlePost(PDO $pdo, string $driver): void
             $stmt->bindValue(':windows', $windows);
             $stmt->bindValue(':times', $times);
             $stmt->bindValue(':check_enabled', isset($_POST['notify_check_enabled']) ? 1 : 0, PDO::PARAM_INT);
+            $stmt->bindValue(':fuel', $fuel);
             $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
             $stmt->execute();
             saveUserNotifyCities($pdo, (int) $user['id'], $cities);
@@ -837,7 +885,7 @@ function handlePost(PDO $pdo, string $driver): void
 
         case 'save_settings':
             $fields = [
-                'fuel' => static fn (string $v): bool => in_array($v, ['diesel', 'e5', 'e10'], true),
+                'fuel' => null, // submitted as checkbox array below
                 'range_km' => static fn (string $v): bool => is_numeric($v) && (float) $v > 0 && (float) $v <= 100,
                 'history_days' => static fn (string $v): bool => ctype_digit($v) && (int) $v > 0 && (int) $v <= 365,
                 'predict_days' => static fn (string $v): bool => ctype_digit($v) && (int) $v > 0 && (int) $v <= 14,
@@ -865,6 +913,15 @@ function handlePost(PDO $pdo, string $driver): void
                         }
                         $kv[$name] = $days;
                     }
+                    continue;
+                }
+                if ($name === 'fuel') {
+                    $fuel = normalizeFuelList((array) ($_POST['fuel'] ?? []));
+                    if ($fuel === null) {
+                        setFlash('error', 'invalidSettings');
+                        redirectTo('?page=admin_settings');
+                    }
+                    $kv[$name] = $fuel;
                     continue;
                 }
                 if (!isset($_POST[$name])) {
@@ -1164,6 +1221,24 @@ function renderAccountPage(PDO $pdo, array $user): never
                     <input type="text" id="nf-token" name="pushover_token" value="<?= h($user['pushover_token']) ?>" autocomplete="off">
                 </div>
                 <?php renderScheduleEditor((string) $user['notify_days'], (string) $user['notify_windows'], (string) $user['notify_suggest_times']); ?>
+                <?php
+                $accountFuels = enabledFuels((string) (settingsAll($pdo)['fuel'] ?? ''));
+                $currentFuel = strtolower(trim((string) ($user['notify_fuel'] ?? '')));
+                if (!in_array($currentFuel, $accountFuels, true)) {
+                    $currentFuel = $accountFuels[0];
+                }
+                $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10'];
+                $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10'];
+                ?>
+                <div class="field">
+                    <label for="nf-fuel" data-i18n="notifyFuel">Fuel to be notified about</label>
+                    <select id="nf-fuel" name="notify_fuel">
+                        <?php foreach ($accountFuels as $f) { ?>
+                        <option value="<?= h($f) ?>" data-i18n="<?= h($fuelI18n[$f]) ?>" <?= $currentFuel === $f ? 'selected' : '' ?>><?= h($fuelLabels[$f]) ?></option>
+                        <?php } ?>
+                    </select>
+                    <p class="field-hint" data-i18n="notifyFuelHint">You are notified about this fuel only. The list shows the fuels your administrator currently tracks.</p>
+                </div>
                 <?php
                 $targetCities = updateTargetCities($pdo);
                 if ($targetCities !== []) {
@@ -1518,12 +1593,16 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                 <input type="hidden" name="action" value="save_settings">
                 <div class="field-grid">
                     <div class="field">
-                        <label for="st-fuel" data-i18n="settingFuel">Fuel</label>
-                        <select id="st-fuel" name="fuel">
-                            <option value="diesel" <?= $fuel === 'diesel' ? 'selected' : '' ?>>Diesel</option>
-                            <option value="e5" <?= $fuel === 'e5' ? 'selected' : '' ?>>E5</option>
-                            <option value="e10" <?= $fuel === 'e10' ? 'selected' : '' ?>>E10</option>
-                        </select>
+                        <label data-i18n="settingFuel">Fuel</label>
+                        <div class="day-toggles">
+                            <?php $enabledFuelSet = array_flip(enabledFuels($fuel)); ?>
+                            <?php $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10']; ?>
+                            <?php $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10']; ?>
+                            <?php foreach (GASOLINE_FUELS as $f) { ?>
+                            <label class="day-toggle"><input type="checkbox" name="fuel[]" value="<?= h($f) ?>" <?= isset($enabledFuelSet[$f]) ? 'checked' : '' ?>><span data-i18n="<?= h($fuelI18n[$f]) ?>"><?= h($fuelLabels[$f]) ?></span></label>
+                            <?php } ?>
+                        </div>
+                        <p class="field-hint" data-i18n="settingFuelHint">Suggestions and checks are computed for every enabled fuel. Each user picks one of these to be notified about.</p>
                     </div>
                     <div class="field">
                         <label for="st-range" data-i18n="settingRangeKm">Range (km)</label>
@@ -4154,6 +4233,8 @@ const translations = {
         notifyWindows: 'Time windows',
         notifySuggestTimes: 'Daily suggestion times',
         notifyCheckEnabled: 'Send buy-now alerts when prices drop',
+        notifyFuel: 'Fuel to be notified about',
+        notifyFuelHint: 'You are notified about this fuel only. The list shows the fuels your administrator currently tracks.',
         notifyCities: 'Cities',
         notifyCitiesHint: 'Notifications cover only the selected cities. Selecting none means every city, including ones added later.',
         notifySaved: 'Notification settings saved.',
@@ -4224,6 +4305,7 @@ const translations = {
         invalidRename: 'Select a station and enter a non-empty new name.',
         suggestionSettings: 'Suggestions & checks',
         settingFuel: 'Fuel',
+        settingFuelHint: 'Suggestions and checks are computed for every enabled fuel. Each user picks one of these to be notified about.',
         settingRangeKm: 'Range (km)',
         settingHistoryDays: 'History days',
         settingPredictDays: 'Prediction days',
@@ -4352,6 +4434,8 @@ const translations = {
         notifyWindows: 'Zeitfenster',
         notifySuggestTimes: 'Tägliche Vorschlagszeiten',
         notifyCheckEnabled: 'Kaufalarme bei Preistiefs senden',
+        notifyFuel: 'Kraftstoff für Benachrichtigungen',
+        notifyFuelHint: 'Sie werden nur über diesen Kraftstoff benachrichtigt. Die Liste zeigt die Kraftstoffe, die Ihr Administrator derzeit erfasst.',
         notifyCities: 'Städte',
         notifyCitiesHint: 'Benachrichtigungen gelten nur für die ausgewählten Städte. Keine Auswahl bedeutet alle Städte, auch später hinzugefügte.',
         notifySaved: 'Benachrichtigungseinstellungen gespeichert.',
@@ -4422,6 +4506,7 @@ const translations = {
         invalidRename: 'Bitte eine Tankstelle auswählen und einen neuen Namen eingeben.',
         suggestionSettings: 'Vorschläge & Preisprüfungen',
         settingFuel: 'Kraftstoff',
+        settingFuelHint: 'Vorschläge und Prüfungen werden für jeden aktivierten Kraftstoff berechnet. Jeder Nutzer wählt einen davon für Benachrichtigungen aus.',
         settingRangeKm: 'Umkreis (km)',
         settingHistoryDays: 'Historie (Tage)',
         settingPredictDays: 'Vorhersage (Tage)',

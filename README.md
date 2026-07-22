@@ -217,10 +217,10 @@ The normal suggestion output is unchanged; a one-line summary (`persist: stored 
 
 ### Server-stored configuration (admin settings)
 
-Administrators can store the operational configuration in the database via the web UI (hamburger menu → Settings): a list of update targets (city + radius pairs) plus the suggestion/check parameters (fuel, range, history/prediction days, limits, notification templates, schedule defaults). The CLI uses those values as its defaults:
+Administrators can store the operational configuration in the database via the web UI (hamburger menu → Settings): a list of update targets (city + radius pairs) plus the suggestion/check parameters (fuel, range, history/prediction days, limits, notification templates, schedule defaults). The **fuel** setting is a multi-select: enable any subset of `diesel`, `e5`, and `e10` (stored comma-separated). `notify` computes suggestions and checks for every enabled fuel, and each user picks one of them to be notified about (see below). The CLI uses those values as its defaults:
 
 - `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius. Passing explicit flags ignores the targets entirely.
-- `gasoline suggest` and `gasoline check` take `--fuel`, `--range-km`, `--history-days`, `--predict-days`, and `--limit-per-day`/`--limit` from the settings table when the corresponding flag is not set. Without `--city`, both run against **every** configured update target (best-effort: one failing city does not stop the others; the exit code reports failures).
+- `gasoline suggest` and `gasoline check` take `--fuel`, `--range-km`, `--history-days`, `--predict-days`, and `--limit-per-day`/`--limit` from the settings table when the corresponding flag is not set. These commands stay single-fuel: when the settings enable more than one fuel, they default to the first enabled one, still overridable with `--fuel`. Without `--city`, both run against **every** configured update target (best-effort: one failing city does not stop the others; the exit code reports failures).
 - Explicit CLI flags always override the stored settings; with an empty settings table everything behaves exactly as before.
 
 Run `gasoline migrate` once to create the tables and seed the settings with the built-in defaults. Seeding never overwrites existing rows, so an install that already stores `history_days = 21` keeps it until an admin changes it (the built-in default is now 30 days).
@@ -236,6 +236,7 @@ gasoline notify --dry-run  # render and report what would be sent, write nothing
 
 - the **notification schedule**: enabled weekdays and one or more time windows (default: every day, 07:00–21:00). Outside the schedule nothing is delivered.
 - the **city selection**: notifications cover only the update-target cities the user selected (multi-select in My Account → Notifications, stored in `user_notify_cities`). An empty selection means all configured cities, including ones added later. Deleting an update target also removes it from every user's selection.
+- the **fuel selection**: each user picks the single fuel they want to be notified about (My Account → Notifications, stored in `users.notify_fuel`). The dropdown lists only the fuels the admin currently enables, so a user always hears about one of the tracked fuels.
 - the **daily suggestion times** (default 08:00 and 13:00): each slot fires one suggestion notification per day; missed slots collapse into one on the next run instead of bursting.
 - the **buy-now alerts** opt-in: check notifications fire only for buy recommendations with medium/high confidence that are strictly cheaper than the day's running baseline (reset daily at the admin-configured reset time), mirroring `gasoline-watch.sh`.
 

@@ -65,6 +65,34 @@ type appSettings struct {
 	SuggestTitleTemplate string
 }
 
+// canonicalFuels lists the suggest/check fuel types in display order. The
+// admin "fuel" setting is any non-empty subset of these, stored as a
+// comma-separated string.
+var canonicalFuels = []string{"diesel", "e5", "e10"}
+
+// Fuels parses the stored comma-separated fuel setting into a normalized,
+// de-duplicated subset of canonicalFuels in canonical order. Empty or fully
+// invalid input falls back to all fuel types, preserving suggestion coverage.
+func (s appSettings) Fuels() []string {
+	seen := map[string]bool{}
+	for _, part := range strings.Split(s.Fuel, ",") {
+		part = strings.ToLower(strings.TrimSpace(part))
+		if isSuggestFuelType(part) {
+			seen[part] = true
+		}
+	}
+	var out []string
+	for _, f := range canonicalFuels {
+		if seen[f] {
+			out = append(out, f)
+		}
+	}
+	if len(out) == 0 {
+		return append([]string(nil), canonicalFuels...)
+	}
+	return out
+}
+
 // defaultAppSettings matches the hardcoded flag defaults of suggest/check.
 func defaultAppSettings() appSettings {
 	return appSettings{
@@ -255,7 +283,7 @@ func applySuggestSettings(ctx context.Context, db *sql.DB, fs *flag.FlagSet, opt
 		return err
 	}
 	if !flagWasSet(fs, "fuel") {
-		opts.Fuel = s.Fuel
+		opts.Fuel = s.Fuels()[0]
 	}
 	if !flagWasSet(fs, "range-km") {
 		opts.RangeKM = s.RangeKM
@@ -279,7 +307,7 @@ func applyCheckSettings(ctx context.Context, db *sql.DB, fs *flag.FlagSet, opts 
 		return err
 	}
 	if !flagWasSet(fs, "fuel") {
-		opts.Fuel = s.Fuel
+		opts.Fuel = s.Fuels()[0]
 	}
 	if !flagWasSet(fs, "range-km") {
 		opts.RangeKM = s.RangeKM

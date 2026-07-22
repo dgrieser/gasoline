@@ -208,6 +208,7 @@ type notifyUserFixture struct {
 	LastSuggest  string
 	Status       string
 	Method       string
+	Fuel         string   // notify_fuel; empty defaults to diesel
 	Cities       []string // notification city selection; empty = all cities
 }
 
@@ -219,16 +220,21 @@ func seedNotifyUser(t *testing.T, db *sql.DB, u notifyUserFixture) {
 	if u.Method == "" {
 		u.Method = "pushover"
 	}
+	if u.Fuel == "" {
+		u.Fuel = "diesel"
+	}
 	ctx := context.Background()
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO users (
 			email, password_hash, is_admin, status, created_at, approved_at,
 			notify_method, pushover_app_name, pushover_user_key, pushover_token,
-			notify_days, notify_windows, notify_suggest_times, notify_check_enabled, notify_last_suggest
-		) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			notify_days, notify_windows, notify_suggest_times, notify_check_enabled, notify_last_suggest,
+			notify_fuel
+		) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.Email, "x", u.Status, "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z",
 		u.Method, "gasoline", u.UserKey, u.Token,
-		u.Days, u.Windows, u.SuggestTimes, boolToInt(u.CheckEnabled), u.LastSuggest)
+		u.Days, u.Windows, u.SuggestTimes, boolToInt(u.CheckEnabled), u.LastSuggest,
+		u.Fuel)
 	if err != nil {
 		t.Fatalf("insert user %s: %v", u.Email, err)
 	}
@@ -916,5 +922,68 @@ func TestNotifyOnceCheckBaselinesArePerUser(t *testing.T) {
 	}
 	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:diesel:Berlin"); !found {
 		t.Fatal("user B's baseline must advance after their successful retry")
+	}
+}
+
+func TestNotifyOncePerUserFuel(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	// Admin enables two fuels; a user's single choice selects which one they
+	// hear about, and a user who chose a disabled fuel hears nothing.
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE settings SET value = 'diesel,e5' WHERE name = ?`, settingFuel); err != nil {
+		t.Fatalf("update fuel setting: %v", err)
+	}
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "diesel@example.com", UserKey: "user-diesel", Token: "token-d",
+		SuggestTimes: "13:00", CheckEnabled: true, Fuel: "diesel",
+	})
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "e5@example.com", UserKey: "user-e5", Token: "token-e5",
+		SuggestTimes: "13:00", CheckEnabled: true, Fuel: "e5",
+	})
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "e10@example.com", UserKey: "user-e10", Token: "token-e10",
+		SuggestTimes: "13:00", CheckEnabled: true, Fuel: "e10",
+	})
+
+	pushes := stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+	if len(result.Failed) != 0 {
+		t.Fatalf("failed sends: %+v", result.Failed)
+	}
+
+	// Each enabled-fuel user receives a check and a suggest; the e10 user is
+	// silent because the admin does not compute e10.
+	fuelByUser := map[string]string{"user-diesel": "diesel", "user-e5": "e5"}
+	seen := map[string]int{}
+	for _, push := range *pushes {
+		if push.User == "user-e10" {
+			t.Fatalf("user who chose a disabled fuel must not be notified: %+v", push)
+		}
+		wantFuel, ok := fuelByUser[push.User]
+		if !ok {
+			t.Fatalf("unexpected recipient: %+v", push)
+		}
+		if !strings.Contains(push.Message, wantFuel) {
+			t.Fatalf("message for %s = %q, want it to mention %q", push.User, push.Message, wantFuel)
+		}
+		if wantFuel == "diesel" && strings.Contains(push.Message, "e5") {
+			t.Fatalf("diesel user message leaked e5 rows: %q", push.Message)
+		}
+		seen[push.User]++
+	}
+	if seen["user-diesel"] != 2 || seen["user-e5"] != 2 {
+		t.Fatalf("push counts = %v, want 2 each for diesel and e5 users", seen)
+	}
+
+	// Baselines are fuel-scoped, so the two users at the same city do not
+	// collide.
+	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel:Berlin"); !found {
+		t.Fatal("diesel user's diesel baseline must advance")
+	}
+	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:e5:Berlin"); !found {
+		t.Fatal("e5 user's e5 baseline must advance")
 	}
 }
