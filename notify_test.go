@@ -205,11 +205,15 @@ type notifyUserFixture struct {
 	Windows      string
 	SuggestTimes string
 	CheckEnabled bool
-	LastSuggest  string
-	Status       string
-	Method       string
-	Fuel         string   // notify_fuel; empty defaults to diesel
-	Cities       []string // notification city selection; empty = all cities
+	// SuggestDisabled turns off suggestion notifications for this user. The
+	// zero value keeps suggestions enabled, matching the schema default and
+	// the pre-toggle behavior, so existing fixtures need no changes.
+	SuggestDisabled bool
+	LastSuggest     string
+	Status          string
+	Method          string
+	Fuel            string   // notify_fuel; empty defaults to diesel
+	Cities          []string // notification city selection; empty = all cities
 }
 
 func seedNotifyUser(t *testing.T, db *sql.DB, u notifyUserFixture) {
@@ -228,13 +232,13 @@ func seedNotifyUser(t *testing.T, db *sql.DB, u notifyUserFixture) {
 		INSERT INTO users (
 			email, password_hash, is_admin, status, created_at, approved_at,
 			notify_method, pushover_app_name, pushover_user_key, pushover_token,
-			notify_days, notify_windows, notify_suggest_times, notify_check_enabled, notify_last_suggest,
-			notify_fuel
-		) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			notify_days, notify_windows, notify_suggest_times, notify_check_enabled,
+			notify_suggest_enabled, notify_last_suggest, notify_fuel
+		) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.Email, "x", u.Status, "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z",
 		u.Method, "gasoline", u.UserKey, u.Token,
-		u.Days, u.Windows, u.SuggestTimes, boolToInt(u.CheckEnabled), u.LastSuggest,
-		u.Fuel)
+		u.Days, u.Windows, u.SuggestTimes, boolToInt(u.CheckEnabled),
+		boolToInt(!u.SuggestDisabled), u.LastSuggest, u.Fuel)
 	if err != nil {
 		t.Fatalf("insert user %s: %v", u.Email, err)
 	}
@@ -366,6 +370,69 @@ func TestNotifyOnceSendsCheckAndSuggestPerSchedule(t *testing.T) {
 	}
 	if lastSuggest != "2026-04-26T13:00" {
 		t.Fatalf("notify_last_suggest = %q, want 2026-04-26T13:00", lastSuggest)
+	}
+}
+
+func TestNotifyOnceRespectsPerKindToggles(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	// Four users cover every combination of the two per-user toggles. They
+	// share the same schedule and a due 13:00 suggestion slot, so the only
+	// thing that differs is which notification kinds each opted into.
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "both@example.com", UserKey: "user-both", Token: "token-both",
+		SuggestTimes: "08:00,13:00", CheckEnabled: true, // suggest enabled by default
+	})
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "suggestonly@example.com", UserKey: "user-sug", Token: "token-sug",
+		SuggestTimes: "08:00,13:00", CheckEnabled: false,
+	})
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "checkonly@example.com", UserKey: "user-chk", Token: "token-chk",
+		SuggestTimes: "08:00,13:00", CheckEnabled: true, SuggestDisabled: true,
+	})
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "none@example.com", UserKey: "user-none", Token: "token-none",
+		SuggestTimes: "08:00,13:00", CheckEnabled: false, SuggestDisabled: true,
+	})
+
+	stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+	if len(result.Failed) != 0 {
+		t.Fatalf("failed sends: %+v", result.Failed)
+	}
+
+	gotKinds := map[string][]string{}
+	for _, rec := range result.Sent {
+		gotKinds[rec.Email] = append(gotKinds[rec.Email], rec.Kind)
+	}
+	assertKinds := func(email string, want ...string) {
+		t.Helper()
+		got := gotKinds[email]
+		if len(got) != len(want) {
+			t.Fatalf("%s sent kinds = %v, want %v", email, got, want)
+		}
+		for _, w := range want {
+			if !containsString(got, w) {
+				t.Fatalf("%s sent kinds = %v, want %v", email, got, want)
+			}
+		}
+	}
+	assertKinds("both@example.com", "check", "suggest")
+	assertKinds("suggestonly@example.com", "suggest")
+	assertKinds("checkonly@example.com", "check")
+	assertKinds("none@example.com") // nothing at all
+
+	// A user who disabled suggestions must not have their slot marker
+	// advanced, so re-enabling later resumes cleanly.
+	var checkOnlyMarker string
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT notify_last_suggest FROM users WHERE email = 'checkonly@example.com'`).Scan(&checkOnlyMarker); err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	if checkOnlyMarker != "" {
+		t.Fatalf("checkonly notify_last_suggest = %q, want empty (suggestions disabled)", checkOnlyMarker)
 	}
 }
 

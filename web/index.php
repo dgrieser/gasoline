@@ -783,6 +783,7 @@ function handlePost(PDO $pdo, string $driver): void
                     pushover_user_key = :user_key, pushover_token = :token,
                     notify_days = :days, notify_windows = :windows,
                     notify_suggest_times = :times, notify_check_enabled = :check_enabled,
+                    notify_suggest_enabled = :suggest_enabled,
                     notify_fuel = :fuel
                  WHERE id = :id'
             );
@@ -794,6 +795,7 @@ function handlePost(PDO $pdo, string $driver): void
             $stmt->bindValue(':windows', $windows);
             $stmt->bindValue(':times', $times);
             $stmt->bindValue(':check_enabled', isset($_POST['notify_check_enabled']) ? 1 : 0, PDO::PARAM_INT);
+            $stmt->bindValue(':suggest_enabled', isset($_POST['notify_suggest_enabled']) ? 1 : 0, PDO::PARAM_INT);
             $stmt->bindValue(':fuel', $fuel);
             $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
             $stmt->execute();
@@ -1255,7 +1257,9 @@ function renderAccountPage(PDO $pdo, array $user): never
                 </div>
                 <?php } ?>
                 <div class="field">
+                    <label class="check-toggle"><input type="checkbox" name="notify_suggest_enabled" <?= (int) $user['notify_suggest_enabled'] === 1 ? 'checked' : '' ?>><span data-i18n="notifySuggestEnabled">Send daily price suggestions</span></label>
                     <label class="check-toggle"><input type="checkbox" name="notify_check_enabled" <?= (int) $user['notify_check_enabled'] === 1 ? 'checked' : '' ?>><span data-i18n="notifyCheckEnabled">Send buy-now alerts when prices drop</span></label>
+                    <p class="field-hint" data-i18n="notifyKindsHint">Choose which notifications you receive. Suggestions forecast good times to fill up; buy-now alerts fire when a current price drops. Leave both off to pause all notifications.</p>
                 </div>
                 <button type="submit" class="btn-primary" data-i18n="save">Save</button>
             </form>
@@ -4226,7 +4230,9 @@ const translations = {
         notifyDays: 'Days of the week',
         notifyWindows: 'Time windows',
         notifySuggestTimes: 'Daily suggestion times',
+        notifySuggestEnabled: 'Send daily price suggestions',
         notifyCheckEnabled: 'Send buy-now alerts when prices drop',
+        notifyKindsHint: 'Choose which notifications you receive. Suggestions forecast good times to fill up; buy-now alerts fire when a current price drops. Leave both off to pause all notifications.',
         notifyFuel: 'Fuel to be notified about',
         notifyFuelHint: 'You are notified about this fuel only. The list shows the fuels your administrator currently tracks.',
         notifyCities: 'Cities',
@@ -4427,7 +4433,9 @@ const translations = {
         notifyDays: 'Wochentage',
         notifyWindows: 'Zeitfenster',
         notifySuggestTimes: 'Tägliche Vorschlagszeiten',
+        notifySuggestEnabled: 'Tägliche Preisvorschläge senden',
         notifyCheckEnabled: 'Kaufalarme bei Preistiefs senden',
+        notifyKindsHint: 'Wähle, welche Benachrichtigungen du erhältst. Vorschläge sagen günstige Tankzeiten voraus; Kaufalarme werden ausgelöst, wenn ein aktueller Preis fällt. Lass beide aus, um alle Benachrichtigungen zu pausieren.',
         notifyFuel: 'Kraftstoff für Benachrichtigungen',
         notifyFuelHint: 'Sie werden nur über diesen Kraftstoff benachrichtigt. Die Liste zeigt die Kraftstoffe, die Ihr Administrator derzeit erfasst.',
         notifyCities: 'Städte',

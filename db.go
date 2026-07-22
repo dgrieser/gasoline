@@ -367,6 +367,7 @@ func schemaStatements(d dialect) []string {
 				notify_windows VARCHAR(255) NOT NULL DEFAULT '07:00-21:00',
 				notify_suggest_times VARCHAR(255) NOT NULL DEFAULT '08:00,13:00',
 				notify_check_enabled TINYINT NOT NULL DEFAULT 0,
+				notify_suggest_enabled TINYINT NOT NULL DEFAULT 1,
 				notify_last_suggest VARCHAR(20) NOT NULL DEFAULT '',
 				notify_fuel VARCHAR(16) NOT NULL DEFAULT 'diesel'
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
@@ -486,6 +487,7 @@ func schemaStatements(d dialect) []string {
 			notify_windows TEXT NOT NULL DEFAULT '07:00-21:00',
 			notify_suggest_times TEXT NOT NULL DEFAULT '08:00,13:00',
 			notify_check_enabled INTEGER NOT NULL DEFAULT 0,
+			notify_suggest_enabled INTEGER NOT NULL DEFAULT 1,
 			notify_last_suggest TEXT NOT NULL DEFAULT '',
 			notify_fuel TEXT NOT NULL DEFAULT 'diesel'
 		)`,

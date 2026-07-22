@@ -1775,6 +1775,9 @@ func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 	if !containsString(result.Applied, "users.notify_fuel") {
 		t.Fatalf("applied migrations = %v, want users.notify_fuel", result.Applied)
 	}
+	if !containsString(result.Applied, "users.notify_suggest_enabled") {
+		t.Fatalf("applied migrations = %v, want users.notify_suggest_enabled", result.Applied)
+	}
 
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -1814,6 +1817,14 @@ func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 	}
 	if !hasNotifyFuel {
 		t.Fatal("expected users.notify_fuel after migration")
+	}
+
+	hasNotifySuggestEnabled, err := tableHasColumn(ctx, db, dialectSQLite, "users", "notify_suggest_enabled")
+	if err != nil {
+		t.Fatalf("tableHasColumn users.notify_suggest_enabled: %v", err)
+	}
+	if !hasNotifySuggestEnabled {
+		t.Fatal("expected users.notify_suggest_enabled after migration")
 	}
 
 	var normalizedName string

@@ -37,6 +37,7 @@ type notifyUser struct {
 	NotifyWindows   string
 	SuggestTimes    string
 	CheckEnabled    bool
+	SuggestEnabled  bool
 	LastSuggest     string // YYYY-MM-DDTHH:MM of the last fired suggestion slot
 	NotifyFuel      string // the single fuel this user is notified about
 }
@@ -163,8 +164,8 @@ func printNotifyResultText(result notifyResult) {
 func loadNotifyUsers(ctx context.Context, db *sql.DB) ([]notifyUser, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, email, pushover_app_name, pushover_user_key, pushover_token,
-			notify_days, notify_windows, notify_suggest_times, notify_check_enabled, notify_last_suggest,
-			notify_fuel
+			notify_days, notify_windows, notify_suggest_times, notify_check_enabled,
+			notify_suggest_enabled, notify_last_suggest, notify_fuel
 		FROM users
 		WHERE status = 'approved' AND notify_method = 'pushover'
 			AND pushover_user_key <> '' AND pushover_token <> ''
@@ -176,12 +177,14 @@ func loadNotifyUsers(ctx context.Context, db *sql.DB) ([]notifyUser, error) {
 	var users []notifyUser
 	for rows.Next() {
 		var u notifyUser
-		var checkEnabled int
+		var checkEnabled, suggestEnabled int
 		if err := rows.Scan(&u.ID, &u.Email, &u.PushoverAppName, &u.PushoverUserKey, &u.PushoverToken,
-			&u.NotifyDays, &u.NotifyWindows, &u.SuggestTimes, &checkEnabled, &u.LastSuggest, &u.NotifyFuel); err != nil {
+			&u.NotifyDays, &u.NotifyWindows, &u.SuggestTimes, &checkEnabled, &suggestEnabled,
+			&u.LastSuggest, &u.NotifyFuel); err != nil {
 			return nil, err
 		}
 		u.CheckEnabled = checkEnabled != 0
+		u.SuggestEnabled = suggestEnabled != 0
 		users = append(users, u)
 	}
 	return users, rows.Err()
@@ -467,6 +470,9 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 		}
 		if u.CheckEnabled {
 			checkUsers = append(checkUsers, u)
+		}
+		if !u.SuggestEnabled {
+			continue
 		}
 		timesSpec := u.SuggestTimes
 		if strings.TrimSpace(timesSpec) == "" {
