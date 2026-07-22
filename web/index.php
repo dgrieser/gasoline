@@ -2114,6 +2114,120 @@ function buildSnapshotQuery(
     return [$sql, $params, $shouldRun, $errors];
 }
 
+/**
+ * Load the notification-worthy future predictions for the in-scope stations.
+ *
+ * Replicates the suggest-notification filter against already-stored data: the
+ * hour windows a persisted `suggest --persist` run marked as a suggestion
+ * (`is_suggestion = 1`) whose confidence is medium/high — exactly the rows the
+ * notifier sends (notify.go keeps `confidence IN ('medium','high')`) — limited
+ * to windows still in the future. It never triggers a suggest run.
+ *
+ * Later runs supersede earlier ones for the same target hour, so only the
+ * newest run per (station, fuel) is considered; a station covered by several
+ * cities' runs resolves independently via its own newest run.
+ *
+ * @param array<int, string> $stationIds effective in-scope station ids
+ * @return array{rows: array<int, array<string, mixed>>, as_of: array<string, string>}
+ *   rows sorted by window start then station id; as_of maps fuel -> newest run_at
+ */
+function loadFilteredPredictions(PDO $pdo, array $stationIds, string $selectedFuel, string $nowUtc): array
+{
+    $empty = ['rows' => [], 'as_of' => []];
+    if ($stationIds === []) {
+        return $empty;
+    }
+
+    $fuels = $selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [$selectedFuel];
+
+    // Shared IN(...) placeholders for both queries.
+    $scopeParams = [];
+    $stationPlaceholders = [];
+    foreach (array_values($stationIds) as $index => $stationId) {
+        $placeholder = ':pred_station_' . $index;
+        $stationPlaceholders[] = $placeholder;
+        $scopeParams[$placeholder] = $stationId;
+    }
+    $fuelPlaceholders = [];
+    foreach (array_values($fuels) as $index => $fuel) {
+        $placeholder = ':pred_fuel_' . $index;
+        $fuelPlaceholders[] = $placeholder;
+        $scopeParams[$placeholder] = $fuel;
+    }
+    $stationIn = implode(', ', $stationPlaceholders);
+    $fuelIn = implode(', ', $fuelPlaceholders);
+
+    // The newest persisted run per (station, fuel), from the full grid — the
+    // authoritative "current" run whose suggestion picks we display.
+    $latestStmt = $pdo->prepare(
+        'SELECT pp.station_id, pp.fuel, MAX(pr.run_at) AS max_run_at '
+        . 'FROM price_predictions pp '
+        . 'JOIN prediction_runs pr ON pr.id = pp.run_id '
+        . 'WHERE pp.station_id IN (' . $stationIn . ') '
+        . 'AND pp.fuel IN (' . $fuelIn . ') '
+        . 'GROUP BY pp.station_id, pp.fuel'
+    );
+    foreach ($scopeParams as $key => $value) {
+        $latestStmt->bindValue($key, $value);
+    }
+    $latestStmt->execute();
+
+    $latestRunByKey = [];   // "station|fuel" -> newest run_at
+    $asOf = [];             // fuel -> newest run_at across the scope
+    foreach ($latestStmt->fetchAll() as $row) {
+        $fuel = (string) $row['fuel'];
+        $runAt = (string) $row['max_run_at'];
+        $latestRunByKey[(string) $row['station_id'] . '|' . $fuel] = $runAt;
+        if (!isset($asOf[$fuel]) || strcmp($runAt, $asOf[$fuel]) > 0) {
+            $asOf[$fuel] = $runAt;
+        }
+    }
+    if ($latestRunByKey === []) {
+        return $empty;
+    }
+
+    // Future, notification-worthy suggestion windows.
+    $rowStmt = $pdo->prepare(
+        'SELECT pp.station_id, pp.fuel, pp.target_start, pp.target_end, '
+        . 'pp.predicted_price, pp.confidence, pr.run_at '
+        . 'FROM price_predictions pp '
+        . 'JOIN prediction_runs pr ON pr.id = pp.run_id '
+        . 'WHERE pp.station_id IN (' . $stationIn . ') '
+        . 'AND pp.fuel IN (' . $fuelIn . ') '
+        . 'AND pp.is_suggestion = 1 '
+        . "AND pp.confidence IN ('medium', 'high') "
+        . 'AND pp.target_start > :pred_now '
+        . 'ORDER BY pp.target_start ASC, pp.station_id ASC'
+    );
+    foreach ($scopeParams as $key => $value) {
+        $rowStmt->bindValue($key, $value);
+    }
+    $rowStmt->bindValue(':pred_now', $nowUtc);
+    $rowStmt->execute();
+
+    $rows = [];
+    foreach ($rowStmt->fetchAll() as $row) {
+        $stationId = (string) $row['station_id'];
+        $fuel = (string) $row['fuel'];
+        // Keep only rows from that station/fuel's newest run — older runs are
+        // history whose picks the newest run has already superseded.
+        $key = $stationId . '|' . $fuel;
+        if (!isset($latestRunByKey[$key]) || (string) $row['run_at'] !== $latestRunByKey[$key]) {
+            continue;
+        }
+        $rows[] = [
+            's' => $stationId,
+            'fuel' => $fuel,
+            'start' => (string) $row['target_start'],
+            'end' => (string) $row['target_end'],
+            'price' => (float) $row['predicted_price'],
+            'conf' => (string) $row['confidence'],
+        ];
+    }
+
+    return ['rows' => $rows, 'as_of' => $asOf];
+}
+
 // ── AJAX: async snapshot data ─────────────────────────────────────────────────
 // The page renders a fast shell; the heavy snapshot payload is fetched here and
 // rendered client-side. Station metadata is sent once (keyed by id) and rows
@@ -2125,6 +2239,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
         'summary' => ['points' => 0, 'stations' => 0, 'first_recorded_at' => null, 'last_recorded_at' => null],
         'stations' => [],
         'rows' => [],
+        'predictions' => [],
+        'predictions_as_of' => [],
         'errors' => $errors,
     ];
 
@@ -2229,6 +2345,36 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
                 $out['summary']['stations'] = count($usedStationIds);
                 $out['summary']['first_recorded_at'] = $out['rows'][0]['t'];
                 $out['summary']['last_recorded_at'] = $out['rows'][count($out['rows']) - 1]['t'];
+            }
+        }
+
+        // Upcoming, notification-worthy predictions for the same in-scope
+        // stations (mirrors the snapshot scoping in buildSnapshotQuery). Read
+        // only — no suggest run is triggered.
+        if ($out['errors'] === []) {
+            $predictionStationIds = [];
+            if ($cityRow !== null) {
+                $predictionStationIds = array_column($stations, 'id');
+                if ($selectedStationIds !== []) {
+                    $predictionStationIds = array_values(array_intersect($predictionStationIds, $selectedStationIds));
+                }
+            } elseif ($selectedStationIds !== []) {
+                $predictionStationIds = $selectedStationIds;
+            }
+
+            if ($predictionStationIds !== []) {
+                $nowUtc = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format(DateTimeInterface::RFC3339);
+                $predictions = loadFilteredPredictions($pdo, $predictionStationIds, $selectedFuel, $nowUtc);
+                $out['predictions'] = $predictions['rows'];
+                $out['predictions_as_of'] = $predictions['as_of'];
+                // Predicted stations may have no snapshot in the current date
+                // range, so ensure their metadata (name/address) is sent too.
+                foreach ($predictions['rows'] as $prediction) {
+                    $predictedId = (string) $prediction['s'];
+                    if (isset($metaById[$predictedId]) && !isset($out['stations'][$predictedId])) {
+                        $out['stations'][$predictedId] = $metaById[$predictedId];
+                    }
+                }
             }
         }
     } catch (Throwable $e) {
@@ -2968,6 +3114,39 @@ function renderDocumentHead(string $titleSuffix): void
             text-overflow: ellipsis;
         }
 
+        /* ── Predictions card ──────────────────────────────────── */
+        /* Reuses the .cheapest-* / .top5-* structure; these add the per-day
+           header, the window time column, and the "as of" run note. */
+        .pred-day {
+            margin-top: 1rem;
+            padding-top: 0.7rem;
+            border-top: 1px solid var(--border);
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            color: var(--muted);
+            letter-spacing: 0.04em;
+        }
+
+        /* The first day sits flush under the fuel label (no divider). */
+        .cheapest-fuel-label + .pred-day {
+            margin-top: 0.5rem;
+            padding-top: 0;
+            border-top: none;
+        }
+
+        .pred-time {
+            color: var(--muted);
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+
+        .pred-asof {
+            margin-top: 0.8rem;
+            font-family: var(--mono);
+            font-size: 0.66rem;
+            color: var(--muted);
+        }
+
         @media (max-width: 560px) {
             .cheapest-grid,
             .cheapest-grid.two-col { grid-template-columns: 1fr; }
@@ -3253,6 +3432,9 @@ function renderDocumentHead(string $titleSuffix): void
             .content { display: contents; }
             .content > .error-box { order: -2; }
             #cheapest-card { order: -1; }
+            /* Keep the predictions card directly beneath the top-5 card (equal
+               order preserves DOM sequence) and above the filters on mobile. */
+            #predictions-card { order: -1; }
             .sidebar { position: static; }
             .sidebar-head { cursor: pointer; }
             .sidebar-chevron { display: inline-flex; }
@@ -3910,12 +4092,15 @@ const translations = {
         invalidFromDate: 'Invalid from date.',
         invalidToDate: 'Invalid to date.',
         noSnapshots: 'No snapshots match the current filters.',
-        cheapestNow: 'Top 5 cheapest — current',
+        cheapestNow: 'Cheapest right now',
         cheapestNoData: 'No price data available.',
-        cheapestPrefix: 'Cheapest',
+        cheapestPrefix: 'Lowest',
         cheapestRangeNoData: 'No price data available.',
-        highestPrefix: 'Highest',
+        highestPrefix: 'Highest price',
         highestNoData: 'No price data available.',
+        predictionsTitle: 'Recommended fill-ups',
+        predictionsNoData: 'No upcoming predictions in the database for these stations.',
+        predictionsAsOf: 'as of {time}',
         rangeAll: 'All',
         range30d: '30d',
         range14d: '14d',
@@ -4105,12 +4290,15 @@ const translations = {
         invalidFromDate: 'Ungültiges Von-Datum.',
         invalidToDate: 'Ungültiges Bis-Datum.',
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
-        cheapestNow: 'Top 5 günstigste Preise — aktuell',
+        cheapestNow: 'Jetzt am günstigsten',
         cheapestNoData: 'Keine Preisdaten vorhanden.',
-        cheapestPrefix: 'Günstigster Preis',
+        cheapestPrefix: 'Tiefstpreis',
         cheapestRangeNoData: 'Keine Preisdaten vorhanden.',
-        highestPrefix: 'Höchster Preis',
+        highestPrefix: 'Höchstpreis',
         highestNoData: 'Keine Preisdaten vorhanden.',
+        predictionsTitle: 'Tankempfehlungen',
+        predictionsNoData: 'Keine kommenden Vorhersagen für diese Tankstellen in der Datenbank.',
+        predictionsAsOf: 'Stand {time}',
         rangeAll: 'Alle',
         range30d: '30d',
         range14d: '14d',
@@ -4273,6 +4461,14 @@ function formatDateTime(isoString) {
     return d.toLocaleString(_loc(), {
         timeZone: _tz(),
         day: '2-digit', month: '2-digit', year: '2-digit',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false,
+    });
+}
+
+function formatTimeOnly(isoString) {
+    return new Date(isoString).toLocaleTimeString(_loc(), {
+        timeZone: _tz(),
         hour: '2-digit', minute: '2-digit',
         hour12: false,
     });
@@ -4544,6 +4740,9 @@ renderDocumentHead('Price History');
             <!-- Top 5 cheapest now -->
             <div class="cheapest-card" id="cheapest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
+            <!-- Upcoming predictions (only those a suggest notification would send) -->
+            <div class="cheapest-card" id="predictions-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
+
             <!-- Chart -->
             <div class="chart-card">
                 <div class="chart-header">
@@ -4712,6 +4911,12 @@ function h(str) {
 // Populated asynchronously by loadData() from the ?action=data endpoint.
 let chartData = [];
 let stationDistancesById = {};
+// Upcoming notification-worthy predictions from ?action=data, kept so a
+// language switch can re-render the card without re-fetching. predictionStationMeta
+// is the station id -> {name,...} map (payload.stations) used to resolve names.
+let predictionData = [];
+let predictionAsOf = {};
+let predictionStationMeta = {};
 let dataLoaded = false;
 // In-memory, non-persistent chart-only filter: null = all stations shown,
 // otherwise a Set of visible station_ids (strings). Reset on fresh data.
@@ -5213,6 +5418,7 @@ const ICON_UP   = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" s
 const cheapestCard      = document.getElementById('cheapest-card');
 const cheapestRangeCard = document.getElementById('cheapest-range-card');
 const highestCard       = document.getElementById('highest-card');
+const predictionsCard   = document.getElementById('predictions-card');
 
 function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
     if (!el) return;
@@ -5340,6 +5546,88 @@ function renderCheapestRange() {
 function renderHighest() {
     const t = translations[currentLang];
     renderPriceCard(highestCard, getRangeFilteredData(), rangeTitle(t.highestPrefix), (a, b) => a > b, ICON_UP, t.highestNoData);
+}
+
+const ICON_CLOCK = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`;
+
+// Upcoming predictions the notifier would send: for the in-scope stations, the
+// stored future suggestion windows with medium/high confidence, grouped per
+// fuel then per day. Within a day the cheapest window is shown large and the
+// rest follow as a compact price-ranked list. Data comes from ?action=data
+// (predictionData / predictionAsOf); the page never triggers a suggest run.
+function renderPredictions() {
+    const t = translations[currentLang];
+    if (!predictionsCard) return;
+    const fuels      = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
+    const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
+
+    const nameById = (id) => (predictionStationMeta[id] && predictionStationMeta[id].name) || id;
+    const distSuffix = (id) => {
+        const dist = stationDistancesById[id] ?? null;
+        return dist !== null ? ` (${dist.toFixed(1)} km)` : '';
+    };
+    // Day bucket key + header in the displayed timezone/locale so grouping
+    // matches the visible date (recomputed on language change).
+    const dayKey = (iso) => new Date(iso).toLocaleDateString(_loc(), {
+        timeZone: _tz(), year: 'numeric', month: '2-digit', day: '2-digit',
+    });
+    const dayLabel = (iso) => new Date(iso).toLocaleDateString(_loc(), {
+        timeZone: _tz(), weekday: 'long', day: '2-digit', month: '2-digit', year: '2-digit',
+    });
+    const windowLabel = (p) => `${formatTimeOnly(p.start)}–${formatTimeOnly(p.end)}`;
+
+    const results = [];
+    for (const fuel of fuels) {
+        const windows = predictionData.filter((p) => p.fuel === fuel);
+        if (windows.length) results.push({ fuel, windows });
+    }
+
+    const colClass = results.length === 1 ? ' single' : results.length === 2 ? ' two-col' : '';
+
+    predictionsCard.innerHTML =
+        `<div class="cheapest-header">${ICON_CLOCK}<span class="cheapest-title">${t.predictionsTitle}</span></div>` +
+        (results.length === 0
+            ? `<div class="cheapest-empty">${t.predictionsNoData}</div>`
+            : `<div class="cheapest-grid${colClass}">` +
+                results.map(({ fuel, windows }) => {
+                    const asOf = predictionAsOf[fuel] || null;
+                    // Group by day; predictionData is already sorted by start
+                    // ascending, so first-seen day order is chronological.
+                    const byDay = new Map();
+                    for (const p of windows) {
+                        const key = dayKey(p.start);
+                        if (!byDay.has(key)) byDay.set(key, []);
+                        byDay.get(key).push(p);
+                    }
+
+                    const days = [...byDay.values()].map((dayWindows) => {
+                        dayWindows.sort((a, b) => (a.price - b.price) || a.start.localeCompare(b.start));
+                        dayWindows = dayWindows.slice(0, 5); // cap: cheapest 5 per day
+                        const best = dayWindows[0];
+                        const bestName = nameById(best.s) + distSuffix(best.s);
+                        const runners = dayWindows.slice(1).map((p) => {
+                            const name = nameById(p.s) + distSuffix(p.s);
+                            return `<div class="top5-row">` +
+                                `<span class="top5-price" style="color:${fuelColors[fuel]}">${p.price.toFixed(3)}</span>` +
+                                `<span class="top5-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(p.s), fuel)};display:inline-block;margin-right:0.4rem"></span>${h(name)}</span>` +
+                                `<span class="pred-time">${h(windowLabel(p))}</span>` +
+                            `</div>`;
+                        }).join('');
+                        return `<div class="pred-day">${h(dayLabel(best.start))}</div>` +
+                            `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${best.price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                            `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(best.s), fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(bestName)}</div>` +
+                            `<div class="cheapest-time">${h(windowLabel(best))}</div>` +
+                            (runners ? `<div class="top5-list">${runners}</div>` : '');
+                    }).join('');
+
+                    return `<div class="cheapest-cell">` +
+                        `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
+                        days +
+                        (asOf ? `<div class="pred-asof">${h(t.predictionsAsOf.replace('{time}', formatDateTime(asOf)))}</div>` : '') +
+                    `</div>`;
+                }).join('') +
+              `</div>`
+        );
 }
 
 /* applyLang lives in the shared script (renderCommonScript). */
@@ -5608,6 +5896,9 @@ function applyData(payload) {
     for (const [id, s] of Object.entries(meta)) {
         if (s.dist !== null && s.dist !== undefined) stationDistancesById[id] = s.dist;
     }
+    predictionData = payload.predictions || [];
+    predictionAsOf = payload.predictions_as_of || {};
+    predictionStationMeta = meta;
     _stationHues = computeStationHues();
     stationFilter = null;
     dataLoaded = true;
@@ -5619,6 +5910,7 @@ function applyData(payload) {
     setStatDate('stat-last',  sum.last_recorded_at  || '');
 
     renderCheapest();
+    renderPredictions();
     renderCheapestRange();
     renderHighest();
     renderTable();
@@ -5695,6 +5987,7 @@ if (retryBtn) retryBtn.addEventListener('click', () => { resetLoadingUI(); loadD
 window.onLangChange = () => {
     if (dataLoaded) {
         renderCheapest();
+        renderPredictions();
         renderCheapestRange();
         renderHighest();
         if (chartEl) renderChart();
