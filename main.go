@@ -2880,6 +2880,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migrateStationsNameOverride(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateUsersNotifyFuel(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migrateSeedDefaultSettings(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -2902,6 +2905,30 @@ func migrateStationsNameOverride(ctx context.Context, tx *sql.Tx, d dialect, res
 		return err
 	}
 	result.Applied = append(result.Applied, "stations.name_override")
+	return nil
+}
+
+// migrateUsersNotifyFuel adds the per-user notify_fuel column to pre-existing
+// installs. New databases already get it from schemaStatements; the ALTER only
+// fires where the users table predates the column.
+func migrateUsersNotifyFuel(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "users", "notify_fuel")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	colType := "TEXT"
+	if d == dialectMySQL {
+		colType = "VARCHAR(16)"
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+		`ALTER TABLE users ADD COLUMN notify_fuel %s NOT NULL DEFAULT 'diesel'`, colType,
+	)); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "users.notify_fuel")
 	return nil
 }
 

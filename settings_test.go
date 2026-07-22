@@ -156,6 +156,52 @@ func TestLoadSettingsUnescapesTemplates(t *testing.T) {
 	}
 }
 
+func TestAppSettingsFuels(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"diesel", "diesel"},
+		{"diesel,e5,e10", "diesel,e5,e10"},
+		{"e10,diesel", "diesel,e10"},   // normalized to canonical order
+		{" E5 , diesel ", "diesel,e5"}, // trims and lowercases
+		{"diesel,diesel", "diesel"},    // dedupes
+		{"diesel,bogus", "diesel"},     // drops invalid entries
+		{"", "diesel,e5,e10"},          // empty falls back to all fuels
+		{"bogus", "diesel,e5,e10"},     // fully invalid falls back to all fuels
+	}
+	for _, tc := range cases {
+		got := strings.Join(appSettings{Fuel: tc.in}.Fuels(), ",")
+		if got != tc.want {
+			t.Errorf("Fuels(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestApplySuggestSettingsUsesFirstEnabledFuel(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = 'e5,e10' WHERE name = ?`, settingFuel); err != nil {
+		t.Fatalf("update setting: %v", err)
+	}
+	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
+	fs.String("fuel", "diesel", "")
+	fs.Float64("range-km", 5, "")
+	fs.Int("history-days", 21, "")
+	fs.Int("predict-days", 3, "")
+	fs.Int("limit-per-day", 3, "")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	opts := suggestOptions{Fuel: "diesel", RangeKM: 5, HistoryDays: 21, PredictDays: 3, LimitPerDay: 3}
+	if err := applySuggestSettings(ctx, db, fs, &opts); err != nil {
+		t.Fatalf("applySuggestSettings: %v", err)
+	}
+	if opts.Fuel != "e5" {
+		t.Fatalf("opts.Fuel = %q, want first enabled fuel e5", opts.Fuel)
+	}
+}
+
 func TestApplySuggestSettingsPrecedence(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

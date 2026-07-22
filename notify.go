@@ -13,6 +13,19 @@ import (
 	"time"
 )
 
+// resolveNotifyFuel returns the single fuel a user should be notified about.
+// A blank or unrecognized stored value falls back to the first admin-enabled
+// fuel. A recognized fuel is honored as-is: if the admin no longer computes it,
+// the per-fuel result map simply has no rows for that user, so they are skipped
+// rather than silently switched to a fuel they did not choose.
+func resolveNotifyFuel(u notifyUser, settings appSettings) string {
+	f := strings.ToLower(strings.TrimSpace(u.NotifyFuel))
+	if isSuggestFuelType(f) {
+		return f
+	}
+	return settings.Fuels()[0]
+}
+
 // notifyUser is one approved web user with a usable Pushover configuration.
 type notifyUser struct {
 	ID              int64
@@ -25,6 +38,7 @@ type notifyUser struct {
 	SuggestTimes    string
 	CheckEnabled    bool
 	LastSuggest     string // YYYY-MM-DDTHH:MM of the last fired suggestion slot
+	NotifyFuel      string // the single fuel this user is notified about
 }
 
 type notifyOptions struct {
@@ -149,7 +163,8 @@ func printNotifyResultText(result notifyResult) {
 func loadNotifyUsers(ctx context.Context, db *sql.DB) ([]notifyUser, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, email, pushover_app_name, pushover_user_key, pushover_token,
-			notify_days, notify_windows, notify_suggest_times, notify_check_enabled, notify_last_suggest
+			notify_days, notify_windows, notify_suggest_times, notify_check_enabled, notify_last_suggest,
+			notify_fuel
 		FROM users
 		WHERE status = 'approved' AND notify_method = 'pushover'
 			AND pushover_user_key <> '' AND pushover_token <> ''
@@ -163,7 +178,7 @@ func loadNotifyUsers(ctx context.Context, db *sql.DB) ([]notifyUser, error) {
 		var u notifyUser
 		var checkEnabled int
 		if err := rows.Scan(&u.ID, &u.Email, &u.PushoverAppName, &u.PushoverUserKey, &u.PushoverToken,
-			&u.NotifyDays, &u.NotifyWindows, &u.SuggestTimes, &checkEnabled, &u.LastSuggest); err != nil {
+			&u.NotifyDays, &u.NotifyWindows, &u.SuggestTimes, &checkEnabled, &u.LastSuggest, &u.NotifyFuel); err != nil {
 			return nil, err
 		}
 		u.CheckEnabled = checkEnabled != 0
@@ -475,12 +490,13 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 	// never suppresses another user's notification, and failed sends are
 	// retried on the next run.
 	if len(checkUsers) > 0 {
-		targetChecks, err := collectTargetChecks(ctx, db, settings, targets, opts)
+		targetChecksByFuel, err := collectTargetChecks(ctx, db, settings, targets, opts)
 		if err != nil {
 			return result, err
 		}
 		for _, u := range checkUsers {
-			userRows, userBaselines, err := userCheckRows(ctx, db, settings, targetChecks, u.ID, citySelections[u.ID])
+			fuel := resolveNotifyFuel(u, settings)
+			userRows, userBaselines, err := userCheckRows(ctx, db, fuel, targetChecksByFuel[fuel], u.ID, citySelections[u.ID])
 			if err != nil {
 				return result, err
 			}
@@ -519,16 +535,15 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 	// all users), assemble the rows per user from their city selection,
 	// deliver, and advance each user's slot marker.
 	if len(suggestUsers) > 0 {
-		targetSuggests, err := collectTargetSuggestions(ctx, db, settings, targets, opts)
+		targetSuggestsByFuel, err := collectTargetSuggestions(ctx, db, settings, targets, opts)
 		if err != nil {
 			return result, err
 		}
-		for _, ts := range targetSuggests {
-			result.SuggestRows += len(ts.rows)
-		}
 		for _, u := range suggestUsers {
 			marker := today + "T" + suggestSlots[u.ID]
-			userRows := userSuggestRows(targetSuggests, citySelections[u.ID])
+			fuel := resolveNotifyFuel(u, settings)
+			userRows := userSuggestRows(targetSuggestsByFuel[fuel], citySelections[u.ID])
+			result.SuggestRows += len(userRows)
 			if len(userRows) == 0 {
 				// Nothing to say: still advance the marker so the empty
 				// result is not retried until the next slot.
@@ -575,41 +590,45 @@ type targetCheckRows struct {
 	rows   []priceCheckRow
 }
 
-// collectTargetChecks runs the check across all update targets and applies
-// the user-independent part of the watcher's notification filter.
-func collectTargetChecks(ctx context.Context, db *sql.DB, settings appSettings, targets []updateTarget, opts notifyOptions) ([]targetCheckRows, error) {
-	var all []targetCheckRows
-	for _, target := range targets {
-		checks, err := checkGas(ctx, db, checkOptions{
-			City:        target.City,
-			RangeKM:     settings.RangeKM,
-			Fuel:        settings.Fuel,
-			HistoryDays: settings.HistoryDays,
-			PredictDays: settings.PredictDays,
-			Limit:       settings.CheckLimit,
-			Now:         opts.Now,
-			Location:    opts.Location,
-		})
-		if err != nil {
-			// A stale or unknown city must not kill the whole run.
-			fmt.Fprintf(os.Stderr, "warning: check for %s failed: %v\n", target.City, err)
-			continue
-		}
-		var matching []priceCheckRow
-		for _, row := range checks {
-			if row.Recommendation == "buy" && (row.Confidence == "medium" || row.Confidence == "high") {
-				matching = append(matching, row)
+// collectTargetChecks runs the check across all update targets for every
+// admin-enabled fuel and applies the user-independent part of the watcher's
+// notification filter. Results are keyed by fuel so each user can be served
+// the fuel they chose.
+func collectTargetChecks(ctx context.Context, db *sql.DB, settings appSettings, targets []updateTarget, opts notifyOptions) (map[string][]targetCheckRows, error) {
+	byFuel := map[string][]targetCheckRows{}
+	for _, fuel := range settings.Fuels() {
+		for _, target := range targets {
+			checks, err := checkGas(ctx, db, checkOptions{
+				City:        target.City,
+				RangeKM:     settings.RangeKM,
+				Fuel:        fuel,
+				HistoryDays: settings.HistoryDays,
+				PredictDays: settings.PredictDays,
+				Limit:       settings.CheckLimit,
+				Now:         opts.Now,
+				Location:    opts.Location,
+			})
+			if err != nil {
+				// A stale or unknown city must not kill the whole run.
+				fmt.Fprintf(os.Stderr, "warning: check for %s (%s) failed: %v\n", target.City, fuel, err)
+				continue
 			}
+			var matching []priceCheckRow
+			for _, row := range checks {
+				if row.Recommendation == "buy" && (row.Confidence == "medium" || row.Confidence == "high") {
+					matching = append(matching, row)
+				}
+			}
+			if len(matching) == 0 {
+				continue
+			}
+			sort.SliceStable(matching, func(i, j int) bool {
+				return matching[i].CurrentPrice < matching[j].CurrentPrice
+			})
+			byFuel[fuel] = append(byFuel[fuel], targetCheckRows{target: target, rows: matching})
 		}
-		if len(matching) == 0 {
-			continue
-		}
-		sort.SliceStable(matching, func(i, j int) bool {
-			return matching[i].CurrentPrice < matching[j].CurrentPrice
-		})
-		all = append(all, targetCheckRows{target: target, rows: matching})
 	}
-	return all, nil
+	return byFuel, nil
 }
 
 // userCheckRows filters the shared target rows against one user's city
@@ -617,14 +636,14 @@ func collectTargetChecks(ctx context.Context, db *sql.DB, settings appSettings, 
 // returns the rows strictly cheaper than that user's running minimum, sorted
 // cheapest-first, plus the baseline updates to persist after a successful
 // delivery to that user.
-func userCheckRows(ctx context.Context, db *sql.DB, settings appSettings, targetChecks []targetCheckRows, userID int64, cities map[string]bool) ([]notifyRow, map[string]string, error) {
+func userCheckRows(ctx context.Context, db *sql.DB, fuel string, targetChecks []targetCheckRows, userID int64, cities map[string]bool) ([]notifyRow, map[string]string, error) {
 	var rows []notifyRow
 	baselines := map[string]string{}
 	for _, tc := range targetChecks {
 		if !citySelected(cities, tc.target.City) {
 			continue
 		}
-		baselineKey := fmt.Sprintf("check_baseline:%d:%s:%s", userID, settings.Fuel, tc.target.City)
+		baselineKey := fmt.Sprintf("check_baseline:%d:%s:%s", userID, fuel, tc.target.City)
 		baselineValue, hasBaseline, err := getNotificationState(ctx, db, baselineKey)
 		if err != nil {
 			return nil, nil, err
@@ -667,35 +686,37 @@ type targetSuggestRows struct {
 // collectTargetSuggestions runs the suggestion across all update targets and
 // keeps medium/high confidence rows, grouped per target so each user's city
 // selection can be applied afterwards.
-func collectTargetSuggestions(ctx context.Context, db *sql.DB, settings appSettings, targets []updateTarget, opts notifyOptions) ([]targetSuggestRows, error) {
-	var all []targetSuggestRows
-	for _, target := range targets {
-		suggestions, err := suggestGas(ctx, db, suggestOptions{
-			City:        target.City,
-			RangeKM:     settings.RangeKM,
-			Fuel:        settings.Fuel,
-			HistoryDays: settings.HistoryDays,
-			PredictDays: settings.PredictDays,
-			LimitPerDay: settings.LimitPerDay,
-			Now:         opts.Now,
-			Location:    opts.Location,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: suggest for %s failed: %v\n", target.City, err)
-			continue
-		}
-		var rows []notifyRow
-		for i := range suggestions {
-			if suggestions[i].Confidence == "medium" || suggestions[i].Confidence == "high" {
-				rows = append(rows, notifyRow{suggest: &suggestions[i]})
+func collectTargetSuggestions(ctx context.Context, db *sql.DB, settings appSettings, targets []updateTarget, opts notifyOptions) (map[string][]targetSuggestRows, error) {
+	byFuel := map[string][]targetSuggestRows{}
+	for _, fuel := range settings.Fuels() {
+		for _, target := range targets {
+			suggestions, err := suggestGas(ctx, db, suggestOptions{
+				City:        target.City,
+				RangeKM:     settings.RangeKM,
+				Fuel:        fuel,
+				HistoryDays: settings.HistoryDays,
+				PredictDays: settings.PredictDays,
+				LimitPerDay: settings.LimitPerDay,
+				Now:         opts.Now,
+				Location:    opts.Location,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: suggest for %s (%s) failed: %v\n", target.City, fuel, err)
+				continue
 			}
+			var rows []notifyRow
+			for i := range suggestions {
+				if suggestions[i].Confidence == "medium" || suggestions[i].Confidence == "high" {
+					rows = append(rows, notifyRow{suggest: &suggestions[i]})
+				}
+			}
+			if len(rows) == 0 {
+				continue
+			}
+			byFuel[fuel] = append(byFuel[fuel], targetSuggestRows{target: target, rows: rows})
 		}
-		if len(rows) == 0 {
-			continue
-		}
-		all = append(all, targetSuggestRows{target: target, rows: rows})
 	}
-	return all, nil
+	return byFuel, nil
 }
 
 // userSuggestRows flattens the shared target rows down to one user's city

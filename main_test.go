@@ -1772,6 +1772,9 @@ func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 	if !containsString(result.Applied, "stations.name_override") {
 		t.Fatalf("applied migrations = %v, want stations.name_override", result.Applied)
 	}
+	if !containsString(result.Applied, "users.notify_fuel") {
+		t.Fatalf("applied migrations = %v, want users.notify_fuel", result.Applied)
+	}
 
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -1803,6 +1806,14 @@ func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 	}
 	if !hasNameOverride {
 		t.Fatal("expected stations.name_override after migration")
+	}
+
+	hasNotifyFuel, err := tableHasColumn(ctx, db, dialectSQLite, "users", "notify_fuel")
+	if err != nil {
+		t.Fatalf("tableHasColumn users.notify_fuel: %v", err)
+	}
+	if !hasNotifyFuel {
+		t.Fatal("expected users.notify_fuel after migration")
 	}
 
 	var normalizedName string
@@ -2305,6 +2316,25 @@ func seedLegacyFixtureDB(t *testing.T) string {
 		e10 REAL,
 		diesel REAL,
 		FOREIGN KEY (station_id) REFERENCES stations(id)
+	);
+
+	CREATE TABLE users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		email TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL,
+		is_admin INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'pending',
+		created_at TEXT NOT NULL,
+		approved_at TEXT,
+		notify_method TEXT NOT NULL DEFAULT 'pushover',
+		pushover_app_name TEXT NOT NULL DEFAULT 'gasoline',
+		pushover_user_key TEXT NOT NULL DEFAULT '',
+		pushover_token TEXT NOT NULL DEFAULT '',
+		notify_days TEXT NOT NULL DEFAULT 'mon,tue,wed,thu,fri,sat,sun',
+		notify_windows TEXT NOT NULL DEFAULT '07:00-21:00',
+		notify_suggest_times TEXT NOT NULL DEFAULT '08:00,13:00',
+		notify_check_enabled INTEGER NOT NULL DEFAULT 0,
+		notify_last_suggest TEXT NOT NULL DEFAULT ''
 	);
 	`
 	if _, err := db.ExecContext(ctx, legacySchema); err != nil {
