@@ -213,7 +213,7 @@ The reported `history_percentile` is regime-relative for stations with enough hi
 3. **Persists** the new grid; newer runs supersede older ones for the same target hour, older rows remain as learning history.
 4. **Prunes** predictions older than 30 days.
 
-The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. A timer run without `--city` covers every configured update target in one invocation, so stations in all cities accrue evaluation data for the bias learning; per-city failures are reported on stderr and via the exit code. Nothing is shown in the web UI yet — the data accrues for analysis and for the bias learning.
+The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. A timer run without `--city` covers every configured update target in one invocation, so stations in all cities accrue evaluation data for the bias learning; per-city failures are reported on stderr and via the exit code. The accrued evaluation data also feeds the bias learning and is surfaced in the web UI on the admin **Prediction accuracy** page (hamburger menu → Prediction accuracy), which compares each past predicted price with the actual price recorded for that window — raw rows, accuracy statistics (MAE, bias, RMSE, share within ±1/±2 ct, per-confidence breakdown), and a predicted-vs-actual graph.
 
 ### Server-stored configuration (admin settings)
 
@@ -370,6 +370,7 @@ The hamburger menu in the header opens:
 - **Users** (admins) — approve pending registrations, promote/demote administrators (never yourself, so one admin always remains), and delete accounts.
 - **Stations** (admins) — set the same persistent display-name overrides as `gasoline rename`: search a station by name or address, enter a new name, and apply. All existing renames are listed with their original name and address, editable inline or removable to restore the Tankerkönig name.
 - **Settings** (admins) — manage the update targets (cities + radii updated automatically by the CLI), the suggestion/check parameters, the notification templates, and the schedule defaults. These are the values the CLI picks up as described in [Server-stored configuration](#server-stored-configuration-admin-settings); notification templates are admin-only and never editable by regular users.
+- **Prediction accuracy** (admins) — compare past predicted prices with the actual prices recorded for those windows, from the evaluated `price_predictions` data (see [Persistent predictions and learning](#persistent-predictions-and-learning-suggest---persist)). Filter by fuel, city, target date range, and confidence; view accuracy statistics (count, MAE, bias, RMSE, share within ±1/±2 ct, and a per-confidence breakdown), a predicted-vs-actual graph (timeline with an error band, or a predicted-vs-actual scatter), and the raw evaluated rows.
 
 The dashboard itself is unchanged — same filters, chart, and tables as before, now behind the login.
 
