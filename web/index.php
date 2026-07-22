@@ -1548,6 +1548,483 @@ function renderAdminStationsPage(PDO $pdo, array $user): never
     renderPageEnd();
 }
 
+function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): never
+{
+    // Cities that have prediction runs, for the optional city filter.
+    $cities = [];
+    try {
+        foreach ($pdo->query('SELECT DISTINCT city_name FROM prediction_runs ORDER BY city_name ASC')->fetchAll() as $row) {
+            $city = trim((string) $row['city_name']);
+            if ($city !== '') {
+                $cities[] = $city;
+            }
+        }
+    } catch (Throwable $e) {
+        // prediction_runs may be empty / freshly migrated — fall back to no cities.
+    }
+
+    // Default the fuel picker to whichever fuel has the most evaluated predictions,
+    // so the page lands on data instead of an empty set.
+    $defaultFuel = 'diesel';
+    try {
+        $fuelRow = $pdo->query(
+            "SELECT fuel FROM price_predictions WHERE actual_price IS NOT NULL GROUP BY fuel ORDER BY COUNT(*) DESC"
+        )->fetch();
+        if ($fuelRow !== false && in_array((string) $fuelRow['fuel'], ['diesel', 'e5', 'e10'], true)) {
+            $defaultFuel = (string) $fuelRow['fuel'];
+        }
+    } catch (Throwable $e) {
+        // Ignore — keep the diesel default.
+    }
+
+    $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10'];
+    $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10'];
+
+    renderPageStart('Prediction accuracy', $user, 'admin_predictions');
+    ?>
+    <style>
+        .pred-layout { max-width: 1180px; }
+        .pred-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0 1.1rem; }
+        .pred-filters .field { margin-bottom: 0.6rem; }
+        #pred-chart { width: 100%; display: block; height: auto; }
+        .pred-note { font-family: var(--mono); font-size: 0.76rem; color: var(--muted); margin-bottom: 0.85rem; }
+        .pred-err-good { color: var(--e10); }
+        .pred-err-bad  { color: var(--red); }
+        .pred-sugg { color: var(--amber); margin-left: 0.25rem; }
+        .pred-legend-line { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
+        .pred-legend-band { width: 16px; height: 10px; border-radius: 2px; display: inline-block; background: rgba(245,166,35,0.25); border: 1px solid rgba(245,166,35,0.45); }
+        .pred-legend-diag { width: 16px; height: 0; border-top: 2px dashed var(--muted); display: inline-block; }
+        .stat-value.pred-small { font-size: 1.15rem; }
+    </style>
+    <div class="settings-layout wide pred-layout">
+        <?php renderFlash(); ?>
+
+        <div class="settings-card">
+            <h2 data-i18n="predAccuracyTitle">Prediction accuracy</h2>
+            <p class="auth-note" data-i18n="predAccuracyHint">Compares each past prediction with the actual price recorded for that target window. Only evaluated predictions — whose target hour has passed and had a recorded price — are included.</p>
+            <div class="pred-filters">
+                <div class="field">
+                    <label for="pred-fuel" data-i18n="fuelType">Fuel type</label>
+                    <select id="pred-fuel">
+                        <?php foreach ($fuelLabels as $fuelValue => $fuelLabel) { ?>
+                        <option value="<?= h($fuelValue) ?>" data-i18n="<?= h($fuelI18n[$fuelValue]) ?>" <?= $defaultFuel === $fuelValue ? 'selected' : '' ?>><?= h($fuelLabel) ?></option>
+                        <?php } ?>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="pred-city" data-i18n="predCity">City</label>
+                    <select id="pred-city">
+                        <option value="" data-i18n="predAllCities">All cities</option>
+                        <?php foreach ($cities as $city) { ?>
+                        <option value="<?= h($city) ?>"><?= h($city) ?></option>
+                        <?php } ?>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="pred-range" data-i18n="predRange">Target range</label>
+                    <select id="pred-range">
+                        <option value="7d" data-i18n="range7d">7d</option>
+                        <option value="14d" selected data-i18n="range14d">14d</option>
+                        <option value="30d" data-i18n="range30d">30d</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="pred-conf" data-i18n="predConfidence">Confidence</label>
+                    <select id="pred-conf">
+                        <option value="all" data-i18n="predConfAll">All</option>
+                        <option value="medium_high" data-i18n="predConfMediumHigh">Medium + High</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="stats" aria-live="polite">
+            <div class="stat"><div class="stat-label" data-i18n="predStatCount">Evaluated</div><div class="stat-value skeleton" id="ps-count" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatStations">Stations</div><div class="stat-value skeleton" id="ps-stations" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatMae">MAE</div><div class="stat-value skeleton pred-small" id="ps-mae" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatBias">Bias (act − pred)</div><div class="stat-value skeleton pred-small" id="ps-bias" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatRmse">RMSE</div><div class="stat-value skeleton pred-small" id="ps-rmse" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatWithin1">Within ±1 ct</div><div class="stat-value skeleton pred-small" id="ps-within1" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatWithin2">Within ±2 ct</div><div class="stat-value skeleton pred-small" id="ps-within2" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatWorst">Worst error</div><div class="stat-value skeleton pred-small" id="ps-worst" aria-busy="true">&nbsp;</div></div>
+        </div>
+
+        <div class="chart-card">
+            <div class="chart-header">
+                <span class="chart-title" data-i18n="predChartTitle">Predicted vs. actual</span>
+                <div class="range-toggles" id="pred-view-toggles">
+                    <button type="button" class="range-toggle active" data-view="timeline" data-i18n="predViewTimeline">Timeline</button>
+                    <button type="button" class="range-toggle" data-view="scatter" data-i18n="predViewScatter">Scatter</button>
+                </div>
+            </div>
+            <div class="chart-body">
+                <div class="chart-loading" id="pred-chart-loading" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div>
+                <svg id="pred-chart" viewBox="0 0 960 380" role="img" hidden></svg>
+            </div>
+            <div class="chart-legend" id="pred-legend" hidden></div>
+            <div class="chart-empty" id="pred-chart-empty" data-i18n="predNoData" role="status" hidden>No evaluated predictions match the current filters.</div>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="predByConfidence">Accuracy by confidence</h2>
+            <div class="table-scroll">
+                <table class="stack-table">
+                    <thead><tr><th data-i18n="predColConf">Confidence</th><th data-i18n="predColCount">Count</th><th data-i18n="predStatMae">MAE</th><th data-i18n="predStatBias">Bias</th></tr></thead>
+                    <tbody id="pred-conf-tbody"><tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="predRawTitle">Raw data</h2>
+            <div class="pred-note" id="pred-truncated" data-i18n="predTruncated" hidden>Showing the most recent 1,000 rows; the statistics above cover the full filtered set.</div>
+            <div class="table-scroll">
+                <table class="stack-table">
+                    <thead>
+                        <tr>
+                            <th data-i18n="predColTarget">Target window</th>
+                            <th data-i18n="predColStation">Station</th>
+                            <th data-i18n="predColRunAt">Predicted at</th>
+                            <th data-i18n="predColLead">Lead time</th>
+                            <th data-i18n="predColConf">Confidence</th>
+                            <th data-i18n="predColPredicted">Predicted</th>
+                            <th data-i18n="predColActual">Actual</th>
+                            <th data-i18n="predColError">Error</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pred-tbody"><tr><td colspan="8" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                </table>
+            </div>
+            <div class="table-more" id="pred-more" hidden>
+                <button type="button" class="btn-reset" id="pred-more-btn"></button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    (function () {
+        const cfg = {
+            fuel:  document.getElementById('pred-fuel'),
+            city:  document.getElementById('pred-city'),
+            range: document.getElementById('pred-range'),
+            conf:  document.getElementById('pred-conf'),
+        };
+        const loadingEl  = document.getElementById('pred-chart-loading');
+        const chartEl    = document.getElementById('pred-chart');
+        const legendEl   = document.getElementById('pred-legend');
+        const emptyEl    = document.getElementById('pred-chart-empty');
+        const tbody      = document.getElementById('pred-tbody');
+        const confTbody  = document.getElementById('pred-conf-tbody');
+        const moreWrap   = document.getElementById('pred-more');
+        const moreBtn    = document.getElementById('pred-more-btn');
+        const truncEl    = document.getElementById('pred-truncated');
+        const viewTogl   = document.getElementById('pred-view-toggles');
+        const statIds    = ['ps-count','ps-stations','ps-mae','ps-bias','ps-rmse','ps-within1','ps-within2','ps-worst'];
+
+        const NS = 'http://www.w3.org/2000/svg';
+        const C_PRED = '#f5a623', C_ACTUAL = '#60a5fa', C_BAND = 'rgba(245,166,35,0.18)';
+
+        let data = null;
+        let view = 'timeline';
+        let rowsRendered = 0;
+        const PAGE = 100;
+
+        const T   = () => translations[currentLang];
+        const loc = () => currentLang === 'de' ? 'de-DE' : 'en-GB';
+        const tz  = () => currentLang === 'de' ? 'Europe/Berlin' : 'UTC';
+
+        function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+        function fmtEur(v) { return (v === null || v === undefined) ? '—' : Number(v).toFixed(3); }
+        function fmtCt(v) { return (v === null || v === undefined) ? '—' : (v * 100).toFixed(2) + ' ct'; }
+        function fmtSignedCt(v) { if (v === null || v === undefined) return '—'; const c = v * 100; return (c >= 0 ? '+' : '') + c.toFixed(2) + ' ct'; }
+        function fmtPct(v) { return (v === null || v === undefined) ? '—' : Number(v).toFixed(1) + '%'; }
+        function fmtInt(v) { return Number(v || 0).toLocaleString(loc()); }
+        function fmtDateTime(iso) { if (!iso) return '—'; return new Date(iso).toLocaleString(loc(), { timeZone: tz(), year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }); }
+        function fmtDate(iso) { return new Date(iso).toLocaleDateString(loc(), { timeZone: tz(), month: 'short', day: '2-digit' }); }
+        function fmtTime(iso) { return new Date(iso).toLocaleTimeString(loc(), { timeZone: tz(), hour: '2-digit', minute: '2-digit' }); }
+        function fmtWindow(s, e) { return fmtTime(s) + '–' + fmtTime(e); }
+        function fmtLead(min) { min = Number(min || 0); if (min < 60) return min + 'm'; const h = Math.floor(min / 60), m = min % 60; return m === 0 ? h + 'h' : h + 'h ' + m + 'm'; }
+        function confLabel(c) { return T()['predConf_' + c] || c; }
+
+        function setStat(id, val) { const el = document.getElementById(id); if (!el) return; el.textContent = val; el.classList.remove('skeleton'); el.removeAttribute('aria-busy'); }
+
+        function buildUrl() {
+            const u = new URL(location.origin + location.pathname);
+            u.searchParams.set('action', 'prediction_accuracy');
+            u.searchParams.set('fuel', cfg.fuel.value);
+            u.searchParams.set('city', cfg.city.value);
+            u.searchParams.set('range', cfg.range.value);
+            u.searchParams.set('confidence', cfg.conf.value);
+            return u.toString();
+        }
+
+        function resetLoading() {
+            if (loadingEl) loadingEl.hidden = false;
+            if (chartEl) chartEl.setAttribute('hidden', '');
+            if (legendEl) legendEl.hidden = true;
+            if (emptyEl) { emptyEl.hidden = true; emptyEl.dataset.i18n = 'predNoData'; }
+            statIds.forEach((id) => { const el = document.getElementById(id); if (el) { el.textContent = ' '; el.classList.add('skeleton'); el.setAttribute('aria-busy', 'true'); } });
+            if (tbody) tbody.innerHTML = '<tr><td colspan="8" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
+            if (confTbody) confTbody.innerHTML = '<tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
+            if (moreWrap) moreWrap.hidden = true;
+            if (truncEl) truncEl.hidden = true;
+        }
+
+        function showError(err) {
+            if (loadingEl) loadingEl.hidden = true;
+            const t = T();
+            const key = (err && err.key && t[err.key]) ? err.key : 'loadError';
+            const msg = (err && err.key && t[err.key]) ? t[err.key] : t.loadError;
+            if (emptyEl) { emptyEl.hidden = false; emptyEl.dataset.i18n = key; emptyEl.textContent = msg; }
+            if (chartEl) chartEl.setAttribute('hidden', '');
+            if (legendEl) legendEl.hidden = true;
+            statIds.forEach((id) => setStat(id, '—'));
+            if (tbody) tbody.innerHTML = '<tr><td colspan="8" role="alert" style="text-align:center;color:var(--red);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="' + key + '">' + esc(msg) + '</td></tr>';
+            if (confTbody) confTbody.innerHTML = '';
+            if (moreWrap) moreWrap.hidden = true;
+        }
+
+        async function load() {
+            resetLoading();
+            try {
+                const res = await fetch(buildUrl(), { headers: { Accept: 'application/json' } });
+                if (res.status === 401) { location.href = '?page=login'; return; }
+                if (res.status === 403) { location.href = '?'; return; }
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const payload = await res.json();
+                if (payload.errors && payload.errors.length) { showError(payload.errors[0]); return; }
+                data = payload;
+                render();
+            } catch (e) {
+                showError();
+            }
+        }
+
+        function render() {
+            if (!data) return;
+            renderStats();
+            renderConf();
+            renderChart();
+            renderTable();
+        }
+
+        function renderStats() {
+            if (loadingEl) loadingEl.hidden = true;
+            const s = data.summary;
+            if (!s) { statIds.forEach((id) => setStat(id, '—')); return; }
+            setStat('ps-count', fmtInt(s.count));
+            setStat('ps-stations', fmtInt(s.stations));
+            setStat('ps-mae', fmtCt(s.mae));
+            setStat('ps-bias', fmtSignedCt(s.bias));
+            setStat('ps-rmse', fmtCt(s.rmse));
+            setStat('ps-within1', fmtPct(s.within1_pct));
+            setStat('ps-within2', fmtPct(s.within2_pct));
+            setStat('ps-worst', fmtCt(Math.max(Math.abs(s.min_error || 0), Math.abs(s.max_error || 0))));
+        }
+
+        function renderConf() {
+            if (!confTbody) return;
+            const rank = { high: 0, medium: 1, low: 2 };
+            const rows = ((data && data.by_confidence) || []).slice().sort((a, b) => (rank[a.confidence] ?? 9) - (rank[b.confidence] ?? 9));
+            const t = T();
+            if (rows.length === 0) { confTbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:1rem;font-family:var(--mono);font-size:.8rem">' + esc(t.predNoData) + '</td></tr>'; return; }
+            confTbody.innerHTML = rows.map((r) =>
+                '<tr>'
+                + '<td data-label="' + esc(t.predColConf) + '">' + esc(confLabel(r.confidence)) + '</td>'
+                + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
+                + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
+                + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
+                + '</tr>'
+            ).join('');
+        }
+
+        function rowHtml(r) {
+            const meta = (data.stations || {})[r.s] || {};
+            const t = T();
+            const good = Math.abs(r.err * 100) <= 1.0;
+            const sugg = r.sugg ? ' <span class="pred-sugg" title="' + esc(t.predSuggestion) + '">★</span>' : '';
+            return '<tr>'
+                + '<td class="stack-primary" data-label="' + esc(t.predColTarget) + '">' + esc(fmtWindow(r.start, r.end)) + '<span class="station-sub">' + esc(fmtDate(r.start)) + '</span></td>'
+                + '<td data-label="' + esc(t.predColStation) + '">' + esc(meta.name || r.s) + sugg + '<span class="station-sub">' + esc(meta.address || '') + '</span></td>'
+                + '<td class="td-muted" data-label="' + esc(t.predColRunAt) + '">' + esc(fmtDateTime(r.run_at)) + '</td>'
+                + '<td class="td-muted" data-label="' + esc(t.predColLead) + '">' + esc(fmtLead(r.lead)) + '</td>'
+                + '<td data-label="' + esc(t.predColConf) + '">' + esc(confLabel(r.conf)) + '</td>'
+                + '<td data-label="' + esc(t.predColPredicted) + '">' + esc(fmtEur(r.p)) + '</td>'
+                + '<td data-label="' + esc(t.predColActual) + '">' + esc(fmtEur(r.a)) + '</td>'
+                + '<td class="' + (good ? 'pred-err-good' : 'pred-err-bad') + '" data-label="' + esc(t.predColError) + '">' + esc(fmtSignedCt(r.err)) + '</td>'
+                + '</tr>';
+        }
+
+        function renderMore() {
+            const rows = data.rows || [];
+            const slice = rows.slice(rowsRendered, rowsRendered + PAGE);
+            tbody.insertAdjacentHTML('beforeend', slice.map(rowHtml).join(''));
+            rowsRendered += slice.length;
+            const remaining = rows.length - rowsRendered;
+            if (remaining <= 0) { moreWrap.hidden = true; }
+            else { moreWrap.hidden = false; moreBtn.textContent = T().showMore + ' (' + remaining + ')'; }
+        }
+
+        function renderTable() {
+            rowsRendered = 0;
+            tbody.innerHTML = '';
+            const rows = data.rows || [];
+            if (truncEl) truncEl.hidden = !data.truncated;
+            if (rows.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem">' + esc(T().predNoData) + '</td></tr>';
+                moreWrap.hidden = true;
+                return;
+            }
+            renderMore();
+        }
+
+        const mk = (tag, attrs, parent) => {
+            const el = document.createElementNS(NS, tag);
+            for (const k in attrs) el.setAttribute(k, String(attrs[k]));
+            (parent || chartEl).appendChild(el);
+            return el;
+        };
+
+        function renderChart() {
+            chartEl.innerHTML = '';
+            legendEl.innerHTML = '';
+            const series = (data && data.series) || [];
+            if (series.length === 0) {
+                chartEl.setAttribute('hidden', '');
+                legendEl.hidden = true;
+                if (emptyEl) emptyEl.hidden = false;
+                return;
+            }
+            if (emptyEl) emptyEl.hidden = true;
+            chartEl.removeAttribute('hidden');
+
+            const light = document.documentElement.getAttribute('data-theme') === 'light';
+            const bg    = light ? '#ffffff' : '#13151a';
+            const grid  = light ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.05)';
+            const axis  = light ? 'rgba(0,0,0,0.15)' : 'rgba(255,255,255,0.12)';
+            const tick  = light ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.4)';
+            const label = '#6b7280';
+
+            const W = Math.max(280, Math.round(chartEl.getBoundingClientRect().width) || 960);
+            const compact = W < 560;
+            const H = compact ? 300 : 380;
+            const m = compact ? { top: 18, right: 14, bottom: 50, left: 54 } : { top: 24, right: 24, bottom: 62, left: 68 };
+            const iW = W - m.left - m.right;
+            const iH = H - m.top - m.bottom;
+            chartEl.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+            mk('rect', { x: 0, y: 0, width: W, height: H, fill: bg });
+
+            const font = "'DM Mono', monospace";
+            if (view === 'scatter') drawScatter(series, { W, H, m, iW, iH, grid, axis, tick, label, font });
+            else drawTimeline(series, { W, H, m, iW, iH, grid, axis, tick, label, font });
+            drawLegend();
+        }
+
+        function drawTimeline(series, c) {
+            const pts = series.map((d) => ({ x: Date.parse(d.t), p: d.p, a: d.a }));
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+            for (const q of pts) {
+                if (q.x < minX) minX = q.x;
+                if (q.x > maxX) maxX = q.x;
+                if (q.p < minY) minY = q.p; if (q.p > maxY) maxY = q.p;
+                if (q.a < minY) minY = q.a; if (q.a > maxY) maxY = q.a;
+            }
+            if (minX === maxX) maxX += 3600000;
+            const padY = Math.max((maxY - minY) * 0.15, 0.02);
+            minY -= padY; maxY += padY;
+            const px = (v) => c.m.left + ((v - minX) / (maxX - minX)) * c.iW;
+            const py = (v) => c.m.top + c.iH - ((v - minY) / (maxY - minY)) * c.iH;
+
+            for (let i = 0; i <= 5; i++) {
+                const val = minY + ((maxY - minY) / 5) * i;
+                const yp = py(val);
+                mk('line', { x1: c.m.left, y1: yp, x2: c.W - c.m.right, y2: yp, stroke: c.grid, 'stroke-width': 1 });
+                mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = val.toFixed(3);
+            }
+            const tickCount = Math.min(c.W < 560 ? 4 : 7, pts.length);
+            for (let i = 0; i < tickCount; i++) {
+                const idx = tickCount === 1 ? 0 : Math.round((pts.length - 1) * (i / (tickCount - 1)));
+                const xp = px(pts[idx].x);
+                const lx = Math.min(Math.max(xp, 22), c.W - 22);
+                const txt = mk('text', { x: lx, y: c.H - c.m.bottom + 14, 'text-anchor': 'middle', 'font-size': 10, 'font-family': c.font, fill: c.tick });
+                const l1 = document.createElementNS(NS, 'tspan'); l1.setAttribute('x', lx); l1.setAttribute('dy', '0'); l1.textContent = fmtDate(series[idx].t); txt.appendChild(l1);
+                const l2 = document.createElementNS(NS, 'tspan'); l2.setAttribute('x', lx); l2.setAttribute('dy', '14'); l2.textContent = fmtTime(series[idx].t); txt.appendChild(l2);
+            }
+            mk('line', { x1: c.m.left, y1: c.H - c.m.bottom, x2: c.W - c.m.right, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
+            mk('line', { x1: c.m.left, y1: c.m.top, x2: c.m.left, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
+
+            // Error band: the area between the predicted and actual lines.
+            const band = [];
+            for (let i = 0; i < pts.length; i++) band.push(px(pts[i].x).toFixed(1) + ',' + py(pts[i].p).toFixed(1));
+            for (let i = pts.length - 1; i >= 0; i--) band.push(px(pts[i].x).toFixed(1) + ',' + py(pts[i].a).toFixed(1));
+            mk('polygon', { points: band.join(' '), fill: C_BAND, stroke: 'none' });
+
+            mk('polyline', { points: pts.map((q) => px(q.x).toFixed(1) + ',' + py(q.p).toFixed(1)).join(' '), fill: 'none', stroke: C_PRED, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' });
+            mk('polyline', { points: pts.map((q) => px(q.x).toFixed(1) + ',' + py(q.a).toFixed(1)).join(' '), fill: 'none', stroke: C_ACTUAL, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' });
+        }
+
+        function drawScatter(series, c) {
+            const pts = series.map((d) => ({ p: d.p, a: d.a }));
+            let lo = Infinity, hi = -Infinity;
+            for (const q of pts) { if (q.p < lo) lo = q.p; if (q.p > hi) hi = q.p; if (q.a < lo) lo = q.a; if (q.a > hi) hi = q.a; }
+            const pad = Math.max((hi - lo) * 0.08, 0.02);
+            lo -= pad; hi += pad;
+            if (lo === hi) hi += 0.01;
+            const px = (v) => c.m.left + ((v - lo) / (hi - lo)) * c.iW;
+            const py = (v) => c.m.top + c.iH - ((v - lo) / (hi - lo)) * c.iH;
+
+            for (let i = 0; i <= 5; i++) {
+                const val = lo + ((hi - lo) / 5) * i;
+                const yp = py(val), xp = px(val);
+                mk('line', { x1: c.m.left, y1: yp, x2: c.W - c.m.right, y2: yp, stroke: c.grid, 'stroke-width': 1 });
+                mk('line', { x1: xp, y1: c.m.top, x2: xp, y2: c.H - c.m.bottom, stroke: c.grid, 'stroke-width': 1 });
+                mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = val.toFixed(2);
+                mk('text', { x: xp, y: c.H - c.m.bottom + 14, 'text-anchor': 'middle', 'font-size': 10, 'font-family': c.font, fill: c.tick }).textContent = val.toFixed(2);
+            }
+            mk('line', { x1: c.m.left, y1: c.H - c.m.bottom, x2: c.W - c.m.right, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
+            mk('line', { x1: c.m.left, y1: c.m.top, x2: c.m.left, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
+            // Perfect-accuracy diagonal (y = x).
+            mk('line', { x1: px(lo), y1: py(lo), x2: px(hi), y2: py(hi), stroke: c.axis, 'stroke-width': 1.5, 'stroke-dasharray': '5 4' });
+            for (const q of pts) mk('circle', { cx: px(q.p).toFixed(1), cy: py(q.a).toFixed(1), r: 3, fill: C_PRED, 'fill-opacity': 0.55, stroke: C_ACTUAL, 'stroke-width': 0.5, 'stroke-opacity': 0.4 });
+            mk('text', { x: c.m.left + c.iW / 2, y: c.H - 6, 'text-anchor': 'middle', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = T().predAxisPredicted;
+            const yc = c.m.top + c.iH / 2;
+            mk('text', { x: 14, y: yc, 'text-anchor': 'middle', 'font-size': 11, 'font-family': c.font, fill: c.label, transform: 'rotate(-90 14 ' + yc + ')' }).textContent = T().predAxisActual;
+        }
+
+        function drawLegend() {
+            legendEl.hidden = false;
+            legendEl.innerHTML = '';
+            const t = T();
+            const add = (swatch, text) => { const it = document.createElement('div'); it.className = 'legend-item'; it.innerHTML = swatch + '<span>' + esc(text) + '</span>'; legendEl.appendChild(it); };
+            if (view === 'scatter') {
+                add('<span class="legend-dot" style="background:' + C_PRED + '"></span>', t.predLegendPoint);
+                add('<span class="pred-legend-diag"></span>', t.predLegendDiagonal);
+            } else {
+                add('<span class="pred-legend-line" style="background:' + C_PRED + '"></span>', t.predLegendPredicted);
+                add('<span class="pred-legend-line" style="background:' + C_ACTUAL + '"></span>', t.predLegendActual);
+                add('<span class="pred-legend-band"></span>', t.predLegendBand);
+            }
+        }
+
+        [cfg.fuel, cfg.city, cfg.range, cfg.conf].forEach((el) => { if (el) el.addEventListener('change', load); });
+        if (moreBtn) moreBtn.addEventListener('click', renderMore);
+        if (viewTogl) viewTogl.querySelectorAll('[data-view]').forEach((btn) => btn.addEventListener('click', () => {
+            view = btn.dataset.view;
+            viewTogl.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('active', b === btn));
+            if (data) renderChart();
+        }));
+
+        window.onLangChange = () => { if (data) { renderStats(); renderConf(); renderChart(); renderTable(); } };
+        window.onThemeChange = () => { if (data) renderChart(); };
+
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', load);
+        else load();
+    })();
+    </script>
+    <?php
+    renderPageEnd();
+}
+
 function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
 {
     $settings = settingsAll($pdo);
@@ -1683,7 +2160,7 @@ gasolineStartSession();
 
 $requestedAction = (string) ($_GET['action'] ?? '');
 $requestedPage = (string) ($_GET['page'] ?? '');
-$isJSONRequest = in_array($requestedAction, ['city_search', 'station_search', 'data'], true);
+$isJSONRequest = in_array($requestedAction, ['city_search', 'station_search', 'data', 'prediction_accuracy'], true);
 
 $authPdo = null;
 $schemaGuardReason = null;
@@ -1758,6 +2235,12 @@ switch ($requestedPage) {
             redirectTo('');
         }
         renderAdminSettingsPage($authPdo, $dbDriver, $currentUser);
+        // no break
+    case 'admin_predictions':
+        if ((int) $currentUser['is_admin'] !== 1) {
+            redirectTo('');
+        }
+        renderAdminPredictionsPage($authPdo, $dbDriver, $currentUser);
         // no break
 }
 
@@ -1961,6 +2444,208 @@ if (isset($_GET['action']) && $_GET['action'] === 'station_search') {
     } catch (Throwable $e) {
         error_log('gasoline station_search error: ' . $e->getMessage());
         echo '[]';
+    }
+    exit;
+}
+
+// ── AJAX: prediction accuracy (predicted vs. actual) ──────────────────────────
+// Admin-only. Surfaces the evaluated prediction grid — `actual_price`/`error` are
+// filled in by the Go `suggest --persist` evaluation step (predictions.go), where
+// error = actual_price − predicted_price. All heavy aggregation stays in SQL so the
+// payload is bounded no matter how large the evaluated grid grows; only a capped
+// sample of raw rows is shipped for the table.
+if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
+    header('Content-Type: application/json; charset=utf-8');
+    $jsonFlags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR;
+    if ((int) $currentUser['is_admin'] !== 1) {
+        http_response_code(403);
+        echo json_encode(['errors' => [['key' => 'notFound', 'params' => [], 'message' => 'Administrator access required.']]], $jsonFlags);
+        exit;
+    }
+
+    $rawTableLimit = 1000;
+
+    // Filters ------------------------------------------------------------------
+    $paFuel = trim((string) ($_GET['fuel'] ?? 'diesel'));
+    if (!in_array($paFuel, ['diesel', 'e5', 'e10'], true)) {
+        $paFuel = 'diesel';
+    }
+    $paCity = trim((string) ($_GET['city'] ?? ''));
+    $paConfidence = trim((string) ($_GET['confidence'] ?? 'all')); // 'all' | 'medium_high'
+
+    // Date range on the target hour. Default: last 14 days. target_start is an
+    // RFC3339 UTC string, so lexicographic comparison against 'Y-m-dTHH:MM:SSZ' is
+    // a correct chronological comparison.
+    $paRange = trim((string) ($_GET['range'] ?? ''));
+    $rangeDaysMap = ['7d' => 7, '14d' => 14, '30d' => 30];
+    $fromRaw = trim((string) ($_GET['from'] ?? ''));
+    $toRaw = trim((string) ($_GET['to'] ?? ''));
+    $utc = new DateTimeZone('UTC');
+    if (isset($rangeDaysMap[$paRange]) || ($fromRaw === '' && $toRaw === '')) {
+        $days = $rangeDaysMap[$paRange] ?? 14;
+        $fromTs = (new DateTimeImmutable('now', $utc))->modify('-' . $days . ' days')->format('Y-m-d\T00:00:00\Z');
+        $toTs = (new DateTimeImmutable('now', $utc))->format('Y-m-d\T23:59:59\Z');
+    } else {
+        $fromTs = preg_match('/^\d{4}-\d{2}-\d{2}$/', $fromRaw) ? $fromRaw . 'T00:00:00Z' : '0000-01-01T00:00:00Z';
+        $toTs = preg_match('/^\d{4}-\d{2}-\d{2}$/', $toRaw) ? $toRaw . 'T23:59:59Z' : '9999-12-31T23:59:59Z';
+    }
+
+    $out = [
+        'summary' => null,
+        'by_confidence' => [],
+        'series' => [],
+        'rows' => [],
+        'stations' => [],
+        'filters' => ['fuel' => $paFuel, 'city' => $paCity, 'confidence' => $paConfidence, 'from' => $fromTs, 'to' => $toTs],
+        'truncated' => false,
+        'errors' => [],
+    ];
+
+    try {
+        $pdo = $authPdo;
+        // Shared WHERE + params reused across the aggregate, breakdown, series and
+        // raw-row queries so every panel reflects exactly the same filtered set.
+        $joinRuns = $paCity !== '' ? 'JOIN prediction_runs pr ON pr.id = pp.run_id ' : '';
+        $where = 'pp.actual_price IS NOT NULL AND pp.fuel = :fuel AND pp.target_start >= :from AND pp.target_start <= :to';
+        $params = [':fuel' => $paFuel, ':from' => $fromTs, ':to' => $toTs];
+        if ($paCity !== '') {
+            $where .= ' AND pr.city_name = :city';
+            $params[':city'] = $paCity;
+        }
+        if ($paConfidence === 'medium_high') {
+            $where .= " AND pp.confidence IN ('medium', 'high')";
+        }
+        $bind = static function (PDOStatement $stmt) use ($params): void {
+            foreach ($params as $k => $v) {
+                $stmt->bindValue($k, $v);
+            }
+        };
+
+        // 1) Overall accuracy stats — SQL aggregates, exact over the full set.
+        $aggStmt = $pdo->prepare(
+            'SELECT COUNT(*) AS n, COUNT(DISTINCT pp.station_id) AS stations, '
+            . 'MIN(pp.target_start) AS first_t, MAX(pp.target_start) AS last_t, '
+            . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, AVG(pp.error * pp.error) AS mse, '
+            . 'MIN(pp.error) AS min_err, MAX(pp.error) AS max_err, '
+            . 'SUM(CASE WHEN ABS(pp.error) <= 0.01 THEN 1 ELSE 0 END) AS within1, '
+            . 'SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 '
+            . 'FROM price_predictions pp ' . $joinRuns
+            . 'WHERE ' . $where
+        );
+        $bind($aggStmt);
+        $aggStmt->execute();
+        $agg = $aggStmt->fetch() ?: [];
+        $count = (int) ($agg['n'] ?? 0);
+
+        if ($count === 0) {
+            echo json_encode($out, $jsonFlags);
+            exit;
+        }
+
+        $mse = (float) ($agg['mse'] ?? 0);
+        $out['summary'] = [
+            'count' => $count,
+            'stations' => (int) ($agg['stations'] ?? 0),
+            'first' => $agg['first_t'] ?? null,
+            'last' => $agg['last_t'] ?? null,
+            'mae' => (float) ($agg['mae'] ?? 0),
+            'bias' => (float) ($agg['bias'] ?? 0),
+            'rmse' => sqrt(max(0.0, $mse)),
+            'min_error' => (float) ($agg['min_err'] ?? 0),
+            'max_error' => (float) ($agg['max_err'] ?? 0),
+            'within1' => (int) ($agg['within1'] ?? 0),
+            'within2' => (int) ($agg['within2'] ?? 0),
+            'within1_pct' => (float) ($agg['within1'] ?? 0) / $count * 100,
+            'within2_pct' => (float) ($agg['within2'] ?? 0) / $count * 100,
+        ];
+
+        // 2) Per-confidence breakdown.
+        $confStmt = $pdo->prepare(
+            'SELECT pp.confidence AS confidence, COUNT(*) AS n, '
+            . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias '
+            . 'FROM price_predictions pp ' . $joinRuns
+            . 'WHERE ' . $where . ' GROUP BY pp.confidence'
+        );
+        $bind($confStmt);
+        $confStmt->execute();
+        foreach ($confStmt->fetchAll() as $row) {
+            $out['by_confidence'][] = [
+                'confidence' => (string) $row['confidence'],
+                'count' => (int) $row['n'],
+                'mae' => (float) $row['mae'],
+                'bias' => (float) $row['bias'],
+            ];
+        }
+
+        // 3) Time series aggregated per target hour. Target windows are hourly, so
+        //    GROUP BY target_start is one point per hour — bounded to the range
+        //    (<= 24*days). Each point carries mean predicted vs mean actual.
+        $seriesStmt = $pdo->prepare(
+            'SELECT pp.target_start AS t, AVG(pp.predicted_price) AS p, AVG(pp.actual_price) AS a, COUNT(*) AS n '
+            . 'FROM price_predictions pp ' . $joinRuns
+            . 'WHERE ' . $where . ' GROUP BY pp.target_start ORDER BY pp.target_start ASC'
+        );
+        $bind($seriesStmt);
+        $seriesStmt->execute();
+        foreach ($seriesStmt->fetchAll() as $row) {
+            $out['series'][] = [
+                't' => (string) $row['t'],
+                'p' => round((float) $row['p'], 4),
+                'a' => round((float) $row['a'], 4),
+                'n' => (int) $row['n'],
+            ];
+        }
+
+        // 4) Raw rows for the table — newest target first, capped. Station metadata
+        //    is sent once keyed by id (mirrors the ?action=data slim-row shape).
+        $rowsStmt = $pdo->prepare(
+            'SELECT pp.station_id, pp.fuel, pr.run_at, pp.target_start, pp.target_end, '
+            . 'pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion, '
+            . 'COALESCE(s.name_override, s.name) AS name, s.brand, s.street, s.house_number, s.post_code, s.place '
+            . 'FROM price_predictions pp '
+            . 'JOIN prediction_runs pr ON pr.id = pp.run_id '
+            . 'JOIN stations s ON s.id = pp.station_id '
+            . 'WHERE ' . $where
+            . ' ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT ' . ($rawTableLimit + 1)
+        );
+        $bind($rowsStmt);
+        $rowsStmt->execute();
+        $rawRows = $rowsStmt->fetchAll();
+        if (count($rawRows) > $rawTableLimit) {
+            $out['truncated'] = true;
+            $rawRows = array_slice($rawRows, 0, $rawTableLimit);
+        }
+        $meta = [];
+        foreach ($rawRows as $row) {
+            $sid = (string) $row['station_id'];
+            if (!isset($meta[$sid])) {
+                $meta[$sid] = [
+                    'name' => (string) $row['name'],
+                    'brand' => trim((string) ($row['brand'] ?? '')),
+                    'address' => stationAddress($row),
+                ];
+            }
+            $out['rows'][] = [
+                's' => $sid,
+                'fuel' => (string) $row['fuel'],
+                'run_at' => (string) $row['run_at'],
+                'start' => (string) $row['target_start'],
+                'end' => (string) $row['target_end'],
+                'p' => (float) $row['predicted_price'],
+                'a' => (float) $row['actual_price'],
+                'err' => (float) $row['error'],
+                'conf' => (string) $row['confidence'],
+                'lead' => (int) $row['lead_minutes'],
+                'sugg' => (int) $row['is_suggestion'] === 1,
+            ];
+        }
+        $out['stations'] = $meta;
+
+        echo json_encode($out, $jsonFlags);
+    } catch (Throwable $e) {
+        error_log('gasoline prediction_accuracy error: ' . $e->getMessage());
+        http_response_code(500);
+        echo json_encode(['errors' => [['key' => 'loadError', 'params' => [], 'message' => 'Could not load prediction data.']]], $jsonFlags);
     }
     exit;
 }
@@ -4104,6 +4789,7 @@ function renderHeader(?array $user, string $activePage): void
                 <a class="menu-item<?= $activePage === 'admin_users' ? ' active' : '' ?>" href="?page=admin_users" data-i18n="menuUsers">Users</a>
                 <a class="menu-item<?= $activePage === 'admin_stations' ? ' active' : '' ?>" href="?page=admin_stations" data-i18n="menuStations">Stations</a>
                 <a class="menu-item<?= $activePage === 'admin_settings' ? ' active' : '' ?>" href="?page=admin_settings" data-i18n="menuSettings">Settings</a>
+                <a class="menu-item<?= $activePage === 'admin_predictions' ? ' active' : '' ?>" href="?page=admin_predictions" data-i18n="menuPredictions">Prediction accuracy</a>
                 <?php } ?>
                 <div class="menu-sep"></div>
                 <form method="post" action="" class="menu-logout"><?= csrfField() ?><input type="hidden" name="action" value="logout"><button type="submit" class="menu-item" data-i18n="menuLogout">Sign out</button></form>
@@ -4327,6 +5013,50 @@ const translations = {
         schemaOutdatedTitle: 'Database not ready',
         schemaOutdatedBody: 'The database schema is missing the required tables. Run the following command on the server, then reload this page:',
         schemaDbNotFound: 'The database was not found.',
+        menuPredictions: 'Prediction accuracy',
+        predAccuracyTitle: 'Prediction accuracy',
+        predAccuracyHint: 'Compares each past prediction with the actual price recorded for that target window. Only evaluated predictions — whose target hour has passed and had a recorded price — are included. Errors are shown in cents (ct); bias is the mean signed error (actual − predicted), so a positive bias means predictions ran low.',
+        predCity: 'City',
+        predAllCities: 'All cities',
+        predRange: 'Target range',
+        predConfidence: 'Confidence',
+        predConfAll: 'All',
+        predConfMediumHigh: 'Medium + High',
+        predChartTitle: 'Predicted vs. actual',
+        predViewTimeline: 'Timeline',
+        predViewScatter: 'Scatter',
+        predNoData: 'No evaluated predictions match the current filters.',
+        predByConfidence: 'Accuracy by confidence',
+        predRawTitle: 'Raw data',
+        predTruncated: 'Showing the most recent 1,000 rows; the statistics above cover the full filtered set.',
+        predColTarget: 'Target window',
+        predColStation: 'Station',
+        predColRunAt: 'Predicted at',
+        predColLead: 'Lead time',
+        predColConf: 'Confidence',
+        predColCount: 'Count',
+        predColPredicted: 'Predicted',
+        predColActual: 'Actual',
+        predColError: 'Error',
+        predStatCount: 'Evaluated',
+        predStatStations: 'Stations',
+        predStatMae: 'MAE',
+        predStatBias: 'Bias (act − pred)',
+        predStatRmse: 'RMSE',
+        predStatWithin1: 'Within ±1 ct',
+        predStatWithin2: 'Within ±2 ct',
+        predStatWorst: 'Worst error',
+        predConf_low: 'Low',
+        predConf_medium: 'Medium',
+        predConf_high: 'High',
+        predLegendPredicted: 'Predicted',
+        predLegendActual: 'Actual',
+        predLegendBand: 'Error',
+        predLegendPoint: 'Target hour',
+        predLegendDiagonal: 'Perfect accuracy',
+        predAxisPredicted: 'Predicted (€)',
+        predAxisActual: 'Actual (€)',
+        predSuggestion: 'This prediction was surfaced as a suggestion',
     },
     de: {
         title: 'Preisverlauf',
@@ -4530,6 +5260,50 @@ const translations = {
         schemaOutdatedTitle: 'Datenbank nicht bereit',
         schemaOutdatedBody: 'Im Datenbankschema fehlen die benötigten Tabellen. Führe folgenden Befehl auf dem Server aus und lade die Seite neu:',
         schemaDbNotFound: 'Die Datenbank wurde nicht gefunden.',
+        menuPredictions: 'Vorhersagegenauigkeit',
+        predAccuracyTitle: 'Vorhersagegenauigkeit',
+        predAccuracyHint: 'Vergleicht jede vergangene Vorhersage mit dem tatsächlich aufgezeichneten Preis im jeweiligen Zielfenster. Nur ausgewertete Vorhersagen — deren Zielstunde vorbei ist und für die ein Preis vorlag — werden berücksichtigt. Fehler werden in Cent (ct) angezeigt; der Bias ist der mittlere vorzeichenbehaftete Fehler (Ist − Vorhersage), ein positiver Bias bedeutet also zu niedrige Vorhersagen.',
+        predCity: 'Stadt',
+        predAllCities: 'Alle Städte',
+        predRange: 'Zeitraum (Ziel)',
+        predConfidence: 'Konfidenz',
+        predConfAll: 'Alle',
+        predConfMediumHigh: 'Mittel + Hoch',
+        predChartTitle: 'Vorhersage vs. Ist',
+        predViewTimeline: 'Zeitverlauf',
+        predViewScatter: 'Streudiagramm',
+        predNoData: 'Keine ausgewerteten Vorhersagen für die aktuellen Filter.',
+        predByConfidence: 'Genauigkeit nach Konfidenz',
+        predRawTitle: 'Rohdaten',
+        predTruncated: 'Es werden die neuesten 1.000 Zeilen angezeigt; die Statistiken oben umfassen den vollständigen gefilterten Datensatz.',
+        predColTarget: 'Zielfenster',
+        predColStation: 'Tankstelle',
+        predColRunAt: 'Vorhergesagt am',
+        predColLead: 'Vorlaufzeit',
+        predColConf: 'Konfidenz',
+        predColCount: 'Anzahl',
+        predColPredicted: 'Vorhergesagt',
+        predColActual: 'Tatsächlich',
+        predColError: 'Fehler',
+        predStatCount: 'Ausgewertet',
+        predStatStations: 'Tankstellen',
+        predStatMae: 'MAE',
+        predStatBias: 'Bias (Ist − Vorh.)',
+        predStatRmse: 'RMSE',
+        predStatWithin1: 'Innerh. ±1 ct',
+        predStatWithin2: 'Innerh. ±2 ct',
+        predStatWorst: 'Größter Fehler',
+        predConf_low: 'Niedrig',
+        predConf_medium: 'Mittel',
+        predConf_high: 'Hoch',
+        predLegendPredicted: 'Vorhergesagt',
+        predLegendActual: 'Tatsächlich',
+        predLegendBand: 'Fehler',
+        predLegendPoint: 'Zielstunde',
+        predLegendDiagonal: 'Perfekte Genauigkeit',
+        predAxisPredicted: 'Vorhergesagt (€)',
+        predAxisActual: 'Tatsächlich (€)',
+        predSuggestion: 'Diese Vorhersage wurde als Empfehlung angezeigt',
     },
 };
 
