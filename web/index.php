@@ -1591,19 +1591,19 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
             <form method="post" action="">
                 <?= csrfField() ?>
                 <input type="hidden" name="action" value="save_settings">
-                <div class="field-grid">
-                    <div class="field">
-                        <label data-i18n="settingFuel">Fuel</label>
-                        <div class="day-toggles">
-                            <?php $enabledFuelSet = array_flip(enabledFuels($fuel)); ?>
-                            <?php $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10']; ?>
-                            <?php $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10']; ?>
-                            <?php foreach (GASOLINE_FUELS as $f) { ?>
-                            <label class="day-toggle"><input type="checkbox" name="fuel[]" value="<?= h($f) ?>" <?= isset($enabledFuelSet[$f]) ? 'checked' : '' ?>><span data-i18n="<?= h($fuelI18n[$f]) ?>"><?= h($fuelLabels[$f]) ?></span></label>
-                            <?php } ?>
-                        </div>
-                        <p class="field-hint" data-i18n="settingFuelHint">Suggestions and checks are computed for every enabled fuel. Each user picks one of these to be notified about.</p>
+                <div class="field">
+                    <label data-i18n="settingFuel">Fuel</label>
+                    <div class="day-toggles">
+                        <?php $enabledFuelSet = array_flip(enabledFuels($fuel)); ?>
+                        <?php $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10']; ?>
+                        <?php $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10']; ?>
+                        <?php foreach (GASOLINE_FUELS as $f) { ?>
+                        <label class="day-toggle"><input type="checkbox" name="fuel[]" value="<?= h($f) ?>" <?= isset($enabledFuelSet[$f]) ? 'checked' : '' ?>><span data-i18n="<?= h($fuelI18n[$f]) ?>"><?= h($fuelLabels[$f]) ?></span></label>
+                        <?php } ?>
                     </div>
+                    <p class="field-hint" data-i18n="settingFuelHint">Suggestions and checks are computed for every enabled fuel. Each user picks one of these to be notified about.</p>
+                </div>
+                <div class="field-grid">
                     <div class="field">
                         <label for="st-range" data-i18n="settingRangeKm">Range (km)</label>
                         <input type="number" id="st-range" name="range_km" min="1" max="100" step="0.5" value="<?= h($get('range_km', '5')) ?>">
@@ -3155,7 +3155,7 @@ function renderDocumentHead(string $titleSuffix): void
         }
 
         /* Runners-up (ranks 2-5) inside the top-5 cheapest card */
-        .top5-list {
+        .rank-list {
             margin-top: 0.8rem;
             padding-top: 0.7rem;
             border-top: 1px solid var(--border);
@@ -3163,7 +3163,7 @@ function renderDocumentHead(string $titleSuffix): void
             gap: 0.45rem;
         }
 
-        .top5-row {
+        .rank-row {
             display: flex;
             align-items: baseline;
             gap: 0.5rem;
@@ -3172,19 +3172,12 @@ function renderDocumentHead(string $titleSuffix): void
             min-width: 0;
         }
 
-        .top5-rank {
-            color: var(--muted);
-            font-size: 0.68rem;
-            width: 1ch;
-            flex-shrink: 0;
-        }
-
-        .top5-price {
+        .rank-price {
             font-weight: 500;
             flex-shrink: 0;
         }
 
-        .top5-station {
+        .rank-station {
             flex: 1;
             min-width: 0;
             color: var(--ink);
@@ -3194,7 +3187,7 @@ function renderDocumentHead(string $titleSuffix): void
         }
 
         /* ── Predictions card ──────────────────────────────────── */
-        /* Reuses the .cheapest-* / .top5-* structure; these add the per-day
+        /* Reuses the .cheapest-* / .rank-* structure; these add the per-day
            header, the window time column, and the "as of" run note. */
         .pred-day {
             margin-top: 1rem;
@@ -4059,6 +4052,7 @@ function renderDocumentHead(string $titleSuffix): void
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
             gap: 0.4rem 1rem;
+            align-items: start;
         }
         html[data-theme="light"] .menu-panel { box-shadow: 0 14px 36px rgba(0, 0, 0, 0.15); }
         @media (max-width: 560px) {
@@ -5582,7 +5576,7 @@ function renderCheapest() {
     for (const fuel of fuels) {
         const top = rows.filter((r) => r[fuel] !== null)
             .sort((a, b) => a[fuel] - b[fuel])
-            .slice(0, 5);
+            .slice(0, 6);
         if (top.length) results.push({ fuel, top });
     }
 
@@ -5603,11 +5597,10 @@ function renderCheapest() {
                     const addressParts = [best.street, best.place].filter(Boolean);
                     const bestDist = stationDistancesById[best.station_id] ?? null;
                     if (bestDist !== null) addressParts.push(`${bestDist.toFixed(1)} km`);
-                    const runnersUp = top.slice(1).map((row, i) =>
-                        `<div class="top5-row" title="${h(formatDateTime(row.recorded_at))}">` +
-                            `<span class="top5-rank">${i + 2}</span>` +
-                            `<span class="top5-price" style="color:${fuelColors[fuel]}">${row[fuel].toFixed(3)}</span>` +
-                            `<span class="top5-station"><span class="legend-dot" style="background:${stationFuelColor(row.station_name, fuel)};display:inline-block;margin-right:0.4rem"></span>${h(row.station_name + distSuffix(row))}</span>` +
+                    const runnersUp = top.slice(1).map((row) =>
+                        `<div class="rank-row" title="${h(formatDateTime(row.recorded_at))}">` +
+                            `<span class="rank-price" style="color:${fuelColors[fuel]}">${row[fuel].toFixed(3)}</span>` +
+                            `<span class="rank-station"><span class="legend-dot" style="background:${stationFuelColor(row.station_name, fuel)};display:inline-block;margin-right:0.4rem"></span>${h(row.station_name + distSuffix(row))}</span>` +
                         `</div>`
                     ).join('');
                     return `<div class="cheapest-cell">` +
@@ -5616,7 +5609,7 @@ function renderCheapest() {
                         `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(best.station_name, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(best.station_name)}</div>` +
                         (addressParts.length ? `<div class="cheapest-station" style="opacity:0.6">${h(addressParts.join(', '))}</div>` : '') +
                         `<div class="cheapest-time">${h(formatDateTime(best.recorded_at))}</div>` +
-                        (runnersUp ? `<div class="top5-list">${runnersUp}</div>` : '') +
+                        (runnersUp ? `<div class="rank-list">${runnersUp}</div>` : '') +
                     `</div>`;
                 }).join('') +
               `</div>`
@@ -5650,6 +5643,15 @@ function renderPredictions() {
     const distSuffix = (id) => {
         const dist = stationDistancesById[id] ?? null;
         return dist !== null ? ` (${dist.toFixed(1)} km)` : '';
+    };
+    // Address line for the top station, mirroring the top-5 card: street, place,
+    // then distance. Distance moves out of the name and into this line.
+    const addressById = (id) => {
+        const meta = predictionStationMeta[id] || {};
+        const parts = [meta.street, meta.place].filter(Boolean);
+        const dist = stationDistancesById[id] ?? null;
+        if (dist !== null) parts.push(`${dist.toFixed(1)} km`);
+        return parts.join(', ');
     };
     // Day bucket key + header in the displayed timezone/locale so grouping
     // matches the visible date (recomputed on language change).
@@ -5689,20 +5691,22 @@ function renderPredictions() {
                         dayWindows.sort((a, b) => (a.price - b.price) || a.start.localeCompare(b.start));
                         dayWindows = dayWindows.slice(0, 5); // cap: cheapest 5 per day
                         const best = dayWindows[0];
-                        const bestName = nameById(best.s) + distSuffix(best.s);
+                        const bestName = nameById(best.s);
+                        const bestAddr = addressById(best.s);
                         const runners = dayWindows.slice(1).map((p) => {
                             const name = nameById(p.s) + distSuffix(p.s);
-                            return `<div class="top5-row">` +
-                                `<span class="top5-price" style="color:${fuelColors[fuel]}">${p.price.toFixed(3)}</span>` +
-                                `<span class="top5-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(p.s), fuel)};display:inline-block;margin-right:0.4rem"></span>${h(name)}</span>` +
+                            return `<div class="rank-row">` +
+                                `<span class="rank-price" style="color:${fuelColors[fuel]}">${p.price.toFixed(3)}</span>` +
+                                `<span class="rank-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(p.s), fuel)};display:inline-block;margin-right:0.4rem"></span>${h(name)}</span>` +
                                 `<span class="pred-time">${h(windowLabel(p))}</span>` +
                             `</div>`;
                         }).join('');
                         return `<div class="pred-day">${h(dayLabel(best.start))}</div>` +
                             `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${best.price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                            `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(best.s), fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(bestName)}</div>` +
                             `<div class="cheapest-time">${h(windowLabel(best))}</div>` +
-                            (runners ? `<div class="top5-list">${runners}</div>` : '');
+                            `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(best.s), fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(bestName)}</div>` +
+                            (bestAddr ? `<div class="cheapest-station" style="opacity:0.6">${h(bestAddr)}</div>` : '') +
+                            (runners ? `<div class="rank-list">${runners}</div>` : '');
                     }).join('');
 
                     return `<div class="cheapest-cell">` +
