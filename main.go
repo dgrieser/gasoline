@@ -2883,6 +2883,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migrateUsersNotifyFuel(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateUsersNotifySuggestEnabled(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migrateSeedDefaultSettings(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -2929,6 +2932,31 @@ func migrateUsersNotifyFuel(ctx context.Context, tx *sql.Tx, d dialect, result *
 		return err
 	}
 	result.Applied = append(result.Applied, "users.notify_fuel")
+	return nil
+}
+
+// migrateUsersNotifySuggestEnabled adds the per-user notify_suggest_enabled
+// column to pre-existing installs. It defaults to 1 so users who received
+// suggestions before the per-user toggle existed keep receiving them; new
+// databases already get the column from schemaStatements.
+func migrateUsersNotifySuggestEnabled(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "users", "notify_suggest_enabled")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	colType := "INTEGER"
+	if d == dialectMySQL {
+		colType = "TINYINT"
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+		`ALTER TABLE users ADD COLUMN notify_suggest_enabled %s NOT NULL DEFAULT 1`, colType,
+	)); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "users.notify_suggest_enabled")
 	return nil
 }
 
