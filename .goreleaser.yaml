@@ -27,23 +27,21 @@ builds:
     goos:
       - linux
       - darwin
-      - windows
     goarch:
       - amd64
       - arm64
-      - "386"
       - arm
     goarm:
-      - "6"
       - "7"
     ignore:
-      # No 32-bit arm/386 on darwin or windows.
-      - goos: darwin
-        goarch: "386"
       - goos: darwin
         goarch: arm
+      - goos: darwin
+        goarch: amd64
       - goos: windows
         goarch: arm
+      - goos: windows
+        goarch: arm64
 
 archives:
   - id: gasoline
