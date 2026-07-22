@@ -1591,19 +1591,19 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
             <form method="post" action="">
                 <?= csrfField() ?>
                 <input type="hidden" name="action" value="save_settings">
-                <div class="field-grid">
-                    <div class="field">
-                        <label data-i18n="settingFuel">Fuel</label>
-                        <div class="day-toggles">
-                            <?php $enabledFuelSet = array_flip(enabledFuels($fuel)); ?>
-                            <?php $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10']; ?>
-                            <?php $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10']; ?>
-                            <?php foreach (GASOLINE_FUELS as $f) { ?>
-                            <label class="day-toggle"><input type="checkbox" name="fuel[]" value="<?= h($f) ?>" <?= isset($enabledFuelSet[$f]) ? 'checked' : '' ?>><span data-i18n="<?= h($fuelI18n[$f]) ?>"><?= h($fuelLabels[$f]) ?></span></label>
-                            <?php } ?>
-                        </div>
-                        <p class="field-hint" data-i18n="settingFuelHint">Suggestions and checks are computed for every enabled fuel. Each user picks one of these to be notified about.</p>
+                <div class="field">
+                    <label data-i18n="settingFuel">Fuel</label>
+                    <div class="day-toggles">
+                        <?php $enabledFuelSet = array_flip(enabledFuels($fuel)); ?>
+                        <?php $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10']; ?>
+                        <?php $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10']; ?>
+                        <?php foreach (GASOLINE_FUELS as $f) { ?>
+                        <label class="day-toggle"><input type="checkbox" name="fuel[]" value="<?= h($f) ?>" <?= isset($enabledFuelSet[$f]) ? 'checked' : '' ?>><span data-i18n="<?= h($fuelI18n[$f]) ?>"><?= h($fuelLabels[$f]) ?></span></label>
+                        <?php } ?>
                     </div>
+                    <p class="field-hint" data-i18n="settingFuelHint">Suggestions and checks are computed for every enabled fuel. Each user picks one of these to be notified about.</p>
+                </div>
+                <div class="field-grid">
                     <div class="field">
                         <label for="st-range" data-i18n="settingRangeKm">Range (km)</label>
                         <input type="number" id="st-range" name="range_km" min="1" max="100" step="0.5" value="<?= h($get('range_km', '5')) ?>">
