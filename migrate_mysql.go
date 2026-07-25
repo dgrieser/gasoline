@@ -25,6 +25,7 @@ var migrationTables = []struct {
 	// ids are copied so price_predictions.run_id keeps pointing at its run.
 	{"prediction_runs", []string{"id", "run_at", "city_name", "fuel", "range_km", "history_days", "predict_days", "jump_anchor_hour", "station_count"}},
 	{"price_predictions", []string{"id", "run_id", "station_id", "fuel", "target_start", "target_end", "predicted_price", "baseline", "confidence", "sample_count", "is_suggestion", "lead_minutes", "actual_price", "error", "evaluated_at"}},
+	{"price_check_decisions", []string{"id", "run_id", "station_id", "fuel", "decided_at", "target_start", "target_end", "observed_price", "observed_at", "predicted_price", "error", "history_percentile", "confidence", "sample_count", "verdict", "recommendation", "expected_lower", "expected_drop", "day_floor_price", "day_floor_at", "regret", "outcome_evaluated_at"}},
 }
 
 type mysqlMigrationResult struct {
@@ -35,6 +36,7 @@ type mysqlMigrationResult struct {
 	PriceSnapshots   int    `json:"price_snapshots"`
 	PredictionRuns   int    `json:"prediction_runs"`
 	PricePredictions int    `json:"price_predictions"`
+	CheckDecisions   int    `json:"check_decisions"`
 	Overwritten      bool   `json:"overwritten"`
 }
 
@@ -106,6 +108,7 @@ func runMigrateToMySQL(args []string) error {
 	fmt.Fprintf(stdout, "price snapshots: %d\n", result.PriceSnapshots)
 	fmt.Fprintf(stdout, "prediction runs: %d\n", result.PredictionRuns)
 	fmt.Fprintf(stdout, "price predictions: %d\n", result.PricePredictions)
+	fmt.Fprintf(stdout, "check decisions: %d\n", result.CheckDecisions)
 	return nil
 }
 
@@ -159,6 +162,7 @@ func copySQLiteToMySQL(ctx context.Context, src, dst *sql.DB, overwrite bool) (m
 		PriceSnapshots:   counts["price_snapshots"],
 		PredictionRuns:   counts["prediction_runs"],
 		PricePredictions: counts["price_predictions"],
+		CheckDecisions:   counts["price_check_decisions"],
 		Overwritten:      overwritten,
 	}, nil
 }

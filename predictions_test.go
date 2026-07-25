@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -52,6 +53,200 @@ func markPredictionEvaluated(t *testing.T, db *sql.DB, id int64, predictionError
 	}
 }
 
+// buildDecisionFixture sets up one sawtooth station and returns the persisted
+// run id plus the options used, so decision tests share one arrangement.
+func buildDecisionFixture(t *testing.T, db *sql.DB, now time.Time) (int64, *suggestComputation, suggestOptions) {
+	t.Helper()
+	ctx := context.Background()
+	city := cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131}
+	insertSuggestCity(t, db, city)
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+	for day := 10; day <= 24; day++ {
+		insertSawtoothDay(t, db, "station-1", "Berlin", time.Date(2026, 4, day, 0, 0, 0, 0, time.UTC), 2.00)
+	}
+	opts := suggestOptions{
+		City:        "Berlin",
+		RangeKM:     5,
+		Fuel:        "diesel",
+		HistoryDays: 30,
+		PredictDays: 1,
+		LimitPerDay: 1,
+		Now:         now,
+		Location:    time.UTC,
+	}
+	computation, err := computeSuggestions(ctx, db, opts)
+	if err != nil {
+		t.Fatalf("computeSuggestions: %v", err)
+	}
+	runID, _, err := persistPredictionRun(ctx, db, computation, opts)
+	if err != nil {
+		t.Fatalf("persistPredictionRun: %v", err)
+	}
+	return runID, computation, opts
+}
+
+func TestPersistCheckDecisionsRecordsVerdictAndError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 25, 9, 30, 0, 0, time.UTC)
+	runID, computation, opts := buildDecisionFixture(t, db, now)
+
+	stored, err := persistCheckDecisions(ctx, db, computation, opts, runID)
+	if err != nil {
+		t.Fatalf("persistCheckDecisions: %v", err)
+	}
+	if stored != 1 {
+		t.Fatalf("stored = %d, want 1 decision", stored)
+	}
+
+	var (
+		gotRunID                      int64
+		fuel, verdict, recommendation string
+		targetStart, targetEnd        string
+		observed, predicted, errValue float64
+		outcomeEvaluated              sql.NullString
+		floor                         sql.NullFloat64
+	)
+	if err := db.QueryRowContext(ctx, `
+		SELECT run_id, fuel, verdict, recommendation, target_start, target_end,
+			observed_price, predicted_price, error, outcome_evaluated_at, day_floor_price
+		FROM price_check_decisions`).Scan(&gotRunID, &fuel, &verdict, &recommendation,
+		&targetStart, &targetEnd, &observed, &predicted, &errValue, &outcomeEvaluated, &floor); err != nil {
+		t.Fatalf("read decision: %v", err)
+	}
+	if gotRunID != runID {
+		t.Fatalf("run_id = %d, want %d (decisions must hang off the same run)", gotRunID, runID)
+	}
+	if fuel != "diesel" {
+		t.Fatalf("fuel = %q, want diesel", fuel)
+	}
+	// The decision targets the current hour, not the next one.
+	if targetStart != "2026-04-25T09:00:00Z" || targetEnd != "2026-04-25T10:00:00Z" {
+		t.Fatalf("window = %s..%s, want 09:00..10:00", targetStart, targetEnd)
+	}
+	if got := observed - predicted; math.Abs(errValue-got) > 1e-9 {
+		t.Fatalf("error = %v, want observed-predicted = %v", errValue, got)
+	}
+	if !isSuggestVerdict(verdict) {
+		t.Fatalf("verdict = %q, want one of low/typical/high", verdict)
+	}
+	if recommendation != "buy" && recommendation != "hold" && recommendation != "wait" {
+		t.Fatalf("recommendation = %q, want buy/hold/wait", recommendation)
+	}
+	// Outcome columns stay empty until the pricing day is complete.
+	if outcomeEvaluated.Valid || floor.Valid {
+		t.Fatalf("outcome prefilled: evaluated=%+v floor=%+v", outcomeEvaluated, floor)
+	}
+}
+
+func isSuggestVerdict(v string) bool {
+	return v == "low" || v == "typical" || v == "high"
+}
+
+func TestEvaluateCheckOutcomesScoresAgainstPricingDayFloor(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 25, 9, 30, 0, 0, time.UTC)
+	runID, computation, opts := buildDecisionFixture(t, db, now)
+	if _, err := persistCheckDecisions(ctx, db, computation, opts, runID); err != nil {
+		t.Fatalf("persistCheckDecisions: %v", err)
+	}
+
+	// Not due yet: the pricing day containing 09:00 has not finished.
+	settled, err := evaluateCheckOutcomes(ctx, db, "diesel", now.Add(2*time.Hour), time.UTC)
+	if err != nil {
+		t.Fatalf("evaluateCheckOutcomes (early): %v", err)
+	}
+	if settled != 0 {
+		t.Fatalf("settled = %d before the pricing day closed, want 0", settled)
+	}
+
+	// The anchor is 12:00, so the decision at 09:00 belongs to the pricing day
+	// starting 2026-04-24T12:00Z. Put a clear floor inside that window and a
+	// cheaper price outside it that must be ignored.
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 25, 5, 0, 0, 0, time.UTC), 1.500, true)
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 25, 13, 0, 0, 0, time.UTC), 1.000, true)
+	// A closed station must not supply the floor either.
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 25, 6, 0, 0, 0, time.UTC), 1.100, false)
+
+	later := time.Date(2026, 4, 27, 0, 0, 0, 0, time.UTC)
+	settled, err = evaluateCheckOutcomes(ctx, db, "diesel", later, time.UTC)
+	if err != nil {
+		t.Fatalf("evaluateCheckOutcomes: %v", err)
+	}
+	if settled != 1 {
+		t.Fatalf("settled = %d, want 1", settled)
+	}
+
+	var (
+		observed, floor, regret float64
+		floorAt, evaluatedAt    string
+	)
+	if err := db.QueryRowContext(ctx, `
+		SELECT observed_price, day_floor_price, day_floor_at, regret, outcome_evaluated_at
+		FROM price_check_decisions`).Scan(&observed, &floor, &floorAt, &regret, &evaluatedAt); err != nil {
+		t.Fatalf("read outcome: %v", err)
+	}
+	if floor != 1.500 {
+		t.Fatalf("day_floor_price = %v, want 1.500 (13:00 and the closed row are outside the pricing day)", floor)
+	}
+	if floorAt != "2026-04-25T05:00:00Z" {
+		t.Fatalf("day_floor_at = %s, want the 05:00 snapshot", floorAt)
+	}
+	if math.Abs(regret-(observed-floor)) > 1e-9 {
+		t.Fatalf("regret = %v, want observed-floor = %v", regret, observed-floor)
+	}
+	if evaluatedAt == "" {
+		t.Fatal("outcome_evaluated_at not set")
+	}
+
+	// A second pass must not re-settle the same row.
+	settled, err = evaluateCheckOutcomes(ctx, db, "diesel", later, time.UTC)
+	if err != nil {
+		t.Fatalf("evaluateCheckOutcomes (repeat): %v", err)
+	}
+	if settled != 0 {
+		t.Fatalf("settled = %d on repeat, want 0", settled)
+	}
+}
+
+func TestEvaluateCheckOutcomesMarksRowsWithoutData(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 25, 9, 30, 0, 0, time.UTC)
+	runID, computation, opts := buildDecisionFixture(t, db, now)
+	if _, err := persistCheckDecisions(ctx, db, computation, opts, runID); err != nil {
+		t.Fatalf("persistCheckDecisions: %v", err)
+	}
+	// Drop every snapshot so the pricing day has no usable price at all.
+	if _, err := db.ExecContext(ctx, `DELETE FROM price_snapshots`); err != nil {
+		t.Fatalf("clear snapshots: %v", err)
+	}
+
+	later := time.Date(2026, 4, 27, 0, 0, 0, 0, time.UTC)
+	measured, err := evaluateCheckOutcomes(ctx, db, "diesel", later, time.UTC)
+	if err != nil {
+		t.Fatalf("evaluateCheckOutcomes: %v", err)
+	}
+	if measured != 0 {
+		t.Fatalf("measured = %d, want 0 without price data", measured)
+	}
+	var (
+		evaluatedAt sql.NullString
+		floor       sql.NullFloat64
+	)
+	if err := db.QueryRowContext(ctx,
+		`SELECT outcome_evaluated_at, day_floor_price FROM price_check_decisions`).Scan(&evaluatedAt, &floor); err != nil {
+		t.Fatalf("read outcome: %v", err)
+	}
+	if !evaluatedAt.Valid {
+		t.Fatal("row left unevaluated: it would be retried forever")
+	}
+	if floor.Valid {
+		t.Fatalf("day_floor_price = %+v, want NULL", floor)
+	}
+}
+
 func TestPersistPredictionRunStoresGridAndFlagsSuggestions(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -76,7 +271,7 @@ func TestPersistPredictionRunStoresGridAndFlagsSuggestions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("computeSuggestions: %v", err)
 	}
-	persisted, err := persistPredictionRun(ctx, db, computation, opts)
+	_, persisted, err := persistPredictionRun(ctx, db, computation, opts)
 	if err != nil {
 		t.Fatalf("persistPredictionRun: %v", err)
 	}

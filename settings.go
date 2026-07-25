@@ -31,6 +31,36 @@ const (
 	// pushover_app_name, preserving pre-existing behavior.
 	settingCheckTitleTemplate   = "check_title_template"
 	settingSuggestTitleTemplate = "suggest_title_template"
+
+	// How the check verdict's price margin is chosen. "fixed" keeps the
+	// historical flat 2 ct margin; "relative" scales it by each station's own
+	// daily price swing, so a station that moves 12 ct a day is not judged by
+	// the same margin as one that moves 4 ct. Default "fixed": alerting does
+	// not change until an admin opts in.
+	settingCheckDeltaMode = "check_delta_mode"
+	// Fraction of a station's daily amplitude used as the margin in relative
+	// mode. Ignored in fixed mode.
+	settingCheckDeltaFraction = "check_delta_fraction"
+)
+
+// Check margin modes.
+const (
+	checkDeltaModeFixed    = "fixed"
+	checkDeltaModeRelative = "relative"
+)
+
+const (
+	// defaultCheckDelta is the historical flat margin, in euro, used by the
+	// low/high verdict and by the "a cheaper window is coming" veto.
+	defaultCheckDelta = 0.020
+	// defaultCheckDeltaFraction is a fifth of the daily swing, which
+	// reproduces roughly the historical margin on a typical ~10 ct sawtooth.
+	defaultCheckDeltaFraction = 0.20
+	// minRelativeCheckDelta and maxRelativeCheckDelta bound the derived
+	// margin so a freak amplitude estimate cannot silence alerting or fire on
+	// noise.
+	minRelativeCheckDelta = 0.005
+	maxRelativeCheckDelta = 0.060
 )
 
 // Default row templates, identical to gasoline-watch.sh's CHECK_ROW_TEMPLATE
@@ -63,6 +93,17 @@ type appSettings struct {
 	SuggestTemplate      string
 	CheckTitleTemplate   string
 	SuggestTitleTemplate string
+	CheckDeltaMode       string
+	CheckDeltaFraction   float64
+}
+
+// VerdictThresholds returns the price margin rule these settings describe.
+// Callers pair it with a station's amplitude to get the concrete margin.
+func (s appSettings) VerdictThresholds() verdictThresholds {
+	if strings.EqualFold(strings.TrimSpace(s.CheckDeltaMode), checkDeltaModeRelative) {
+		return verdictThresholds{Relative: true, Fraction: s.CheckDeltaFraction, Delta: defaultCheckDelta}
+	}
+	return verdictThresholds{Delta: defaultCheckDelta}
 }
 
 // canonicalFuels lists the suggest/check fuel types in display order. The
@@ -108,6 +149,9 @@ func defaultAppSettings() appSettings {
 		NotifyWindows:   defaultNotifyWindows,
 		CheckTemplate:   defaultCheckTemplate,
 		SuggestTemplate: defaultSuggestTemplate,
+		// Fixed mode reproduces the historical verdicts exactly.
+		CheckDeltaMode:     checkDeltaModeFixed,
+		CheckDeltaFraction: defaultCheckDeltaFraction,
 	}
 }
 
@@ -130,6 +174,8 @@ func seededSettings() [][2]string {
 		{settingSuggestTemplate, d.SuggestTemplate},
 		{settingCheckTitleTemplate, d.CheckTitleTemplate},
 		{settingSuggestTitleTemplate, d.SuggestTitleTemplate},
+		{settingCheckDeltaMode, d.CheckDeltaMode},
+		{settingCheckDeltaFraction, strconv.FormatFloat(d.CheckDeltaFraction, 'f', -1, 64)},
 	}
 }
 
@@ -219,6 +265,22 @@ func loadSettings(ctx context.Context, q settingsQuerier) (appSettings, error) {
 			s.CheckTitleTemplate = unescapeTemplate(value)
 		case settingSuggestTitleTemplate:
 			s.SuggestTitleTemplate = unescapeTemplate(value)
+		case settingCheckDeltaMode:
+			mode := strings.ToLower(value)
+			if mode != checkDeltaModeFixed && mode != checkDeltaModeRelative {
+				return appSettings{}, fmt.Errorf("invalid setting %s: %q is not %s or %s",
+					name, value, checkDeltaModeFixed, checkDeltaModeRelative)
+			}
+			s.CheckDeltaMode = mode
+		case settingCheckDeltaFraction:
+			f, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return appSettings{}, fmt.Errorf("invalid setting %s: %q is not a number", name, value)
+			}
+			if f <= 0 || f > 1 {
+				return appSettings{}, fmt.Errorf("invalid setting %s: %v is outside (0, 1]", name, f)
+			}
+			s.CheckDeltaFraction = f
 		}
 	}
 	return s, rows.Err()
@@ -297,6 +359,8 @@ func applySuggestSettings(ctx context.Context, db *sql.DB, fs *flag.FlagSet, opt
 	if !flagWasSet(fs, "limit-per-day") {
 		opts.LimitPerDay = s.LimitPerDay
 	}
+	// Not flag-backed: the margin rule is admin-only configuration.
+	opts.Thresholds = s.VerdictThresholds()
 	return nil
 }
 
@@ -321,5 +385,7 @@ func applyCheckSettings(ctx context.Context, db *sql.DB, fs *flag.FlagSet, opts 
 	if !flagWasSet(fs, "limit") {
 		opts.Limit = s.CheckLimit
 	}
+	// Not flag-backed: the margin rule is admin-only configuration.
+	opts.Thresholds = s.VerdictThresholds()
 	return nil
 }

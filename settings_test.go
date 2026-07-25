@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -40,6 +41,10 @@ func TestInitSchemaCreatesAuthAndSettingsTables(t *testing.T) {
 		// user's pushover_app_name until an admin configures a template.
 		settingCheckTitleTemplate:   "",
 		settingSuggestTitleTemplate: "",
+		// Fixed margin mode keeps the historical verdicts; the fraction is
+		// only consulted once an admin switches to relative mode.
+		settingCheckDeltaMode:     checkDeltaModeFixed,
+		settingCheckDeltaFraction: "0.2",
 	}
 	rows, err := db.QueryContext(ctx, `SELECT name, value FROM settings`)
 	if err != nil {
@@ -478,5 +483,137 @@ func TestRunUpdateNoFlagsNoTargetsErrors(t *testing.T) {
 	err := run([]string{"update", "--db", dbPath})
 	if err == nil || !strings.Contains(err.Error(), "--city") {
 		t.Fatalf("err = %v, want update requires --city", err)
+	}
+}
+
+func TestVerdictThresholdsDefaultsPreserveHistoricalMargin(t *testing.T) {
+	// The zero value stands in for every caller that never sets thresholds
+	// (tests, and any path that predates the setting).
+	var zero verdictThresholds
+	if got := zero.forStation(0.10, true); got != defaultCheckDelta {
+		t.Fatalf("zero-value margin = %v, want the historical %v", got, defaultCheckDelta)
+	}
+	// The seeded defaults must resolve to the same flat margin.
+	if got := defaultAppSettings().VerdictThresholds().forStation(0.10, true); got != defaultCheckDelta {
+		t.Fatalf("default settings margin = %v, want the historical %v", got, defaultCheckDelta)
+	}
+}
+
+func TestVerdictThresholdsRelativeMode(t *testing.T) {
+	relative := appSettings{CheckDeltaMode: checkDeltaModeRelative, CheckDeltaFraction: 0.20}.VerdictThresholds()
+
+	// A 10 ct daily swing at a fifth gives the historical 2 ct margin.
+	if got := relative.forStation(0.10, true); math.Abs(got-0.020) > 1e-9 {
+		t.Fatalf("margin for a 10 ct swing = %v, want 0.020", got)
+	}
+	// A calmer station gets a tighter margin, a wilder one a wider margin.
+	if got := relative.forStation(0.04, true); got >= 0.020 {
+		t.Fatalf("margin for a 4 ct swing = %v, want below the flat 0.020", got)
+	}
+	if got := relative.forStation(0.20, true); got <= 0.020 {
+		t.Fatalf("margin for a 20 ct swing = %v, want above the flat 0.020", got)
+	}
+	// Clamps hold at both ends.
+	if got := relative.forStation(0.001, true); got != minRelativeCheckDelta {
+		t.Fatalf("margin for a flat station = %v, want the %v floor", got, minRelativeCheckDelta)
+	}
+	if got := relative.forStation(10.0, true); got != maxRelativeCheckDelta {
+		t.Fatalf("margin for an absurd swing = %v, want the %v ceiling", got, maxRelativeCheckDelta)
+	}
+	// Without a usable amplitude it falls back to the flat margin.
+	if got := relative.forStation(0, false); got != defaultCheckDelta {
+		t.Fatalf("margin without amplitude = %v, want the flat %v", got, defaultCheckDelta)
+	}
+}
+
+func TestLoadSettingsRejectsInvalidDeltaSettings(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ name, value string }{
+		{settingCheckDeltaMode, "sometimes"},
+		{settingCheckDeltaFraction, "abc"},
+		{settingCheckDeltaFraction, "0"},
+		{settingCheckDeltaFraction, "1.5"},
+	} {
+		db := openTestDB(t)
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO settings (name, value, updated_at) VALUES (?, ?, '2026-04-20T00:00:00Z')
+			 ON CONFLICT(name) DO UPDATE SET value = excluded.value`, tc.name, tc.value); err != nil {
+			t.Fatalf("write setting: %v", err)
+		}
+		if _, err := loadSettings(ctx, db); err == nil {
+			t.Fatalf("loadSettings accepted %s=%q, want an error", tc.name, tc.value)
+		}
+	}
+}
+
+func TestApplyCheckSettingsThreadsMarginRule(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	newFlags := func() *flag.FlagSet {
+		fs := flag.NewFlagSet("check", flag.ContinueOnError)
+		fs.String("fuel", "diesel", "")
+		fs.Float64("range-km", 5, "")
+		fs.Int("history-days", 30, "")
+		fs.Int("predict-days", 3, "")
+		fs.Int("limit", 5, "")
+		if err := fs.Parse(nil); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return fs
+	}
+
+	// Seeded defaults must yield the historical flat margin.
+	var opts checkOptions
+	if err := applyCheckSettings(ctx, db, newFlags(), &opts); err != nil {
+		t.Fatalf("applyCheckSettings: %v", err)
+	}
+	if opts.Thresholds.Relative {
+		t.Fatal("default settings produced a relative margin rule")
+	}
+	if got := opts.Thresholds.forStation(0.04, true); got != defaultCheckDelta {
+		t.Fatalf("default margin = %v, want the historical %v", got, defaultCheckDelta)
+	}
+
+	// Switching the admin setting must reach checkOptions.
+	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE name = ?`,
+		checkDeltaModeRelative, settingCheckDeltaMode); err != nil {
+		t.Fatalf("update setting: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = '0.5' WHERE name = ?`,
+		settingCheckDeltaFraction); err != nil {
+		t.Fatalf("update setting: %v", err)
+	}
+	opts = checkOptions{}
+	if err := applyCheckSettings(ctx, db, newFlags(), &opts); err != nil {
+		t.Fatalf("applyCheckSettings: %v", err)
+	}
+	if !opts.Thresholds.Relative {
+		t.Fatal("relative mode did not reach checkOptions")
+	}
+	if got := opts.Thresholds.forStation(0.04, true); math.Abs(got-0.020) > 1e-9 {
+		t.Fatalf("relative margin for a 4 ct swing at 0.5 = %v, want 0.020", got)
+	}
+	// The same rule now judges a wider station differently, which is the point.
+	if got := opts.Thresholds.forStation(0.10, true); math.Abs(got-0.050) > 1e-9 {
+		t.Fatalf("relative margin for a 10 ct swing at 0.5 = %v, want 0.050", got)
+	}
+}
+
+func TestPriceCheckVerdictHonoursMargin(t *testing.T) {
+	// Percentile held at 50 so only the margin can decide the verdict.
+	const percentile = 50.0
+	// 3 ct below the reference: "low" under a 2 ct margin, merely "typical"
+	// under a 5 ct one.
+	if got := priceCheckVerdict(1.67, 1.70, percentile, 0.020); got != "low" {
+		t.Fatalf("verdict with a 2 ct margin = %q, want low", got)
+	}
+	if got := priceCheckVerdict(1.67, 1.70, percentile, 0.050); got != "typical" {
+		t.Fatalf("verdict with a 5 ct margin = %q, want typical", got)
+	}
+	if got := priceCheckVerdict(1.73, 1.70, percentile, 0.020); got != "high" {
+		t.Fatalf("verdict above the reference with a 2 ct margin = %q, want high", got)
+	}
+	if got := priceCheckVerdict(1.73, 1.70, percentile, 0.050); got != "typical" {
+		t.Fatalf("verdict above the reference with a 5 ct margin = %q, want typical", got)
 	}
 }

@@ -2577,7 +2577,7 @@ func TestBuildForecastModelFollowsBaselineShift(t *testing.T) {
 		t.Fatalf("baseline forecast = %.4f, want ~2.05 (current regime), not the old 1.90 level", station.BaselineForecast)
 	}
 
-	score, ok := scoreForecast(model, "s1", time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC).Weekday(), 11)
+	score, ok := scoreForecast(model, "s1", time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC))
 	if !ok {
 		t.Fatal("scoreForecast returned !ok")
 	}
@@ -2596,7 +2596,7 @@ func TestBuildForecastModelSparseHistoryFallsBackToAbsolute(t *testing.T) {
 	if station.OffsetMode {
 		t.Fatal("station in offset mode with only two days of data")
 	}
-	score, ok := scoreForecast(model, "s1", now.Weekday(), 11)
+	score, ok := scoreForecast(model, "s1", time.Date(now.Year(), now.Month(), now.Day(), 11, 0, 0, 0, time.UTC))
 	if !ok {
 		t.Fatal("scoreForecast returned !ok in absolute fallback mode")
 	}
@@ -2786,5 +2786,47 @@ func TestInferJumpAnchorHourIgnoresRisesAcrossGaps(t *testing.T) {
 	}
 	if anchor := inferJumpAnchorHour(intervals, time.UTC); anchor != 0 {
 		t.Fatalf("anchor = %d, want 0 (rises across closure gaps must not count)", anchor)
+	}
+}
+
+func TestStationDailyAmplitude(t *testing.T) {
+	// Two weeks of a ~9.2 ct sawtooth puts the station in offset mode, where
+	// the hourly medians are offsets from the daily baseline and their spread
+	// is the intraday swing.
+	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	intervals := sawtoothIntervals("s1", firstDay, 14, func(int) float64 { return 2.00 })
+	now := time.Date(2026, 4, 24, 9, 30, 0, 0, time.UTC)
+	model := buildForecastModel(intervals, now, time.UTC)
+
+	if !model.Stations["s1"].OffsetMode {
+		t.Fatal("station not in offset mode; the fixture cannot exercise amplitude")
+	}
+	amplitude, ok := stationDailyAmplitude(model, "s1")
+	if !ok {
+		t.Fatal("stationDailyAmplitude returned !ok for an offset-mode station")
+	}
+	if amplitude <= 0 || amplitude > 0.5 {
+		t.Fatalf("amplitude = %.4f, want a plausible daily swing in euro", amplitude)
+	}
+
+	// An unknown station has no amplitude at all.
+	if _, ok := stationDailyAmplitude(model, "nope"); ok {
+		t.Fatal("stationDailyAmplitude reported an amplitude for an unknown station")
+	}
+}
+
+func TestStationDailyAmplitudeSkipsAbsoluteModeStations(t *testing.T) {
+	// Two days is too little history for offset mode. Those samples are
+	// absolute prices, whose spread would mix level drift into the swing.
+	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	intervals := sawtoothIntervals("s1", firstDay, 2, func(int) float64 { return 2.00 })
+	now := time.Date(2026, 4, 12, 0, 30, 0, 0, time.UTC)
+	model := buildForecastModel(intervals, now, time.UTC)
+
+	if model.Stations["s1"].OffsetMode {
+		t.Fatal("station unexpectedly in offset mode")
+	}
+	if _, ok := stationDailyAmplitude(model, "s1"); ok {
+		t.Fatal("amplitude derived for an absolute-mode station: it would include level drift")
 	}
 }

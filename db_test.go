@@ -358,6 +358,19 @@ func TestCopyDatabaseData(t *testing.T) {
 		t.Fatalf("persistUpdate: %v", err)
 	}
 
+	// A prediction run plus a check decision, so the copy is exercised for the
+	// tables that carry foreign keys onto each other.
+	runID := insertPredictionRunRow(t, src, time.Date(2026, 7, 1, 9, 0, 0, 0, time.UTC))
+	if _, err := src.ExecContext(ctx, `
+		INSERT INTO price_check_decisions (run_id, station_id, fuel, decided_at, target_start, target_end,
+			observed_price, observed_at, predicted_price, error, history_percentile, confidence, sample_count,
+			verdict, recommendation, expected_lower, expected_drop)
+		VALUES (?, 'station-1', 'diesel', '2026-07-01T09:00:00Z', '2026-07-01T09:00:00Z', '2026-07-01T10:00:00Z',
+			1.60, '2026-07-01T08:55:00Z', 1.62, -0.02, 20, 'high', 9, 'low', 'buy', 0, NULL)
+	`, runID); err != nil {
+		t.Fatalf("insert decision: %v", err)
+	}
+
 	dstPath := filepath.Join(t.TempDir(), "target.db")
 	dst, err := openDB(dstPath)
 	if err != nil {
@@ -371,6 +384,16 @@ func TestCopyDatabaseData(t *testing.T) {
 	result, err := copySQLiteToMySQL(ctx, src, dst, false)
 	if err != nil {
 		t.Fatalf("copySQLiteToMySQL: %v", err)
+	}
+	if result.CheckDecisions != 1 {
+		t.Fatalf("check decisions copied = %d, want 1", result.CheckDecisions)
+	}
+	var copiedVerdict string
+	if err := dst.QueryRowContext(ctx, `SELECT verdict FROM price_check_decisions`).Scan(&copiedVerdict); err != nil {
+		t.Fatalf("read copied decision: %v", err)
+	}
+	if copiedVerdict != "low" {
+		t.Fatalf("copied verdict = %q, want low", copiedVerdict)
 	}
 	if result.Cities != 1 || result.Stations != 2 || result.PriceSnapshots != 2 {
 		t.Fatalf("copied cities/stations/snapshots = %d/%d/%d, want 1/2/2", result.Cities, result.Stations, result.PriceSnapshots)
