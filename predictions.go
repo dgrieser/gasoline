@@ -285,26 +285,51 @@ func evaluateCheckOutcomes(ctx context.Context, db *sql.DB, fuel string, now tim
 
 	evaluatedAt := now.UTC().Format(time.RFC3339)
 	measured := 0
+	// The floor depends only on (station, pricing day), and the persist timer
+	// runs hourly, so a station accumulates roughly 24 decisions sharing one
+	// window. Memoizing collapses those to a single query each.
+	type floorKey struct {
+		StationID string
+		DayStart  time.Time
+	}
+	type floorResult struct {
+		Price float64
+		At    string
+		Found bool
+	}
+	floors := make(map[floorKey]floorResult)
+
 	for _, decision := range pending {
-		var (
-			floorPrice float64
-			floorAt    string
-		)
-		err := floorStmt.QueryRowContext(ctx, decision.StationID,
-			decision.DayStart.UTC().Format(time.RFC3339),
-			decision.DayEnd.UTC().Format(time.RFC3339)).Scan(&floorPrice, &floorAt)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return 0, err
+		key := floorKey{StationID: decision.StationID, DayStart: decision.DayStart}
+		result, cached := floors[key]
+		if !cached {
+			var (
+				floorPrice float64
+				floorAt    string
+			)
+			err := floorStmt.QueryRowContext(ctx, decision.StationID,
+				decision.DayStart.UTC().Format(time.RFC3339),
+				decision.DayEnd.UTC().Format(time.RFC3339)).Scan(&floorPrice, &floorAt)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return 0, err
+			}
+			result = floorResult{Price: floorPrice, At: floorAt, Found: err == nil}
+			floors[key] = result
 		}
 		var (
 			floor  sql.NullFloat64
 			at     sql.NullString
 			regret sql.NullFloat64
 		)
-		if err == nil {
-			floor = sql.NullFloat64{Float64: floorPrice, Valid: true}
-			at = sql.NullString{String: floorAt, Valid: true}
-			regret = sql.NullFloat64{Float64: decision.Observed - floorPrice, Valid: true}
+		if result.Found {
+			floor = sql.NullFloat64{Float64: result.Price, Valid: true}
+			at = sql.NullString{String: result.At, Valid: true}
+			// Signed on purpose. The observed price normally lies inside the
+			// pricing day, so regret is >= 0; a negative value means the
+			// decision was taken against a snapshot older than the day it was
+			// scored against. That is worth seeing — observed_at reveals it —
+			// so it is recorded rather than clamped away.
+			regret = sql.NullFloat64{Float64: decision.Observed - result.Price, Valid: true}
 			measured++
 		}
 		if _, err := updateStmt.ExecContext(ctx, floor, at, regret, evaluatedAt, decision.ID); err != nil {
@@ -592,10 +617,15 @@ func persistCheckDecisions(ctx context.Context, db *sql.DB, computation *suggest
 			decidedAt,
 			targetStart.UTC().Format(time.RFC3339),
 			targetEnd.UTC().Format(time.RFC3339),
-			check.CurrentPrice,
+			// The unrounded values the verdict was decided on, not the
+			// display-rounded ones: the day floor this is later compared
+			// against comes straight from price_snapshots at full precision,
+			// so rounding here would put a half-cent artifact into both the
+			// stored error and the regret.
+			check.rawCurrentPrice,
 			check.RecordedAt,
-			check.PredictedCurrentPrice,
-			check.CurrentPrice-check.PredictedCurrentPrice,
+			check.rawPredictedPrice,
+			check.rawCurrentPrice-check.rawPredictedPrice,
 			check.HistoryPercentile,
 			check.Confidence,
 			check.SampleCount,

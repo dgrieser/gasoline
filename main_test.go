@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -2828,5 +2829,42 @@ func TestStationDailyAmplitudeSkipsAbsoluteModeStations(t *testing.T) {
 	}
 	if _, ok := stationDailyAmplitude(model, "s1"); ok {
 		t.Fatal("amplitude derived for an absolute-mode station: it would include level drift")
+	}
+}
+
+// modelWithHourlyOffsets builds an offset-mode model carrying exactly
+// hourCount populated hours, so the minAmplitudeHours gate can be pinned
+// without contriving a snapshot fixture that yields partial day coverage.
+func modelWithHourlyOffsets(hourCount int) forecastModel {
+	model := forecastModel{
+		Stations:    map[string]forecastStation{"s1": {OffsetMode: true}},
+		WeekdayHour: map[stationWeekdayHourKey][]priceSample{},
+		Hour:        map[stationHourKey][]priceSample{},
+		Recent:      map[string][]priceSample{},
+	}
+	for hour := 0; hour < hourCount; hour++ {
+		// A 0.10 spread across the populated hours.
+		offset := -0.05 + 0.10*float64(hour)/float64(max(hourCount-1, 1))
+		model.Hour[stationHourKey{StationID: "s1", Hour: hour}] = []priceSample{
+			{Price: offset, Weight: 60},
+		}
+	}
+	return model
+}
+
+func TestStationDailyAmplitudeRequiresEnoughHours(t *testing.T) {
+	// One hour below the gate: the observed range is a slice of the sawtooth,
+	// not its height, so no amplitude may be reported.
+	if _, ok := stationDailyAmplitude(modelWithHourlyOffsets(minAmplitudeHours-1), "s1"); ok {
+		t.Fatalf("amplitude reported with only %d hours, want !ok below the %d-hour gate",
+			minAmplitudeHours-1, minAmplitudeHours)
+	}
+	// Exactly at the gate it must be reported.
+	amplitude, ok := stationDailyAmplitude(modelWithHourlyOffsets(minAmplitudeHours), "s1")
+	if !ok {
+		t.Fatalf("no amplitude at exactly %d hours, want ok at the gate", minAmplitudeHours)
+	}
+	if math.Abs(amplitude-0.10) > 1e-9 {
+		t.Fatalf("amplitude = %v, want the 0.10 spread the fixture defines", amplitude)
 	}
 }

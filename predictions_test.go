@@ -710,3 +710,111 @@ func TestRunSuggestAllConfiguredCitiesBestEffort(t *testing.T) {
 		t.Fatalf("prediction_runs for Berlin = %d, want 1 (good city persisted despite failure)", runs)
 	}
 }
+
+// TestPersistCheckDecisionsStoresUnroundedPrices is the regression test for
+// storing display-rounded prices in the decision log. German pump prices carry
+// three decimals, so rounding the observed price to two moved it by up to half
+// a cent against a day floor read at full precision — enough to make the regret
+// of a decision taken exactly at the day's low come out negative.
+func TestPersistCheckDecisionsStoresUnroundedPrices(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 25, 9, 30, 0, 0, time.UTC)
+	runID, _, opts := buildDecisionFixture(t, db, now)
+
+	// A three-decimal price that rounds *down* to two decimals, placed so it
+	// is both the latest snapshot at decision time and the cheapest price of
+	// the pricing day. Regret must therefore be exactly zero.
+	const lowPrice = 1.754
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 25, 9, 0, 0, 0, time.UTC), lowPrice, true)
+
+	// Rebuild against the snapshot just inserted.
+	computation, err := computeSuggestions(ctx, db, opts)
+	if err != nil {
+		t.Fatalf("computeSuggestions: %v", err)
+	}
+	if _, err := persistCheckDecisions(ctx, db, computation, opts, runID); err != nil {
+		t.Fatalf("persistCheckDecisions: %v", err)
+	}
+
+	var observed, predicted, storedErr float64
+	if err := db.QueryRowContext(ctx,
+		`SELECT observed_price, predicted_price, error FROM price_check_decisions`).
+		Scan(&observed, &predicted, &storedErr); err != nil {
+		t.Fatalf("read decision: %v", err)
+	}
+	if math.Abs(observed-lowPrice) > 1e-9 {
+		t.Fatalf("observed_price = %v, want the unrounded %v (rounding to 2 decimals gives %v)",
+			observed, lowPrice, roundTo(lowPrice, 2))
+	}
+	if math.Abs(storedErr-(observed-predicted)) > 1e-9 {
+		t.Fatalf("error = %v, want observed-predicted = %v", storedErr, observed-predicted)
+	}
+
+	later := time.Date(2026, 4, 27, 0, 0, 0, 0, time.UTC)
+	if _, err := evaluateCheckOutcomes(ctx, db, "diesel", later, time.UTC); err != nil {
+		t.Fatalf("evaluateCheckOutcomes: %v", err)
+	}
+	var floor, regret float64
+	if err := db.QueryRowContext(ctx,
+		`SELECT day_floor_price, regret FROM price_check_decisions`).Scan(&floor, &regret); err != nil {
+		t.Fatalf("read outcome: %v", err)
+	}
+	if math.Abs(floor-lowPrice) > 1e-9 {
+		t.Fatalf("day_floor_price = %v, want %v", floor, lowPrice)
+	}
+	if math.Abs(regret) > 1e-9 {
+		t.Fatalf("regret = %v, want exactly 0 for a decision taken at the day's low", regret)
+	}
+	if regret < 0 {
+		t.Fatalf("regret = %v is negative: the observed price cannot be below its own day's floor", regret)
+	}
+}
+
+// TestEvaluateCheckOutcomesReusesFloorPerPricingDay pins the memoization: the
+// hourly persist timer produces many decisions per station per pricing day, and
+// they must resolve to one floor lookup, all agreeing.
+func TestEvaluateCheckOutcomesReusesFloorPerPricingDay(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 25, 9, 30, 0, 0, time.UTC)
+	runID, computation, opts := buildDecisionFixture(t, db, now)
+
+	// Three runs' worth of decisions for the same station and pricing day.
+	for i := 0; i < 3; i++ {
+		if _, err := persistCheckDecisions(ctx, db, computation, opts, runID); err != nil {
+			t.Fatalf("persistCheckDecisions: %v", err)
+		}
+	}
+	var pending int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM price_check_decisions`).Scan(&pending); err != nil {
+		t.Fatalf("count decisions: %v", err)
+	}
+	if pending != 3 {
+		t.Fatalf("decisions = %d, want 3", pending)
+	}
+
+	later := time.Date(2026, 4, 27, 0, 0, 0, 0, time.UTC)
+	measured, err := evaluateCheckOutcomes(ctx, db, "diesel", later, time.UTC)
+	if err != nil {
+		t.Fatalf("evaluateCheckOutcomes: %v", err)
+	}
+	if measured != 3 {
+		t.Fatalf("measured = %d, want all 3 settled", measured)
+	}
+	rows, err := db.QueryContext(ctx, `SELECT DISTINCT day_floor_price, day_floor_at FROM price_check_decisions`)
+	if err != nil {
+		t.Fatalf("query floors: %v", err)
+	}
+	defer rows.Close()
+	distinct := 0
+	for rows.Next() {
+		distinct++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if distinct != 1 {
+		t.Fatalf("distinct floors = %d, want 1: decisions sharing a pricing day must agree", distinct)
+	}
+}

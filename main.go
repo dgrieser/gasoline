@@ -369,6 +369,15 @@ type priceCheckRow struct {
 	ExpectedDrop          float64              `json:"expected_drop,omitempty"`
 	Confidence            string               `json:"confidence"`
 	SampleCount           int                  `json:"sample_count"`
+
+	// CurrentPrice and PredictedCurrentPrice above are rounded for display,
+	// but the verdict is decided on the unrounded values. German pump prices
+	// carry three decimals, so rounding to two moves a price by up to half a
+	// cent — enough to matter when the decision log's whole purpose is
+	// measuring a residual against a 1 ct bucket. These keep the values the
+	// verdict actually saw. Unexported, so the JSON output is unchanged.
+	rawCurrentPrice   float64
+	rawPredictedPrice float64
 }
 
 type futureForecast struct {
@@ -2490,13 +2499,25 @@ func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel 
 			Fuel:                  fuel,
 			CurrentPrice:          roundTo(snapshot.Price.Float64, 2),
 			PredictedCurrentPrice: roundTo(currentScore.PredictedPrice, 2),
+			rawCurrentPrice:       snapshot.Price.Float64,
+			rawPredictedPrice:     currentScore.PredictedPrice,
 			HistoryPercentile:     roundTo(percentile, 1),
 			Confidence:            currentScore.Confidence,
 			SampleCount:           currentScore.SampleCount,
 		}
 		// The margin scales with this station's own daily swing when the
 		// admin enabled relative mode; otherwise it is the flat default.
-		delta := thresholds.forStation(stationDailyAmplitude(model, stationID))
+		// Guarded here rather than inside forStation because the argument is
+		// evaluated first: in the default fixed mode the 24-hour median scan
+		// would otherwise run for every station only to be discarded.
+		var (
+			amplitude    float64
+			hasAmplitude bool
+		)
+		if thresholds.Relative {
+			amplitude, hasAmplitude = stationDailyAmplitude(model, stationID)
+		}
+		delta := thresholds.forStation(amplitude, hasAmplitude)
 		row.Verdict = priceCheckVerdict(snapshot.Price.Float64, currentScore.PredictedPrice, percentile, delta)
 
 		if future, ok := bestFutureForecast(model, stationID, nowLocal, predictDays); ok {

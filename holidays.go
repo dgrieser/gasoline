@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // German public holidays.
 //
@@ -38,11 +41,36 @@ func easterSunday(year int) time.Time {
 	return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
 }
 
+// easterYearDays caches each year's Easter Sunday as a day-of-year number.
+// isGermanHoliday runs once per hourly price bucket — hundreds of thousands of
+// times across a model build — and the calendar arithmetic is the expensive
+// part. sync.Map rather than a plain map because tests run in parallel.
+var easterYearDays sync.Map // int year -> int day-of-year
+
+func easterYearDay(year int) int {
+	if cached, ok := easterYearDays.Load(year); ok {
+		return cached.(int)
+	}
+	yearDay := easterSunday(year).YearDay()
+	easterYearDays.Store(year, yearDay)
+	return yearDay
+}
+
+// movableFeastOffsets are the nationwide holidays defined relative to Easter
+// Sunday. Easter Sunday itself and Pfingstsonntag are omitted: both are
+// Sundays, which already form their own weekday bucket.
+var movableFeastOffsets = [...]int{
+	-2, // Karfreitag
+	1,  // Ostermontag
+	39, // Christi Himmelfahrt
+	50, // Pfingstmontag
+}
+
 // isGermanHoliday reports whether the local date of t is a nationwide German
 // public holiday. Only the date is considered; the time of day and the
 // location's offset are irrelevant because callers already pass local times.
 func isGermanHoliday(t time.Time) bool {
-	year, month, day := t.Date()
+	_, month, day := t.Date()
 	switch {
 	case month == time.January && day == 1: // Neujahr
 		return true
@@ -53,18 +81,13 @@ func isGermanHoliday(t time.Time) bool {
 	case month == time.December && (day == 25 || day == 26): // Weihnachten
 		return true
 	}
-	// The movable feasts, all fixed offsets from Easter Sunday. Easter Sunday
-	// and Pfingstsonntag are themselves omitted: they are Sundays, which
-	// already form their own weekday bucket.
-	easter := easterSunday(year)
-	for _, offset := range []int{
-		-2, // Karfreitag
-		1,  // Ostermontag
-		39, // Christi Himmelfahrt
-		50, // Pfingstmontag
-	} {
-		feast := easter.AddDate(0, 0, offset)
-		if feast.Year() == year && feast.Month() == month && feast.Day() == day {
+	// Compared as day-of-year numbers rather than by building four dates.
+	// Easter falls between 22 March and 25 April, so every offset here stays
+	// inside the same year and the comparison holds in leap years too.
+	easter := easterYearDay(t.Year())
+	target := t.YearDay()
+	for _, offset := range movableFeastOffsets {
+		if target == easter+offset {
 			return true
 		}
 	}
