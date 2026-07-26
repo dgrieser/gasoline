@@ -428,6 +428,34 @@ func schemaStatements(d dialect) []string {
 				FOREIGN KEY (run_id) REFERENCES prediction_runs(id),
 				FOREIGN KEY (station_id) REFERENCES stations(id)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS price_check_decisions (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				run_id BIGINT NOT NULL,
+				station_id VARCHAR(64) NOT NULL,
+				fuel VARCHAR(16) NOT NULL,
+				decided_at VARCHAR(64) NOT NULL,
+				target_start VARCHAR(64) NOT NULL,
+				target_end VARCHAR(64) NOT NULL,
+				observed_price DOUBLE NOT NULL,
+				observed_at VARCHAR(64) NOT NULL,
+				predicted_price DOUBLE NOT NULL,
+				error DOUBLE NOT NULL,
+				history_percentile DOUBLE NOT NULL,
+				confidence VARCHAR(16) NOT NULL,
+				sample_count INTEGER NOT NULL DEFAULT 0,
+				verdict VARCHAR(16) NOT NULL,
+				recommendation VARCHAR(16) NOT NULL,
+				expected_lower TINYINT NOT NULL DEFAULT 0,
+				expected_drop DOUBLE,
+				day_floor_price DOUBLE,
+				day_floor_at VARCHAR(64),
+				regret DOUBLE,
+				outcome_evaluated_at VARCHAR(64),
+				INDEX idx_price_check_decisions_station_fuel_target (station_id, fuel, target_start DESC),
+				INDEX idx_price_check_decisions_due (fuel, outcome_evaluated_at, target_end),
+				FOREIGN KEY (run_id) REFERENCES prediction_runs(id),
+				FOREIGN KEY (station_id) REFERENCES stations(id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 		}
 	}
 	return []string{
@@ -553,6 +581,38 @@ func schemaStatements(d dialect) []string {
 			ON price_predictions(fuel, evaluated_at, target_end)`,
 		`CREATE INDEX IF NOT EXISTS idx_price_predictions_run
 			ON price_predictions(run_id)`,
+		`CREATE TABLE IF NOT EXISTS price_check_decisions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id INTEGER NOT NULL,
+			station_id TEXT NOT NULL,
+			fuel TEXT NOT NULL,
+			decided_at TEXT NOT NULL,
+			target_start TEXT NOT NULL,
+			target_end TEXT NOT NULL,
+			observed_price REAL NOT NULL,
+			observed_at TEXT NOT NULL,
+			predicted_price REAL NOT NULL,
+			error REAL NOT NULL,
+			history_percentile REAL NOT NULL,
+			confidence TEXT NOT NULL,
+			sample_count INTEGER NOT NULL DEFAULT 0,
+			verdict TEXT NOT NULL,
+			recommendation TEXT NOT NULL,
+			expected_lower INTEGER NOT NULL DEFAULT 0,
+			expected_drop REAL,
+			day_floor_price REAL,
+			day_floor_at TEXT,
+			regret REAL,
+			outcome_evaluated_at TEXT,
+			FOREIGN KEY (run_id) REFERENCES prediction_runs(id),
+			FOREIGN KEY (station_id) REFERENCES stations(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_price_check_decisions_station_fuel_target
+			ON price_check_decisions(station_id, fuel, target_start DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_price_check_decisions_due
+			ON price_check_decisions(fuel, outcome_evaluated_at, target_end)`,
+		`CREATE INDEX IF NOT EXISTS idx_price_check_decisions_run
+			ON price_check_decisions(run_id)`,
 	}
 }
 

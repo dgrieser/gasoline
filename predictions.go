@@ -35,6 +35,12 @@ const (
 	// row this stays under SQLite's historical 999-variable limit, so the
 	// insert also works against builds without the modern 32766 default.
 	persistInsertBatch = 80
+	// decisionInsertBatch rows per multi-row INSERT for check decisions. At
+	// 17 placeholders per row this stays under the same 999-variable limit.
+	decisionInsertBatch = 40
+	// evaluateOutcomeBatchLimit bounds how many decisions one run settles
+	// against the completed pricing day, mirroring evaluateBatchLimit.
+	evaluateOutcomeBatchLimit = 5000
 )
 
 // evaluateDuePredictions fills actual_price and error for stored predictions
@@ -161,6 +167,181 @@ func evaluateDuePredictions(ctx context.Context, db *sql.DB, fuel string, now ti
 	return measured, nil
 }
 
+// evaluateCheckOutcomes scores logged check decisions against the cheapest
+// price their pricing day turned out to offer, so "the model said buy" can be
+// compared with "the price really was near the day's floor".
+//
+// The floor is taken over the pricing day — the 24h window anchored at the
+// market-wide daily jump hour recorded on the decision's run — because that is
+// the window inside which prices form one regime. A calendar day would
+// straddle two.
+//
+// A decision only becomes due once its pricing day has finished. The pricing
+// day containing target_start ends at most 24h after it, so requiring
+// target_start <= now-24h settles rows without needing the anchor in SQL.
+// Decisions without usable snapshot data are still marked evaluated, with a
+// NULL floor, so they are not retried forever.
+func evaluateCheckOutcomes(ctx context.Context, db *sql.DB, fuel string, now time.Time, location *time.Location) (int, error) {
+	column, err := suggestFuelColumn(fuel)
+	if err != nil {
+		return 0, err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if location == nil {
+		location = time.Local
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	due := now.Add(-24 * time.Hour).UTC().Format(time.RFC3339)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT d.id, d.station_id, d.target_start, d.observed_price, r.jump_anchor_hour
+		FROM price_check_decisions d
+		JOIN prediction_runs r ON r.id = d.run_id
+		WHERE d.fuel = ?
+			AND d.outcome_evaluated_at IS NULL
+			AND d.target_start <= ?
+		ORDER BY d.target_start ASC
+		LIMIT `+fmt.Sprint(evaluateOutcomeBatchLimit),
+		fuel, due)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type dueDecision struct {
+		ID        int64
+		StationID string
+		Observed  float64
+		DayStart  time.Time
+		DayEnd    time.Time
+	}
+	var pending []dueDecision
+	for rows.Next() {
+		var (
+			id         int64
+			stationID  string
+			startText  string
+			observed   float64
+			anchorHour int
+		)
+		if err := rows.Scan(&id, &stationID, &startText, &observed, &anchorHour); err != nil {
+			return 0, err
+		}
+		start, err := time.Parse(time.RFC3339, startText)
+		if err != nil {
+			return 0, fmt.Errorf("parse target_start %q: %w", startText, err)
+		}
+		startLocal := start.In(location)
+		day, err := time.ParseInLocation("2006-01-02", pricingDay(startLocal, anchorHour), location)
+		if err != nil {
+			return 0, fmt.Errorf("parse pricing day for decision %d: %w", id, err)
+		}
+		dayStart := day.Add(time.Duration(anchorHour) * time.Hour)
+		pending = append(pending, dueDecision{
+			ID:        id,
+			StationID: stationID,
+			Observed:  observed,
+			DayStart:  dayStart,
+			DayEnd:    dayStart.AddDate(0, 0, 1),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(pending) == 0 {
+		return 0, nil
+	}
+
+	floorStmt, err := tx.PrepareContext(ctx, fmt.Sprintf(`
+		SELECT %s, recorded_at
+		FROM price_snapshots
+		WHERE station_id = ?
+			AND is_open = 1
+			AND %s IS NOT NULL
+			AND recorded_at >= ?
+			AND recorded_at < ?
+		ORDER BY %s ASC, recorded_at ASC
+		LIMIT 1
+	`, column, column, column))
+	if err != nil {
+		return 0, err
+	}
+	defer floorStmt.Close()
+	updateStmt, err := tx.PrepareContext(ctx, `
+		UPDATE price_check_decisions
+		SET day_floor_price = ?, day_floor_at = ?, regret = ?, outcome_evaluated_at = ?
+		WHERE id = ? AND outcome_evaluated_at IS NULL
+	`)
+	if err != nil {
+		return 0, err
+	}
+	defer updateStmt.Close()
+
+	evaluatedAt := now.UTC().Format(time.RFC3339)
+	measured := 0
+	// The floor depends only on (station, pricing day), and the persist timer
+	// runs hourly, so a station accumulates roughly 24 decisions sharing one
+	// window. Memoizing collapses those to a single query each.
+	type floorKey struct {
+		StationID string
+		DayStart  time.Time
+	}
+	type floorResult struct {
+		Price float64
+		At    string
+		Found bool
+	}
+	floors := make(map[floorKey]floorResult)
+
+	for _, decision := range pending {
+		key := floorKey{StationID: decision.StationID, DayStart: decision.DayStart}
+		result, cached := floors[key]
+		if !cached {
+			var (
+				floorPrice float64
+				floorAt    string
+			)
+			err := floorStmt.QueryRowContext(ctx, decision.StationID,
+				decision.DayStart.UTC().Format(time.RFC3339),
+				decision.DayEnd.UTC().Format(time.RFC3339)).Scan(&floorPrice, &floorAt)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return 0, err
+			}
+			result = floorResult{Price: floorPrice, At: floorAt, Found: err == nil}
+			floors[key] = result
+		}
+		var (
+			floor  sql.NullFloat64
+			at     sql.NullString
+			regret sql.NullFloat64
+		)
+		if result.Found {
+			floor = sql.NullFloat64{Float64: result.Price, Valid: true}
+			at = sql.NullString{String: result.At, Valid: true}
+			// Signed on purpose. The observed price normally lies inside the
+			// pricing day, so regret is >= 0; a negative value means the
+			// decision was taken against a snapshot older than the day it was
+			// scored against. That is worth seeing — observed_at reveals it —
+			// so it is recorded rather than clamped away.
+			regret = sql.NullFloat64{Float64: decision.Observed - result.Price, Valid: true}
+			measured++
+		}
+		if _, err := updateStmt.ExecContext(ctx, floor, at, regret, evaluatedAt, decision.ID); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return measured, nil
+}
+
 // applyPredictionBias loads the learned per-station corrections and attaches
 // them to the model, so every consumer of scoreForecast (suggest, check,
 // notify) benefits. With no persisted evaluation data this is a no-op.
@@ -258,7 +439,11 @@ func loadPredictionBias(ctx context.Context, db *sql.DB, fuel string, now time.T
 // window. Rows covered by a printed suggestion are flagged. Newer runs
 // supersede older ones for the same target hour — readers should take the
 // latest run — while older rows remain as learning history.
-func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestComputation, opts suggestOptions) (int, error) {
+//
+// The run's id is returned alongside the row count so sibling records — the
+// check decisions — can hang off the same run and inherit its city, fuel and
+// parameter context instead of duplicating it.
+func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestComputation, opts suggestOptions) (int64, int, error) {
 	nowLocal := computation.Now.In(computation.Location)
 	start := nextLocalHour(nowLocal)
 	end := localDayStart(start).AddDate(0, 0, opts.PredictDays)
@@ -272,7 +457,7 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer tx.Rollback()
 
@@ -282,11 +467,11 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 	`, computation.Now.UTC().Format(time.RFC3339), computation.CityName, opts.Fuel, opts.RangeKM,
 		opts.HistoryDays, opts.PredictDays, computation.Model.JumpAnchorHour, len(stationIDs))
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	runID, err := result.LastInsertId()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	insertPrefix := `
@@ -312,7 +497,7 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 	for candidateStart := start; candidateStart.Before(end); candidateStart = candidateStart.Add(time.Hour) {
 		candidateEnd := candidateStart.Add(time.Hour)
 		for _, stationID := range stationIDs {
-			score, ok := scoreForecast(computation.Model, stationID, candidateStart.Weekday(), candidateStart.Hour())
+			score, ok := scoreForecast(computation.Model, stationID, candidateStart)
 			if !ok {
 				continue
 			}
@@ -342,8 +527,117 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 			total++
 			if total%persistInsertBatch == 0 {
 				if err := flush(); err != nil {
-					return 0, err
+					return 0, 0, err
 				}
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return runID, total, nil
+}
+
+// persistCheckDecisions stores what the check path would decide right now:
+// one row per open station with a usable price, carrying the observed price,
+// the model's current-hour reference price, and the verdict/recommendation
+// derived from them.
+//
+// This is the only record of the numbers that drive low-price notifications —
+// the notify path itself computes them and throws them away. The rows are
+// produced by generatePriceChecks, the same pure function the check and notify
+// paths use, so there is no duplicated verdict logic to drift.
+//
+// Unlike a forecast, the "actual" is already known here: it is the observed
+// price in the same snapshot, so error is stored at insert time and no
+// deferred evaluation pass is needed. The outcome columns are the exception —
+// they need the pricing day to finish and are filled by evaluateCheckOutcomes.
+func persistCheckDecisions(ctx context.Context, db *sql.DB, computation *suggestComputation, opts suggestOptions, runID int64) (int, error) {
+	// limit 0 keeps every station: the admin CheckLimit truncation is a
+	// delivery concern, and measurement wants the full picture.
+	checks := generatePriceChecks(computation.Model, computation.Snapshots, opts.Fuel,
+		computation.Now, computation.Location, opts.PredictDays, 0, opts.Thresholds)
+	if len(checks) == 0 {
+		// Every station closed or without a usable price. Nothing to record;
+		// unlike checkGas this is not an error.
+		return 0, nil
+	}
+
+	nowLocal := computation.Now.In(computation.Location)
+	targetStart := localHourStart(nowLocal)
+	targetEnd := targetStart.Add(time.Hour)
+	decidedAt := computation.Now.UTC().Format(time.RFC3339)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	insertPrefix := `
+		INSERT INTO price_check_decisions (run_id, station_id, fuel, decided_at, target_start, target_end,
+			observed_price, observed_at, predicted_price, error, history_percentile, confidence, sample_count,
+			verdict, recommendation, expected_lower, expected_drop)
+		VALUES `
+	var (
+		placeholders string
+		args         []any
+		total        int
+	)
+	flush := func() error {
+		if len(args) == 0 {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, insertPrefix+placeholders, args...); err != nil {
+			return err
+		}
+		placeholders = ""
+		args = args[:0]
+		return nil
+	}
+
+	for _, check := range checks {
+		expectedLower := 0
+		if check.ExpectedLower {
+			expectedLower = 1
+		}
+		// ExpectedDrop is only set when a cheaper future window exists.
+		expectedDrop := sql.NullFloat64{Float64: check.ExpectedDrop, Valid: check.ExpectedDrop > 0}
+		if placeholders != "" {
+			placeholders += ", "
+		}
+		placeholders += "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+		args = append(args,
+			runID,
+			check.StationID,
+			opts.Fuel,
+			decidedAt,
+			targetStart.UTC().Format(time.RFC3339),
+			targetEnd.UTC().Format(time.RFC3339),
+			// The unrounded values the verdict was decided on, not the
+			// display-rounded ones: the day floor this is later compared
+			// against comes straight from price_snapshots at full precision,
+			// so rounding here would put a half-cent artifact into both the
+			// stored error and the regret.
+			check.rawCurrentPrice,
+			check.RecordedAt,
+			check.rawPredictedPrice,
+			check.rawCurrentPrice-check.rawPredictedPrice,
+			check.HistoryPercentile,
+			check.Confidence,
+			check.SampleCount,
+			check.Verdict,
+			check.Recommendation,
+			expectedLower,
+			expectedDrop,
+		)
+		total++
+		if total%decisionInsertBatch == 0 {
+			if err := flush(); err != nil {
+				return 0, err
 			}
 		}
 	}
@@ -404,10 +698,31 @@ func prunePredictions(ctx context.Context, db *sql.DB, now time.Time) (int, erro
 	if err != nil {
 		return 0, err
 	}
+	// A run is only orphaned once neither predictions nor decisions point at
+	// it; dropping it earlier would break the decisions' foreign key.
 	if _, err := db.ExecContext(ctx, `
 		DELETE FROM prediction_runs
 		WHERE NOT EXISTS (SELECT 1 FROM price_predictions pp WHERE pp.run_id = prediction_runs.id)
+			AND NOT EXISTS (SELECT 1 FROM price_check_decisions pd WHERE pd.run_id = prediction_runs.id)
 	`); err != nil {
+		return 0, err
+	}
+	return int(pruned), nil
+}
+
+// pruneCheckDecisions enforces the same retention window on decision rows.
+// Runs it leaves orphaned are collected by prunePredictions.
+func pruneCheckDecisions(ctx context.Context, db *sql.DB, now time.Time) (int, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	cutoff := now.AddDate(0, 0, -predictionRetentionDays).UTC().Format(time.RFC3339)
+	result, err := db.ExecContext(ctx, `DELETE FROM price_check_decisions WHERE target_end < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	pruned, err := result.RowsAffected()
+	if err != nil {
 		return 0, err
 	}
 	return int(pruned), nil

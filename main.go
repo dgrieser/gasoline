@@ -224,6 +224,9 @@ type suggestOptions struct {
 	LimitPerDay int
 	Now         time.Time
 	Location    *time.Location
+	// Thresholds is carried for the check decisions logged alongside a
+	// persisted run, so they use the same margin rule the check path would.
+	Thresholds verdictThresholds
 }
 
 type checkOptions struct {
@@ -235,6 +238,9 @@ type checkOptions struct {
 	Limit       int
 	Now         time.Time
 	Location    *time.Location
+	// Thresholds selects the price margin rule. The zero value is the
+	// historical flat margin, so callers that do not set it are unaffected.
+	Thresholds verdictThresholds
 }
 
 type suggestSnapshot struct {
@@ -363,6 +369,15 @@ type priceCheckRow struct {
 	ExpectedDrop          float64              `json:"expected_drop,omitempty"`
 	Confidence            string               `json:"confidence"`
 	SampleCount           int                  `json:"sample_count"`
+
+	// CurrentPrice and PredictedCurrentPrice above are rounded for display,
+	// but the verdict is decided on the unrounded values. German pump prices
+	// carry three decimals, so rounding to two moves a price by up to half a
+	// cent — enough to matter when the decision log's whole purpose is
+	// measuring a residual against a 1 ct bucket. These keep the values the
+	// verdict actually saw. Unexported, so the JSON output is unchanged.
+	rawCurrentPrice   float64
+	rawPredictedPrice float64
 }
 
 type futureForecast struct {
@@ -1351,9 +1366,16 @@ func runSuggest(args []string) error {
 	// Evaluate before computing so freshly measured errors feed this run's
 	// bias correction. Evaluation is fuel-scoped, not city-scoped, so one
 	// pass covers every city.
-	var evaluated int
+	var evaluated, outcomes int
 	if *persist {
 		evaluated, err = evaluateDuePredictions(ctx, db, opts.Fuel, opts.Now)
+		if err != nil {
+			return err
+		}
+		// Settle check decisions whose pricing day has finished, so a
+		// decision logged today is scored against that day's floor on a
+		// later run.
+		outcomes, err = evaluateCheckOutcomes(ctx, db, opts.Fuel, opts.Now, opts.Location)
 		if err != nil {
 			return err
 		}
@@ -1363,11 +1385,11 @@ func runSuggest(args []string) error {
 	// city independently, report failures at the end.
 	results := make([]citySuggestResult, 0, len(cities))
 	failures := 0
-	persisted, biased := 0, 0
+	var totals persistCounts
 	for _, cityName := range cities {
 		cityOpts := opts
 		cityOpts.City = cityName
-		suggestions, stored, biasedStations, err := suggestOneCity(ctx, db, cityOpts, *persist)
+		suggestions, counts, err := suggestOneCity(ctx, db, cityOpts, *persist)
 		if err != nil {
 			if len(cities) == 1 {
 				return err
@@ -1381,8 +1403,7 @@ func runSuggest(args []string) error {
 			results = append(results, citySuggestResult{City: cityName, Error: err.Error()})
 			continue
 		}
-		persisted += stored
-		biased += biasedStations
+		totals = totals.add(counts)
 		if len(cities) > 1 && suggestions == nil {
 			// Multi-city JSON: a success always carries an array; only
 			// failed cities have null suggestions.
@@ -1392,12 +1413,19 @@ func runSuggest(args []string) error {
 	}
 
 	if *persist {
+		// Decisions first: prunePredictions collects the runs both tables
+		// leave behind, so it has to run last.
+		prunedDecisions, err := pruneCheckDecisions(ctx, db, opts.Now)
+		if err != nil {
+			return err
+		}
 		pruned, err := prunePredictions(ctx, db, opts.Now)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "persist: stored %d predictions, evaluated %d, bias-corrected %d stations, pruned %d\n",
-			persisted, evaluated, biased, pruned)
+		fmt.Fprintf(os.Stderr,
+			"persist: stored %d predictions, %d decisions, evaluated %d, outcomes %d, bias-corrected %d stations, pruned %d/%d\n",
+			totals.Predictions, totals.Decisions, evaluated, outcomes, totals.BiasedStations, pruned, prunedDecisions)
 	}
 
 	if !quiet {
@@ -1703,28 +1731,47 @@ func resolveCities(ctx context.Context, db *sql.DB, fs *flag.FlagSet, flagCity s
 	return cities, nil
 }
 
+// persistCounts tallies what one persisted city run wrote, for the summary
+// line. Zero across the board when --persist is not set.
+type persistCounts struct {
+	Predictions    int
+	Decisions      int
+	BiasedStations int
+}
+
+func (c persistCounts) add(other persistCounts) persistCounts {
+	c.Predictions += other.Predictions
+	c.Decisions += other.Decisions
+	c.BiasedStations += other.BiasedStations
+	return c
+}
+
 // suggestOneCity computes one city's suggestions and, when persist is set,
-// stores the prediction run. Returns the suggestions plus the number of
-// stored predictions and bias-corrected stations for the persist summary.
-func suggestOneCity(ctx context.Context, db *sql.DB, opts suggestOptions, persist bool) ([]suggestionRow, int, int, error) {
+// stores the prediction run and the check decisions taken against the same
+// model. Returns the suggestions plus the counts for the persist summary.
+func suggestOneCity(ctx context.Context, db *sql.DB, opts suggestOptions, persist bool) ([]suggestionRow, persistCounts, error) {
 	computation, err := computeSuggestions(ctx, db, opts)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, persistCounts{}, err
 	}
 	if !persist {
-		return computation.Suggestions, 0, 0, nil
+		return computation.Suggestions, persistCounts{}, nil
 	}
-	stored, err := persistPredictionRun(ctx, db, computation, opts)
+	runID, stored, err := persistPredictionRun(ctx, db, computation, opts)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, persistCounts{}, err
 	}
-	biased := 0
+	decisions, err := persistCheckDecisions(ctx, db, computation, opts, runID)
+	if err != nil {
+		return nil, persistCounts{}, err
+	}
+	counts := persistCounts{Predictions: stored, Decisions: decisions}
 	for _, station := range computation.Model.Stations {
 		if station.BiasCorrection != 0 {
-			biased++
+			counts.BiasedStations++
 		}
 	}
-	return computation.Suggestions, stored, biased, nil
+	return computation.Suggestions, counts, nil
 }
 
 // citySuggestResult is one city's outcome in a multi-city suggest run.
@@ -1777,6 +1824,10 @@ type suggestComputation struct {
 	Location    *time.Location
 	Model       forecastModel
 	Suggestions []suggestionRow
+	// Snapshots are the raw rows the model was built from. They are kept so
+	// the persist path can score the current hour against the observed price
+	// without reloading them.
+	Snapshots []suggestSnapshot
 }
 
 func suggestGas(ctx context.Context, db *sql.DB, opts suggestOptions) ([]suggestionRow, error) {
@@ -1829,6 +1880,7 @@ func computeSuggestions(ctx context.Context, db *sql.DB, opts suggestOptions) (*
 		Location:    location,
 		Model:       model,
 		Suggestions: suggestions,
+		Snapshots:   snapshots,
 	}, nil
 }
 
@@ -1864,7 +1916,7 @@ func checkGas(ctx context.Context, db *sql.DB, opts checkOptions) ([]priceCheckR
 	if err := applyPredictionBias(ctx, db, &model, opts.Fuel, now); err != nil {
 		return nil, err
 	}
-	checks := generatePriceChecks(model, snapshots, opts.Fuel, now, location, opts.PredictDays, opts.Limit)
+	checks := generatePriceChecks(model, snapshots, opts.Fuel, now, location, opts.PredictDays, opts.Limit, opts.Thresholds)
 	if len(checks) == 0 {
 		return nil, errors.New("not enough current open-price data for checks")
 	}
@@ -2137,12 +2189,17 @@ func (m *forecastModel) addSample(bucket hourBucket, price float64) {
 		Weight: bucket.Minutes * math.Exp(-bucket.AgeDays/10),
 		Date:   bucket.Start.Format("2006-01-02"),
 	}
-	weekdayKey := stationWeekdayHourKey{
-		StationID: bucket.StationID,
-		Weekday:   bucket.Start.Weekday(),
-		Hour:      bucket.Start.Hour(),
+	// A public holiday does not price like its calendar weekday, so it is kept
+	// out of the weekday bucket. The sample still feeds the hour and recent
+	// sets, which carry no weekday assumption, so no price data is lost.
+	if !isGermanHoliday(bucket.Start) {
+		weekdayKey := stationWeekdayHourKey{
+			StationID: bucket.StationID,
+			Weekday:   bucket.Start.Weekday(),
+			Hour:      bucket.Start.Hour(),
+		}
+		m.WeekdayHour[weekdayKey] = append(m.WeekdayHour[weekdayKey], sample)
 	}
-	m.WeekdayHour[weekdayKey] = append(m.WeekdayHour[weekdayKey], sample)
 	hourKey := stationHourKey{
 		StationID: bucket.StationID,
 		Hour:      bucket.Start.Hour(),
@@ -2318,7 +2375,7 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 	for candidateStart := start; candidateStart.Before(end); candidateStart = candidateStart.Add(time.Hour) {
 		for _, stationID := range stationIDs {
 			station := model.Stations[stationID].Station
-			score, ok := scoreForecast(model, stationID, candidateStart.Weekday(), candidateStart.Hour())
+			score, ok := scoreForecast(model, stationID, candidateStart)
 			if !ok {
 				continue
 			}
@@ -2395,7 +2452,7 @@ func mergeSuggestions(suggestions []suggestionRow) []suggestionRow {
 	return result
 }
 
-func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel string, now time.Time, location *time.Location, predictDays, limit int) []priceCheckRow {
+func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel string, now time.Time, location *time.Location, predictDays, limit int, thresholds verdictThresholds) []priceCheckRow {
 	nowLocal := now.In(location)
 	latestByStation := latestSnapshotsByStation(snapshots)
 	stationIDs := make([]string, 0, len(latestByStation))
@@ -2411,7 +2468,7 @@ func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel 
 			continue
 		}
 
-		currentScore, ok := scoreForecast(model, stationID, nowLocal.Weekday(), nowLocal.Hour())
+		currentScore, ok := scoreForecast(model, stationID, nowLocal)
 		if !ok {
 			continue
 		}
@@ -2442,11 +2499,26 @@ func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel 
 			Fuel:                  fuel,
 			CurrentPrice:          roundTo(snapshot.Price.Float64, 2),
 			PredictedCurrentPrice: roundTo(currentScore.PredictedPrice, 2),
+			rawCurrentPrice:       snapshot.Price.Float64,
+			rawPredictedPrice:     currentScore.PredictedPrice,
 			HistoryPercentile:     roundTo(percentile, 1),
 			Confidence:            currentScore.Confidence,
 			SampleCount:           currentScore.SampleCount,
 		}
-		row.Verdict = priceCheckVerdict(snapshot.Price.Float64, currentScore.PredictedPrice, percentile)
+		// The margin scales with this station's own daily swing when the
+		// admin enabled relative mode; otherwise it is the flat default.
+		// Guarded here rather than inside forStation because the argument is
+		// evaluated first: in the default fixed mode the 24-hour median scan
+		// would otherwise run for every station only to be discarded.
+		var (
+			amplitude    float64
+			hasAmplitude bool
+		)
+		if thresholds.Relative {
+			amplitude, hasAmplitude = stationDailyAmplitude(model, stationID)
+		}
+		delta := thresholds.forStation(amplitude, hasAmplitude)
+		row.Verdict = priceCheckVerdict(snapshot.Price.Float64, currentScore.PredictedPrice, percentile, delta)
 
 		if future, ok := bestFutureForecast(model, stationID, nowLocal, predictDays); ok {
 			row.BestFutureDate = future.Start.Format("2006-01-02")
@@ -2458,7 +2530,7 @@ func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel 
 			if drop > 0 {
 				row.ExpectedDrop = roundTo(drop, 2)
 			}
-			if drop >= 0.020 {
+			if drop >= delta {
 				row.ExpectedLower = true
 				row.Confidence = lowerConfidence(row.Confidence, future.Score.Confidence)
 			}
@@ -2497,7 +2569,7 @@ func bestFutureForecast(model forecastModel, stationID string, nowLocal time.Tim
 		ok   bool
 	)
 	for candidateStart := start; candidateStart.Before(end); candidateStart = candidateStart.Add(time.Hour) {
-		score, scoreOK := scoreForecast(model, stationID, candidateStart.Weekday(), candidateStart.Hour())
+		score, scoreOK := scoreForecast(model, stationID, candidateStart)
 		if !scoreOK {
 			continue
 		}
@@ -2529,8 +2601,21 @@ type suggestionCandidate struct {
 	start time.Time
 }
 
-func scoreForecast(model forecastModel, stationID string, weekday time.Weekday, hour int) (forecastScore, bool) {
+// scoreForecast predicts the price for one station at one local target time.
+// The full time is taken rather than weekday and hour because the weekday
+// blend is only valid on ordinary days: on a public holiday the weekday bucket
+// describes a different kind of day, so the target's date decides whether that
+// blend applies at all.
+func scoreForecast(model forecastModel, stationID string, target time.Time) (forecastScore, bool) {
+	weekday, hour := target.Weekday(), target.Hour()
 	sameWeekday := model.WeekdayHour[stationWeekdayHourKey{StationID: stationID, Weekday: weekday, Hour: hour}]
+	if isGermanHoliday(target) {
+		// Holidays are excluded from the weekday buckets at ingest, so this
+		// bucket holds ordinary weekdays only — the wrong reference for a
+		// holiday. Fall through to the hour/recent blend below, the same path
+		// a station with too little weekday history already takes.
+		sameWeekday = nil
+	}
 	sameHour := model.Hour[stationHourKey{StationID: stationID, Hour: hour}]
 	recent := model.Recent[stationID]
 	sameHourScore, ok := weightedMedianPrice(sameHour)
@@ -2632,11 +2717,85 @@ func weightedPricePercentile(samples []priceSample, price float64) (float64, boo
 	return 100 * (lowerWeight + equalWeight/2) / totalWeight, true
 }
 
-func priceCheckVerdict(currentPrice, predictedPrice, historyPercentile float64) string {
+// verdictThresholds is the price-margin rule for one check run.
+//
+// Only the absolute margin is configurable. The 30/70 percentile cutoffs are
+// already station-relative — weightedPricePercentile ranks the de-baselined
+// price within that station's own distribution — so scaling them would add
+// nothing.
+type verdictThresholds struct {
+	// Delta is the flat margin in euro. Zero means the historical default.
+	Delta float64
+	// Relative switches to a margin derived from the station's own daily
+	// amplitude, with Delta as the fallback where no amplitude is available.
+	Relative bool
+	Fraction float64
+}
+
+// forStation resolves the margin to apply to one station. The zero
+// verdictThresholds yields exactly the historical flat margin, so a caller
+// that never sets thresholds keeps today's behavior.
+func (t verdictThresholds) forStation(amplitude float64, hasAmplitude bool) float64 {
+	delta := t.Delta
+	if delta <= 0 {
+		delta = defaultCheckDelta
+	}
+	if !t.Relative || !hasAmplitude || amplitude <= 0 || t.Fraction <= 0 {
+		return delta
+	}
+	scaled := amplitude * t.Fraction
+	if scaled < minRelativeCheckDelta {
+		return minRelativeCheckDelta
+	}
+	if scaled > maxRelativeCheckDelta {
+		return maxRelativeCheckDelta
+	}
+	return scaled
+}
+
+// minAmplitudeHours is how many distinct hours of the day must be represented
+// before the spread across them is treated as a daily amplitude. Below that
+// the observed range is a sample of part of the sawtooth, not its height.
+const minAmplitudeHours = 12
+
+// stationDailyAmplitude estimates how far a station's price swings within a
+// pricing day, as the spread across its hourly medians.
+//
+// It is only defined for offset-mode stations: their samples are already
+// offsets from the daily baseline, so the spread is the intraday swing alone.
+// For absolute-price stations the same spread would also contain day-to-day
+// level drift, which is exactly what the amplitude must not include.
+func stationDailyAmplitude(model forecastModel, stationID string) (float64, bool) {
+	station, ok := model.Stations[stationID]
+	if !ok || !station.OffsetMode {
+		return 0, false
+	}
+	var lowest, highest float64
+	seen := 0
+	for hour := 0; hour < 24; hour++ {
+		median, ok := weightedMedianPrice(model.Hour[stationHourKey{StationID: stationID, Hour: hour}])
+		if !ok {
+			continue
+		}
+		if seen == 0 || median < lowest {
+			lowest = median
+		}
+		if seen == 0 || median > highest {
+			highest = median
+		}
+		seen++
+	}
+	if seen < minAmplitudeHours {
+		return 0, false
+	}
+	return highest - lowest, true
+}
+
+func priceCheckVerdict(currentPrice, predictedPrice, historyPercentile, delta float64) string {
 	switch {
-	case historyPercentile <= 30 || currentPrice <= predictedPrice-0.020:
+	case historyPercentile <= 30 || currentPrice <= predictedPrice-delta:
 		return "low"
-	case historyPercentile >= 70 || currentPrice >= predictedPrice+0.020:
+	case historyPercentile >= 70 || currentPrice >= predictedPrice+delta:
 		return "high"
 	default:
 		return "typical"

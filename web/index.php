@@ -157,6 +157,34 @@ function redirectTo(string $query): never
 
 // ── Auth: schema guard ────────────────────────────────────────────────────────
 
+/**
+ * Report whether one table exists, using the same driver-aware catalog lookup
+ * as gasolineSchemaReady. Used for tables added after a deployment's database
+ * was created, so the page degrades instead of erroring.
+ */
+function gasolineTableExists(PDO $pdo, string $driver, string $table): bool
+{
+    try {
+        if ($driver === 'mysql') {
+            $stmt = $pdo->prepare(
+                'SELECT COUNT(*) AS n FROM information_schema.tables
+                 WHERE table_schema = DATABASE() AND table_name = :t'
+            );
+        } else {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = :t"
+            );
+        }
+        $stmt->bindValue(':t', $table);
+        $stmt->execute();
+        $row = $stmt->fetch();
+        return (int) ($row['n'] ?? 0) > 0;
+    } catch (Throwable $e) {
+        error_log('gasoline table check error: ' . $e->getMessage());
+        return false;
+    }
+}
+
 function gasolineSchemaReady(PDO $pdo, string $driver): bool
 {
     try {
@@ -903,6 +931,10 @@ function handlePost(PDO $pdo, string $driver): void
                 // to each user's configured notification title.
                 'check_title_template' => static fn (string $v): bool => true,
                 'suggest_title_template' => static fn (string $v): bool => true,
+                // Verdict margin rule. "fixed" keeps the historical flat 2 ct
+                // margin; "relative" scales it by each station's daily swing.
+                'check_delta_mode' => static fn (string $v): bool => in_array($v, ['fixed', 'relative'], true),
+                'check_delta_fraction' => static fn (string $v): bool => is_numeric($v) && (float) $v > 0 && (float) $v <= 1,
             ];
             $kv = [];
             foreach ($fields as $name => $validate) {
@@ -1676,6 +1708,39 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         </div>
 
         <div class="settings-card">
+            <h2 data-i18n="predByLead">Accuracy by lead time</h2>
+            <p class="auth-note" data-i18n="predLeadHint">How far ahead the prediction was made. Errors beyond six hours are dominated by price moves nobody could have known about, which is why only shorter leads train the bias correction.</p>
+            <div class="table-scroll">
+                <table class="stack-table">
+                    <thead><tr><th data-i18n="predColBucket">Lead time</th><th data-i18n="predColCount">Count</th><th data-i18n="predStatMae">MAE</th><th data-i18n="predStatBias">Bias</th></tr></thead>
+                    <tbody id="pred-lead-tbody"><tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="predByHour">Accuracy by hour (UTC)</h2>
+            <p class="auth-note" data-i18n="predHourHint">Hours are the target hour in UTC, not your local time. A consistent bias in particular hours means the model misses that part of the daily price curve.</p>
+            <div class="table-scroll">
+                <table class="stack-table">
+                    <thead><tr><th data-i18n="predColHour">Hour (UTC)</th><th data-i18n="predColCount">Count</th><th data-i18n="predStatMae">MAE</th><th data-i18n="predStatBias">Bias</th></tr></thead>
+                    <tbody id="pred-hour-tbody"><tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="settings-card" id="pred-dec-card" hidden>
+            <h2 data-i18n="predDecTitle">Alert outcomes</h2>
+            <p class="auth-note" data-i18n="predDecHint">What the check path decided, scored against the cheapest price that pricing day actually offered. Regret is how much more than the day's low the price was at the moment of the decision, so a good "buy" has a regret near zero. These are the model's decisions recorded on the suggestion timer, not a log of delivered notifications: per-user schedules, city selections and the repeat-suppression baseline are not reflected here.</p>
+            <div class="table-scroll">
+                <table class="stack-table">
+                    <thead><tr><th data-i18n="predColRecommendation">Recommendation</th><th data-i18n="predColCount">Count</th><th data-i18n="predColRegret">Mean regret</th><th data-i18n="predColHit1">Within 1 ct</th><th data-i18n="predColHit2">Within 2 ct</th></tr></thead>
+                    <tbody id="pred-dec-tbody"><tr><td colspan="5" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="settings-card">
             <h2 data-i18n="predRawTitle">Raw data</h2>
             <div class="pred-note" id="pred-truncated" data-i18n="predTruncated" hidden>Showing the most recent 1,000 rows; the statistics above cover the full filtered set.</div>
             <div class="table-scroll">
@@ -1715,6 +1780,10 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         const emptyEl    = document.getElementById('pred-chart-empty');
         const tbody      = document.getElementById('pred-tbody');
         const confTbody  = document.getElementById('pred-conf-tbody');
+        const leadTbody  = document.getElementById('pred-lead-tbody');
+        const hourTbody  = document.getElementById('pred-hour-tbody');
+        const decTbody   = document.getElementById('pred-dec-tbody');
+        const decCard    = document.getElementById('pred-dec-card');
         const moreWrap   = document.getElementById('pred-more');
         const moreBtn    = document.getElementById('pred-more-btn');
         const truncEl    = document.getElementById('pred-truncated');
@@ -1766,6 +1835,9 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             statIds.forEach((id) => { const el = document.getElementById(id); if (el) { el.textContent = ' '; el.classList.add('skeleton'); el.setAttribute('aria-busy', 'true'); } });
             if (tbody) tbody.innerHTML = '<tr><td colspan="8" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
             if (confTbody) confTbody.innerHTML = '<tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
+            if (leadTbody) leadTbody.innerHTML = '<tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
+            if (hourTbody) hourTbody.innerHTML = '<tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
+            if (decTbody) decTbody.innerHTML = '<tr><td colspan="5" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
             if (moreWrap) moreWrap.hidden = true;
             if (truncEl) truncEl.hidden = true;
         }
@@ -1781,6 +1853,9 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             statIds.forEach((id) => setStat(id, '—'));
             if (tbody) tbody.innerHTML = '<tr><td colspan="8" role="alert" style="text-align:center;color:var(--red);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="' + key + '">' + esc(msg) + '</td></tr>';
             if (confTbody) confTbody.innerHTML = '';
+            if (leadTbody) leadTbody.innerHTML = '';
+            if (hourTbody) hourTbody.innerHTML = '';
+            if (decTbody) decTbody.innerHTML = '';
             if (moreWrap) moreWrap.hidden = true;
         }
 
@@ -1804,6 +1879,9 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             if (!data) return;
             renderStats();
             renderConf();
+            renderLead();
+            renderHour();
+            renderDecisions();
             renderChart();
             renderTable();
         }
@@ -1834,6 +1912,67 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
                 + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
                 + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
+                + '</tr>'
+            ).join('');
+        }
+
+        // Empty-state cell shared by the breakdown tables.
+        function emptyRow(span) {
+            return '<tr><td colspan="' + span + '" style="text-align:center;color:var(--muted);padding:1rem;font-family:var(--mono);font-size:.8rem">'
+                + esc(T().predNoData) + '</td></tr>';
+        }
+
+        function renderLead() {
+            if (!leadTbody) return;
+            // Ordered by the bucket's lower bound: the labels would sort
+            // lexicographically, putting "12-24h" before "1-3h".
+            const rows = ((data && data.by_lead) || []).slice().sort((a, b) => (a.lead_floor || 0) - (b.lead_floor || 0));
+            const t = T();
+            if (rows.length === 0) { leadTbody.innerHTML = emptyRow(4); return; }
+            leadTbody.innerHTML = rows.map((r) =>
+                '<tr>'
+                + '<td data-label="' + esc(t.predColBucket) + '">' + esc(r.bucket) + '</td>'
+                + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
+                + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
+                + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
+                + '</tr>'
+            ).join('');
+        }
+
+        function renderHour() {
+            if (!hourTbody) return;
+            const rows = ((data && data.by_hour) || []).slice().sort((a, b) => a.hour - b.hour);
+            const t = T();
+            if (rows.length === 0) { hourTbody.innerHTML = emptyRow(4); return; }
+            hourTbody.innerHTML = rows.map((r) =>
+                '<tr>'
+                + '<td data-label="' + esc(t.predColHour) + '">' + esc(String(r.hour).padStart(2, '0') + ':00') + '</td>'
+                + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
+                + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
+                + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
+                + '</tr>'
+            ).join('');
+        }
+
+        function recLabel(r) { return T()['predRec_' + r] || r; }
+
+        function renderDecisions() {
+            if (!decTbody || !decCard) return;
+            // null means the table does not exist in this database yet.
+            const rows = (data && data.decisions) || null;
+            if (rows === null) { decCard.hidden = true; return; }
+            decCard.hidden = false;
+            const rank = { buy: 0, hold: 1, wait: 2 };
+            const sorted = rows.slice().sort((a, b) => (rank[a.recommendation] ?? 9) - (rank[b.recommendation] ?? 9));
+            const t = T();
+            if (sorted.length === 0) { decTbody.innerHTML = emptyRow(5); return; }
+            decTbody.innerHTML = sorted.map((r) =>
+                '<tr>'
+                + '<td data-label="' + esc(t.predColRecommendation) + '">' + esc(recLabel(r.recommendation)) + '</td>'
+                + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
+                + '<td data-label="' + esc(t.predColRegret) + '">' + esc(fmtCt(r.avg_regret)) + '</td>'
+                + '<td data-label="' + esc(t.predColHit1) + '">' + esc(fmtPct(r.within1_pct)) + '</td>'
+                + '<td data-label="' + esc(t.predColHit2) + '">' + esc(fmtPct(r.within2_pct)) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -2014,7 +2153,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             if (data) renderChart();
         }));
 
-        window.onLangChange = () => { if (data) { renderStats(); renderConf(); renderChart(); renderTable(); } };
+        window.onLangChange = () => { if (data) { renderStats(); renderConf(); renderLead(); renderHour(); renderDecisions(); renderChart(); renderTable(); } };
         window.onThemeChange = () => { if (data) renderChart(); };
 
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', load);
@@ -2113,7 +2252,20 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                         <label for="st-reset" data-i18n="settingCheckResetTime">Check baseline reset</label>
                         <input type="text" id="st-reset" name="check_reset_time" value="<?= h($get('check_reset_time', '00:00')) ?>" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
                     </div>
+                    <div class="field">
+                        <label for="st-delta-mode" data-i18n="settingCheckDeltaMode">Price margin</label>
+                        <select id="st-delta-mode" name="check_delta_mode">
+                            <?php $deltaMode = $get('check_delta_mode', 'fixed'); ?>
+                            <option value="fixed"<?= $deltaMode === 'relative' ? '' : ' selected' ?> data-i18n="settingCheckDeltaFixed">Fixed (2 ct)</option>
+                            <option value="relative"<?= $deltaMode === 'relative' ? ' selected' : '' ?> data-i18n="settingCheckDeltaRelative">Relative to station swing</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="st-delta-fraction" data-i18n="settingCheckDeltaFraction">Margin fraction</label>
+                        <input type="number" id="st-delta-fraction" name="check_delta_fraction" min="0.01" max="1" step="0.01" value="<?= h($get('check_delta_fraction', '0.2')) ?>">
+                    </div>
                 </div>
+                <p class="auth-note" data-i18n="settingCheckDeltaHint">The price margin decides when a price counts as low and when a cheaper upcoming window suppresses a buy. Fixed keeps the historical flat 2 ct for every station. Relative uses the margin fraction of each station's own daily price swing instead, so calm and volatile stations are judged on their own terms; stations without a reliable swing estimate keep the fixed margin.</p>
                 <div class="field">
                     <label for="st-windows" data-i18n="settingNotifyWindows">Default notification windows</label>
                     <input type="text" id="st-windows" name="notify_windows" placeholder="07:00-21:00" value="<?= h($get('notify_windows', '07:00-21:00')) ?>">
@@ -2493,6 +2645,11 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
     $out = [
         'summary' => null,
         'by_confidence' => [],
+        'by_lead' => [],
+        'by_hour' => [],
+        // null (not []) while the decisions table does not exist yet, so the
+        // UI can hide the card instead of showing an empty one.
+        'decisions' => null,
         'series' => [],
         'rows' => [],
         'stations' => [],
@@ -2503,6 +2660,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
 
     try {
         $pdo = $authPdo;
+        $driver = $dbDriver;
         // Shared WHERE + params reused across the aggregate, breakdown, series and
         // raw-row queries so every panel reflects exactly the same filtered set.
         $joinRuns = $paCity !== '' ? 'JOIN prediction_runs pr ON pr.id = pp.run_id ' : '';
@@ -2575,6 +2733,104 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
                 'mae' => (float) $row['mae'],
                 'bias' => (float) $row['bias'],
             ];
+        }
+
+        // 2b) Per-lead-time breakdown: does error grow with the horizon? The
+        //     3-6h boundary is deliberately 360 minutes, the cutoff below
+        //     which predictions.go lets predictions train the bias
+        //     correction, so the table shows both sides of that line.
+        $leadBucket = 'CASE'
+            . " WHEN pp.lead_minutes < 60 THEN '0-1h'"
+            . " WHEN pp.lead_minutes < 180 THEN '1-3h'"
+            . " WHEN pp.lead_minutes < 360 THEN '3-6h'"
+            . " WHEN pp.lead_minutes < 720 THEN '6-12h'"
+            . " WHEN pp.lead_minutes < 1440 THEN '12-24h'"
+            . " ELSE '24h+' END";
+        $leadStmt = $pdo->prepare(
+            'SELECT ' . $leadBucket . ' AS bucket, COUNT(*) AS n, '
+            . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, MIN(pp.lead_minutes) AS lead_floor '
+            . 'FROM price_predictions pp ' . $joinRuns
+            . 'WHERE ' . $where . ' GROUP BY ' . $leadBucket
+        );
+        $bind($leadStmt);
+        $leadStmt->execute();
+        foreach ($leadStmt->fetchAll() as $row) {
+            $out['by_lead'][] = [
+                'bucket' => (string) $row['bucket'],
+                'count' => (int) $row['n'],
+                'mae' => (float) $row['mae'],
+                'bias' => (float) $row['bias'],
+                // Sort key: the JS orders buckets by their lower bound rather
+                // than by the label, which would sort lexicographically.
+                'lead_floor' => (int) $row['lead_floor'],
+            ];
+        }
+
+        // 2c) Per-hour-of-day breakdown. target_start is a fixed-width
+        //     RFC3339 UTC string (see the invariant above), so characters
+        //     12-13 are the hour. SUBSTR avoids strftime()/HOUR(), neither of
+        //     which exists in both SQLite and MySQL. Buckets are therefore
+        //     UTC hours; the UI labels them as such rather than silently
+        //     shifting them into the viewer's timezone.
+        $hourExpr = 'SUBSTR(pp.target_start, 12, 2)';
+        $hourStmt = $pdo->prepare(
+            'SELECT ' . $hourExpr . ' AS hour, COUNT(*) AS n, '
+            . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias '
+            . 'FROM price_predictions pp ' . $joinRuns
+            . 'WHERE ' . $where . ' GROUP BY ' . $hourExpr . ' ORDER BY hour ASC'
+        );
+        $bind($hourStmt);
+        $hourStmt->execute();
+        foreach ($hourStmt->fetchAll() as $row) {
+            $out['by_hour'][] = [
+                'hour' => (int) $row['hour'],
+                'count' => (int) $row['n'],
+                'mae' => (float) $row['mae'],
+                'bias' => (float) $row['bias'],
+            ];
+        }
+
+        // 2d) Alert outcomes: when the check path said buy, how close to that
+        //     pricing day's floor did the price turn out to be? Only settled
+        //     rows count. The table is newer than the rest of the schema, so
+        //     its absence must not break the page.
+        if (gasolineTableExists($pdo, $driver, 'price_check_decisions')) {
+            $decWhere = 'd.outcome_evaluated_at IS NOT NULL AND d.regret IS NOT NULL'
+                . ' AND d.fuel = :fuel AND d.target_start >= :from AND d.target_start <= :to';
+            $decParams = [':fuel' => $paFuel, ':from' => $fromTs, ':to' => $toTs];
+            $decJoin = '';
+            if ($paCity !== '') {
+                $decJoin = 'JOIN prediction_runs pr ON pr.id = d.run_id ';
+                $decWhere .= ' AND pr.city_name = :city';
+                $decParams[':city'] = $paCity;
+            }
+            if ($paConfidence === 'medium_high') {
+                $decWhere .= " AND d.confidence IN ('medium', 'high')";
+            }
+            $decStmt = $pdo->prepare(
+                'SELECT d.recommendation AS recommendation, COUNT(*) AS n, '
+                . 'AVG(d.regret) AS avg_regret, '
+                . 'SUM(CASE WHEN d.regret <= 0.01 THEN 1 ELSE 0 END) AS within1, '
+                . 'SUM(CASE WHEN d.regret <= 0.02 THEN 1 ELSE 0 END) AS within2 '
+                . 'FROM price_check_decisions d ' . $decJoin
+                . 'WHERE ' . $decWhere . ' GROUP BY d.recommendation'
+            );
+            foreach ($decParams as $k => $v) {
+                $decStmt->bindValue($k, $v);
+            }
+            $decStmt->execute();
+            $decisions = [];
+            foreach ($decStmt->fetchAll() as $row) {
+                $n = (int) $row['n'];
+                $decisions[] = [
+                    'recommendation' => (string) $row['recommendation'],
+                    'count' => $n,
+                    'avg_regret' => (float) $row['avg_regret'],
+                    'within1_pct' => $n > 0 ? (float) $row['within1'] / $n * 100 : 0.0,
+                    'within2_pct' => $n > 0 ? (float) $row['within2'] / $n * 100 : 0.0,
+                ];
+            }
+            $out['decisions'] = $decisions;
         }
 
         // 3) Time series aggregated per target hour. Target windows are hourly, so
@@ -4999,6 +5255,11 @@ const translations = {
         settingCheckLimit: 'Check row limit',
         settingSuggestTimes: 'Default suggestion times',
         settingCheckResetTime: 'Check baseline reset',
+        settingCheckDeltaMode: 'Price margin',
+        settingCheckDeltaFixed: 'Fixed (2 ct)',
+        settingCheckDeltaRelative: 'Relative to station swing',
+        settingCheckDeltaFraction: 'Margin fraction',
+        settingCheckDeltaHint: "The price margin decides when a price counts as low and when a cheaper upcoming window suppresses a buy. Fixed keeps the historical flat 2 ct for every station. Relative uses the margin fraction of each station's own daily price swing instead, so calm and volatile stations are judged on their own terms; stations without a reliable swing estimate keep the fixed margin.",
         settingNotifyWindows: 'Default notification windows',
         settingNotifyDays: 'Default notification days',
         templateCheck: 'Buy-alert notification template',
@@ -5027,6 +5288,21 @@ const translations = {
         predViewScatter: 'Scatter',
         predNoData: 'No evaluated predictions match the current filters.',
         predByConfidence: 'Accuracy by confidence',
+        predByLead: 'Accuracy by lead time',
+        predLeadHint: 'How far ahead the prediction was made. Errors beyond six hours are dominated by price moves nobody could have known about, which is why only shorter leads train the bias correction.',
+        predColBucket: 'Lead time',
+        predByHour: 'Accuracy by hour (UTC)',
+        predHourHint: 'Hours are the target hour in UTC, not your local time. A consistent bias in particular hours means the model misses that part of the daily price curve.',
+        predColHour: 'Hour (UTC)',
+        predDecTitle: 'Alert outcomes',
+        predDecHint: 'What the check path decided, scored against the cheapest price that pricing day actually offered. Regret is how much more than the day\'s low the price was at the moment of the decision, so a good "buy" has a regret near zero. These are the model\'s decisions recorded on the suggestion timer, not a log of delivered notifications: per-user schedules, city selections and the repeat-suppression baseline are not reflected here.',
+        predColRecommendation: 'Recommendation',
+        predColRegret: 'Mean regret',
+        predColHit1: 'Within 1 ct',
+        predColHit2: 'Within 2 ct',
+        predRec_buy: 'Buy',
+        predRec_hold: 'Hold',
+        predRec_wait: 'Wait',
         predRawTitle: 'Raw data',
         predTruncated: 'Showing the most recent 1,000 rows; the statistics above cover the full filtered set.',
         predColTarget: 'Target window',
@@ -5246,6 +5522,11 @@ const translations = {
         settingCheckLimit: 'Zeilenlimit der Preisprüfung',
         settingSuggestTimes: 'Standard-Vorschlagszeiten',
         settingCheckResetTime: 'Preis-Baseline zurücksetzen um',
+        settingCheckDeltaMode: 'Preisabstand',
+        settingCheckDeltaFixed: 'Fest (2 ct)',
+        settingCheckDeltaRelative: 'Relativ zur Tagesspanne',
+        settingCheckDeltaFraction: 'Anteil der Tagesspanne',
+        settingCheckDeltaHint: 'Der Preisabstand bestimmt, ab wann ein Preis als niedrig gilt und wann ein günstigeres kommendes Zeitfenster eine Kaufempfehlung unterdrückt. „Fest“ behält die bisherigen 2 ct für jede Tankstelle bei. „Relativ“ verwendet stattdessen den eingestellten Anteil der tankstelleneigenen Tagesspanne, sodass ruhige und schwankungsreiche Tankstellen jeweils an ihrem eigenen Verhalten gemessen werden; Tankstellen ohne verlässliche Schätzung der Tagesspanne behalten den festen Abstand.',
         settingNotifyWindows: 'Standard-Zeitfenster',
         settingNotifyDays: 'Standard-Wochentage',
         templateCheck: 'Vorlage für Kaufalarme',
@@ -5274,6 +5555,21 @@ const translations = {
         predViewScatter: 'Streudiagramm',
         predNoData: 'Keine ausgewerteten Vorhersagen für die aktuellen Filter.',
         predByConfidence: 'Genauigkeit nach Konfidenz',
+        predByLead: 'Genauigkeit nach Vorlaufzeit',
+        predLeadHint: 'Wie weit im Voraus die Vorhersage erstellt wurde. Fehler jenseits von sechs Stunden werden von Preisbewegungen bestimmt, die niemand vorhersehen konnte — deshalb fließen nur kürzere Vorlaufzeiten in die Bias-Korrektur ein.',
+        predColBucket: 'Vorlaufzeit',
+        predByHour: 'Genauigkeit nach Stunde (UTC)',
+        predHourHint: 'Die Stunden beziehen sich auf die Zielstunde in UTC, nicht auf Ihre lokale Zeit. Ein durchgängiger Bias in bestimmten Stunden bedeutet, dass das Modell diesen Teil des Tagesverlaufs verfehlt.',
+        predColHour: 'Stunde (UTC)',
+        predDecTitle: 'Ergebnisse der Kaufempfehlungen',
+        predDecHint: 'Was der Preis-Check entschieden hat, gemessen am günstigsten Preis, den der jeweilige Preistag tatsächlich geboten hat. Die Differenz zum Tagestief gibt an, wie viel mehr als das Tagestief der Preis im Moment der Entscheidung betrug — eine gute Kaufempfehlung liegt also nahe null. Erfasst sind die Entscheidungen des Modells zum Zeitpunkt des Vorschlags-Timers, nicht die tatsächlich versendeten Benachrichtigungen: persönliche Zeitfenster, Städteauswahl und die Wiederholungssperre sind hier nicht berücksichtigt.',
+        predColRecommendation: 'Empfehlung',
+        predColRegret: 'Mittlere Differenz zum Tagestief',
+        predColHit1: 'Innerhalb 1 ct',
+        predColHit2: 'Innerhalb 2 ct',
+        predRec_buy: 'Kaufen',
+        predRec_hold: 'Abwarten',
+        predRec_wait: 'Warten',
         predRawTitle: 'Rohdaten',
         predTruncated: 'Es werden die neuesten 1.000 Zeilen angezeigt; die Statistiken oben umfassen den vollständigen gefilterten Datensatz.',
         predColTarget: 'Zielfenster',
