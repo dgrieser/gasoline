@@ -103,8 +103,9 @@ type updateResult struct {
 
 // cityUpdateResult is one target's outcome. FetchedCount is what the API
 // returned for that target; StoredCount is how many of those snapshots this
-// target actually owns. They differ only when an overlapping target's centre
-// sits nearer to a shared station (see dedupeFetches).
+// target wrote. They differ when an overlapping target's centre sits nearer to
+// a shared station, which makes that target write it instead (see
+// dedupeFetches).
 type cityUpdateResult struct {
 	Query        string     `json:"query"`
 	City         cachedCity `json:"city"`
@@ -854,7 +855,9 @@ func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, q cityQuery,
 	}, nil
 }
 
-// stationObservation is the winning reading for one station in a sweep.
+// stationObservation is the winning reading for one station in a sweep, plus
+// the target that owns it. Ownership and reading are chosen independently: the
+// nearest target owns the station, but the freshest fetch supplies the prices.
 type stationObservation struct {
 	Station    tankerStation
 	City       cachedCity
@@ -865,27 +868,45 @@ type stationObservation struct {
 }
 
 // dedupeFetches folds a sweep into one observation per station, so targets
-// with overlapping radii no longer store the same reading once per city. The
-// nearest centre wins; ties go to the earlier target. Attribution therefore
-// stays stable across runs, which is what lets persistPriceSnapshot roll an
-// unchanged row forward instead of inserting a fresh one every time.
+// with overlapping radii no longer store the same reading once per city.
+//
+// Ownership goes to the nearest centre, ties to the earlier target, so it
+// stays stable across runs — that stability is what lets persistPriceSnapshot
+// roll an unchanged row forward instead of inserting a fresh one every time.
+// The reading itself comes from the newest fetch that saw the station, whoever
+// that was: targets are fetched one after another, so a farther target can
+// observe a price change the nearer one missed, and dropping it would hide the
+// change until the next sweep.
+//
 // Observations come back in station-id order so a sweep writes deterministically.
 func dedupeFetches(fetches []cityFetch) []stationObservation {
 	best := make(map[string]stationObservation, len(fetches))
 	for i, f := range fetches {
 		for _, station := range f.Stations {
-			obs := stationObservation{
-				Station:    station,
-				City:       f.City,
-				FetchIndex: i,
-				RadiusKM:   f.Query.radius,
-				RecordedAt: f.RecordedAt,
-				DistanceKM: haversineKM(f.City.Lat, f.City.Lng, station.Lat, station.Lng),
-			}
-			if current, ok := best[station.ID]; ok && current.DistanceKM <= obs.DistanceKM {
+			distance := haversineKM(f.City.Lat, f.City.Lng, station.Lat, station.Lng)
+			current, seen := best[station.ID]
+			if !seen {
+				best[station.ID] = stationObservation{
+					Station:    station,
+					City:       f.City,
+					FetchIndex: i,
+					RadiusKM:   f.Query.radius,
+					RecordedAt: f.RecordedAt,
+					DistanceKM: distance,
+				}
 				continue
 			}
-			best[station.ID] = obs
+			if distance < current.DistanceKM {
+				current.City = f.City
+				current.FetchIndex = i
+				current.RadiusKM = f.Query.radius
+				current.DistanceKM = distance
+			}
+			if f.RecordedAt.After(current.RecordedAt) {
+				current.Station = station
+				current.RecordedAt = f.RecordedAt
+			}
+			best[station.ID] = current
 		}
 	}
 
@@ -913,6 +934,7 @@ func persistSweep(ctx context.Context, db *sql.DB, d dialect, fetches []cityFetc
 	}
 	defer tx.Rollback()
 
+	centres := newCityCentres()
 	for _, obs := range observations {
 		recordedAt := obs.RecordedAt.Format(time.RFC3339)
 		if _, err := tx.ExecContext(ctx, stationsUpsertSQL(d),
@@ -921,7 +943,7 @@ func persistSweep(ctx context.Context, db *sql.DB, d dialect, fetches []cityFetc
 			return err
 		}
 
-		if err := persistPriceSnapshot(ctx, tx, obs.City, obs.Station, obs.RecordedAt, obs.RadiusKM); err != nil {
+		if err := persistPriceSnapshot(ctx, tx, centres, obs.City, obs.Station, obs.RecordedAt, obs.RadiusKM); err != nil {
 			return err
 		}
 	}
@@ -4016,8 +4038,17 @@ func compactSnapshotRows(snapshots []compactSnapshotRow) ([]compactSnapshotRow, 
 	return kept, deleteIDs
 }
 
-func persistPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
-	latest, previous, err := latestPriceSnapshots(ctx, tx, station.ID)
+func persistPriceSnapshot(ctx context.Context, tx *sql.Tx, centres *cityCentres, city cachedCity, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
+	latest, previous, currentOwner, err := latestPriceSnapshots(ctx, tx, station.ID)
+	if err != nil {
+		return err
+	}
+
+	// A station inside two targets' radii reaches this once per sweep, not once
+	// per city (see dedupeFetches), so no row has to be duplicated to keep it.
+	// Which city the row names is decided separately, against every city known
+	// to own it — not just the ones this sweep happened to fetch.
+	owner, err := resolveSnapshotOwner(ctx, tx, centres, currentOwner, city, station)
 	if err != nil {
 		return err
 	}
@@ -4031,66 +4062,131 @@ func persistPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, stat
 
 	switch {
 	case latest == nil:
-		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
+		return insertPriceSnapshot(ctx, tx, owner, station, recordedAt, searchRadiusKm)
 	case !priceSnapshotValuesEqual(*latest, current):
-		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
+		return insertPriceSnapshot(ctx, tx, owner, station, recordedAt, searchRadiusKm)
 	case previous != nil && !priceSnapshotValuesEqual(*latest, *previous):
-		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
+		return insertPriceSnapshot(ctx, tx, owner, station, recordedAt, searchRadiusKm)
 	default:
-		// A station inside two targets' radii reaches this once per sweep, not
-		// once per city (see dedupeFetches), so rolling the unchanged row
-		// forward cannot steal it from another city. city_name follows the
-		// station's current owner.
 		_, err := tx.ExecContext(ctx, `
 			UPDATE price_snapshots
 			SET city_name = ?, recorded_at = ?, search_radius_km = ?, is_open = ?, e5 = ?, e10 = ?, diesel = ?
 			WHERE id = ?
-		`, city.Name, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel), latest.ID)
+		`, owner, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel), latest.ID)
 		return err
 	}
 }
 
-// latestPriceSnapshots returns the two most recent snapshots for a station.
-func latestPriceSnapshots(ctx context.Context, tx *sql.Tx, stationID string) (*priceSnapshotValues, *priceSnapshotValues, error) {
+// latestPriceSnapshots returns the two most recent snapshots for a station plus
+// the city_name of the latest one, which is the station's current owner.
+func latestPriceSnapshots(ctx context.Context, tx *sql.Tx, stationID string) (*priceSnapshotValues, *priceSnapshotValues, string, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, is_open, e5, e10, diesel
+		SELECT id, city_name, is_open, e5, e10, diesel
 		FROM price_snapshots
 		WHERE station_id = ?
 		ORDER BY recorded_at DESC, id DESC
 		LIMIT 2
 	`, stationID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 	defer rows.Close()
 
 	var snapshots []*priceSnapshotValues
+	var cities []string
 	for rows.Next() {
 		snapshot := priceSnapshotValues{}
-		if err := rows.Scan(&snapshot.ID, &snapshot.IsOpen, &snapshot.E5, &snapshot.E10, &snapshot.Diesel); err != nil {
-			return nil, nil, err
+		var cityName string
+		if err := rows.Scan(&snapshot.ID, &cityName, &snapshot.IsOpen, &snapshot.E5, &snapshot.E10, &snapshot.Diesel); err != nil {
+			return nil, nil, "", err
 		}
 		snapshots = append(snapshots, &snapshot)
+		cities = append(cities, cityName)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	if len(snapshots) == 0 {
-		return nil, nil, nil
+		return nil, nil, "", nil
 	}
 	if len(snapshots) == 1 {
-		return snapshots[0], nil, nil
+		return snapshots[0], nil, cities[0], nil
 	}
-	return snapshots[0], snapshots[1], nil
+	return snapshots[0], snapshots[1], cities[0], nil
 }
 
-func insertPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
+// cityCentres caches city-centre lookups for one sweep. A snapshot's owner is
+// stored as a normalized city name, and resolving it means scanning a cities
+// table that `import cities` can fill with thousands of rows, so each owner is
+// looked up at most once per sweep.
+type cityCentres struct {
+	byName map[string]*cachedCity
+}
+
+func newCityCentres() *cityCentres {
+	return &cityCentres{byName: map[string]*cachedCity{}}
+}
+
+// lookup returns the centre cached for a normalized city name, or nil when no
+// such city is known.
+func (c *cityCentres) lookup(ctx context.Context, tx *sql.Tx, name string) (*cachedCity, error) {
+	if centre, ok := c.byName[name]; ok {
+		return centre, nil
+	}
+	var centre cachedCity
+	// Same preference order as loadCachedCity: a row whose query name already
+	// is the normalized name wins, then the oldest.
+	err := tx.QueryRowContext(ctx, `
+		SELECT normalized_name, lat, lng
+		FROM cities
+		WHERE normalized_name = ?
+		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
+		LIMIT 1
+	`, name).Scan(&centre.Name, &centre.Lat, &centre.Lng)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.byName[name] = nil
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.byName[name] = &centre
+	return &centre, nil
+}
+
+// resolveSnapshotOwner picks the city_name a snapshot carries. dedupeFetches
+// only ranks the targets a sweep actually fetched, so a single-city run — or a
+// sweep whose nearer target failed — must not take a station away from the
+// nearer city that already owns it. Ownership therefore moves only to a
+// strictly nearer centre, which keeps ownership independent of invocation
+// order and transient fetch failures.
+func resolveSnapshotOwner(ctx context.Context, tx *sql.Tx, centres *cityCentres, currentOwner string, candidate cachedCity, station tankerStation) (string, error) {
+	if currentOwner == "" || currentOwner == candidate.Name {
+		return candidate.Name, nil
+	}
+	owner, err := centres.lookup(ctx, tx, currentOwner)
+	if err != nil {
+		return "", err
+	}
+	if owner == nil {
+		// The owning city is no longer cached (target deleted, cache cleared),
+		// so it can no longer claim the station.
+		return candidate.Name, nil
+	}
+	if haversineKM(owner.Lat, owner.Lng, station.Lat, station.Lng) <=
+		haversineKM(candidate.Lat, candidate.Lng, station.Lat, station.Lng) {
+		return currentOwner, nil
+	}
+	return candidate.Name, nil
+}
+
+func insertPriceSnapshot(ctx context.Context, tx *sql.Tx, cityName string, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO price_snapshots (
 			station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, station.ID, city.Name, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel))
+	`, station.ID, cityName, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel))
 	return err
 }
 

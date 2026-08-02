@@ -129,7 +129,9 @@ Useful `update` flags:
 - `--user-agent "your-app/1.0"`
 - `--output json` or `-o json`
 
-`--city` is repeatable, and cities with overlapping radii are handled as one sweep: every target is fetched first, then a station reported by more than one of them is stored **once**, owned by the target whose centre is nearest. Per-city output therefore reports both `fetched_count` (what the API returned) and `stored_count` (what that city owns); the text output notes when a target lost stations to a nearer one. This keeps a shared station from defeating snapshot compaction — without it, overlapping targets add a row per city on every run even when prices never change.
+`--city` is repeatable, and cities with overlapping radii are handled as one sweep: every target is fetched first, then a station reported by more than one of them is stored **once**, owned by the target whose centre is nearest. The prices stored are the freshest ones seen in that sweep, even if a farther target observed them — targets are fetched one after another, so a price can change mid-sweep. Per-city output reports both `fetched_count` (what the API returned) and `stored_count` (what that city wrote); the text output notes when a target lost stations to a nearer one. This keeps a shared station from defeating snapshot compaction — without it, overlapping targets add a row per city on every run even when prices never change.
+
+Ownership is compared against the city that already owns a station, not only against the targets in the current run, so a station stays with its nearest city when you update a single city, when a nearer target's fetch fails, or when cities are updated in separate invocations. It moves only when a strictly nearer city fetches it, or when the owning city is no longer cached.
 
 Compact existing snapshots in place:
 
@@ -400,6 +402,6 @@ Pushing a tag that matches `v*` triggers the GitHub Actions release workflow. It
 
 - City geocoding is cached in the database, so Nominatim is only queried once per place unless the cached row is cleared or refreshed.
 - `update` stores only changed snapshots plus the adjacent unchanged snapshots needed to preserve price graphs.
-- A station inside two update targets' radii belongs to the nearest one, and `price_snapshots.city_name` records that owner. It is provenance only: `suggest`, `check`, `notify`, and the web viewer decide city membership geometrically (distance from the city centre), not from this column. `gasoline stations --city` is the one command that filters on it, so a shared station appears there only under its nearest city.
+- A station inside two update targets' radii belongs to the nearest one, and `price_snapshots.city_name` records that owner. It is provenance only: `suggest`, `check`, `notify`, and the web viewer decide city membership geometrically (distance from the city centre), not from this column. `gasoline stations --city` is the one command that filters on it, so a shared station appears there only under its nearest city — stably, regardless of which cities a given `update` invocation covered.
 - Distance-only changes do not create a new snapshot, but open/closed changes do.
 - `import cities` downloads populated-place data from GeoNames and keeps only matching entries for the requested 2-letter country code.
