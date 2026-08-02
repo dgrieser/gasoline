@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1320,8 +1321,11 @@ func TestRunUpdateMultiCity(t *testing.T) {
 				return nil, fmt.Errorf("unexpected geocode q: %s", q)
 			}
 		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
-			radByLat[u.Query().Get("lat")] = u.Query().Get("rad")
-			body := `{"ok":true,"stations":[{"id":"s-1","name":"S","brand":"B","street":"St","place":"P","lat":1,"lng":2,"dist":1,"diesel":1.5,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`
+			lat := u.Query().Get("lat")
+			radByLat[lat] = u.Query().Get("rad")
+			// Distinct, non-overlapping stations: this test is about radius
+			// precedence, not de-duplication (see TestRunUpdateMultiCityOverlap).
+			body := fmt.Sprintf(`{"ok":true,"stations":[{"id":"s-%s","name":"S","brand":"B","street":"St","place":"P","lat":%s,"lng":2,"dist":1,"diesel":1.5,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`, lat, lat)
 			return jsonResponse(http.StatusOK, body), nil
 		default:
 			return nil, fmt.Errorf("unexpected URL: %s", u.String())
@@ -1430,15 +1434,92 @@ func TestRunUpdateMultiCityBestEffort(t *testing.T) {
 	}
 }
 
-// A station within range of two requested cities must keep a distinct snapshot
-// row per city; the later city must not compact over (steal) the earlier one.
+func TestDedupeFetches(t *testing.T) {
+	station := func(id string, lat, lng float64) tankerStation {
+		return tankerStation{ID: id, Name: id, Lat: lat, Lng: lng}
+	}
+	fetch := func(name string, lat, lng, radius float64, stations ...tankerStation) cityFetch {
+		return cityFetch{
+			Query:      cityQuery{name: name, radius: radius},
+			City:       cachedCity{QueryName: name, Name: name, Lat: lat, Lng: lng},
+			Stations:   stations,
+			RecordedAt: time.Date(2026, 4, 2, 9, 0, 0, 0, time.UTC),
+		}
+	}
+
+	shared := station("shared", 52.42, 13.10) // ~3.5 km to Potsdam, ~22 km to Berlin
+	berlinOnly := station("berlin-only", 52.52, 13.41)
+	potsdamOnly := station("potsdam-only", 52.39, 13.05)
+
+	berlin := fetch("Berlin", 52.5, 13.4, 25, berlinOnly, shared)
+	potsdam := fetch("Potsdam", 52.4, 13.06, 25, shared, potsdamOnly)
+
+	observations := dedupeFetches([]cityFetch{berlin, potsdam})
+	if len(observations) != 3 {
+		t.Fatalf("observations = %d, want 3 (the shared station counted once)", len(observations))
+	}
+
+	owner := map[string]string{}
+	var ids []string
+	for _, obs := range observations {
+		owner[obs.Station.ID] = obs.City.Name
+		ids = append(ids, obs.Station.ID)
+	}
+	if owner["shared"] != "Potsdam" {
+		t.Fatalf("shared station owner = %q, want Potsdam (nearest centre)", owner["shared"])
+	}
+	if owner["berlin-only"] != "Berlin" || owner["potsdam-only"] != "Potsdam" {
+		t.Fatalf("exclusive stations mis-attributed: %v", owner)
+	}
+	if !sort.StringsAreSorted(ids) {
+		t.Fatalf("observation order = %v, want station-id order for deterministic writes", ids)
+	}
+
+	// Reversing the targets must not change who owns the shared station:
+	// stable attribution is what keeps unchanged rows compactable across runs.
+	reversed := dedupeFetches([]cityFetch{potsdam, berlin})
+	for _, obs := range reversed {
+		if obs.Station.ID == "shared" && obs.City.Name != "Potsdam" {
+			t.Fatalf("shared station owner = %q after reordering, want Potsdam", obs.City.Name)
+		}
+	}
+}
+
+// Equidistant targets must resolve the same way every run, otherwise a station
+// would flip owners and defeat snapshot compaction.
+func TestDedupeFetchesTieGoesToEarlierTarget(t *testing.T) {
+	st := tankerStation{ID: "tie", Name: "tie", Lat: 52.0, Lng: 13.0}
+	first := cityFetch{
+		Query:    cityQuery{name: "First", radius: 25},
+		City:     cachedCity{Name: "First", Lat: 52.1, Lng: 13.0},
+		Stations: []tankerStation{st},
+	}
+	second := cityFetch{
+		Query:    cityQuery{name: "Second", radius: 25},
+		City:     cachedCity{Name: "Second", Lat: 51.9, Lng: 13.0},
+		Stations: []tankerStation{st},
+	}
+
+	observations := dedupeFetches([]cityFetch{first, second})
+	if len(observations) != 1 {
+		t.Fatalf("observations = %d, want 1", len(observations))
+	}
+	if observations[0].City.Name != "First" {
+		t.Fatalf("owner = %q, want First on an exact tie", observations[0].City.Name)
+	}
+}
+
+// A station within range of two requested cities is stored once, owned by the
+// city whose centre is nearest — and repeated runs must not accumulate rows
+// for it, since the shared station no longer defeats snapshot compaction.
 func TestRunUpdateMultiCityOverlap(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "overlap.db")
 	t.Setenv(envAPIKeyName, "test-key")
 
-	// Identical station (same id, same prices) reported for both cities.
-	sharedStation := `{"ok":true,"stations":[{"id":"shared-1","name":"S","brand":"B","street":"St","place":"P","lat":1,"lng":2,"dist":1,"diesel":1.5,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`
+	// Identical station (same id, same prices) reported for both cities. It
+	// sits ~3.5 km from Potsdam's centre and ~22 km from Berlin's.
+	sharedStation := `{"ok":true,"stations":[{"id":"shared-1","name":"S","brand":"B","street":"St","place":"P","lat":52.42,"lng":13.10,"dist":1,"diesel":1.5,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`
 	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
 		u := req.URL
 		switch {
@@ -1446,8 +1527,8 @@ func TestRunUpdateMultiCityOverlap(t *testing.T) {
 			switch q := u.Query().Get("q"); {
 			case strings.Contains(q, "Berlin"):
 				return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.5","lon":"13.4"}]`), nil
-			case strings.Contains(q, "Pforzheim"):
-				return jsonResponse(http.StatusOK, `[{"name":"Pforzheim","display_name":"Pforzheim, DE","lat":"48.9","lon":"8.7"}]`), nil
+			case strings.Contains(q, "Potsdam"):
+				return jsonResponse(http.StatusOK, `[{"name":"Potsdam","display_name":"Potsdam, DE","lat":"52.4","lon":"13.06"}]`), nil
 			default:
 				return nil, fmt.Errorf("unexpected geocode q: %s", q)
 			}
@@ -1459,9 +1540,36 @@ func TestRunUpdateMultiCityOverlap(t *testing.T) {
 	})
 	defer restore()
 
-	_ = captureStdout(t, func() error {
-		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--city", "Pforzheim", "--output", "json"})
-	})
+	updateBoth := func() multiUpdateResult {
+		t.Helper()
+		out := captureStdout(t, func() error {
+			return run([]string{"update", "--db", dbPath, "--radius", "25", "--city", "Berlin", "--city", "Potsdam", "--output", "json"})
+		})
+		var result multiUpdateResult
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("unmarshal: %v\noutput=%s", err, out)
+		}
+		return result
+	}
+
+	result := updateBoth()
+	if result.StoredCount != 1 || result.FetchedCount != 2 {
+		t.Fatalf("stored_count = %d, fetched_count = %d, want 1 and 2", result.StoredCount, result.FetchedCount)
+	}
+	byCity := map[string]cityUpdateResult{}
+	for _, r := range result.Results {
+		byCity[r.City.Name] = r
+	}
+	if got := byCity["Potsdam"]; got.StoredCount != 1 || got.FetchedCount != 1 {
+		t.Fatalf("Potsdam stored/fetched = %d/%d, want 1/1: the nearer centre owns the station", got.StoredCount, got.FetchedCount)
+	}
+	if got := byCity["Berlin"]; got.StoredCount != 0 || got.FetchedCount != 1 {
+		t.Fatalf("Berlin stored/fetched = %d/%d, want 0/1: the station belongs to Potsdam", got.StoredCount, got.FetchedCount)
+	}
+
+	// A second sweep with unchanged prices must roll the row forward, not
+	// insert. This is what the old per-city duplication made impossible.
+	updateBoth()
 
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -1486,8 +1594,8 @@ func TestRunUpdateMultiCityOverlap(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("rows: %v", err)
 	}
-	if len(cities) != 2 || cities[0] != "Berlin" || cities[1] != "Pforzheim" {
-		t.Fatalf("shared station city associations = %v, want [Berlin Pforzheim]", cities)
+	if len(cities) != 1 || cities[0] != "Potsdam" {
+		t.Fatalf("shared station city associations = %v, want [Potsdam]", cities)
 	}
 }
 
