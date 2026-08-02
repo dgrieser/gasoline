@@ -101,21 +101,30 @@ type updateResult struct {
 	DBPath      string     `json:"db_path"`
 }
 
+// cityUpdateResult is one target's outcome. FetchedCount is what the API
+// returned for that target; StoredCount is how many of those snapshots this
+// target wrote. They differ when an overlapping target's centre sits nearer to
+// a shared station, which makes that target write it instead (see
+// dedupeFetches).
 type cityUpdateResult struct {
-	Query       string     `json:"query"`
-	City        cachedCity `json:"city"`
-	CacheStatus string     `json:"cache_status,omitempty"`
-	RadiusKm    float64    `json:"radius_km"`
-	StoredCount int        `json:"stored_count"`
-	RecordedAt  string     `json:"recorded_at,omitempty"`
-	Error       string     `json:"error,omitempty"`
+	Query        string     `json:"query"`
+	City         cachedCity `json:"city"`
+	CacheStatus  string     `json:"cache_status,omitempty"`
+	RadiusKm     float64    `json:"radius_km"`
+	FetchedCount int        `json:"fetched_count"`
+	StoredCount  int        `json:"stored_count"`
+	RecordedAt   string     `json:"recorded_at,omitempty"`
+	Error        string     `json:"error,omitempty"`
 }
 
 type multiUpdateResult struct {
-	Results     []cityUpdateResult `json:"results"`
-	StoredCount int                `json:"stored_count"`
-	RecordedAt  string             `json:"recorded_at"`
-	DBPath      string             `json:"db_path"`
+	Results []cityUpdateResult `json:"results"`
+	// FetchedCount sums what the targets returned; StoredCount is the rows
+	// written after overlapping targets are de-duplicated.
+	FetchedCount int    `json:"fetched_count"`
+	StoredCount  int    `json:"stored_count"`
+	RecordedAt   string `json:"recorded_at"`
+	DBPath       string `json:"db_path"`
 }
 
 type compactResult struct {
@@ -692,12 +701,79 @@ func runUpdate(args []string) error {
 		return err
 	}
 
-	// Single city: preserve the original behavior and output shape.
-	if len(queries) == 1 {
-		res, err := updateCity(ctx, db, dbCfg.Driver, cfg, queries[0], *fuelType, *sortBy)
+	// Fetch every target before writing anything: targets with overlapping
+	// radii report the same station, and a sweep has to see all of them at
+	// once to keep exactly one snapshot per station. Each city is geocoded,
+	// fetched, and stamped independently, so a slow or failed earlier city
+	// does not backdate later ones.
+	runAt := time.Now().UTC().Format(time.RFC3339)
+	fetched := make([]*cityFetch, len(queries))
+	fetchErrs := make([]string, len(queries))
+	failures := 0
+	for i, q := range queries {
+		f, err := fetchCityStations(ctx, db, cfg, q, *fuelType, *sortBy)
 		if err != nil {
+			// Single city: preserve the original error shape.
+			if len(queries) == 1 {
+				return err
+			}
+			failures++
+			fetchErrs[i] = err.Error()
+			continue
+		}
+		fetched[i] = &f
+	}
+
+	// queryOf maps a fetch back to the target that produced it, so per-city
+	// counts survive the failures that leave holes in `fetched`.
+	fetches := make([]cityFetch, 0, len(queries))
+	queryOf := make([]int, 0, len(queries))
+	for i := range queries {
+		if fetched[i] != nil {
+			fetches = append(fetches, *fetched[i])
+			queryOf = append(queryOf, i)
+		}
+	}
+
+	observations := dedupeFetches(fetches)
+	if len(fetches) > 0 {
+		if err := persistSweep(ctx, db, dbCfg.Driver, fetches, observations); err != nil {
 			return err
 		}
+	}
+
+	stored := make([]int, len(queries))
+	for _, obs := range observations {
+		stored[queryOf[obs.FetchIndex]]++
+	}
+
+	results := make([]cityUpdateResult, 0, len(queries))
+	totalFetched := 0
+	for i, q := range queries {
+		if fetched[i] == nil {
+			results = append(results, cityUpdateResult{Query: q.name, RadiusKm: q.radius, Error: fetchErrs[i]})
+			continue
+		}
+		f := fetched[i]
+		cacheStatus := "resolved via geocoder"
+		if f.Cached {
+			cacheStatus = "loaded from cache"
+		}
+		totalFetched += len(f.Stations)
+		results = append(results, cityUpdateResult{
+			Query:        q.name,
+			City:         f.City,
+			CacheStatus:  cacheStatus,
+			RadiusKm:     q.radius,
+			FetchedCount: len(f.Stations),
+			StoredCount:  stored[i],
+			RecordedAt:   f.RecordedAt.Format(time.RFC3339),
+		})
+	}
+
+	// Single city: preserve the original behavior and output shape.
+	if len(queries) == 1 {
+		res := results[0]
 		if output == outputJSON {
 			return writeJSON(updateResult{
 				City:        res.City,
@@ -712,31 +788,13 @@ func runUpdate(args []string) error {
 		return nil
 	}
 
-	// Multiple cities: best-effort — process all, persist successes, collect errors.
-	// Each city is geocoded, fetched, and stamped independently (so a slow or
-	// failed earlier city does not backdate later ones), and overlapping station
-	// results keep a distinct row per city (see persistPriceSnapshot).
-	runAt := time.Now().UTC().Format(time.RFC3339)
-	results := make([]cityUpdateResult, 0, len(queries))
-	total := 0
-	failures := 0
-	for _, q := range queries {
-		res, err := updateCity(ctx, db, dbCfg.Driver, cfg, q, *fuelType, *sortBy)
-		if err != nil {
-			failures++
-			results = append(results, cityUpdateResult{Query: q.name, RadiusKm: q.radius, Error: err.Error()})
-			continue
-		}
-		total += res.StoredCount
-		results = append(results, res)
-	}
-
 	if output == outputJSON {
 		if err := writeJSON(multiUpdateResult{
-			Results:     results,
-			StoredCount: total,
-			RecordedAt:  runAt,
-			DBPath:      dbCfg.Description(),
+			Results:      results,
+			FetchedCount: totalFetched,
+			StoredCount:  len(observations),
+			RecordedAt:   runAt,
+			DBPath:       dbCfg.Description(),
 		}); err != nil {
 			return err
 		}
@@ -747,10 +805,15 @@ func runUpdate(args []string) error {
 				continue
 			}
 			printCityUpdate(res)
-			fmt.Fprintf(stdout, "  radius %.2f km, stored %d snapshots at %s\n\n", res.RadiusKm, res.StoredCount, res.RecordedAt)
+			if shared := res.FetchedCount - res.StoredCount; shared > 0 {
+				fmt.Fprintf(stdout, "  radius %.2f km, stored %d of %d snapshots at %s (%d shared with a nearer city)\n\n",
+					res.RadiusKm, res.StoredCount, res.FetchedCount, res.RecordedAt, shared)
+			} else {
+				fmt.Fprintf(stdout, "  radius %.2f km, stored %d snapshots at %s\n\n", res.RadiusKm, res.StoredCount, res.RecordedAt)
+			}
 		}
 		fmt.Fprintf(stdout, "updated %d of %d cities, stored %d station snapshots in %s\n",
-			len(queries)-failures, len(queries), total, dbCfg.Description())
+			len(queries)-failures, len(queries), len(observations), dbCfg.Description())
 	}
 
 	if failures > 0 {
@@ -759,34 +822,141 @@ func runUpdate(args []string) error {
 	return nil
 }
 
-// updateCity geocodes one city, fetches its stations, and persists the snapshots.
-func updateCity(ctx context.Context, db *sql.DB, d dialect, cfg config, q cityQuery, fuelType, sortBy string) (cityUpdateResult, error) {
+// cityFetch is one target's stations, geocoded and fetched but not yet stored
+// as snapshots.
+type cityFetch struct {
+	Query      cityQuery
+	City       cachedCity
+	Cached     bool
+	Stations   []tankerStation
+	RecordedAt time.Time
+}
+
+// fetchCityStations geocodes one target and fetches its stations. It writes no
+// snapshots, so a whole sweep can be de-duplicated before it touches
+// price_snapshots. (Geocoding still caches the city itself, as before.)
+func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, q cityQuery, fuelType, sortBy string) (cityFetch, error) {
 	location, cached, err := getOrCreateCity(ctx, db, q.name, cfg.UserAgent)
 	if err != nil {
-		return cityUpdateResult{}, err
+		return cityFetch{}, err
 	}
 	stations, err := fetchStations(ctx, cfg, location.Lat, location.Lng, q.radius, fuelType, sortBy)
 	if err != nil {
-		return cityUpdateResult{}, err
+		return cityFetch{}, err
 	}
 	// Stamp after the data is fetched so the snapshot reflects when it was
 	// observed, not when the (possibly multi-city) run began.
-	recordedAt := time.Now().UTC()
-	if err := persistUpdate(ctx, db, d, location, stations, recordedAt, q.radius); err != nil {
-		return cityUpdateResult{}, err
-	}
-	cacheStatus := "resolved via geocoder"
-	if cached {
-		cacheStatus = "loaded from cache"
-	}
-	return cityUpdateResult{
-		Query:       q.name,
-		City:        location,
-		CacheStatus: cacheStatus,
-		RadiusKm:    q.radius,
-		StoredCount: len(stations),
-		RecordedAt:  recordedAt.Format(time.RFC3339),
+	return cityFetch{
+		Query:      q,
+		City:       location,
+		Cached:     cached,
+		Stations:   stations,
+		RecordedAt: time.Now().UTC(),
 	}, nil
+}
+
+// stationObservation is the winning reading for one station in a sweep, plus
+// the target that owns it. Ownership and reading are chosen independently: the
+// nearest target owns the station, but the freshest fetch supplies the prices.
+type stationObservation struct {
+	Station    tankerStation
+	City       cachedCity
+	FetchIndex int
+	RadiusKM   float64
+	RecordedAt time.Time
+	DistanceKM float64
+}
+
+// dedupeFetches folds a sweep into one observation per station, so targets
+// with overlapping radii no longer store the same reading once per city.
+//
+// Ownership goes to the nearest centre, ties to the earlier target, so it
+// stays stable across runs — that stability is what lets persistPriceSnapshot
+// roll an unchanged row forward instead of inserting a fresh one every time.
+// The reading itself comes from the newest fetch that saw the station, whoever
+// that was: targets are fetched one after another, so a farther target can
+// observe a price change the nearer one missed, and dropping it would hide the
+// change until the next sweep.
+//
+// Observations come back in station-id order so a sweep writes deterministically.
+func dedupeFetches(fetches []cityFetch) []stationObservation {
+	best := make(map[string]stationObservation, len(fetches))
+	for i, f := range fetches {
+		for _, station := range f.Stations {
+			distance := haversineKM(f.City.Lat, f.City.Lng, station.Lat, station.Lng)
+			current, seen := best[station.ID]
+			if !seen {
+				best[station.ID] = stationObservation{
+					Station:    station,
+					City:       f.City,
+					FetchIndex: i,
+					RadiusKM:   f.Query.radius,
+					RecordedAt: f.RecordedAt,
+					DistanceKM: distance,
+				}
+				continue
+			}
+			if distance < current.DistanceKM {
+				current.City = f.City
+				current.FetchIndex = i
+				current.RadiusKM = f.Query.radius
+				current.DistanceKM = distance
+			}
+			if f.RecordedAt.After(current.RecordedAt) {
+				current.Station = station
+				current.RecordedAt = f.RecordedAt
+			}
+			best[station.ID] = current
+		}
+	}
+
+	ids := make([]string, 0, len(best))
+	for id := range best {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	observations := make([]stationObservation, 0, len(ids))
+	for _, id := range ids {
+		observations = append(observations, best[id])
+	}
+	return observations
+}
+
+// persistSweep stores one de-duplicated sweep in a single transaction: every
+// station once, attributed to the target that owns it, plus every fetched
+// city. Best-effort across targets happens in the fetch phase, so a target
+// that failed simply contributes no observations here.
+func persistSweep(ctx context.Context, db *sql.DB, d dialect, fetches []cityFetch, observations []stationObservation) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	centres := newCityCentres()
+	for _, obs := range observations {
+		recordedAt := obs.RecordedAt.Format(time.RFC3339)
+		if _, err := tx.ExecContext(ctx, stationsUpsertSQL(d),
+			obs.Station.ID, obs.Station.Name, obs.Station.Brand, obs.Station.Street, obs.Station.HouseNumber,
+			obs.Station.PostCode, obs.Station.Place, obs.Station.Lat, obs.Station.Lng, recordedAt, recordedAt); err != nil {
+			return err
+		}
+
+		if err := persistPriceSnapshot(ctx, tx, centres, obs.City, obs.Station, obs.RecordedAt, obs.RadiusKM); err != nil {
+			return err
+		}
+	}
+
+	for _, f := range fetches {
+		if _, err := tx.ExecContext(ctx, citiesInsertIgnoreSQL(d),
+			f.City.QueryName, f.City.Name, f.City.DisplayName, f.City.Lat, f.City.Lng, f.RecordedAt.Format(time.RFC3339),
+		); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 func printCityUpdate(res cityUpdateResult) {
@@ -3702,31 +3872,16 @@ func fetchStations(ctx context.Context, cfg config, lat, lng, radius float64, fu
 	return payload.Stations, nil
 }
 
+// persistUpdate stores one city's fetch: the single-target shape of
+// persistSweep, which is what a multi-city sweep uses.
 func persistUpdate(ctx context.Context, db *sql.DB, d dialect, city cachedCity, stations []tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	for _, station := range stations {
-		if _, err := tx.ExecContext(ctx, stationsUpsertSQL(d),
-			station.ID, station.Name, station.Brand, station.Street, station.HouseNumber, station.PostCode, station.Place, station.Lat, station.Lng, recordedAt.Format(time.RFC3339), recordedAt.Format(time.RFC3339)); err != nil {
-			return err
-		}
-
-		if err := persistPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm); err != nil {
-			return err
-		}
-	}
-
-	if _, err := tx.ExecContext(ctx, citiesInsertIgnoreSQL(d),
-		city.QueryName, city.Name, city.DisplayName, city.Lat, city.Lng, recordedAt.Format(time.RFC3339),
-	); err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	fetches := []cityFetch{{
+		Query:      cityQuery{name: city.QueryName, radius: searchRadiusKm},
+		City:       city,
+		Stations:   stations,
+		RecordedAt: recordedAt,
+	}}
+	return persistSweep(ctx, db, d, fetches, dedupeFetches(fetches))
 }
 
 type priceSnapshotValues struct {
@@ -3883,8 +4038,17 @@ func compactSnapshotRows(snapshots []compactSnapshotRow) ([]compactSnapshotRow, 
 	return kept, deleteIDs
 }
 
-func persistPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
-	latest, previous, latestCity, err := latestPriceSnapshots(ctx, tx, station.ID)
+func persistPriceSnapshot(ctx context.Context, tx *sql.Tx, centres *cityCentres, city cachedCity, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
+	latest, previous, currentOwner, err := latestPriceSnapshots(ctx, tx, station.ID)
+	if err != nil {
+		return err
+	}
+
+	// A station inside two targets' radii reaches this once per sweep, not once
+	// per city (see dedupeFetches), so no row has to be duplicated to keep it.
+	// Which city the row names is decided separately, against every city known
+	// to own it — not just the ones this sweep happened to fetch.
+	owner, err := resolveSnapshotOwner(ctx, tx, centres, currentOwner, city, station)
 	if err != nil {
 		return err
 	}
@@ -3898,30 +4062,23 @@ func persistPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, stat
 
 	switch {
 	case latest == nil:
-		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
+		return insertPriceSnapshot(ctx, tx, owner, station, recordedAt, searchRadiusKm)
 	case !priceSnapshotValuesEqual(*latest, current):
-		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
+		return insertPriceSnapshot(ctx, tx, owner, station, recordedAt, searchRadiusKm)
 	case previous != nil && !priceSnapshotValuesEqual(*latest, *previous):
-		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
-	case latestCity != city.Name:
-		// The latest unchanged row belongs to a different city (overlapping
-		// radius). Record a separate observation for this city instead of
-		// rolling that row forward, which would steal the station from the
-		// other city.
-		return insertPriceSnapshot(ctx, tx, city, station, recordedAt, searchRadiusKm)
+		return insertPriceSnapshot(ctx, tx, owner, station, recordedAt, searchRadiusKm)
 	default:
 		_, err := tx.ExecContext(ctx, `
 			UPDATE price_snapshots
 			SET city_name = ?, recorded_at = ?, search_radius_km = ?, is_open = ?, e5 = ?, e10 = ?, diesel = ?
 			WHERE id = ?
-		`, city.Name, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel), latest.ID)
+		`, owner, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel), latest.ID)
 		return err
 	}
 }
 
 // latestPriceSnapshots returns the two most recent snapshots for a station plus
-// the city_name of the latest one (used to avoid compacting over another city's
-// row when overlapping cities report the same station).
+// the city_name of the latest one, which is the station's current owner.
 func latestPriceSnapshots(ctx context.Context, tx *sql.Tx, stationID string) (*priceSnapshotValues, *priceSnapshotValues, string, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, city_name, is_open, e5, e10, diesel
@@ -3959,12 +4116,77 @@ func latestPriceSnapshots(ctx context.Context, tx *sql.Tx, stationID string) (*p
 	return snapshots[0], snapshots[1], cities[0], nil
 }
 
-func insertPriceSnapshot(ctx context.Context, tx *sql.Tx, city cachedCity, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
+// cityCentres caches city-centre lookups for one sweep. A snapshot's owner is
+// stored as a normalized city name, and resolving it means scanning a cities
+// table that `import cities` can fill with thousands of rows, so each owner is
+// looked up at most once per sweep.
+type cityCentres struct {
+	byName map[string]*cachedCity
+}
+
+func newCityCentres() *cityCentres {
+	return &cityCentres{byName: map[string]*cachedCity{}}
+}
+
+// lookup returns the centre cached for a normalized city name, or nil when no
+// such city is known.
+func (c *cityCentres) lookup(ctx context.Context, tx *sql.Tx, name string) (*cachedCity, error) {
+	if centre, ok := c.byName[name]; ok {
+		return centre, nil
+	}
+	var centre cachedCity
+	// Same preference order as loadCachedCity: a row whose query name already
+	// is the normalized name wins, then the oldest.
+	err := tx.QueryRowContext(ctx, `
+		SELECT normalized_name, lat, lng
+		FROM cities
+		WHERE normalized_name = ?
+		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
+		LIMIT 1
+	`, name).Scan(&centre.Name, &centre.Lat, &centre.Lng)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.byName[name] = nil
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.byName[name] = &centre
+	return &centre, nil
+}
+
+// resolveSnapshotOwner picks the city_name a snapshot carries. dedupeFetches
+// only ranks the targets a sweep actually fetched, so a single-city run — or a
+// sweep whose nearer target failed — must not take a station away from the
+// nearer city that already owns it. Ownership therefore moves only to a
+// strictly nearer centre, which keeps ownership independent of invocation
+// order and transient fetch failures.
+func resolveSnapshotOwner(ctx context.Context, tx *sql.Tx, centres *cityCentres, currentOwner string, candidate cachedCity, station tankerStation) (string, error) {
+	if currentOwner == "" || currentOwner == candidate.Name {
+		return candidate.Name, nil
+	}
+	owner, err := centres.lookup(ctx, tx, currentOwner)
+	if err != nil {
+		return "", err
+	}
+	if owner == nil {
+		// The owning city is no longer cached (target deleted, cache cleared),
+		// so it can no longer claim the station.
+		return candidate.Name, nil
+	}
+	if haversineKM(owner.Lat, owner.Lng, station.Lat, station.Lng) <=
+		haversineKM(candidate.Lat, candidate.Lng, station.Lat, station.Lng) {
+		return currentOwner, nil
+	}
+	return candidate.Name, nil
+}
+
+func insertPriceSnapshot(ctx context.Context, tx *sql.Tx, cityName string, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO price_snapshots (
 			station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, station.ID, city.Name, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel))
+	`, station.ID, cityName, recordedAt.Format(time.RFC3339), searchRadiusKm, boolToInt(station.IsOpen), nullableFloat(station.E5), nullableFloat(station.E10), nullableFloat(station.Diesel))
 	return err
 }
 

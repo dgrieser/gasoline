@@ -129,11 +129,17 @@ Useful `update` flags:
 - `--user-agent "your-app/1.0"`
 - `--output json` or `-o json`
 
+`--city` is repeatable, and cities with overlapping radii are handled as one sweep: every target is fetched first, then a station reported by more than one of them is stored **once**, owned by the target whose centre is nearest. The prices stored are the freshest ones seen in that sweep, even if a farther target observed them — targets are fetched one after another, so a price can change mid-sweep. Per-city output reports both `fetched_count` (what the API returned) and `stored_count` (what that city wrote); the text output notes when a target lost stations to a nearer one. This keeps a shared station from defeating snapshot compaction — without it, overlapping targets add a row per city on every run even when prices never change.
+
+Ownership is compared against the city that already owns a station, not only against the targets in the current run, so a station stays with its nearest city when you update a single city, when a nearer target's fetch fails, or when cities are updated in separate invocations. It moves only when a strictly nearer city fetches it, or when the owning city is no longer cached.
+
 Compact existing snapshots in place:
 
 ```bash
 gasoline compact
 ```
+
+Run this once after upgrading if you have been updating cities with overlapping radii: earlier versions stored a row per city for every shared station on every run, and `compact` collapses those into the single row the current `update` maintains.
 
 List cached cities:
 
@@ -227,7 +233,7 @@ The normal suggestion output is unchanged; a one-line summary (`persist: stored 
 
 Administrators can store the operational configuration in the database via the web UI (hamburger menu → Settings): a list of update targets (city + radius pairs) plus the suggestion/check parameters (fuel, range, history/prediction days, limits, notification templates, schedule defaults). The **fuel** setting is a multi-select: enable any subset of `diesel`, `e5`, and `e10` (stored comma-separated). `notify` computes suggestions and checks for every enabled fuel, and each user picks one of them to be notified about (see below). The CLI uses those values as its defaults:
 
-- `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius. Passing explicit flags ignores the targets entirely.
+- `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius, as a single de-duplicated sweep: targets whose radii overlap share stations, and each shared station is stored once under its nearest target. Passing explicit flags ignores the targets entirely.
 - `gasoline suggest` and `gasoline check` take `--fuel`, `--range-km`, `--history-days`, `--predict-days`, and `--limit-per-day`/`--limit` from the settings table when the corresponding flag is not set. These commands stay single-fuel: when the settings enable more than one fuel, they default to the first enabled one, still overridable with `--fuel`. Without `--city`, both run against **every** configured update target (best-effort: one failing city does not stop the others; the exit code reports failures).
 - Explicit CLI flags always override the stored settings; with an empty settings table everything behaves exactly as before.
 
@@ -396,5 +402,6 @@ Pushing a tag that matches `v*` triggers the GitHub Actions release workflow. It
 
 - City geocoding is cached in the database, so Nominatim is only queried once per place unless the cached row is cleared or refreshed.
 - `update` stores only changed snapshots plus the adjacent unchanged snapshots needed to preserve price graphs.
+- A station inside two update targets' radii belongs to the nearest one, and `price_snapshots.city_name` records that owner. It is provenance only: `suggest`, `check`, `notify`, and the web viewer decide city membership geometrically (distance from the city centre), not from this column. `gasoline stations --city` is the one command that filters on it, so a shared station appears there only under its nearest city — stably, regardless of which cities a given `update` invocation covered.
 - Distance-only changes do not create a new snapshot, but open/closed changes do.
 - `import cities` downloads populated-place data from GeoNames and keeps only matching entries for the requested 2-letter country code.
