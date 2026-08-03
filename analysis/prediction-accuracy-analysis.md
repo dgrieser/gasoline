@@ -265,9 +265,66 @@ database (each query is numbered to match the findings above). The queries are
 read-only and each is written to complete on the ~400k-row 30-day retention
 volume using existing indexes.
 
-> Note: this analysis was produced without live DB access — the sandbox this
+> Note: sections 1–4 were produced without live DB access — the sandbox this
 > ran in only permits HTTPS egress through a TLS-terminating proxy, which
 > cannot carry the MySQL wire protocol (server-greets-first, non-TLS-first).
-> All numbers above come from the accuracy UI over the full filtered dataset;
-> the SQL pack exists to confirm the per-mechanism attributions before
-> implementing.
+> The numbers there come from the accuracy UI over the full filtered dataset.
+> Section 6 below records the results of running the SQL pack against the
+> live database.
+
+## 6. Verification results (queries run 2026-08-03, raw output in results-2026-08-03.txt)
+
+| Hypothesis | Verdict | Evidence |
+| --- | --- | --- |
+| A-1 shape shrinkage | **Confirmed, strongly** | Query #3: bias is monotone in the hour offset — cells at −3…−7 ct offset show −0.2…−0.35 ct bias, cells at +14…+23 ct offset show +4.7…+20 ct bias. The model captures only part of every peak, proportionally to its height. |
+| A noon miss is systematic, not "unknowable future" | **Confirmed** | Query #2: local hour 12 bias is +5.89 / +5.78 / +5.30 / +6.19 ct at 0-1h / 1-6h / 6-24h / >24h leads — flat across leads, i.e. a shape defect the model repeats even one hour ahead. |
+| A-2 baseline drift | **Weakened** | Query #4: day-over-day deltas oscillate (−3.6…+3.9 ct/day), mean only ≈ +0.3 ct/day. A damped drift term removes the small systematic long-lead bias (~+0.5 ct) but will not move MAE much. |
+| B bias learner works at station level | Confirmed | Query #2: night/morning 0-1h bias ≈ 0, MAE 0.6–1.0 ct. |
+| C confidence inversion | **Confirmed (≤24h)** | Query #7: low beats medium at 0-6h (2.20 vs 3.14 ct MAE) and 6-24h (3.14 vs 3.69); only at >24h does medium win narrowly (4.60 vs 4.87). "high" is empty everywhere. |
+| D headline stats over-weight long leads | **Confirmed** | Query #1: deduplicated to the latest run per window, MAE drops 4.15 → **2.81 ct**, bias +0.74 → +0.19 ct, within ±2 ct 37.6 % → **59.4 %**. The UI's headline overstates the error a user acting on fresh output experiences. |
+| E live-price persistence helps short leads | **Refuted** | Query #5: the model beats naive persistence at every lead, including 0-1h (2.54 vs 3.06 ct). Short-lead error concentrates at jump hours, where persistence is even worse. Recommendation 3.4 is withdrawn in its naive form. |
+| F winner's curse on suggestions | **Confirmed** | Query #6: `is_suggestion = 1` rows have bias +2.79 ct vs +0.66 ct for the rest — displayed suggestion prices are ~2–3 ct optimistic. |
+| Jump-anchor stability | OK | Query #9: anchor = 12 for 1,223 runs; one brief flip to 0 (15 runs, Jul 23–24). |
+
+New findings from the live data:
+
+1. **The noon spike is weekday-dependent (bimodal).** The worst
+   over-predictions (−32…−37 ct: spike predicted, none came) are all Saturday
+   Jul 25 / Sunday Jul 26 targets; the worst under-predictions (+31…+34 ct)
+   are weekday targets. The per-hour correction should therefore distinguish
+   at least weekday vs weekend (the weekday bucket exists in the model but
+   carries only 0.60 weight and is thin at 30-day history).
+2. **Hour 14 local flips sign with lead** (bias −2.46 ct at 0-1h, +1.8 ct at
+   >24h): the spike decays faster than the model's hour profile on the day
+   itself. Corrections must be keyed by (local hour × lead bucket), not hour
+   alone — the table in query #2 is exactly the correction grid.
+3. **Duplicate station identities.** "Kaiser-Tankstelle (Isenstedt)" appears
+   as three distinct station ids with identical prices; they triple-count in
+   every statistic and split the bias learner's samples three ways. Worth
+   deduplicating by coordinates or merging at ingest.
+4. **Evening over-prediction at 1-6h leads** (hours 15–19 local: −0.5…−1.6 ct)
+   fits the `estimateCurrentBaseline` path inflating the current-day level
+   when the post-noon buckets exceed the historical hour offsets — another
+   place the (hour × lead) correction grid self-heals.
+5. **Decision quality baseline** (query #10): "buy" recommendations averaged
+   2.96 ct above the day floor (44 % within 2 ct). A useful KPI to track as
+   the model improves.
+
+### Updated priority list
+
+1. **Per-(local hour × lead bucket) bias correction loop** — the correction
+   grid is query #2 verbatim; recency-weighted median per cell, weekday/
+   weekend split at the jump hours, cap ±8 ct. Directly removes the +5.9 ct
+   noon residual, the hour-14 sign flip, and the evening 1-6h over-prediction.
+2. **Remove the `recent`-term shape shrinkage** for offset-mode stations
+   (query #3 is the before/after metric: the bias-vs-offset slope should go
+   to ~0).
+3. **Dedupe the accuracy page headline** to latest-run-per-window (real
+   user-facing MAE is 2.81 ct, not 4.15 ct) and correct the displayed
+   suggestion price by the measured +2.8 ct winner's-curse bias.
+4. **Confidence recalibration** from rolling empirical error quantiles.
+5. **Damped drift term** — small, removes the residual +0.5 ct long-lead bias.
+6. **Station identity dedup** (data hygiene; also concentrates learning
+   samples).
+7. ~~Live-price blend at short leads~~ — withdrawn; the model already beats
+   persistence at every lead (query #5).
