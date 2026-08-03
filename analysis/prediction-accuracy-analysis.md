@@ -310,6 +310,13 @@ New findings from the live data:
    2.96 ct above the day floor (44 % within 2 ct). A useful KPI to track as
    the model improves.
 
+> **Status:** every item in the priority list below has been implemented on
+> this branch — see the "learned corrections" section of the README and the
+> `merge-stations` command. The re-measurement baseline is this document's
+> numbers; after ~14 days of `suggest --persist` runs on the new model, the
+> accuracy page (and query pack) will show whether the corrections converged
+> as predicted.
+
 ### Updated priority list
 
 1. **Per-(local hour × lead bucket) bias correction loop** — the correction

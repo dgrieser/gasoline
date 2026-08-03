@@ -53,6 +53,15 @@ func markPredictionEvaluated(t *testing.T, db *sql.DB, id int64, predictionError
 	}
 }
 
+func markPredictionSuggestion(t *testing.T, db *sql.DB, id int64) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE price_predictions SET is_suggestion = 1 WHERE id = ?
+	`, id); err != nil {
+		t.Fatalf("mark suggestion: %v", err)
+	}
+}
+
 // buildDecisionFixture sets up one sawtooth station and returns the persisted
 // run id plus the options used, so decision tests share one arrangement.
 func buildDecisionFixture(t *testing.T, db *sql.DB, now time.Time) (int64, *suggestComputation, suggestOptions) {
@@ -410,23 +419,225 @@ func TestLoadPredictionBiasCapsAndFilters(t *testing.T) {
 		markPredictionEvaluated(t, db, id, 0.05, now.AddDate(0, 0, -20))
 	}
 
-	bias, err := loadPredictionBias(ctx, db, "diesel", now)
+	corrections, err := loadLearnedCorrections(ctx, db, "diesel", now, time.UTC)
 	if err != nil {
-		t.Fatalf("loadPredictionBias: %v", err)
+		t.Fatalf("loadLearnedCorrections: %v", err)
 	}
-	if len(bias) != 1 {
-		t.Fatalf("bias = %+v, want only the consistently biased station", bias)
+	if len(corrections.StationBias) != 1 {
+		t.Fatalf("station bias = %+v, want only the consistently biased station", corrections.StationBias)
 	}
-	if got := bias["biased"]; got != predictionBiasMaxAbs {
+	if got := corrections.StationBias["biased"]; got != predictionBiasMaxAbs {
 		t.Fatalf("bias = %.4f, want capped at %.2f", got, predictionBiasMaxAbs)
 	}
 
 	model := forecastModel{Stations: map[string]forecastStation{"biased": {}}}
-	if err := applyPredictionBias(ctx, db, &model, "diesel", now); err != nil {
-		t.Fatalf("applyPredictionBias: %v", err)
+	if err := applyLearnedCorrections(ctx, db, &model, "diesel", now, time.UTC); err != nil {
+		t.Fatalf("applyLearnedCorrections: %v", err)
 	}
 	if got := model.Stations["biased"].BiasCorrection; got != predictionBiasMaxAbs {
 		t.Fatalf("BiasCorrection = %.4f, want %.2f", got, predictionBiasMaxAbs)
+	}
+}
+
+func TestLoadLearnedCorrectionsHourLeadGrid(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.5, 13.4)
+	now := time.Date(2026, 4, 27, 15, 0, 0, 0, time.UTC) // Monday
+	runID := insertPredictionRunRow(t, db, now.AddDate(0, 0, -8))
+
+	// 60 weekday noon targets with a consistent +6 ct miss (leads in the
+	// 1-6h bucket), on two plain Mondays (no weekends, no holidays).
+	weekday := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC) // Monday noon
+	for i := 0; i < 60; i++ {
+		target := weekday.AddDate(0, 0, -(i%2)*7).Add(time.Duration(i%3) * time.Minute)
+		id := insertPredictionRow(t, db, runID, "station-1", target, 2.00, 120+i%60)
+		markPredictionEvaluated(t, db, id, 0.06, now.AddDate(0, 0, -1))
+	}
+	// 60 weekend noon targets with no miss: the weekend cell must stay
+	// separate instead of blending into the weekday one.
+	weekend := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC) // Saturday noon
+	for i := 0; i < 60; i++ {
+		target := weekend.Add(time.Duration(i%3) * time.Minute)
+		id := insertPredictionRow(t, db, runID, "station-1", target, 2.00, 120+i%60)
+		markPredictionEvaluated(t, db, id, 0.0, now.AddDate(0, 0, -1))
+	}
+
+	corrections, err := loadLearnedCorrections(ctx, db, "diesel", now, time.UTC)
+	if err != nil {
+		t.Fatalf("loadLearnedCorrections: %v", err)
+	}
+	weekdayCell := hourLeadKey{Hour: 12, Lead: leadBucket1to6h, Weekend: false}
+	if got := corrections.HourLeadBias[weekdayCell]; got < 0.059 || got > 0.061 {
+		t.Fatalf("weekday noon cell = %.4f, want ~0.06: %+v", got, corrections.HourLeadBias)
+	}
+	weekendCell := hourLeadKey{Hour: 12, Lead: leadBucket1to6h, Weekend: true}
+	if got, ok := corrections.HourLeadBias[weekendCell]; ok && got != 0 {
+		t.Fatalf("weekend noon cell = %.4f, want absent or 0", got)
+	}
+
+	// scoreForecast must add the cell to matching targets, reuse the 6-24h
+	// cell beyond 24h, and stay inert without NowLocal.
+	model := forecastModel{
+		Stations: map[string]forecastStation{"s": {}},
+		Hour: map[stationHourKey][]priceSample{
+			{StationID: "s", Hour: 12}: {{Price: 2.00, Weight: 60}},
+		},
+		Recent: map[string][]priceSample{
+			"s": {{Price: 2.00, Weight: 60}},
+		},
+		NowLocal: now,
+		HourLeadBias: map[hourLeadKey]float64{
+			{Hour: 12, Lead: leadBucket1to6h, Weekend: false}:  0.06,
+			{Hour: 12, Lead: leadBucket6to24h, Weekend: false}: 0.05,
+		},
+	}
+	score, ok := scoreForecast(model, "s", time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("scoreForecast returned !ok")
+	}
+	if score.PredictedPrice < 2.049 || score.PredictedPrice > 2.051 {
+		t.Fatalf("tomorrow-noon prediction = %.4f, want 2.05 (6-24h cell)", score.PredictedPrice)
+	}
+	score, ok = scoreForecast(model, "s", time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("scoreForecast returned !ok")
+	}
+	if score.PredictedPrice < 2.049 || score.PredictedPrice > 2.051 {
+		t.Fatalf(">24h prediction = %.4f, want 2.05 (reused 6-24h cell)", score.PredictedPrice)
+	}
+	inert := model
+	inert.NowLocal = time.Time{}
+	score, ok = scoreForecast(inert, "s", time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC))
+	if !ok || score.PredictedPrice != 2.00 {
+		t.Fatalf("zero-NowLocal prediction = %.4f, want raw 2.00", score.PredictedPrice)
+	}
+}
+
+func TestLoadLearnedCorrectionsCalibratesConfidence(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestStation(t, db, "precise", "Precise", 52.5, 13.4)
+	insertSuggestStation(t, db, "noisy", "Noisy", 52.5, 13.4)
+	now := time.Date(2026, 4, 27, 15, 0, 0, 0, time.UTC)
+	runID := insertPredictionRunRow(t, db, now.AddDate(0, 0, -3))
+
+	target := now.AddDate(0, 0, -1)
+	for i := 0; i < predictionConfidenceMinSamples; i++ {
+		id := insertPredictionRow(t, db, runID, "precise", target.Add(time.Duration(i)*time.Minute), 2.00, 30)
+		markPredictionEvaluated(t, db, id, 0, now.AddDate(0, 0, -1))
+		id = insertPredictionRow(t, db, runID, "noisy", target.Add(time.Duration(i)*time.Minute), 2.00, 30)
+		// Alternating large errors: no learnable bias, wide residuals.
+		errValue := 0.06
+		if i%2 == 0 {
+			errValue = -0.06
+		}
+		markPredictionEvaluated(t, db, id, errValue, now.AddDate(0, 0, -1))
+	}
+
+	corrections, err := loadLearnedCorrections(ctx, db, "diesel", now, time.UTC)
+	if err != nil {
+		t.Fatalf("loadLearnedCorrections: %v", err)
+	}
+	preciseKey := stationLeadKey{StationID: "precise", Lead: leadBucket0to1h}
+	if got := corrections.ConfidenceByLead[preciseKey]; got != "high" {
+		t.Fatalf("precise confidence = %q, want high", got)
+	}
+	noisyKey := stationLeadKey{StationID: "noisy", Lead: leadBucket0to1h}
+	if got := corrections.ConfidenceByLead[noisyKey]; got != "low" {
+		t.Fatalf("noisy confidence = %q, want low", got)
+	}
+
+	// The calibrated label overrides the heuristic in scoreForecast, and a
+	// >24h target cannot claim more than medium from a <=24h measurement.
+	model := forecastModel{
+		Stations: map[string]forecastStation{"precise": {}},
+		Hour: map[stationHourKey][]priceSample{
+			// Hour 15: both targets below (now+30m and now+2d) hit 15:00.
+			{StationID: "precise", Hour: 15}: {
+				{Price: 2.00, Weight: 60}, {Price: 2.00, Weight: 60}, {Price: 2.00, Weight: 60},
+				{Price: 2.00, Weight: 60}, {Price: 2.00, Weight: 60},
+			},
+		},
+		Recent:   map[string][]priceSample{"precise": {{Price: 2.00, Weight: 60}}},
+		NowLocal: now,
+		ConfidenceByLead: map[stationLeadKey]string{
+			{StationID: "precise", Lead: leadBucket0to1h}:  "high",
+			{StationID: "precise", Lead: leadBucket6to24h}: "high",
+		},
+	}
+	score, ok := scoreForecast(model, "precise", now.Add(30*time.Minute))
+	if !ok || score.Confidence != "high" {
+		t.Fatalf("short-lead confidence = %q, want calibrated high", score.Confidence)
+	}
+	score, ok = scoreForecast(model, "precise", now.AddDate(0, 0, 2))
+	if !ok || score.Confidence != "medium" {
+		t.Fatalf(">24h confidence = %q, want high capped to medium", score.Confidence)
+	}
+}
+
+func TestLoadLearnedCorrectionsMeasuresSuggestionBias(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.5, 13.4)
+	now := time.Date(2026, 4, 27, 15, 0, 0, 0, time.UTC)
+	runID := insertPredictionRunRow(t, db, now.AddDate(0, 0, -8))
+
+	target := now.AddDate(0, 0, -2)
+	for i := 0; i < predictionSuggestionBiasMinSamples; i++ {
+		// Long leads on purpose: suggested windows usually sit days out, and
+		// they must still feed the measurement.
+		id := insertPredictionRow(t, db, runID, "station-1", target.Add(time.Duration(i)*time.Minute), 2.00, 2000)
+		markPredictionEvaluated(t, db, id, 0.03, now.AddDate(0, 0, -1))
+		markPredictionSuggestion(t, db, id)
+	}
+
+	corrections, err := loadLearnedCorrections(ctx, db, "diesel", now, time.UTC)
+	if err != nil {
+		t.Fatalf("loadLearnedCorrections: %v", err)
+	}
+	if corrections.SuggestionBias < 0.029 || corrections.SuggestionBias > 0.031 {
+		t.Fatalf("suggestion bias = %.4f, want ~0.03", corrections.SuggestionBias)
+	}
+}
+
+func TestGenerateSuggestionsAppliesSuggestionBiasToDisplayOnly(t *testing.T) {
+	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	intervals := sawtoothIntervals("s1", firstDay, 14, func(int) float64 { return 2.00 })
+	now := time.Date(2026, 4, 24, 9, 30, 0, 0, time.UTC)
+	model := buildForecastModel(intervals, now, time.UTC)
+
+	baseline := generateSuggestions(model, "diesel", now, time.UTC, 1, 1)
+	if len(baseline) == 0 {
+		t.Fatal("no baseline suggestions")
+	}
+	model.SuggestionBias = 0.03
+	shifted := generateSuggestions(model, "diesel", now, time.UTC, 1, 1)
+	if len(shifted) != len(baseline) {
+		t.Fatalf("suggestion count changed: %d vs %d", len(shifted), len(baseline))
+	}
+	if shifted[0].StartTime != baseline[0].StartTime || shifted[0].StationID != baseline[0].StationID {
+		t.Fatalf("selection changed: %+v vs %+v", shifted[0], baseline[0])
+	}
+	want := roundTo(baseline[0].PredictedPrice+0.03, 2)
+	if shifted[0].PredictedPrice != want {
+		t.Fatalf("displayed price = %.3f, want %.3f (raw %.3f + bias)", shifted[0].PredictedPrice, want, baseline[0].PredictedPrice)
+	}
+
+	// The persisted grid must not carry the display correction: the stored
+	// price comes straight from scoreForecast.
+	score, ok := scoreForecast(model, "s1", time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("scoreForecast returned !ok")
+	}
+	rawModel := model
+	rawModel.SuggestionBias = 0
+	rawScore, ok := scoreForecast(rawModel, "s1", time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("scoreForecast returned !ok")
+	}
+	if score.PredictedPrice != rawScore.PredictedPrice {
+		t.Fatalf("scoreForecast shifted by SuggestionBias: %.4f vs %.4f", score.PredictedPrice, rawScore.PredictedPrice)
 	}
 }
 

@@ -24,10 +24,37 @@ const (
 	predictionBiasMinSamples = 5
 	// predictionBiasMaxAbs caps the learned correction in euro.
 	predictionBiasMaxAbs = 0.03
-	// predictionBiasMaxLeadMinutes restricts learning to short-lead
-	// predictions: long-lead errors are dominated by unknowable future jumps,
-	// not systematic model bias.
+	// predictionBiasMaxLeadMinutes restricts the per-station level learning
+	// to short-lead predictions: long-lead errors are dominated by unknowable
+	// future level moves, not station-specific bias.
 	predictionBiasMaxLeadMinutes = 360
+	// predictionHourBiasMaxLeadMinutes bounds which leads train the
+	// hour-of-day correction grid. The intraday shape error is visible at
+	// every lead, but beyond a day the level surprise would drown it out.
+	predictionHourBiasMaxLeadMinutes = 1440
+	// predictionHourBiasMinSamples gates one grid cell. Cells are
+	// market-wide, so this is easily met wherever the correction matters.
+	predictionHourBiasMinSamples = 50
+	// predictionHourBiasMaxAbs caps one grid cell in euro. Wider than the
+	// station cap because the residual it corrects (the noon spike miss) is
+	// itself several cents.
+	predictionHourBiasMaxAbs = 0.08
+	// predictionLearnErrorClampEuro winsorizes evaluated errors before any
+	// learning. Outages and midpoint artifacts produce 30+ ct outliers that
+	// must not steer corrections; the clamp keeps their sign but not their
+	// leverage.
+	predictionLearnErrorClampEuro = 0.15
+	// predictionConfidenceMinSamples gates one empirical confidence cell.
+	predictionConfidenceMinSamples = 30
+	// predictionConfidenceHighMaxErrEuro / MediumMaxErrEuro map a cell's p80
+	// absolute residual onto labels: a "high" confidence prediction is wrong
+	// by more than 2 ct at most one time in five.
+	predictionConfidenceHighMaxErrEuro   = 0.02
+	predictionConfidenceMediumMaxErrEuro = 0.04
+	// predictionSuggestionBiasMinSamples / MaxAbs gate and cap the measured
+	// selection bias of suggested windows.
+	predictionSuggestionBiasMinSamples = 30
+	predictionSuggestionBiasMaxAbs     = 0.05
 	// evaluateBatchLimit bounds how many due predictions one run settles, so
 	// a run after long downtime stays cheap.
 	evaluateBatchLimit = 5000
@@ -342,15 +369,26 @@ func evaluateCheckOutcomes(ctx context.Context, db *sql.DB, fuel string, now tim
 	return measured, nil
 }
 
-// applyPredictionBias loads the learned per-station corrections and attaches
-// them to the model, so every consumer of scoreForecast (suggest, check,
-// notify) benefits. With no persisted evaluation data this is a no-op.
-func applyPredictionBias(ctx context.Context, db *sql.DB, model *forecastModel, fuel string, now time.Time) error {
-	bias, err := loadPredictionBias(ctx, db, fuel, now)
+// learnedCorrections bundles everything the evaluate-and-correct loop feeds
+// back into the model: the hour-of-day grid, per-station level bias,
+// empirical confidence, and the suggestion selection bias. All of it derives
+// from the same evaluated price_predictions rows.
+type learnedCorrections struct {
+	StationBias      map[string]float64
+	HourLeadBias     map[hourLeadKey]float64
+	ConfidenceByLead map[stationLeadKey]string
+	SuggestionBias   float64
+}
+
+// applyLearnedCorrections loads the learned corrections and attaches them to
+// the model, so every consumer of scoreForecast (suggest, check, notify)
+// benefits. With no persisted evaluation data this is a no-op.
+func applyLearnedCorrections(ctx context.Context, db *sql.DB, model *forecastModel, fuel string, now time.Time, location *time.Location) error {
+	corrections, err := loadLearnedCorrections(ctx, db, fuel, now, location)
 	if err != nil {
 		return err
 	}
-	for stationID, correction := range bias {
+	for stationID, correction := range corrections.StationBias {
 		station, ok := model.Stations[stationID]
 		if !ok {
 			continue
@@ -358,80 +396,217 @@ func applyPredictionBias(ctx context.Context, db *sql.DB, model *forecastModel, 
 		station.BiasCorrection = correction
 		model.Stations[stationID] = station
 	}
+	model.HourLeadBias = corrections.HourLeadBias
+	model.ConfidenceByLead = corrections.ConfidenceByLead
+	model.SuggestionBias = corrections.SuggestionBias
 	return nil
 }
 
-// loadPredictionBias computes a recency-weighted median of recent short-lead
-// prediction errors per station. The bias is applied on top of predictions,
-// which closes the loop: once corrected predictions are persisted and
-// evaluated, their residual errors shrink and the bias converges instead of
-// compounding.
-func loadPredictionBias(ctx context.Context, db *sql.DB, fuel string, now time.Time) (map[string]float64, error) {
+// evaluatedError is one evaluated prediction row prepared for learning: the
+// error is winsorized, the weight decays with evaluation age, and the cell
+// locates the row on the hour-lead correction grid.
+type evaluatedError struct {
+	StationID    string
+	Lead         leadBucket
+	Cell         hourLeadKey
+	IsSuggestion bool
+	Error        float64
+	Weight       float64
+}
+
+// loadLearnedCorrections derives every learned correction from recent
+// evaluated predictions in one pass. The corrections are applied on top of
+// future predictions, which closes the loop: once corrected predictions are
+// persisted and evaluated, their residual errors shrink and each correction
+// converges instead of compounding. Later corrections are learned from
+// residuals after earlier ones (grid first, then station bias, then
+// suggestion bias) so they never double-count the same error.
+func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now time.Time, location *time.Location) (learnedCorrections, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	if location == nil {
+		location = time.Local
+	}
+	corrections := learnedCorrections{
+		StationBias:      make(map[string]float64),
+		HourLeadBias:     make(map[hourLeadKey]float64),
+		ConfidenceByLead: make(map[stationLeadKey]string),
+	}
 	windowStart := now.AddDate(0, 0, -predictionBiasWindowDays).UTC().Format(time.RFC3339)
+	// Suggestion rows are included at any lead: suggestions routinely target
+	// windows days ahead, and their selection bias must be measured where
+	// they actually live.
 	rows, err := db.QueryContext(ctx, `
-		SELECT station_id, error, evaluated_at
+		SELECT station_id, target_start, lead_minutes, is_suggestion, error, evaluated_at
 		FROM price_predictions
 		WHERE fuel = ?
 			AND error IS NOT NULL
 			AND evaluated_at >= ?
-			AND lead_minutes <= ?
-	`, fuel, windowStart, predictionBiasMaxLeadMinutes)
+			AND (lead_minutes <= ? OR is_suggestion = 1)
+	`, fuel, windowStart, predictionHourBiasMaxLeadMinutes)
 	if err != nil {
-		return nil, err
+		return learnedCorrections{}, err
 	}
 	defer rows.Close()
 
-	samples := make(map[string][]priceSample)
+	var evaluated []evaluatedError
+	hourSamples := make(map[hourLeadKey][]priceSample)
 	for rows.Next() {
 		var (
 			stationID       string
+			targetStartText string
+			leadMinutes     int
+			isSuggestion    int
 			predictionError float64
 			evaluatedAtText string
 		)
-		if err := rows.Scan(&stationID, &predictionError, &evaluatedAtText); err != nil {
-			return nil, err
+		if err := rows.Scan(&stationID, &targetStartText, &leadMinutes, &isSuggestion, &predictionError, &evaluatedAtText); err != nil {
+			return learnedCorrections{}, err
+		}
+		targetStart, err := time.Parse(time.RFC3339, targetStartText)
+		if err != nil {
+			return learnedCorrections{}, fmt.Errorf("parse target_start %q: %w", targetStartText, err)
 		}
 		evaluatedAt, err := time.Parse(time.RFC3339, evaluatedAtText)
 		if err != nil {
-			return nil, fmt.Errorf("parse evaluated_at %q: %w", evaluatedAtText, err)
+			return learnedCorrections{}, fmt.Errorf("parse evaluated_at %q: %w", evaluatedAtText, err)
+		}
+		if predictionError > predictionLearnErrorClampEuro {
+			predictionError = predictionLearnErrorClampEuro
+		}
+		if predictionError < -predictionLearnErrorClampEuro {
+			predictionError = -predictionLearnErrorClampEuro
 		}
 		ageDays := now.Sub(evaluatedAt).Hours() / 24
 		if ageDays < 0 {
 			ageDays = 0
 		}
-		samples[stationID] = append(samples[stationID], priceSample{
-			Price:  predictionError,
-			Weight: math.Exp(-ageDays / predictionBiasHalfLifeDays),
-		})
+		targetLocal := targetStart.In(location)
+		lead := leadBucketFor(float64(leadMinutes))
+		cell := lead
+		if cell == leadBucketBeyond24h {
+			// Mirrors scoreForecast: long leads reuse the 6-24h grid cell.
+			cell = leadBucket6to24h
+		}
+		row := evaluatedError{
+			StationID:    stationID,
+			Lead:         lead,
+			Cell:         hourLeadKey{Hour: targetLocal.Hour(), Lead: cell, Weekend: isWeekendLike(targetLocal)},
+			IsSuggestion: isSuggestion != 0,
+			Error:        predictionError,
+			Weight:       math.Exp(-ageDays / predictionBiasHalfLifeDays),
+		}
+		evaluated = append(evaluated, row)
+		if leadMinutes <= predictionHourBiasMaxLeadMinutes {
+			hourSamples[row.Cell] = append(hourSamples[row.Cell], priceSample{Price: row.Error, Weight: row.Weight})
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return learnedCorrections{}, err
 	}
 
-	bias := make(map[string]float64)
-	for stationID, stationSamples := range samples {
-		if len(stationSamples) < predictionBiasMinSamples {
+	// 1) Hour-lead grid: the market-wide shape residual per local target
+	// hour, lead bucket and day class.
+	for cell, samples := range hourSamples {
+		if len(samples) < predictionHourBiasMinSamples {
 			continue
 		}
-		median, ok := weightedMedianPrice(stationSamples)
+		median, ok := weightedMedianPrice(samples)
 		if !ok {
 			continue
 		}
-		if median > predictionBiasMaxAbs {
-			median = predictionBiasMaxAbs
-		}
-		if median < -predictionBiasMaxAbs {
-			median = -predictionBiasMaxAbs
-		}
+		median = clampAbs(median, predictionHourBiasMaxAbs)
 		if median == 0 {
 			continue
 		}
-		bias[stationID] = median
+		corrections.HourLeadBias[cell] = median
 	}
-	return bias, nil
+
+	// 2) Per-station level bias, from short-lead residuals after the grid.
+	// Short leads only: past 6h the residual is dominated by level moves the
+	// station could not have known, not by station-specific bias.
+	stationSamples := make(map[string][]priceSample)
+	for _, row := range evaluated {
+		if row.Lead != leadBucket0to1h && row.Lead != leadBucket1to6h {
+			continue
+		}
+		residual := row.Error - corrections.HourLeadBias[row.Cell]
+		stationSamples[row.StationID] = append(stationSamples[row.StationID], priceSample{Price: residual, Weight: row.Weight})
+	}
+	for stationID, samples := range stationSamples {
+		if len(samples) < predictionBiasMinSamples {
+			continue
+		}
+		median, ok := weightedMedianPrice(samples)
+		if !ok {
+			continue
+		}
+		median = clampAbs(median, predictionBiasMaxAbs)
+		if median == 0 {
+			continue
+		}
+		corrections.StationBias[stationID] = median
+	}
+
+	// 3) Empirical confidence: the p80 absolute residual (after grid and
+	// station corrections) per station and lead bucket, mapped onto labels.
+	// Measured accuracy replaces the sample-count heuristic, which the data
+	// showed inverted (its "low" beat its "medium").
+	confidenceResiduals := make(map[stationLeadKey][]float64)
+	for _, row := range evaluated {
+		if row.Lead == leadBucketBeyond24h {
+			continue
+		}
+		residual := row.Error - corrections.HourLeadBias[row.Cell] - corrections.StationBias[row.StationID]
+		key := stationLeadKey{StationID: row.StationID, Lead: row.Lead}
+		confidenceResiduals[key] = append(confidenceResiduals[key], math.Abs(residual))
+	}
+	for key, residuals := range confidenceResiduals {
+		if len(residuals) < predictionConfidenceMinSamples {
+			continue
+		}
+		sort.Float64s(residuals)
+		p80 := residuals[(len(residuals)*8)/10]
+		switch {
+		case p80 <= predictionConfidenceHighMaxErrEuro:
+			corrections.ConfidenceByLead[key] = "high"
+		case p80 <= predictionConfidenceMediumMaxErrEuro:
+			corrections.ConfidenceByLead[key] = "medium"
+		default:
+			corrections.ConfidenceByLead[key] = "low"
+		}
+	}
+
+	// 4) Suggestion selection bias: what remains of suggested rows' error
+	// after all model-level corrections is the winner's curse of picking the
+	// minimum across many noisy candidates. Persisted predictions never
+	// include it (they store the raw model), so this stays a pure
+	// measurement and cannot feed back on itself.
+	var suggestionSamples []priceSample
+	for _, row := range evaluated {
+		if !row.IsSuggestion {
+			continue
+		}
+		residual := row.Error - corrections.HourLeadBias[row.Cell] - corrections.StationBias[row.StationID]
+		suggestionSamples = append(suggestionSamples, priceSample{Price: residual, Weight: row.Weight})
+	}
+	if len(suggestionSamples) >= predictionSuggestionBiasMinSamples {
+		if median, ok := weightedMedianPrice(suggestionSamples); ok {
+			corrections.SuggestionBias = clampAbs(median, predictionSuggestionBiasMaxAbs)
+		}
+	}
+	return corrections, nil
+}
+
+func clampAbs(value, limit float64) float64 {
+	if value > limit {
+		return limit
+	}
+	if value < -limit {
+		return -limit
+	}
+	return value
 }
 
 // persistPredictionRun stores one prediction_runs row plus the full forecast

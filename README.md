@@ -220,7 +220,12 @@ The margin that decides "low", and that suppresses a buy when a cheaper window i
 
 1. **Evaluates** stored predictions whose target hour has passed, filling in the actual price (the price in effect at the window midpoint) and the prediction error.
 2. **Scores** logged check decisions whose pricing day has finished against the cheapest price that day actually offered, recording the day's floor, when it occurred, and the *regret* — how much more than the floor the price was at the moment of the decision.
-3. **Learns** a per-station bias correction from recent short-lead errors (recency-weighted median over the last 14 days, at least 5 evaluated samples, capped at ±3 ct) and applies it to all new predictions — `suggest`, `check`, and `notify` all pick it up automatically, also without `--persist`.
+3. **Learns** from the evaluated errors (all inputs winsorized at ±15 ct so outages cannot steer them, recency-weighted over the last 14 days) and applies the result to all new predictions — `suggest`, `check`, and `notify` all pick it up automatically, also without `--persist`:
+   - an **hour-of-day correction grid** keyed by local target hour, lead bucket (0–1h / 1–6h / 6–24h, with longer leads reusing the 6–24h cell) and weekday vs. weekend/holiday, for the parts of the daily price curve the shape model systematically misses (at least 50 samples per cell, capped at ±8 ct);
+   - a **per-station bias** from short-lead residuals after the grid (at least 5 samples, capped at ±3 ct);
+   - an **empirical confidence** per station and lead bucket — the p80 absolute residual mapped onto high (≤2 ct) / medium (≤4 ct) / low, replacing the sample-count heuristic wherever at least 30 evaluated predictions exist (a >24h target is capped at medium, since the calibration was measured at shorter leads);
+   - a **suggestion price correction**: picking the minimum predicted window across many candidates preferentially picks predictions that erred low, so the printed suggestion price runs optimistic; the measured median residual of past suggested windows (at least 30 samples, capped at ±5 ct) is added to displayed suggestion prices only — the persisted grid keeps storing the raw model so the measurement never feeds back on itself.
+   The forecast additionally extrapolates a **damped baseline drift** (median day-over-day baseline move across stations of the last 7 pricing days, halved and capped at ±2 ct/day), so predictions crossing pricing-day boundaries no longer assume a perfectly flat market.
 4. **Persists** the new grid; newer runs supersede older ones for the same target hour, older rows remain as learning history.
 5. **Records** the check decisions taken against that same model: per open station the observed price, the model's reference price for the current hour, the history percentile, and the resulting verdict and recommendation.
 6. **Prunes** predictions and decisions older than 30 days.
@@ -267,6 +272,15 @@ gasoline rename --clear 474e5046-deaf-4f9b-9a32-9797b778f047
 ```
 
 Administrators can manage the same overrides in the web UI (hamburger menu → Stations).
+
+Merge duplicate station identities — the Tankerkönig API sometimes lists the same physical station under several ids with identical prices, which multiplies every statistic and splits the learned corrections' samples across ids:
+
+```bash
+gasoline merge-stations --detect                 # list candidates (same coordinates or address)
+gasoline merge-stations --into <canonical-id> <duplicate-id> [<duplicate-id>...]
+```
+
+A merge moves the duplicates' price history, predictions and check decisions onto the canonical station and marks the duplicates as aliases; future `update` sweeps record the aliased ids' prices under the canonical station automatically, so the merge is sticky even though the API keeps returning the old ids. Run `gasoline compact` afterwards to collapse overlapping snapshots from the merged histories.
 
 Run continuous buy/suggestion notifications:
 
