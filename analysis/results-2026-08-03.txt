@@ -1,0 +1,873 @@
+--------------
+-- Prediction-accuracy verification pack (read-only).
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- Companion to prediction-accuracy-analysis.md; query numbers match the
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- findings/recommendations referenced there.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- Conventions:
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--   * All timestamps are stored as RFC3339 UTC strings ("2026-08-03T19:00:00Z"),
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     so hours are extracted with SUBSTRING(ts, 12, 2) and dates with
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     SUBSTRING(ts, 1, 10).
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--   * "local_hour" below assumes CEST (UTC+2). In winter change the +2 to +1,
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     or replace with CONVERT_TZ if the server has timezone tables loaded.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--   * Errors are stored in euro; multiply by 100 for cents.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--   * Adjust the fuel filter as needed ('diesel' | 'e5' | 'e10').
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #1  Headline stats: all evaluated rows vs deduplicated to the latest run
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     per (station, target window). The second view is what a user acting on
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     a fresh suggestion experiences; the first over-weights long leads.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+SELECT 'all rows' AS view_name,
+       COUNT(*) AS n,
+       ROUND(AVG(ABS(error)) * 100, 2)  AS mae_ct,
+       ROUND(AVG(error) * 100, 2)       AS bias_ct,
+       ROUND(SQRT(AVG(error * error)) * 100, 2) AS rmse_ct,
+       ROUND(100 * AVG(ABS(error) <= 0.01), 1) AS within_1ct_pct,
+       ROUND(100 * AVG(ABS(error) <= 0.02), 1) AS within_2ct_pct
+FROM price_predictions
+WHERE fuel = 'diesel' AND error IS NOT NULL
+UNION ALL
+SELECT 'latest run per window',
+       COUNT(*),
+       ROUND(AVG(ABS(pp.error)) * 100, 2),
+       ROUND(AVG(pp.error) * 100, 2),
+       ROUND(SQRT(AVG(pp.error * pp.error)) * 100, 2),
+       ROUND(100 * AVG(ABS(pp.error) <= 0.01), 1),
+       ROUND(100 * AVG(ABS(pp.error) <= 0.02), 1)
+FROM price_predictions pp
+JOIN (
+    SELECT station_id, target_start, MAX(run_id) AS run_id
+    FROM price_predictions
+    WHERE fuel = 'diesel' AND error IS NOT NULL
+    GROUP BY station_id, target_start
+) latest ON latest.station_id = pp.station_id
+        AND latest.target_start = pp.target_start
+        AND latest.run_id = pp.run_id
+WHERE pp.fuel = 'diesel' AND pp.error IS NOT NULL
+--------------
+
++-----------------------+--------+--------+---------+---------+----------------+----------------+
+| view_name             | n      | mae_ct | bias_ct | rmse_ct | within_1ct_pct | within_2ct_pct |
++-----------------------+--------+--------+---------+---------+----------------+----------------+
+| all rows              | 383115 |   4.15 |    0.74 |    6.16 |           23.5 |           37.6 |
+| latest run per window |   6637 |   2.81 |    0.19 |    5.07 |           43.4 |           59.4 |
++-----------------------+--------+--------+---------+---------+----------------+----------------+
+2 rows in set (1.84 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #2  Bias/MAE by local target hour x lead bucket.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     Expectation from the UI stats: strong positive bias at local hours
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     12-13 across ALL lead buckets (systematic shape miss, not just
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     unknowable future) and bias growing with lead uniformly (trend drift).
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+SELECT (CAST(SUBSTRING(target_start, 12, 2) AS UNSIGNED) + 2) % 24 AS local_hour,
+       CASE
+           WHEN lead_minutes <= 60  THEN 'a 0-1h'
+           WHEN lead_minutes <= 360 THEN 'b 1-6h'
+           WHEN lead_minutes <= 1440 THEN 'c 6-24h'
+           ELSE 'd >24h'
+       END AS lead_bucket,
+       COUNT(*) AS n,
+       ROUND(AVG(ABS(error)) * 100, 2) AS mae_ct,
+       ROUND(AVG(error) * 100, 2)      AS bias_ct
+FROM price_predictions
+WHERE fuel = 'diesel' AND error IS NOT NULL
+GROUP BY local_hour, lead_bucket
+ORDER BY local_hour, lead_bucket
+--------------
+
++------------+-------------+-------+--------+---------+
+| local_hour | lead_bucket | n     | mae_ct | bias_ct |
++------------+-------------+-------+--------+---------+
+|          0 | a 0-1h      |   191 |   1.04 |    0.09 |
+|          0 | b 1-6h      |   855 |   1.84 |     0.1 |
+|          0 | c 6-24h     |  3117 |    3.3 |    0.08 |
+|          0 | d >24h      |  4141 |   4.24 |    0.52 |
+|          1 | a 0-1h      |   191 |   0.88 |    0.17 |
+|          1 | b 1-6h      |   872 |   1.52 |    0.06 |
+|          1 | c 6-24h     |  3118 |   3.27 |    0.08 |
+|          1 | d >24h      |  4314 |    4.2 |    0.51 |
+|          2 | a 0-1h      |   191 |   0.73 |    0.24 |
+|          2 | b 1-6h      |   903 |   1.25 |    0.06 |
+|          2 | c 6-24h     |  3105 |   3.22 |    0.05 |
+|          2 | d >24h      |  4487 |   4.16 |    0.52 |
+|          3 | a 0-1h      |   209 |   0.62 |    0.22 |
+|          3 | b 1-6h      |   920 |   1.04 |    0.12 |
+|          3 | c 6-24h     |  3088 |   3.15 |    0.01 |
+|          3 | d >24h      |  4678 |   4.11 |    0.52 |
+|          4 | a 0-1h      |   198 |   0.74 |     0.3 |
+|          4 | b 1-6h      |   989 |   0.96 |    0.12 |
+|          4 | c 6-24h     |  3188 |   3.14 |   -0.11 |
+|          4 | d >24h      |  5012 |   4.11 |    0.44 |
+|          5 | a 0-1h      |   239 |   0.71 |    0.23 |
+|          5 | b 1-6h      |  1214 |   0.79 |    0.15 |
+|          5 | c 6-24h     |  3783 |   2.85 |   -0.03 |
+|          5 | d >24h      |  6155 |   3.95 |     0.6 |
+|          6 | a 0-1h      |   316 |   0.82 |    0.04 |
+|          6 | b 1-6h      |  1516 |   0.91 |   -0.04 |
+|          6 | c 6-24h     |  4738 |   2.87 |   -0.37 |
+|          6 | d >24h      |  7884 |   3.84 |    0.46 |
+|          7 | a 0-1h      |   298 |    0.9 |   -0.01 |
+|          7 | b 1-6h      |  1636 |   0.94 |    0.02 |
+|          7 | c 6-24h     |  5158 |   2.76 |   -0.44 |
+|          7 | d >24h      |  8746 |   3.81 |     0.4 |
+|          8 | a 0-1h      |   361 |   1.37 |    0.09 |
+|          8 | b 1-6h      |  1750 |    1.5 |    0.04 |
+|          8 | c 6-24h     |  5627 |   3.02 |   -0.41 |
+|          8 | d >24h      |  9960 |    4.1 |    0.49 |
+|          9 | a 0-1h      |   319 |   1.85 |   -0.79 |
+|          9 | b 1-6h      |  1735 |   1.94 |   -0.42 |
+|          9 | c 6-24h     |  5716 |    3.2 |   -0.79 |
+|          9 | d >24h      | 10245 |   4.16 |    0.14 |
+|         10 | a 0-1h      |   368 |   1.93 |   -0.62 |
+|         10 | b 1-6h      |  1710 |   2.17 |   -0.63 |
+|         10 | c 6-24h     |  5724 |   3.31 |   -0.93 |
+|         10 | d >24h      | 10579 |   4.29 |    0.09 |
+|         11 | a 0-1h      |   344 |   2.27 |   -1.05 |
+|         11 | b 1-6h      |  1735 |   2.45 |   -0.95 |
+|         11 | c 6-24h     |  5756 |   3.34 |   -1.05 |
+|         11 | d >24h      | 10888 |   4.32 |    0.04 |
+|         12 | a 0-1h      |   311 |    7.5 |    5.89 |
+|         12 | b 1-6h      |  1711 |      8 |    5.78 |
+|         12 | c 6-24h     |  5844 |    7.5 |     5.3 |
+|         12 | d >24h      | 11166 |   8.25 |    6.19 |
+|         13 | a 0-1h      |   344 |    6.2 |    3.75 |
+|         13 | b 1-6h      |  1703 |   6.11 |    3.73 |
+|         13 | c 6-24h     |  5852 |   5.69 |    3.29 |
+|         13 | d >24h      | 11475 |   6.43 |    4.12 |
+|         14 | a 0-1h      |   343 |   5.91 |   -2.46 |
+|         14 | b 1-6h      |  1686 |   4.34 |    1.65 |
+|         14 | c 6-24h     |  5901 |   4.31 |    1.27 |
+|         14 | d >24h      | 11785 |    5.2 |    1.84 |
+|         15 | a 0-1h      |   352 |   4.64 |   -1.68 |
+|         15 | b 1-6h      |  1710 |   4.68 |   -0.46 |
+|         15 | c 6-24h     |  5901 |   4.36 |    0.07 |
+|         15 | d >24h      | 12102 |   4.72 |    0.69 |
+|         16 | a 0-1h      |   343 |   4.37 |   -1.86 |
+|         16 | b 1-6h      |  1694 |   4.44 |   -1.18 |
+|         16 | c 6-24h     |  5957 |   3.89 |   -0.02 |
+|         16 | d >24h      | 12412 |   4.44 |    0.52 |
+|         17 | a 0-1h      |   344 |   3.04 |   -0.61 |
+|         17 | b 1-6h      |  1693 |   4.46 |   -1.32 |
+|         17 | c 6-24h     |  5990 |   3.69 |    0.25 |
+|         17 | d >24h      | 12721 |   4.43 |    0.77 |
+|         18 | a 0-1h      |   318 |   2.47 |    0.26 |
+|         18 | b 1-6h      |  1726 |   4.21 |   -1.59 |
+|         18 | c 6-24h     |  6014 |   3.21 |    0.19 |
+|         18 | d >24h      | 13006 |   4.19 |    0.62 |
+|         19 | a 0-1h      |   344 |   2.25 |     0.2 |
+|         19 | b 1-6h      |  1700 |   4.16 |   -1.52 |
+|         19 | c 6-24h     |  6047 |   2.94 |    0.28 |
+|         19 | d >24h      | 13315 |   4.19 |    0.69 |
+|         20 | a 0-1h      |   311 |    2.1 |    0.13 |
+|         20 | b 1-6h      |  1672 |   3.49 |   -0.77 |
+|         20 | c 6-24h     |  5990 |   3.15 |    0.04 |
+|         20 | d >24h      | 13258 |   4.24 |    0.69 |
+|         21 | a 0-1h      |   266 |   1.66 |   -0.18 |
+|         21 | b 1-6h      |  1283 |   3.06 |   -0.56 |
+|         21 | c 6-24h     |  4762 |   3.25 |    0.08 |
+|         21 | d >24h      | 11282 |    4.3 |    0.72 |
+|         22 | a 0-1h      |   183 |   1.36 |   -0.07 |
+|         22 | b 1-6h      |   885 |   2.67 |   -0.04 |
+|         22 | c 6-24h     |  3292 |   3.45 |      -0 |
+|         22 | d >24h      |  7959 |   4.46 |     0.7 |
+|         23 | a 0-1h      |   173 |   1.28 |     0.1 |
+|         23 | b 1-6h      |   842 |   2.16 |    0.18 |
+|         23 | c 6-24h     |  3130 |   3.33 |    0.09 |
+|         23 | d >24h      |  7750 |   4.37 |    0.84 |
++------------+-------------+-------+--------+---------+
+96 rows in set (0.58 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #3  Shape-shrinkage test (finding A-1 / recommendation 3.2).
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     For each (station, local hour) cell: bias vs the hour's offset from the
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     station's own mean actual price. If bias grows with the offset
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     (positive at peak hours, negative at valley hours), the blend is
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     damping the intraday shape ("recent" term / median smoothing).
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+WITH sh AS (
+    SELECT station_id,
+           (CAST(SUBSTRING(target_start, 12, 2) AS UNSIGNED) + 2) % 24 AS local_hour,
+           AVG(error) AS bias,
+           AVG(actual_price) AS hour_avg,
+           COUNT(*) AS n
+    FROM price_predictions
+    WHERE fuel = 'diesel' AND error IS NOT NULL AND actual_price IS NOT NULL
+    GROUP BY station_id, local_hour
+),
+s AS (
+    SELECT station_id, SUM(hour_avg * n) / SUM(n) AS station_avg
+    FROM sh GROUP BY station_id
+)
+SELECT CAST(ROUND((sh.hour_avg - s.station_avg) * 100) AS SIGNED) AS hour_offset_ct,
+       COUNT(*) AS cells,
+       ROUND(AVG(sh.bias) * 100, 2) AS avg_bias_ct
+FROM sh JOIN s ON s.station_id = sh.station_id
+GROUP BY hour_offset_ct
+ORDER BY hour_offset_ct
+--------------
+
++----------------+-------+-------------+
+| hour_offset_ct | cells | avg_bias_ct |
++----------------+-------+-------------+
+|             -7 |     1 |        0.95 |
+|             -6 |    27 |       -0.33 |
+|             -5 |    46 |       -0.23 |
+|             -4 |    39 |        -0.3 |
+|             -3 |   102 |       -0.35 |
+|             -2 |   104 |        0.08 |
+|             -1 |    57 |         0.4 |
+|              0 |    66 |        1.23 |
+|              1 |    22 |        0.92 |
+|              2 |    14 |        0.32 |
+|              3 |     6 |        0.32 |
+|              4 |     8 |        1.13 |
+|              5 |     7 |        3.32 |
+|              6 |     4 |        1.76 |
+|              7 |     7 |        1.14 |
+|              8 |     5 |         1.8 |
+|              9 |     4 |        0.12 |
+|             10 |     3 |        2.17 |
+|             11 |     5 |        1.59 |
+|             12 |     5 |        3.04 |
+|             13 |     2 |        2.13 |
+|             14 |     5 |        4.71 |
+|             15 |     6 |        5.99 |
+|             16 |     5 |        5.58 |
+|             17 |     3 |        4.15 |
+|             18 |     7 |        9.92 |
+|             20 |     2 |        6.51 |
+|             21 |     1 |       17.21 |
+|             22 |     1 |       17.82 |
+|             23 |     1 |       20.28 |
+|             24 |     1 |        4.14 |
+|             33 |     1 |        5.58 |
++----------------+-------+-------------+
+32 rows in set (0.61 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #4  Day-over-day baseline drift (finding A-2 / recommendation 3.3).
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     Uses the persisted `baseline` column. A consistently positive avg delta
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     (~+0.5 ct/day in the screenshot window) is the level the flat-baseline
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     assumption gives away per day of lead.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+WITH station_day AS (
+    SELECT pp.station_id,
+           SUBSTRING(r.run_at, 1, 10) AS run_day,
+           AVG(pp.baseline) AS baseline
+    FROM price_predictions pp
+    JOIN prediction_runs r ON r.id = pp.run_id
+    WHERE pp.fuel = 'diesel' AND pp.baseline IS NOT NULL
+    GROUP BY pp.station_id, run_day
+),
+deltas AS (
+    SELECT station_id, run_day,
+           baseline - LAG(baseline) OVER (PARTITION BY station_id ORDER BY run_day) AS delta
+    FROM station_day
+)
+SELECT run_day,
+       COUNT(*) AS stations,
+       ROUND(AVG(delta) * 100, 2) AS avg_day_over_day_ct
+FROM deltas
+WHERE delta IS NOT NULL
+GROUP BY run_day
+ORDER BY run_day
+--------------
+
++------------+----------+---------------------+
+| run_day    | stations | avg_day_over_day_ct |
++------------+----------+---------------------+
+| 2026-07-21 |        8 |               -3.62 |
+| 2026-07-22 |        8 |                0.48 |
+| 2026-07-23 |        8 |                3.87 |
+| 2026-07-24 |       27 |                2.63 |
+| 2026-07-25 |       27 |               -1.98 |
+| 2026-07-26 |       27 |               -0.23 |
+| 2026-07-27 |       28 |                0.83 |
+| 2026-07-28 |       28 |               -2.04 |
+| 2026-07-29 |       28 |                 0.4 |
+| 2026-07-30 |       28 |                2.66 |
+| 2026-07-31 |       28 |                 0.8 |
+| 2026-08-01 |       28 |                0.33 |
+| 2026-08-02 |       28 |                0.69 |
+| 2026-08-03 |       28 |               -0.43 |
++------------+----------+---------------------+
+14 rows in set (0.70 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #5  Persistence baseline vs model at each lead (recommendation 3.4).
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     price_check_decisions stores the observed live price at run time for
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     every station, so "just assume the price stays where it is" can be
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     scored against the model on identical targets. If persistence wins at
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     short leads, blend the live price in.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+SELECT CASE
+           WHEN pp.lead_minutes <= 60   THEN 'a 0-1h'
+           WHEN pp.lead_minutes <= 180  THEN 'b 1-3h'
+           WHEN pp.lead_minutes <= 360  THEN 'c 3-6h'
+           WHEN pp.lead_minutes <= 720  THEN 'd 6-12h'
+           WHEN pp.lead_minutes <= 1440 THEN 'e 12-24h'
+           ELSE 'f >24h'
+       END AS lead_bucket,
+       COUNT(*) AS n,
+       ROUND(AVG(ABS(pp.error)) * 100, 2) AS model_mae_ct,
+       ROUND(AVG(ABS(pp.actual_price - d.observed_price)) * 100, 2) AS persistence_mae_ct
+FROM price_predictions pp
+JOIN price_check_decisions d
+  ON d.run_id = pp.run_id AND d.station_id = pp.station_id AND d.fuel = pp.fuel
+WHERE pp.fuel = 'diesel'
+  AND pp.error IS NOT NULL
+  AND pp.actual_price IS NOT NULL
+GROUP BY lead_bucket
+ORDER BY lead_bucket
+--------------
+
++-------------+--------+--------------+--------------------+
+| lead_bucket | n      | model_mae_ct | persistence_mae_ct |
++-------------+--------+--------------+--------------------+
+| a 0-1h      |   4427 |         2.54 |               3.06 |
+| b 1-3h      |   8483 |         2.93 |               4.74 |
+| c 3-6h      |  11816 |         3.29 |               5.75 |
+| d 6-12h     |  21561 |         3.26 |               4.75 |
+| e 12-24h    |  44283 |         3.81 |               5.51 |
+| f >24h      | 119402 |         4.59 |               6.35 |
++-------------+--------+--------------+--------------------+
+6 rows in set (1 min 9.45 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #6  Winner's curse on suggested windows (recommendation 3.7).
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     If bias for is_suggestion = 1 is clearly more positive than for the
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     rest, the displayed "predicted price" of suggestions is optimistic
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     even though ranking may be fine.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+SELECT is_suggestion,
+       COUNT(*) AS n,
+       ROUND(AVG(ABS(error)) * 100, 2) AS mae_ct,
+       ROUND(AVG(error) * 100, 2)      AS bias_ct
+FROM price_predictions
+WHERE fuel = 'diesel' AND error IS NOT NULL
+GROUP BY is_suggestion
+--------------
+
++---------------+--------+--------+---------+
+| is_suggestion | n      | mae_ct | bias_ct |
++---------------+--------+--------+---------+
+|             0 | 368461 |   4.14 |    0.66 |
+|             1 |  14654 |   4.62 |    2.79 |
++---------------+--------+--------+---------+
+2 rows in set (0.48 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #7  Confidence calibration by lead bucket (finding C / recommendation 3.5).
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     Checks whether "low beats medium" persists within the same lead bucket
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     (i.e. is a real inversion, not a lead-mix artifact), and confirms the
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     "high" tier is empty.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+SELECT confidence,
+       CASE
+           WHEN lead_minutes <= 360  THEN 'a 0-6h'
+           WHEN lead_minutes <= 1440 THEN 'b 6-24h'
+           ELSE 'c >24h'
+       END AS lead_bucket,
+       COUNT(*) AS n,
+       ROUND(AVG(ABS(error)) * 100, 2) AS mae_ct,
+       ROUND(AVG(error) * 100, 2)      AS bias_ct
+FROM price_predictions
+WHERE fuel = 'diesel' AND error IS NOT NULL
+GROUP BY confidence, lead_bucket
+ORDER BY confidence, lead_bucket
+--------------
+
++------------+-------------+--------+--------+---------+
+| confidence | lead_bucket | n      | mae_ct | bias_ct |
++------------+-------------+--------+--------+---------+
+| low        | a 0-6h      |   4571 |    2.2 |   -0.76 |
+| low        | b 6-24h     |   3219 |   3.14 |    0.16 |
+| low        | c >24h      |   3011 |   4.87 |    1.98 |
+| medium     | a 0-6h      |  36426 |   3.14 |    0.22 |
+| medium     | b 6-24h     | 113579 |   3.69 |    0.36 |
+| medium     | c >24h      | 222309 |    4.6 |    1.05 |
++------------+-------------+--------+--------+---------+
+6 rows in set (0.55 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #8  Error tail: the 50 worst evaluated predictions with context.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     Look for: target windows containing the noon jump (midpoint artifact),
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     station outages, or one station dominating the tail.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+SELECT pp.station_id,
+       s.name AS station_name,
+       pp.target_start,
+       pp.lead_minutes,
+       pp.confidence,
+       ROUND(pp.predicted_price, 3) AS predicted,
+       ROUND(pp.actual_price, 3)    AS actual,
+       ROUND(pp.error * 100, 1)     AS error_ct
+FROM price_predictions pp
+JOIN stations s ON s.id = pp.station_id
+WHERE pp.fuel = 'diesel' AND pp.error IS NOT NULL
+ORDER BY ABS(pp.error) DESC
+LIMIT 50
+--------------
+
++--------------------------------------+----------------------------------------------------------+----------------------+--------------+------------+-----------+--------+----------+
+| station_id                           | station_name                                             | target_start         | lead_minutes | confidence | predicted | actual | error_ct |
++--------------------------------------+----------------------------------------------------------+----------------------+--------------+------------+-----------+--------+----------+
+| ea56ab3e-108c-413f-9b8b-4e9ff8e4caf2 | Kaiser-Tankstelle                                        | 2026-07-25T10:00:00Z |         1379 | medium     |     2.478 |  2.109 |    -36.9 |
+| de11c5d4-7113-48c5-8e5f-9228a8f17622 | Kaiser-Tankstelle Isenstedt                              | 2026-07-25T10:00:00Z |         1379 | medium     |     2.478 |  2.109 |    -36.9 |
+| 333bfa4e-d9b1-4801-8ac8-a41a4983aee8 | Kaiser-Tankstelle Isenstedt                              | 2026-07-25T10:00:00Z |         1379 | medium     |     2.478 |  2.109 |    -36.9 |
+| 333bfa4e-d9b1-4801-8ac8-a41a4983aee8 | Kaiser-Tankstelle Isenstedt                              | 2026-07-25T13:00:00Z |         1559 | medium     |     2.469 |  2.119 |      -35 |
+| de11c5d4-7113-48c5-8e5f-9228a8f17622 | Kaiser-Tankstelle Isenstedt                              | 2026-07-25T13:00:00Z |         1559 | medium     |     2.469 |  2.119 |      -35 |
+| ea56ab3e-108c-413f-9b8b-4e9ff8e4caf2 | Kaiser-Tankstelle                                        | 2026-07-25T13:00:00Z |         1559 | medium     |     2.469 |  2.119 |      -35 |
+| 51d4b5d2-a095-1aa0-e100-80009459e03a | Supermarkt-Tankstelle ESPELKAMP GENERAL- BISHOP- STR. 10 | 2026-07-30T10:00:00Z |         2759 | medium     |     2.028 |  2.369 |     34.1 |
+| de11c5d4-7113-48c5-8e5f-9228a8f17622 | Kaiser-Tankstelle Isenstedt                              | 2026-07-29T10:00:00Z |         1199 | medium     |     2.012 |  2.349 |     33.7 |
+| ea56ab3e-108c-413f-9b8b-4e9ff8e4caf2 | Kaiser-Tankstelle                                        | 2026-07-29T10:00:00Z |         1199 | medium     |     2.012 |  2.349 |     33.7 |
+| 333bfa4e-d9b1-4801-8ac8-a41a4983aee8 | Kaiser-Tankstelle Isenstedt                              | 2026-07-29T10:00:00Z |         1199 | medium     |     2.012 |  2.349 |     33.7 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-30T10:00:00Z |         2999 | medium     |     2.089 |  2.419 |       33 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-30T10:00:00Z |         3059 | medium     |     2.089 |  2.419 |       33 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-30T10:00:00Z |         2879 | medium     |     2.099 |  2.419 |       32 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-30T10:00:00Z |         2939 | medium     |     2.099 |  2.419 |       32 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-30T10:00:00Z |         3119 | medium     |     2.099 |  2.419 |       32 |
+| 7ca9550e-352a-4abf-95b3-bfae301479d9 | Shell Muehlacker Lienzingerstr. 76                       | 2026-07-30T10:00:00Z |         2879 | medium     |     2.129 |  2.449 |       32 |
+| 7ca9550e-352a-4abf-95b3-bfae301479d9 | Shell Muehlacker Lienzingerstr. 76                       | 2026-07-30T10:00:00Z |         2939 | medium     |     2.129 |  2.449 |       32 |
+| 7ca9550e-352a-4abf-95b3-bfae301479d9 | Shell Muehlacker Lienzingerstr. 76                       | 2026-07-30T10:00:00Z |         2999 | medium     |     2.129 |  2.449 |       32 |
+| ea56ab3e-108c-413f-9b8b-4e9ff8e4caf2 | Kaiser-Tankstelle                                        | 2026-07-25T14:00:00Z |         1619 | medium     |     2.439 |  2.119 |      -32 |
+| de11c5d4-7113-48c5-8e5f-9228a8f17622 | Kaiser-Tankstelle Isenstedt                              | 2026-07-25T14:00:00Z |         1619 | medium     |     2.439 |  2.119 |      -32 |
+| 333bfa4e-d9b1-4801-8ac8-a41a4983aee8 | Kaiser-Tankstelle Isenstedt                              | 2026-07-25T14:00:00Z |         1619 | medium     |     2.439 |  2.119 |      -32 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |         2879 | medium     |     2.133 |  2.449 |     31.6 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |         3239 | medium     |     2.133 |  2.449 |     31.6 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |         3299 | medium     |     2.133 |  2.449 |     31.6 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |         3359 | medium     |     2.133 |  2.449 |     31.6 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |         3419 | medium     |     2.133 |  2.449 |     31.6 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |         3479 | medium     |     2.133 |  2.449 |     31.6 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |         3539 | medium     |     2.133 |  2.449 |     31.6 |
+| 7ca9550e-352a-4abf-95b3-bfae301479d9 | Shell Muehlacker Lienzingerstr. 76                       | 2026-07-30T10:00:00Z |          299 | medium     |     2.135 |  2.449 |     31.4 |
+| 7ca9550e-352a-4abf-95b3-bfae301479d9 | Shell Muehlacker Lienzingerstr. 76                       | 2026-07-30T10:00:00Z |         1439 | medium     |     2.139 |  2.449 |       31 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-30T10:00:00Z |          119 | medium     |     2.109 |  2.419 |       31 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-30T10:00:00Z |          179 | medium     |     2.109 |  2.419 |       31 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-30T10:00:00Z |         3179 | medium     |     2.109 |  2.419 |       31 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-30T10:00:00Z |         3239 | medium     |     2.109 |  2.419 |       31 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-26T10:00:00Z |           59 | medium     |     2.099 |  2.409 |       31 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-26T10:00:00Z |          119 | medium     |     2.099 |  2.409 |       31 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-26T10:00:00Z |          179 | medium     |     2.099 |  2.409 |       31 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-29T10:00:00Z |         2879 | medium     |     2.079 |  2.389 |       31 |
+| 2c9eb20a-891c-4231-ad37-159be50d478b | Esso Tankstelle                                          | 2026-07-29T10:00:00Z |         2939 | medium     |     2.079 |  2.389 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          899 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          839 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          779 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          719 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          659 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          599 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          539 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          479 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          419 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          359 | medium     |     2.139 |  2.449 |       31 |
+| eeb3ff6c-b434-4ca8-b526-77a803672d26 | Shell Muehlacker Kanalstr. 22/2                          | 2026-07-30T10:00:00Z |          299 | medium     |     2.139 |  2.449 |       31 |
++--------------------------------------+----------------------------------------------------------+----------------------+--------------+------------+-----------+--------+----------+
+50 rows in set (1.35 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #9  Jump-anchor stability across runs. If the inferred anchor hour
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     flip-flops (e.g. 12 <-> 0), pricing-day baselines get inconsistent and
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     offsets smear — worth knowing before tuning anything else.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+SELECT jump_anchor_hour,
+       COUNT(*) AS runs,
+       MIN(run_at) AS first_run,
+       MAX(run_at) AS last_run
+FROM prediction_runs
+GROUP BY jump_anchor_hour
+ORDER BY runs DESC
+--------------
+
++------------------+------+----------------------+----------------------+
+| jump_anchor_hour | runs | first_run            | last_run             |
++------------------+------+----------------------+----------------------+
+|               12 | 1223 | 2026-07-20T12:38:24Z | 2026-08-03T19:00:00Z |
+|                0 |   15 | 2026-07-23T20:00:02Z | 2026-07-24T10:00:01Z |
++------------------+------+----------------------+----------------------+
+2 rows in set (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- #10 Decision quality: signed regret by recommendation. "buy" rows should
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     sit near the day floor (small positive regret); large-regret "buy"s and
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+--     tiny-regret "wait"s are the actionable failure cases.
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+-- ---------------------------------------------------------------------------
+--------------
+
+Query OK, 0 rows affected (0.00 sec)
+
+--------------
+SELECT recommendation,
+       COUNT(*) AS n,
+       ROUND(AVG(regret) * 100, 2) AS avg_regret_ct,
+       ROUND(100 * AVG(regret <= 0.02), 1) AS within_2ct_of_floor_pct
+FROM price_check_decisions
+WHERE fuel = 'diesel' AND regret IS NOT NULL
+GROUP BY recommendation
+ORDER BY recommendation
+--------------
+
++----------------+------+---------------+-------------------------+
+| recommendation | n    | avg_regret_ct | within_2ct_of_floor_pct |
++----------------+------+---------------+-------------------------+
+| buy            |  813 |          2.96 |                    44.4 |
+| hold           |  564 |          3.96 |                    33.3 |
+| wait           | 2411 |           7.3 |                    17.6 |
++----------------+------+---------------+-------------------------+
+3 rows in set (0.01 sec)
+
+Bye

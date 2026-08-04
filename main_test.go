@@ -2964,6 +2964,160 @@ func TestBuildForecastModelSparseHistoryFallsBackToAbsolute(t *testing.T) {
 	}
 }
 
+func TestScoreForecastOffsetModeIgnoresRecentLevel(t *testing.T) {
+	// The recent bucket carries a poisoned +0.50 level. In offset mode the
+	// blend must not let it damp the intraday shape; in absolute mode it
+	// stays part of the level estimate.
+	weekdaySamples := []priceSample{
+		{Price: -0.10, Weight: 60, Date: "2026-04-06"},
+		{Price: -0.10, Weight: 60, Date: "2026-04-13"},
+		{Price: -0.10, Weight: 60, Date: "2026-04-20"},
+	}
+	model := forecastModel{
+		Stations: map[string]forecastStation{
+			"s": {OffsetMode: true, BaselineForecast: 2.00},
+		},
+		WeekdayHour: map[stationWeekdayHourKey][]priceSample{
+			{StationID: "s", Weekday: time.Monday, Hour: 11}: weekdaySamples,
+		},
+		Hour: map[stationHourKey][]priceSample{
+			{StationID: "s", Hour: 11}: {{Price: -0.10, Weight: 60}},
+		},
+		Recent: map[string][]priceSample{
+			"s": {{Price: 0.50, Weight: 600}},
+		},
+	}
+	target := time.Date(2026, 4, 27, 11, 0, 0, 0, time.UTC) // Monday
+	score, ok := scoreForecast(model, "s", target)
+	if !ok {
+		t.Fatal("scoreForecast returned !ok")
+	}
+	if score.PredictedPrice < 1.899 || score.PredictedPrice > 1.901 {
+		t.Fatalf("offset-mode prediction = %.4f, want 1.90 (recent level ignored)", score.PredictedPrice)
+	}
+
+	absolute := model
+	absolute.Stations = map[string]forecastStation{"s": {}}
+	absolute.WeekdayHour = map[stationWeekdayHourKey][]priceSample{}
+	absolute.Hour = map[stationHourKey][]priceSample{
+		{StationID: "s", Hour: 11}: {{Price: 1.90, Weight: 60}},
+	}
+	absolute.Recent = map[string][]priceSample{
+		"s": {{Price: 2.10, Weight: 60}},
+	}
+	score, ok = scoreForecast(absolute, "s", target)
+	if !ok {
+		t.Fatal("scoreForecast returned !ok in absolute mode")
+	}
+	if score.PredictedPrice < 1.949 || score.PredictedPrice > 1.951 {
+		t.Fatalf("absolute-mode prediction = %.4f, want 1.95 (recent still blended)", score.PredictedPrice)
+	}
+}
+
+func TestEstimateBaselineDriftDampsAndCaps(t *testing.T) {
+	nowLocal := time.Date(2026, 4, 25, 9, 0, 0, 0, time.UTC)
+	days := func(values ...float64) map[string]dayBaseline {
+		result := make(map[string]dayBaseline)
+		for i, value := range values {
+			day := nowLocal.AddDate(0, 0, -len(values)+i).Format("2006-01-02")
+			result[day] = dayBaseline{Value: value, CoverageMinutes: 1440}
+		}
+		return result
+	}
+
+	// Steady +1 ct/day across six adjacent deltas: damped to +0.5 ct.
+	rising := map[string]map[string]dayBaseline{"s1": days(2.00, 2.01, 2.02, 2.03, 2.04, 2.05, 2.06)}
+	drift := estimateBaselineDrift(rising, 0, nowLocal)
+	if drift < 0.0049 || drift > 0.0051 {
+		t.Fatalf("drift = %.4f, want 0.005 (damped +0.01/day)", drift)
+	}
+
+	// A violent trend is capped.
+	steep := map[string]map[string]dayBaseline{"s1": days(2.00, 2.06, 2.12, 2.18, 2.24, 2.30, 2.36)}
+	if drift := estimateBaselineDrift(steep, 0, nowLocal); drift != baselineDriftMaxAbsPerDay {
+		t.Fatalf("steep drift = %.4f, want capped %.2f", drift, baselineDriftMaxAbsPerDay)
+	}
+
+	// Too few deltas: no drift.
+	sparse := map[string]map[string]dayBaseline{"s1": days(2.00, 2.01, 2.02)}
+	if drift := estimateBaselineDrift(sparse, 0, nowLocal); drift != 0 {
+		t.Fatalf("sparse drift = %.4f, want 0", drift)
+	}
+
+	// Flat market: exactly zero.
+	flat := map[string]map[string]dayBaseline{"s1": days(2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 2.00)}
+	if drift := estimateBaselineDrift(flat, 0, nowLocal); drift != 0 {
+		t.Fatalf("flat drift = %.4f, want 0", drift)
+	}
+}
+
+func TestScoreForecastExtrapolatesBaselineDrift(t *testing.T) {
+	nowLocal := time.Date(2026, 4, 25, 9, 0, 0, 0, time.UTC)
+	model := forecastModel{
+		Stations: map[string]forecastStation{
+			"s": {OffsetMode: true, BaselineForecast: 2.00},
+		},
+		Hour: map[stationHourKey][]priceSample{
+			{StationID: "s", Hour: 9}: {{Price: 0, Weight: 60}},
+		},
+		Recent:         map[string][]priceSample{"s": {{Price: 0, Weight: 60}}},
+		JumpAnchorHour: 12,
+		NowLocal:       nowLocal,
+		BaselineDrift:  0.005,
+	}
+
+	// Same pricing day (before the next noon crossing): no drift applied.
+	score, ok := scoreForecast(model, "s", nowLocal.Add(30*time.Minute))
+	if !ok || score.PredictedPrice != 2.00 {
+		t.Fatalf("same-day prediction = %.4f, want 2.00", score.PredictedPrice)
+	}
+	// Two noon crossings ahead: two days of drift.
+	score, ok = scoreForecast(model, "s", nowLocal.AddDate(0, 0, 2))
+	if !ok {
+		t.Fatal("scoreForecast returned !ok")
+	}
+	if score.PredictedPrice < 2.0099 || score.PredictedPrice > 2.0101 {
+		t.Fatalf("two-days-out prediction = %.4f, want 2.01 (+2x drift)", score.PredictedPrice)
+	}
+}
+
+func TestGenerateSuggestionsOrdersByRawScoreNotRoundedDisplay(t *testing.T) {
+	// Two stations whose raw prices differ but round to the same cent. The
+	// raw-cheaper one must win, with and without a non-cent-aligned display
+	// bias — under rounded ordering the two would tie (falling through to
+	// name order, which here prefers the raw-more-expensive station) and the
+	// bias could then split the tie differently.
+	hourSamples := func(price float64) []priceSample {
+		return []priceSample{{Price: price, Weight: 60}}
+	}
+	model := forecastModel{
+		Stations: map[string]forecastStation{
+			"cheap-raw": {Station: suggestionStationRow{ID: "cheap-raw", Name: "zzz station"}},
+			"dear-raw":  {Station: suggestionStationRow{ID: "dear-raw", Name: "aaa station"}},
+		},
+		Hour: map[stationHourKey][]priceSample{
+			{StationID: "cheap-raw", Hour: 23}: hourSamples(1.796),
+			{StationID: "dear-raw", Hour: 23}:  hourSamples(1.804),
+		},
+		Recent: map[string][]priceSample{
+			"cheap-raw": hourSamples(1.796),
+			"dear-raw":  hourSamples(1.804),
+		},
+	}
+	now := time.Date(2026, 4, 24, 22, 30, 0, 0, time.UTC)
+
+	for _, bias := range []float64{0, 0.0031} {
+		model.SuggestionBias = bias
+		suggestions := generateSuggestions(model, "diesel", now, time.UTC, 1, 1)
+		if len(suggestions) == 0 {
+			t.Fatalf("no suggestions with bias %.4f", bias)
+		}
+		if suggestions[0].StationID != "cheap-raw" {
+			t.Fatalf("bias %.4f selected %s, want the raw-cheaper station", bias, suggestions[0].StationID)
+		}
+	}
+}
+
 func TestPricingDayAnchorsAtJumpHour(t *testing.T) {
 	early := time.Date(2026, 4, 11, 5, 0, 0, 0, time.UTC)
 	if day := pricingDay(early, 12); day != "2026-04-10" {

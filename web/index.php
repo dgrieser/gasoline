@@ -1681,6 +1681,14 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             <div class="stat"><div class="stat-label" data-i18n="predStatWorst">Worst error</div><div class="stat-value skeleton pred-small" id="ps-worst" aria-busy="true">&nbsp;</div></div>
         </div>
 
+        <p class="auth-note" data-i18n="predLatestHint">The tiles above count every stored prediction, so each target window appears once per hourly run and long leads dominate. These tiles keep only the latest prediction per station and window — the accuracy of acting on fresh output.</p>
+        <div class="stats" aria-live="polite">
+            <div class="stat"><div class="stat-label" data-i18n="predStatLatestCount">Latest run: evaluated</div><div class="stat-value skeleton" id="ps-l-count" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatLatestMae">Latest run: MAE</div><div class="stat-value skeleton pred-small" id="ps-l-mae" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatLatestBias">Latest run: bias</div><div class="stat-value skeleton pred-small" id="ps-l-bias" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="predStatLatestWithin2">Latest run: within ±2 ct</div><div class="stat-value skeleton pred-small" id="ps-l-within2" aria-busy="true">&nbsp;</div></div>
+        </div>
+
         <div class="chart-card">
             <div class="chart-header">
                 <span class="chart-title" data-i18n="predChartTitle">Predicted vs. actual</span>
@@ -1788,7 +1796,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         const moreBtn    = document.getElementById('pred-more-btn');
         const truncEl    = document.getElementById('pred-truncated');
         const viewTogl   = document.getElementById('pred-view-toggles');
-        const statIds    = ['ps-count','ps-stations','ps-mae','ps-bias','ps-rmse','ps-within1','ps-within2','ps-worst'];
+        const statIds    = ['ps-count','ps-stations','ps-mae','ps-bias','ps-rmse','ps-within1','ps-within2','ps-worst','ps-l-count','ps-l-mae','ps-l-bias','ps-l-within2'];
 
         const NS = 'http://www.w3.org/2000/svg';
         const C_PRED = '#f5a623', C_ACTUAL = '#60a5fa', C_BAND = 'rgba(245,166,35,0.18)';
@@ -1898,6 +1906,15 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             setStat('ps-within1', fmtPct(s.within1_pct));
             setStat('ps-within2', fmtPct(s.within2_pct));
             setStat('ps-worst', fmtCt(Math.max(Math.abs(s.min_error || 0), Math.abs(s.max_error || 0))));
+            const l = data.summary_latest;
+            if (!l) {
+                ['ps-l-count','ps-l-mae','ps-l-bias','ps-l-within2'].forEach((id) => setStat(id, '—'));
+                return;
+            }
+            setStat('ps-l-count', fmtInt(l.count));
+            setStat('ps-l-mae', fmtCt(l.mae));
+            setStat('ps-l-bias', fmtSignedCt(l.bias));
+            setStat('ps-l-within2', fmtPct(l.within2_pct));
         }
 
         function renderConf() {
@@ -2644,6 +2661,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
 
     $out = [
         'summary' => null,
+        'summary_latest' => null,
         'by_confidence' => [],
         'by_lead' => [],
         'by_hour' => [],
@@ -2716,6 +2734,39 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
             'within1_pct' => (float) ($agg['within1'] ?? 0) / $count * 100,
             'within2_pct' => (float) ($agg['within2'] ?? 0) / $count * 100,
         ];
+
+        // 1b) Same stats deduplicated to the latest run per (station, target
+        //     window). Every hourly persist run re-predicts the same future
+        //     hours, so the full set counts one window dozens of times across
+        //     leads and is dominated by long-lead rows; the freshest
+        //     prediction per window is what a user acting on current output
+        //     experiences. Both views are shown side by side.
+        $latestJoin = 'JOIN ('
+            . 'SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id '
+            . 'FROM price_predictions pp ' . $joinRuns
+            . 'WHERE ' . $where
+            . ' GROUP BY pp.station_id, pp.target_start'
+            . ') latest ON latest.station_id = pp.station_id'
+            . ' AND latest.target_start = pp.target_start'
+            . ' AND latest.run_id = pp.run_id';
+        $latestStmt = $pdo->prepare(
+            'SELECT COUNT(*) AS n, '
+            . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, '
+            . 'SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 '
+            . 'FROM price_predictions pp ' . $latestJoin
+        );
+        $bind($latestStmt);
+        $latestStmt->execute();
+        $latestAgg = $latestStmt->fetch() ?: [];
+        $latestCount = (int) ($latestAgg['n'] ?? 0);
+        if ($latestCount > 0) {
+            $out['summary_latest'] = [
+                'count' => $latestCount,
+                'mae' => (float) ($latestAgg['mae'] ?? 0),
+                'bias' => (float) ($latestAgg['bias'] ?? 0),
+                'within2_pct' => (float) ($latestAgg['within2'] ?? 0) / $latestCount * 100,
+            ];
+        }
 
         // 2) Per-confidence breakdown.
         $confStmt = $pdo->prepare(
@@ -5322,6 +5373,11 @@ const translations = {
         predStatWithin1: 'Within ±1 ct',
         predStatWithin2: 'Within ±2 ct',
         predStatWorst: 'Worst error',
+        predLatestHint: 'The tiles above count every stored prediction, so each target window appears once per hourly run and long leads dominate. These tiles keep only the latest prediction per station and window — the accuracy of acting on fresh output.',
+        predStatLatestCount: 'Latest run: evaluated',
+        predStatLatestMae: 'Latest run: MAE',
+        predStatLatestBias: 'Latest run: bias',
+        predStatLatestWithin2: 'Latest run: within ±2 ct',
         predConf_low: 'Low',
         predConf_medium: 'Medium',
         predConf_high: 'High',
@@ -5589,6 +5645,11 @@ const translations = {
         predStatWithin1: 'Innerh. ±1 ct',
         predStatWithin2: 'Innerh. ±2 ct',
         predStatWorst: 'Größter Fehler',
+        predLatestHint: 'Die Kacheln oben zählen jede gespeicherte Vorhersage — jedes Zielfenster erscheint also einmal pro stündlichem Lauf, und lange Vorlaufzeiten dominieren. Diese Kacheln behalten nur die neueste Vorhersage je Tankstelle und Fenster: die Genauigkeit, wenn man auf frische Ausgaben reagiert.',
+        predStatLatestCount: 'Neuester Lauf: ausgewertet',
+        predStatLatestMae: 'Neuester Lauf: MAE',
+        predStatLatestBias: 'Neuester Lauf: Bias',
+        predStatLatestWithin2: 'Neuester Lauf: innerh. ±2 ct',
         predConf_low: 'Niedrig',
         predConf_medium: 'Mittel',
         predConf_high: 'Hoch',

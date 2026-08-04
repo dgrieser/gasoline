@@ -283,7 +283,7 @@ type forecastStation struct {
 	// prediction window: future baseline shifts are unknowable from history.
 	BaselineForecast float64
 	// BiasCorrection is a learned correction from persisted predicted-vs-actual
-	// errors (see loadPredictionBias). Zero when no evaluation data exists.
+	// errors (see loadLearnedCorrections). Zero when no evaluation data exists.
 	BiasCorrection float64
 }
 
@@ -327,6 +327,21 @@ const (
 	// jumpDominanceRatio is how clearly the anchor hour's total upward
 	// movement must beat the runner-up hour before it is trusted.
 	jumpDominanceRatio = 1.5
+	// baselineDriftWindowDays is how far back adjacent-day baseline deltas
+	// feed the drift estimate. Long enough to smooth daily noise, short
+	// enough to track a turning market.
+	baselineDriftWindowDays = 7
+	// baselineDriftDamping shrinks the measured drift before extrapolating
+	// it: day-over-day moves are noisy (they oscillate several cents around a
+	// small mean), so extrapolating the full median would overshoot whenever
+	// the market turns.
+	baselineDriftDamping = 0.5
+	// baselineDriftMaxAbsPerDay caps the extrapolated drift in euro per
+	// pricing day.
+	baselineDriftMaxAbsPerDay = 0.02
+	// baselineDriftMinSamples gates the drift until enough adjacent-day
+	// deltas exist across stations.
+	baselineDriftMinSamples = 5
 )
 
 type stationWeekdayHourKey struct {
@@ -349,12 +364,90 @@ type forecastModel struct {
 	// once-per-day price raise happens (0 when no dominant jump was found, in
 	// which case pricing days are plain calendar days).
 	JumpAnchorHour int
+	// NowLocal is the model's build time in the forecast location. Lead-time
+	// dependent corrections need it to place a target relative to now; the
+	// zero value disables them, which keeps hand-built models in tests inert.
+	NowLocal time.Time
+	// BaselineDrift is the damped market-wide day-over-day baseline move in
+	// euro per pricing day (see estimateBaselineDrift). Zero in flat markets.
+	BaselineDrift float64
+	// HourLeadBias holds market-wide learned corrections for the parts of the
+	// daily price curve the shape model systematically misses, keyed by local
+	// target hour, lead bucket and day class (see loadLearnedCorrections).
+	HourLeadBias map[hourLeadKey]float64
+	// ConfidenceByLead holds empirically calibrated confidence labels per
+	// station and lead bucket, measured from evaluated prediction errors.
+	// When a cell exists it overrides the sample-count heuristic.
+	ConfidenceByLead map[stationLeadKey]string
+	// SuggestionBias is the measured selection bias of suggested windows:
+	// picking the minimum predicted window across many candidates
+	// preferentially picks windows whose prediction erred low, so the printed
+	// price runs optimistic even when the model is unbiased overall. Added to
+	// displayed suggestion prices only — never to the persisted grid, which
+	// must keep measuring the raw model.
+	SuggestionBias float64
+}
+
+// leadBucket coarsens a prediction's lead time for learned corrections. The
+// boundaries mirror the accuracy page's buckets: within one bucket the error
+// profile is close to uniform, across them it visibly shifts.
+type leadBucket int
+
+const (
+	leadBucket0to1h leadBucket = iota
+	leadBucket1to6h
+	leadBucket6to24h
+	// leadBucketBeyond24h exists so callers can recognize long leads; learned
+	// corrections are not trained there (day-ahead surprises would leak into
+	// them) but the 6-24h cell still applies, since the intraday shape error
+	// it captures does not fade with distance.
+	leadBucketBeyond24h
+)
+
+func leadBucketFor(minutes float64) leadBucket {
+	switch {
+	case minutes <= 60:
+		return leadBucket0to1h
+	case minutes <= 360:
+		return leadBucket1to6h
+	case minutes <= 1440:
+		return leadBucket6to24h
+	default:
+		return leadBucketBeyond24h
+	}
+}
+
+// hourLeadKey addresses one cell of the learned hour-of-day correction grid.
+type hourLeadKey struct {
+	Hour    int
+	Lead    leadBucket
+	Weekend bool
+}
+
+type stationLeadKey struct {
+	StationID string
+	Lead      leadBucket
+}
+
+// isWeekendLike groups days whose pricing behaves like a weekend: the noon
+// raise that dominates weekday errors is much weaker or absent on Saturdays,
+// Sundays and public holidays (the error tail shows the model over-predicting
+// exactly those spikes), so corrections must not blend the two regimes.
+func isWeekendLike(t time.Time) bool {
+	weekday := t.Weekday()
+	return weekday == time.Saturday || weekday == time.Sunday || isGermanHoliday(t)
 }
 
 type forecastScore struct {
 	PredictedPrice float64
 	Confidence     string
 	SampleCount    int
+	// LearnedCorrection is the part of PredictedPrice contributed by the
+	// learned feedback loops (station bias + hour-lead grid). Persisted with
+	// each prediction so learning can reconstruct the raw model error later —
+	// stored errors always measure the corrected prediction, and training on
+	// them as if they were raw would make the loops correct their own output.
+	LearnedCorrection float64
 }
 
 type priceCheckRow struct {
@@ -448,6 +541,8 @@ func run(args []string) error {
 		return runNotify(args[1:])
 	case "rename":
 		return runRename(args[1:])
+	case "merge-stations":
+		return runMergeStations(args[1:])
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "gasoline %s (commit %s, built %s)\n", version, commit, date)
 		return nil
@@ -474,6 +569,7 @@ Commands:
   check         check if latest stored prices are currently low
   notify        send Pushover notifications to configured web users
   rename        set a persistent display-name override for a station
+  merge-stations merge duplicate station identities into one canonical station
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
   version       print build version information
@@ -502,6 +598,8 @@ Examples:
   gasoline notify --dry-run
   gasoline rename <station-id> "Custom Name"
   gasoline rename --clear <station-id>
+  gasoline merge-stations --detect
+  gasoline merge-stations --into <canonical-id> <duplicate-id> [<duplicate-id>...]
   gasoline import cities DE
   gasoline clear cities`)
 }
@@ -934,16 +1032,38 @@ func persistSweep(ctx context.Context, db *sql.DB, d dialect, fetches []cityFetc
 	}
 	defer tx.Rollback()
 
+	aliases, err := loadStationAliases(ctx, tx)
+	if err != nil {
+		return err
+	}
+
 	centres := newCityCentres()
+	written := make(map[string]bool)
 	for _, obs := range observations {
 		recordedAt := obs.RecordedAt.Format(time.RFC3339)
+		// The stations row is kept fresh under the fetched id even for an
+		// alias, so last_seen_at keeps recording that the API still returns
+		// it; only the price history is redirected to the canonical station.
 		if _, err := tx.ExecContext(ctx, stationsUpsertSQL(d),
 			obs.Station.ID, obs.Station.Name, obs.Station.Brand, obs.Station.Street, obs.Station.HouseNumber,
 			obs.Station.PostCode, obs.Station.Place, obs.Station.Lat, obs.Station.Lng, recordedAt, recordedAt); err != nil {
 			return err
 		}
 
-		if err := persistPriceSnapshot(ctx, tx, centres, obs.City, obs.Station, obs.RecordedAt, obs.RadiusKM); err != nil {
+		snapshotStation := obs.Station
+		if canonical, ok := aliases[obs.Station.ID]; ok {
+			snapshotStation.ID = canonical
+		}
+		// When the API returns a station and one or more of its aliases in
+		// the same sweep, only the first write per canonical id counts — they
+		// carry the same prices, and a second write would immediately pass
+		// the "value changed since previous" test against the first.
+		if written[snapshotStation.ID] {
+			continue
+		}
+		written[snapshotStation.ID] = true
+
+		if err := persistPriceSnapshot(ctx, tx, centres, obs.City, snapshotStation, obs.RecordedAt, obs.RadiusKM); err != nil {
 			return err
 		}
 	}
@@ -957,6 +1077,33 @@ func persistSweep(ctx context.Context, db *sql.DB, d dialect, fetches []cityFetc
 	}
 
 	return tx.Commit()
+}
+
+// loadStationAliases returns duplicate-station redirects as alias id →
+// canonical id, following at most one hop (merge-stations never creates
+// chains, but a manual edit must not loop the sweep).
+func loadStationAliases(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, alias_of
+		FROM stations
+		WHERE alias_of IS NOT NULL AND alias_of != ''
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	aliases := make(map[string]string)
+	for rows.Next() {
+		var id, canonical string
+		if err := rows.Scan(&id, &canonical); err != nil {
+			return nil, err
+		}
+		if canonical != id {
+			aliases[id] = canonical
+		}
+	}
+	return aliases, rows.Err()
 }
 
 func printCityUpdate(res cityUpdateResult) {
@@ -2037,7 +2184,7 @@ func computeSuggestions(ctx context.Context, db *sql.DB, opts suggestOptions) (*
 	}
 
 	model := buildForecastModel(intervals, now, location)
-	if err := applyPredictionBias(ctx, db, &model, opts.Fuel, now); err != nil {
+	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, now, location); err != nil {
 		return nil, err
 	}
 	suggestions := mergeSuggestions(generateSuggestions(model, opts.Fuel, now, location, opts.PredictDays, opts.LimitPerDay))
@@ -2083,7 +2230,7 @@ func checkGas(ctx context.Context, db *sql.DB, opts checkOptions) ([]priceCheckR
 	}
 
 	model := buildForecastModel(intervals, now, location)
-	if err := applyPredictionBias(ctx, db, &model, opts.Fuel, now); err != nil {
+	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, now, location); err != nil {
 		return nil, err
 	}
 	checks := generatePriceChecks(model, snapshots, opts.Fuel, now, location, opts.PredictDays, opts.Limit, opts.Thresholds)
@@ -2264,9 +2411,11 @@ func buildForecastModel(intervals []priceInterval, now time.Time, location *time
 		Recent:      make(map[string][]priceSample),
 	}
 	nowLocal := now.In(location)
+	model.NowLocal = nowLocal
 	model.JumpAnchorHour = inferJumpAnchorHour(intervals, location)
 	buckets := collectHourBuckets(intervals, now, location)
 	baselines := computeDailyBaselines(buckets, model.JumpAnchorHour, nowLocal)
+	model.BaselineDrift = estimateBaselineDrift(baselines, model.JumpAnchorHour, nowLocal)
 	currentDay := pricingDay(nowLocal, model.JumpAnchorHour)
 
 	for _, interval := range intervals {
@@ -2492,6 +2641,51 @@ func computeDailyBaselines(buckets []hourBucket, anchorHour int, nowLocal time.T
 	return baselines
 }
 
+// estimateBaselineDrift measures how the market level has been moving: the
+// median of adjacent-pricing-day baseline deltas across all stations inside
+// the drift window, damped and capped before it is extrapolated per day of
+// lead. Non-adjacent days are skipped — a delta across a coverage gap spans
+// several days' moves and would be misread as one day's.
+func estimateBaselineDrift(baselines map[string]map[string]dayBaseline, anchorHour int, nowLocal time.Time) float64 {
+	cutoff := pricingDay(nowLocal.AddDate(0, 0, -baselineDriftWindowDays), anchorHour)
+	var deltas []float64
+	for _, days := range baselines {
+		ordered := make([]string, 0, len(days))
+		for day := range days {
+			ordered = append(ordered, day)
+		}
+		sort.Strings(ordered)
+		for i := 1; i < len(ordered); i++ {
+			if ordered[i] < cutoff {
+				continue
+			}
+			previous, err := time.Parse("2006-01-02", ordered[i-1])
+			if err != nil {
+				continue
+			}
+			current, err := time.Parse("2006-01-02", ordered[i])
+			if err != nil {
+				continue
+			}
+			if current.Sub(previous) != 24*time.Hour {
+				continue
+			}
+			deltas = append(deltas, days[ordered[i]].Value-days[ordered[i-1]].Value)
+		}
+	}
+	if len(deltas) < baselineDriftMinSamples {
+		return 0
+	}
+	drift := medianFloat(deltas) * baselineDriftDamping
+	if drift > baselineDriftMaxAbsPerDay {
+		drift = baselineDriftMaxAbsPerDay
+	}
+	if drift < -baselineDriftMaxAbsPerDay {
+		drift = -baselineDriftMaxAbsPerDay
+	}
+	return drift
+}
+
 // estimateCurrentBaseline de-shapes the open pricing day's buckets by
 // subtracting the learned per-hour offsets (built from complete days only) and
 // takes their duration-weighted median. This removes the time-of-day bias, so
@@ -2555,20 +2749,26 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 			stationOutput.DistanceKM = roundTo(station.DistanceKM, 1)
 			byDate[date] = append(byDate[date], suggestionCandidate{
 				suggestionRow: suggestionRow{
-					Date:           date,
-					Weekday:        candidateStart.Weekday().String(),
-					StartTime:      candidateStart.Format("15:04"),
-					EndTime:        candidateEnd.Format("15:04"),
-					StationID:      station.ID,
-					StationName:    station.Name,
-					DistanceKM:     stationOutput.DistanceKM,
-					Station:        stationOutput,
-					Fuel:           fuel,
-					PredictedPrice: roundTo(score.PredictedPrice, 2),
+					Date:        date,
+					Weekday:     candidateStart.Weekday().String(),
+					StartTime:   candidateStart.Format("15:04"),
+					EndTime:     candidateEnd.Format("15:04"),
+					StationID:   station.ID,
+					StationName: station.Name,
+					DistanceKM:  stationOutput.DistanceKM,
+					Station:     stationOutput,
+					Fuel:        fuel,
+					// The selection bias is a display honesty correction: the
+					// printed price stops being optimistic by the measured
+					// amount. Ordering uses rawPrice below, so the correction
+					// (and the cent rounding) cannot change which window gets
+					// suggested; the persisted grid stores the raw score.
+					PredictedPrice: roundTo(score.PredictedPrice+model.SuggestionBias, 2),
 					Confidence:     score.Confidence,
 					SampleCount:    score.SampleCount,
 				},
-				start: candidateStart,
+				start:    candidateStart,
+				rawPrice: score.PredictedPrice,
 			})
 		}
 	}
@@ -2769,6 +2969,13 @@ func futureForecastLess(a, b futureForecast) bool {
 type suggestionCandidate struct {
 	suggestionRow
 	start time.Time
+	// rawPrice is the model score before display rounding and the suggestion
+	// selection-bias correction. Candidate ordering uses it so that neither
+	// cent rounding nor the display correction can flip which window wins:
+	// two raw prices that round to the same cent would otherwise fall through
+	// to the tie-breakers, and adding a non-cent-aligned constant before
+	// rounding can split or create exactly such ties.
+	rawPrice float64
 }
 
 // scoreForecast predicts the price for one station at one local target time.
@@ -2802,12 +3009,22 @@ func scoreForecast(model forecastModel, stationID string, target time.Time) (for
 		confidence  string
 		sampleCount int
 	)
+	station := model.Stations[stationID]
 	if len(sameWeekday) >= 3 {
 		sameWeekdayScore, ok := weightedMedianPrice(sameWeekday)
 		if !ok {
 			return forecastScore{}, false
 		}
-		predicted = 0.60*sameWeekdayScore + 0.30*sameHourScore + 0.10*recentScore
+		if station.OffsetMode {
+			// In offset mode the recent bucket's median is ~0 by construction
+			// (offsets center on the pricing-day baseline), so blending it in
+			// only damps the intraday shape — measured as bias growing with
+			// the hour offset: peaks under-predicted, valleys over-predicted.
+			// The level job it did in absolute mode belongs to the baseline.
+			predicted = (0.60*sameWeekdayScore + 0.30*sameHourScore) / 0.90
+		} else {
+			predicted = 0.60*sameWeekdayScore + 0.30*sameHourScore + 0.10*recentScore
+		}
 		sampleCount = len(sameWeekday)
 		switch {
 		case len(sameWeekday) >= 8 && distinctSampleDays(sameWeekday) >= 5:
@@ -2818,22 +3035,71 @@ func scoreForecast(model forecastModel, stationID string, target time.Time) (for
 			confidence = "low"
 		}
 	} else {
-		predicted = 0.75*sameHourScore + 0.25*recentScore
+		if station.OffsetMode {
+			predicted = sameHourScore
+		} else {
+			predicted = 0.75*sameHourScore + 0.25*recentScore
+		}
 		sampleCount = len(sameHour)
 		confidence = "low"
 	}
 
-	station := model.Stations[stationID]
 	if station.OffsetMode {
 		predicted += station.BaselineForecast
+		// The baseline itself is held flat — the daily surprise is unknowable —
+		// but its recent damped drift is not: without it every prediction that
+		// crosses a pricing-day boundary inherits a stale level, giving the
+		// measured lead-growing bias in trending markets.
+		if model.BaselineDrift != 0 && !model.NowLocal.IsZero() {
+			predicted += model.BaselineDrift * float64(pricingDaysAhead(model.NowLocal, target, model.JumpAnchorHour))
+		}
 	}
+	learnedCorrection := station.BiasCorrection
 	predicted += station.BiasCorrection
 
+	if !model.NowLocal.IsZero() {
+		lead := leadBucketFor(target.Sub(model.NowLocal).Minutes())
+		// Learned cells stop at 24h — beyond that, day-ahead level surprises
+		// would contaminate them — but the intraday shape error they capture
+		// does not fade with distance, so long leads reuse the 6-24h cell.
+		cell := lead
+		if cell == leadBucketBeyond24h {
+			cell = leadBucket6to24h
+		}
+		if correction, ok := model.HourLeadBias[hourLeadKey{Hour: target.Hour(), Lead: cell, Weekend: isWeekendLike(target)}]; ok {
+			predicted += correction
+			learnedCorrection += correction
+		}
+		if label, ok := model.ConfidenceByLead[stationLeadKey{StationID: stationID, Lead: cell}]; ok {
+			// The calibration was measured at <=24h leads; a >24h target adds
+			// level risk the cell never saw, so it cannot claim "high" there.
+			if lead == leadBucketBeyond24h && label == "high" {
+				label = "medium"
+			}
+			confidence = label
+		}
+	}
+
 	return forecastScore{
-		PredictedPrice: predicted,
-		Confidence:     confidence,
-		SampleCount:    sampleCount,
+		PredictedPrice:    predicted,
+		Confidence:        confidence,
+		SampleCount:       sampleCount,
+		LearnedCorrection: learnedCorrection,
 	}, true
+}
+
+// pricingDaysAhead counts how many pricing-day boundaries (anchor-hour
+// crossings) lie between now and the target. Same pricing day means zero.
+func pricingDaysAhead(nowLocal, target time.Time, anchorHour int) int {
+	nowDay, err := time.Parse("2006-01-02", pricingDay(nowLocal, anchorHour))
+	if err != nil {
+		return 0
+	}
+	targetDay, err := time.Parse("2006-01-02", pricingDay(target, anchorHour))
+	if err != nil {
+		return 0
+	}
+	return int(targetDay.Sub(nowDay).Hours() / 24)
 }
 
 func weightedMedianPrice(samples []priceSample) (float64, bool) {
@@ -3209,6 +3475,12 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migrateStationsNameOverride(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateStationsAliasOf(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
+	if err := migratePredictionsAppliedCorrection(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migrateUsersNotifyFuel(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -3237,6 +3509,53 @@ func migrateStationsNameOverride(ctx context.Context, tx *sql.Tx, d dialect, res
 		return err
 	}
 	result.Applied = append(result.Applied, "stations.name_override")
+	return nil
+}
+
+// migrateStationsAliasOf adds the alias_of column that marks a station as a
+// duplicate identity of another (see merge-stations). New databases already
+// get it from schemaStatements.
+func migrateStationsAliasOf(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "stations", "alias_of")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	colType := "TEXT"
+	if d == dialectMySQL {
+		colType = "VARCHAR(64)"
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE stations ADD COLUMN alias_of %s`, colType)); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "stations.alias_of")
+	return nil
+}
+
+// migratePredictionsAppliedCorrection adds the column recording the learned
+// correction a prediction carried when it was stored. It stays NULL on rows
+// persisted before the column existed, which doubles as a version gate: the
+// learning loops only train on rows whose raw model error they can
+// reconstruct, so predictions of older model versions never contaminate the
+// current corrections.
+func migratePredictionsAppliedCorrection(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "price_predictions", "applied_correction")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	colType := "REAL"
+	if d == dialectMySQL {
+		colType = "DOUBLE"
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE price_predictions ADD COLUMN applied_correction %s`, colType)); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "price_predictions.applied_correction")
 	return nil
 }
 
@@ -4351,8 +4670,8 @@ func recommendationRank(recommendation string) int {
 }
 
 func suggestionCandidateLess(a, b suggestionCandidate) bool {
-	if a.PredictedPrice != b.PredictedPrice {
-		return a.PredictedPrice < b.PredictedPrice
+	if a.rawPrice != b.rawPrice {
+		return a.rawPrice < b.rawPrice
 	}
 	if confidenceRank(a.Confidence) != confidenceRank(b.Confidence) {
 		return confidenceRank(a.Confidence) > confidenceRank(b.Confidence)
