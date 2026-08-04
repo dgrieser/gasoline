@@ -30,9 +30,11 @@ func insertPredictionRunRow(t *testing.T, db *sql.DB, runAt time.Time) int64 {
 
 func insertPredictionRow(t *testing.T, db *sql.DB, runID int64, stationID string, targetStart time.Time, predicted float64, leadMinutes int) int64 {
 	t.Helper()
+	// applied_correction 0: the row is version-compatible with the current
+	// learning (its raw model error equals its stored error).
 	result, err := db.ExecContext(context.Background(), `
-		INSERT INTO price_predictions (run_id, station_id, fuel, target_start, target_end, predicted_price, confidence, sample_count, is_suggestion, lead_minutes)
-		VALUES (?, ?, 'diesel', ?, ?, ?, 'low', 1, 0, ?)
+		INSERT INTO price_predictions (run_id, station_id, fuel, target_start, target_end, predicted_price, confidence, sample_count, is_suggestion, lead_minutes, applied_correction)
+		VALUES (?, ?, 'diesel', ?, ?, ?, 'low', 1, 0, ?, 0)
 	`, runID, stationID, targetStart.UTC().Format(time.RFC3339), targetStart.Add(time.Hour).UTC().Format(time.RFC3339), predicted, leadMinutes)
 	if err != nil {
 		t.Fatalf("insert prediction: %v", err)
@@ -42,6 +44,15 @@ func insertPredictionRow(t *testing.T, db *sql.DB, runID int64, stationID string
 		t.Fatalf("prediction id: %v", err)
 	}
 	return id
+}
+
+func setPredictionAppliedCorrection(t *testing.T, db *sql.DB, id int64, correction any) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE price_predictions SET applied_correction = ? WHERE id = ?
+	`, correction, id); err != nil {
+		t.Fatalf("set applied_correction: %v", err)
+	}
 }
 
 func markPredictionEvaluated(t *testing.T, db *sql.DB, id int64, predictionError float64, evaluatedAt time.Time) {
@@ -576,6 +587,66 @@ func TestLoadLearnedCorrectionsCalibratesConfidence(t *testing.T) {
 	}
 }
 
+func TestPersistPredictionRunStoresAppliedCorrection(t *testing.T) {
+	db := openTestDB(t)
+	now := time.Date(2026, 4, 25, 9, 30, 0, 0, time.UTC)
+	buildDecisionFixture(t, db, now)
+
+	var total, missing int
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*), SUM(CASE WHEN applied_correction IS NULL THEN 1 ELSE 0 END)
+		FROM price_predictions
+	`).Scan(&total, &missing); err != nil {
+		t.Fatalf("count predictions: %v", err)
+	}
+	if total == 0 {
+		t.Fatal("fixture persisted no predictions")
+	}
+	// Every persisted row must record the correction it carried — a NULL
+	// marks a row as untrainable (older model version), and the persist path
+	// must never produce one.
+	if missing != 0 {
+		t.Fatalf("%d of %d persisted predictions lack applied_correction", missing, total)
+	}
+}
+
+func TestLoadLearnedCorrectionsReconstructsRawModelError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestStation(t, db, "corrected", "Corrected", 52.5, 13.4)
+	insertSuggestStation(t, db, "legacy", "Legacy", 52.5, 13.4)
+	now := time.Date(2026, 4, 27, 15, 0, 0, 0, time.UTC)
+	runID := insertPredictionRunRow(t, db, now.AddDate(0, 0, -2))
+
+	target := now.AddDate(0, 0, -1)
+	for i := 0; i < 6; i++ {
+		// The stored prediction already carried a +1 ct correction and still
+		// came out 1 ct low: the raw model gap is +2 ct, and that — not the
+		// residual — is what the loop must learn, or it would shrink its own
+		// correction every cycle.
+		id := insertPredictionRow(t, db, runID, "corrected", target.Add(time.Duration(i)*time.Hour), 2.00, 60)
+		markPredictionEvaluated(t, db, id, 0.01, now.AddDate(0, 0, -1))
+		setPredictionAppliedCorrection(t, db, id, 0.01)
+
+		// Same errors on a station whose rows predate the column: produced by
+		// an older model version, they must not train anything.
+		id = insertPredictionRow(t, db, runID, "legacy", target.Add(time.Duration(i)*time.Hour), 2.00, 60)
+		markPredictionEvaluated(t, db, id, 0.01, now.AddDate(0, 0, -1))
+		setPredictionAppliedCorrection(t, db, id, nil)
+	}
+
+	corrections, err := loadLearnedCorrections(ctx, db, "diesel", now, time.UTC)
+	if err != nil {
+		t.Fatalf("loadLearnedCorrections: %v", err)
+	}
+	if got := corrections.StationBias["corrected"]; got < 0.0199 || got > 0.0201 {
+		t.Fatalf("bias = %.4f, want 0.02 (stored error 0.01 + applied correction 0.01)", got)
+	}
+	if _, ok := corrections.StationBias["legacy"]; ok {
+		t.Fatalf("legacy rows without applied_correction trained a bias: %+v", corrections.StationBias)
+	}
+}
+
 func TestLoadLearnedCorrectionsMeasuresSuggestionBias(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -611,7 +682,9 @@ func TestGenerateSuggestionsAppliesSuggestionBiasToDisplayOnly(t *testing.T) {
 	if len(baseline) == 0 {
 		t.Fatal("no baseline suggestions")
 	}
-	model.SuggestionBias = 0.03
+	// Deliberately not cent-aligned: measured biases never are, and a raw
+	// price near a cent boundary must not round into a different selection.
+	model.SuggestionBias = 0.0279
 	shifted := generateSuggestions(model, "diesel", now, time.UTC, 1, 1)
 	if len(shifted) != len(baseline) {
 		t.Fatalf("suggestion count changed: %d vs %d", len(shifted), len(baseline))
@@ -619,9 +692,17 @@ func TestGenerateSuggestionsAppliesSuggestionBiasToDisplayOnly(t *testing.T) {
 	if shifted[0].StartTime != baseline[0].StartTime || shifted[0].StationID != baseline[0].StationID {
 		t.Fatalf("selection changed: %+v vs %+v", shifted[0], baseline[0])
 	}
-	want := roundTo(baseline[0].PredictedPrice+0.03, 2)
+	window, err := time.ParseInLocation("2006-01-02 15:04", baseline[0].Date+" "+baseline[0].StartTime, time.UTC)
+	if err != nil {
+		t.Fatalf("parse suggested window: %v", err)
+	}
+	rawScore, ok := scoreForecast(model, "s1", window)
+	if !ok {
+		t.Fatal("scoreForecast returned !ok for the suggested window")
+	}
+	want := roundTo(rawScore.PredictedPrice+0.0279, 2)
 	if shifted[0].PredictedPrice != want {
-		t.Fatalf("displayed price = %.3f, want %.3f (raw %.3f + bias)", shifted[0].PredictedPrice, want, baseline[0].PredictedPrice)
+		t.Fatalf("displayed price = %.3f, want %.3f (raw %.4f + bias, rounded once)", shifted[0].PredictedPrice, want, rawScore.PredictedPrice)
 	}
 
 	// The persisted grid must not carry the display correction: the stored
@@ -632,12 +713,12 @@ func TestGenerateSuggestionsAppliesSuggestionBiasToDisplayOnly(t *testing.T) {
 	}
 	rawModel := model
 	rawModel.SuggestionBias = 0
-	rawScore, ok := scoreForecast(rawModel, "s1", time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC))
+	unbiased, ok := scoreForecast(rawModel, "s1", time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC))
 	if !ok {
 		t.Fatal("scoreForecast returned !ok")
 	}
-	if score.PredictedPrice != rawScore.PredictedPrice {
-		t.Fatalf("scoreForecast shifted by SuggestionBias: %.4f vs %.4f", score.PredictedPrice, rawScore.PredictedPrice)
+	if score.PredictedPrice != unbiased.PredictedPrice {
+		t.Fatalf("scoreForecast shifted by SuggestionBias: %.4f vs %.4f", score.PredictedPrice, unbiased.PredictedPrice)
 	}
 }
 

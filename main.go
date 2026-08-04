@@ -442,6 +442,12 @@ type forecastScore struct {
 	PredictedPrice float64
 	Confidence     string
 	SampleCount    int
+	// LearnedCorrection is the part of PredictedPrice contributed by the
+	// learned feedback loops (station bias + hour-lead grid). Persisted with
+	// each prediction so learning can reconstruct the raw model error later —
+	// stored errors always measure the corrected prediction, and training on
+	// them as if they were raw would make the loops correct their own output.
+	LearnedCorrection float64
 }
 
 type priceCheckRow struct {
@@ -2753,15 +2759,16 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 					Station:     stationOutput,
 					Fuel:        fuel,
 					// The selection bias is a display honesty correction: the
-					// same constant shifts every candidate, so the argmin —
-					// which window gets suggested — is unchanged, but the
 					// printed price stops being optimistic by the measured
-					// amount. The persisted grid stores the raw score.
+					// amount. Ordering uses rawPrice below, so the correction
+					// (and the cent rounding) cannot change which window gets
+					// suggested; the persisted grid stores the raw score.
 					PredictedPrice: roundTo(score.PredictedPrice+model.SuggestionBias, 2),
 					Confidence:     score.Confidence,
 					SampleCount:    score.SampleCount,
 				},
-				start: candidateStart,
+				start:    candidateStart,
+				rawPrice: score.PredictedPrice,
 			})
 		}
 	}
@@ -2962,6 +2969,13 @@ func futureForecastLess(a, b futureForecast) bool {
 type suggestionCandidate struct {
 	suggestionRow
 	start time.Time
+	// rawPrice is the model score before display rounding and the suggestion
+	// selection-bias correction. Candidate ordering uses it so that neither
+	// cent rounding nor the display correction can flip which window wins:
+	// two raw prices that round to the same cent would otherwise fall through
+	// to the tie-breakers, and adding a non-cent-aligned constant before
+	// rounding can split or create exactly such ties.
+	rawPrice float64
 }
 
 // scoreForecast predicts the price for one station at one local target time.
@@ -3040,6 +3054,7 @@ func scoreForecast(model forecastModel, stationID string, target time.Time) (for
 			predicted += model.BaselineDrift * float64(pricingDaysAhead(model.NowLocal, target, model.JumpAnchorHour))
 		}
 	}
+	learnedCorrection := station.BiasCorrection
 	predicted += station.BiasCorrection
 
 	if !model.NowLocal.IsZero() {
@@ -3053,6 +3068,7 @@ func scoreForecast(model forecastModel, stationID string, target time.Time) (for
 		}
 		if correction, ok := model.HourLeadBias[hourLeadKey{Hour: target.Hour(), Lead: cell, Weekend: isWeekendLike(target)}]; ok {
 			predicted += correction
+			learnedCorrection += correction
 		}
 		if label, ok := model.ConfidenceByLead[stationLeadKey{StationID: stationID, Lead: cell}]; ok {
 			// The calibration was measured at <=24h leads; a >24h target adds
@@ -3065,9 +3081,10 @@ func scoreForecast(model forecastModel, stationID string, target time.Time) (for
 	}
 
 	return forecastScore{
-		PredictedPrice: predicted,
-		Confidence:     confidence,
-		SampleCount:    sampleCount,
+		PredictedPrice:    predicted,
+		Confidence:        confidence,
+		SampleCount:       sampleCount,
+		LearnedCorrection: learnedCorrection,
 	}, true
 }
 
@@ -3461,6 +3478,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migrateStationsAliasOf(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migratePredictionsAppliedCorrection(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migrateUsersNotifyFuel(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -3511,6 +3531,31 @@ func migrateStationsAliasOf(ctx context.Context, tx *sql.Tx, d dialect, result *
 		return err
 	}
 	result.Applied = append(result.Applied, "stations.alias_of")
+	return nil
+}
+
+// migratePredictionsAppliedCorrection adds the column recording the learned
+// correction a prediction carried when it was stored. It stays NULL on rows
+// persisted before the column existed, which doubles as a version gate: the
+// learning loops only train on rows whose raw model error they can
+// reconstruct, so predictions of older model versions never contaminate the
+// current corrections.
+func migratePredictionsAppliedCorrection(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "price_predictions", "applied_correction")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	colType := "REAL"
+	if d == dialectMySQL {
+		colType = "DOUBLE"
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE price_predictions ADD COLUMN applied_correction %s`, colType)); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "price_predictions.applied_correction")
 	return nil
 }
 
@@ -4625,8 +4670,8 @@ func recommendationRank(recommendation string) int {
 }
 
 func suggestionCandidateLess(a, b suggestionCandidate) bool {
-	if a.PredictedPrice != b.PredictedPrice {
-		return a.PredictedPrice < b.PredictedPrice
+	if a.rawPrice != b.rawPrice {
+		return a.rawPrice < b.rawPrice
 	}
 	if confidenceRank(a.Confidence) != confidenceRank(b.Confidence) {
 		return confidenceRank(a.Confidence) > confidenceRank(b.Confidence)

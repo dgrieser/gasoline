@@ -28,6 +28,11 @@ type mergeStationsResult struct {
 	Predictions     int64    `json:"predictions"`
 	CheckDecisions  int64    `json:"check_decisions"`
 	AliasesRepinned int64    `json:"aliases_repinned"`
+	// PredictionsDeduped / DecisionsDeduped count rows deleted because after
+	// the rewrite they duplicated another row of the same run and target
+	// window — one run had scored several identities of the same station.
+	PredictionsDeduped int64 `json:"predictions_deduped"`
+	DecisionsDeduped   int64 `json:"decisions_deduped"`
 }
 
 type duplicateCandidate struct {
@@ -128,8 +133,8 @@ func runMergeStations(args []string) error {
 	}
 	fmt.Fprintf(stdout, "merged %d station(s) into %s\n", len(result.MergedIDs), result.CanonicalID)
 	fmt.Fprintf(stdout, "snapshots moved: %d\n", result.Snapshots)
-	fmt.Fprintf(stdout, "predictions moved: %d\n", result.Predictions)
-	fmt.Fprintf(stdout, "check decisions moved: %d\n", result.CheckDecisions)
+	fmt.Fprintf(stdout, "predictions moved: %d (duplicates removed: %d)\n", result.Predictions, result.PredictionsDeduped)
+	fmt.Fprintf(stdout, "check decisions moved: %d (duplicates removed: %d)\n", result.CheckDecisions, result.DecisionsDeduped)
 	fmt.Fprintln(stdout, "future updates of the merged ids will record under the canonical station")
 	fmt.Fprintln(stdout, "run `gasoline compact` to collapse overlapping snapshots from the merged histories")
 	return nil
@@ -212,10 +217,92 @@ func mergeStations(ctx context.Context, db *sql.DB, canonical string, duplicates
 		}
 	}
 
+	// After the rewrite, a run that scored several identities of the same
+	// station holds several rows for one logical measurement. Statistics and
+	// learning consume plain row counts, so leaving them would keep the
+	// station multi-weighted for the whole retention window.
+	predictionsDeduped, err := dedupeMergedRows(ctx, tx, "price_predictions", canonical,
+		`CASE WHEN actual_price IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN evaluated_at IS NOT NULL THEN 1 ELSE 0 END`)
+	if err != nil {
+		return mergeStationsResult{}, err
+	}
+	result.PredictionsDeduped = predictionsDeduped
+	decisionsDeduped, err := dedupeMergedRows(ctx, tx, "price_check_decisions", canonical,
+		`CASE WHEN outcome_evaluated_at IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN regret IS NOT NULL THEN 1 ELSE 0 END`)
+	if err != nil {
+		return mergeStationsResult{}, err
+	}
+	result.DecisionsDeduped = decisionsDeduped
+
 	if err := tx.Commit(); err != nil {
 		return mergeStationsResult{}, err
 	}
 	return result, nil
+}
+
+// dedupeMergedRows collapses rows of one table that share the merged
+// station's (run_id, fuel, target_start) to a single row. Among duplicates
+// the row with the highest completeness rank (an SQL expression counting
+// populated evaluation fields) survives, ties broken by lowest id, so the
+// choice is deterministic and never discards an evaluated row in favor of an
+// unevaluated one.
+func dedupeMergedRows(ctx context.Context, tx *sql.Tx, table, stationID, completenessRank string) (int64, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT id, run_id, fuel, target_start, %s AS completeness
+		FROM %s
+		WHERE station_id = ?
+		ORDER BY run_id ASC, fuel ASC, target_start ASC, completeness DESC, id ASC
+	`, completenessRank, table), stationID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type logicalKey struct {
+		RunID       int64
+		Fuel        string
+		TargetStart string
+	}
+	var (
+		deleteIDs []int64
+		kept      = make(map[logicalKey]bool)
+	)
+	for rows.Next() {
+		var (
+			id           int64
+			key          logicalKey
+			completeness int
+		)
+		if err := rows.Scan(&id, &key.RunID, &key.Fuel, &key.TargetStart, &completeness); err != nil {
+			return 0, err
+		}
+		if kept[key] {
+			deleteIDs = append(deleteIDs, id)
+			continue
+		}
+		kept[key] = true
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	const deleteBatch = 500
+	for start := 0; start < len(deleteIDs); start += deleteBatch {
+		end := start + deleteBatch
+		if end > len(deleteIDs) {
+			end = len(deleteIDs)
+		}
+		placeholders := strings.Repeat("?, ", end-start-1) + "?"
+		args := make([]any, 0, end-start)
+		for _, id := range deleteIDs[start:end] {
+			args = append(args, id)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+			`DELETE FROM %s WHERE id IN (%s)`, table, placeholders), args...); err != nil {
+			return 0, err
+		}
+	}
+	return int64(len(deleteIDs)), nil
 }
 
 // detectDuplicateStations groups non-alias stations that share (rounded)

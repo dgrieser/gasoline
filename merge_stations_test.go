@@ -37,15 +37,23 @@ func TestMergeStationsRewritesHistoryAndSetsAlias(t *testing.T) {
 	insertSuggestSnapshot(t, db, "dup-a", "Berlin", day.Add(9*time.Hour), 1.80, true)
 	insertSuggestSnapshot(t, db, "dup-b", "Berlin", day.Add(10*time.Hour), 1.80, true)
 
+	// One run scored all three identities of the same station for the same
+	// target window; only dup-a's row got evaluated.
 	runID := insertPredictionRunRow(t, db, day)
-	insertPredictionRow(t, db, runID, "dup-a", day.Add(12*time.Hour), 1.85, 60)
+	insertPredictionRow(t, db, runID, "canonical", day.Add(12*time.Hour), 1.85, 60)
+	evaluatedRow := insertPredictionRow(t, db, runID, "dup-a", day.Add(12*time.Hour), 1.85, 60)
+	markPredictionEvaluated(t, db, evaluatedRow, 0.02, day.Add(14*time.Hour))
+	insertPredictionRow(t, db, runID, "dup-b", day.Add(12*time.Hour), 1.85, 60)
 
 	result, err := mergeStations(ctx, db, "canonical", []string{"dup-a", "dup-b"})
 	if err != nil {
 		t.Fatalf("mergeStations: %v", err)
 	}
-	if result.Snapshots != 2 || result.Predictions != 1 {
-		t.Fatalf("moved snapshots/predictions = %d/%d, want 2/1", result.Snapshots, result.Predictions)
+	if result.Snapshots != 2 || result.Predictions != 2 {
+		t.Fatalf("moved snapshots/predictions = %d/%d, want 2/2", result.Snapshots, result.Predictions)
+	}
+	if result.PredictionsDeduped != 2 {
+		t.Fatalf("predictions deduped = %d, want 2", result.PredictionsDeduped)
 	}
 	if countSnapshots(t, db, "canonical") != 3 || countSnapshots(t, db, "dup-a") != 0 {
 		t.Fatalf("snapshot counts after merge: canonical=%d dup-a=%d, want 3/0",
@@ -56,6 +64,25 @@ func TestMergeStationsRewritesHistoryAndSetsAlias(t *testing.T) {
 		if !alias.Valid || alias.String != "canonical" {
 			t.Fatalf("alias_of(%s) = %+v, want canonical", dup, alias)
 		}
+	}
+
+	// A run that scored several identities of the same station leaves rows
+	// that duplicate one logical measurement after the rewrite; the merge
+	// must collapse them, keeping the evaluated row.
+	var (
+		kept   int
+		keptID int64
+	)
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*), MIN(id) FROM price_predictions WHERE station_id = 'canonical'
+	`).Scan(&kept, &keptID); err != nil {
+		t.Fatalf("count predictions: %v", err)
+	}
+	if kept != 1 {
+		t.Fatalf("predictions after merge = %d, want the duplicates collapsed to 1", kept)
+	}
+	if keptID != evaluatedRow {
+		t.Fatalf("surviving prediction id = %d, want the evaluated row %d", keptID, evaluatedRow)
 	}
 
 	// Merging into an alias must be refused; merging an alias-of-alias must

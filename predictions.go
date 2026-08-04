@@ -58,9 +58,10 @@ const (
 	// evaluateBatchLimit bounds how many due predictions one run settles, so
 	// a run after long downtime stays cheap.
 	evaluateBatchLimit = 5000
-	// persistInsertBatch rows per multi-row INSERT. At 11 placeholders per
-	// row this stays under SQLite's historical 999-variable limit, so the
-	// insert also works against builds without the modern 32766 default.
+	// persistInsertBatch rows per multi-row INSERT. At 12 placeholders per
+	// row this stays under SQLite's historical 999-variable limit (12 x 80 =
+	// 960), so the insert also works against builds without the modern 32766
+	// default.
 	persistInsertBatch = 80
 	// decisionInsertBatch rows per multi-row INSERT for check decisions. At
 	// 17 placeholders per row this stays under the same 999-variable limit.
@@ -402,25 +403,39 @@ func applyLearnedCorrections(ctx context.Context, db *sql.DB, model *forecastMod
 	return nil
 }
 
-// evaluatedError is one evaluated prediction row prepared for learning: the
-// error is winsorized, the weight decays with evaluation age, and the cell
+// evaluatedError is one evaluated prediction row prepared for learning. The
+// stored error measures the *corrected* prediction (scoreForecast bakes the
+// learned corrections into the persisted price), so training reads the raw
+// model error back by adding the correction the row recorded it carried:
+// RawGap = error + applied_correction = actual − raw model prediction. The
+// gap is winsorized, the weight decays with evaluation age, and the cell
 // locates the row on the hour-lead correction grid.
 type evaluatedError struct {
 	StationID    string
 	Lead         leadBucket
 	Cell         hourLeadKey
 	IsSuggestion bool
-	Error        float64
+	RawGap       float64
 	Weight       float64
 }
 
 // loadLearnedCorrections derives every learned correction from recent
-// evaluated predictions in one pass. The corrections are applied on top of
-// future predictions, which closes the loop: once corrected predictions are
-// persisted and evaluated, their residual errors shrink and each correction
-// converges instead of compounding. Later corrections are learned from
-// residuals after earlier ones (grid first, then station bias, then
-// suggestion bias) so they never double-count the same error.
+// evaluated predictions in one pass.
+//
+// All learning runs on the reconstructed raw model error, never on the stored
+// error directly: the stored error already contains whatever corrections were
+// active when the prediction was persisted, and treating it as raw would make
+// each loop correct its own output — oscillating corrections, and confidence
+// that looks better than it is because the correction is subtracted twice.
+// Rows whose applied_correction is NULL cannot be reconstructed (they predate
+// the column, i.e. were produced by an older model version whose structural
+// errors do not describe this one) and are excluded; after an upgrade the
+// corrections therefore rebuild from fresh evaluations within a day or two
+// instead of training on stale errors.
+//
+// Later corrections are learned from raw gaps after earlier ones (grid first,
+// then station bias, then confidence and suggestion bias) so they never
+// double-count the same error.
 func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now time.Time, location *time.Location) (learnedCorrections, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -438,10 +453,11 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 	// windows days ahead, and their selection bias must be measured where
 	// they actually live.
 	rows, err := db.QueryContext(ctx, `
-		SELECT station_id, target_start, lead_minutes, is_suggestion, error, evaluated_at
+		SELECT station_id, target_start, lead_minutes, is_suggestion, error, applied_correction, evaluated_at
 		FROM price_predictions
 		WHERE fuel = ?
 			AND error IS NOT NULL
+			AND applied_correction IS NOT NULL
 			AND evaluated_at >= ?
 			AND (lead_minutes <= ? OR is_suggestion = 1)
 	`, fuel, windowStart, predictionHourBiasMaxLeadMinutes)
@@ -454,14 +470,15 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 	hourSamples := make(map[hourLeadKey][]priceSample)
 	for rows.Next() {
 		var (
-			stationID       string
-			targetStartText string
-			leadMinutes     int
-			isSuggestion    int
-			predictionError float64
-			evaluatedAtText string
+			stationID         string
+			targetStartText   string
+			leadMinutes       int
+			isSuggestion      int
+			predictionError   float64
+			appliedCorrection float64
+			evaluatedAtText   string
 		)
-		if err := rows.Scan(&stationID, &targetStartText, &leadMinutes, &isSuggestion, &predictionError, &evaluatedAtText); err != nil {
+		if err := rows.Scan(&stationID, &targetStartText, &leadMinutes, &isSuggestion, &predictionError, &appliedCorrection, &evaluatedAtText); err != nil {
 			return learnedCorrections{}, err
 		}
 		targetStart, err := time.Parse(time.RFC3339, targetStartText)
@@ -472,12 +489,7 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 		if err != nil {
 			return learnedCorrections{}, fmt.Errorf("parse evaluated_at %q: %w", evaluatedAtText, err)
 		}
-		if predictionError > predictionLearnErrorClampEuro {
-			predictionError = predictionLearnErrorClampEuro
-		}
-		if predictionError < -predictionLearnErrorClampEuro {
-			predictionError = -predictionLearnErrorClampEuro
-		}
+		rawGap := clampAbs(predictionError+appliedCorrection, predictionLearnErrorClampEuro)
 		ageDays := now.Sub(evaluatedAt).Hours() / 24
 		if ageDays < 0 {
 			ageDays = 0
@@ -494,20 +506,22 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 			Lead:         lead,
 			Cell:         hourLeadKey{Hour: targetLocal.Hour(), Lead: cell, Weekend: isWeekendLike(targetLocal)},
 			IsSuggestion: isSuggestion != 0,
-			Error:        predictionError,
+			RawGap:       rawGap,
 			Weight:       math.Exp(-ageDays / predictionBiasHalfLifeDays),
 		}
 		evaluated = append(evaluated, row)
 		if leadMinutes <= predictionHourBiasMaxLeadMinutes {
-			hourSamples[row.Cell] = append(hourSamples[row.Cell], priceSample{Price: row.Error, Weight: row.Weight})
+			hourSamples[row.Cell] = append(hourSamples[row.Cell], priceSample{Price: row.RawGap, Weight: row.Weight})
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return learnedCorrections{}, err
 	}
 
-	// 1) Hour-lead grid: the market-wide shape residual per local target
-	// hour, lead bucket and day class.
+	// 1) Hour-lead grid: the market-wide shape gap of the raw model per local
+	// target hour, lead bucket and day class. Because the gaps are raw, the
+	// learned value is a level, not a delta on the previous correction — the
+	// loop has a stable fixed point instead of chasing its own output.
 	for cell, samples := range hourSamples {
 		if len(samples) < predictionHourBiasMinSamples {
 			continue
@@ -523,15 +537,15 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 		corrections.HourLeadBias[cell] = median
 	}
 
-	// 2) Per-station level bias, from short-lead residuals after the grid.
-	// Short leads only: past 6h the residual is dominated by level moves the
+	// 2) Per-station level bias, from short-lead raw gaps after the grid.
+	// Short leads only: past 6h the gap is dominated by level moves the
 	// station could not have known, not by station-specific bias.
 	stationSamples := make(map[string][]priceSample)
 	for _, row := range evaluated {
 		if row.Lead != leadBucket0to1h && row.Lead != leadBucket1to6h {
 			continue
 		}
-		residual := row.Error - corrections.HourLeadBias[row.Cell]
+		residual := row.RawGap - corrections.HourLeadBias[row.Cell]
 		stationSamples[row.StationID] = append(stationSamples[row.StationID], priceSample{Price: residual, Weight: row.Weight})
 	}
 	for stationID, samples := range stationSamples {
@@ -549,8 +563,10 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 		corrections.StationBias[stationID] = median
 	}
 
-	// 3) Empirical confidence: the p80 absolute residual (after grid and
-	// station corrections) per station and lead bucket, mapped onto labels.
+	// 3) Empirical confidence: the p80 absolute residual per station and lead
+	// bucket, mapped onto labels. The residual is what a *new* prediction is
+	// expected to be off by — the raw gap minus the corrections that will be
+	// applied to it — so the calibration measures the corrected model.
 	// Measured accuracy replaces the sample-count heuristic, which the data
 	// showed inverted (its "low" beat its "medium").
 	confidenceResiduals := make(map[stationLeadKey][]float64)
@@ -558,7 +574,7 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 		if row.Lead == leadBucketBeyond24h {
 			continue
 		}
-		residual := row.Error - corrections.HourLeadBias[row.Cell] - corrections.StationBias[row.StationID]
+		residual := row.RawGap - corrections.HourLeadBias[row.Cell] - corrections.StationBias[row.StationID]
 		key := stationLeadKey{StationID: row.StationID, Lead: row.Lead}
 		confidenceResiduals[key] = append(confidenceResiduals[key], math.Abs(residual))
 	}
@@ -578,17 +594,17 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 		}
 	}
 
-	// 4) Suggestion selection bias: what remains of suggested rows' error
+	// 4) Suggestion selection bias: what remains of suggested rows' raw gap
 	// after all model-level corrections is the winner's curse of picking the
-	// minimum across many noisy candidates. Persisted predictions never
-	// include it (they store the raw model), so this stays a pure
+	// minimum across many noisy candidates. The displayed correction is never
+	// persisted (the grid stores the model's price), so this stays a pure
 	// measurement and cannot feed back on itself.
 	var suggestionSamples []priceSample
 	for _, row := range evaluated {
 		if !row.IsSuggestion {
 			continue
 		}
-		residual := row.Error - corrections.HourLeadBias[row.Cell] - corrections.StationBias[row.StationID]
+		residual := row.RawGap - corrections.HourLeadBias[row.Cell] - corrections.StationBias[row.StationID]
 		suggestionSamples = append(suggestionSamples, priceSample{Price: residual, Weight: row.Weight})
 	}
 	if len(suggestionSamples) >= predictionSuggestionBiasMinSamples {
@@ -650,7 +666,7 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 	}
 
 	insertPrefix := `
-		INSERT INTO price_predictions (run_id, station_id, fuel, target_start, target_end, predicted_price, baseline, confidence, sample_count, is_suggestion, lead_minutes, evaluated_at)
+		INSERT INTO price_predictions (run_id, station_id, fuel, target_start, target_end, predicted_price, baseline, confidence, sample_count, is_suggestion, lead_minutes, applied_correction, evaluated_at)
 		VALUES `
 	var (
 		placeholders string
@@ -685,7 +701,7 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 			if placeholders != "" {
 				placeholders += ", "
 			}
-			placeholders += "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+			placeholders += "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
 			args = append(args,
 				runID,
 				stationID,
@@ -698,6 +714,7 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 				score.SampleCount,
 				isSuggestion,
 				int(candidateStart.Sub(nowLocal).Minutes()),
+				score.LearnedCorrection,
 			)
 			total++
 			if total%persistInsertBatch == 0 {

@@ -3081,6 +3081,43 @@ func TestScoreForecastExtrapolatesBaselineDrift(t *testing.T) {
 	}
 }
 
+func TestGenerateSuggestionsOrdersByRawScoreNotRoundedDisplay(t *testing.T) {
+	// Two stations whose raw prices differ but round to the same cent. The
+	// raw-cheaper one must win, with and without a non-cent-aligned display
+	// bias — under rounded ordering the two would tie (falling through to
+	// name order, which here prefers the raw-more-expensive station) and the
+	// bias could then split the tie differently.
+	hourSamples := func(price float64) []priceSample {
+		return []priceSample{{Price: price, Weight: 60}}
+	}
+	model := forecastModel{
+		Stations: map[string]forecastStation{
+			"cheap-raw": {Station: suggestionStationRow{ID: "cheap-raw", Name: "zzz station"}},
+			"dear-raw":  {Station: suggestionStationRow{ID: "dear-raw", Name: "aaa station"}},
+		},
+		Hour: map[stationHourKey][]priceSample{
+			{StationID: "cheap-raw", Hour: 23}: hourSamples(1.796),
+			{StationID: "dear-raw", Hour: 23}:  hourSamples(1.804),
+		},
+		Recent: map[string][]priceSample{
+			"cheap-raw": hourSamples(1.796),
+			"dear-raw":  hourSamples(1.804),
+		},
+	}
+	now := time.Date(2026, 4, 24, 22, 30, 0, 0, time.UTC)
+
+	for _, bias := range []float64{0, 0.0031} {
+		model.SuggestionBias = bias
+		suggestions := generateSuggestions(model, "diesel", now, time.UTC, 1, 1)
+		if len(suggestions) == 0 {
+			t.Fatalf("no suggestions with bias %.4f", bias)
+		}
+		if suggestions[0].StationID != "cheap-raw" {
+			t.Fatalf("bias %.4f selected %s, want the raw-cheaper station", bias, suggestions[0].StationID)
+		}
+	}
+}
+
 func TestPricingDayAnchorsAtJumpHour(t *testing.T) {
 	early := time.Date(2026, 4, 11, 5, 0, 0, 0, time.UTC)
 	if day := pricingDay(early, 12); day != "2026-04-10" {
