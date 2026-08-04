@@ -1628,6 +1628,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         .pred-legend-diag { width: 16px; height: 0; border-top: 2px dashed var(--muted); display: inline-block; }
         .stat-value.pred-small { font-size: 1.15rem; }
     </style>
+    <div id="price-tooltip" role="tooltip" aria-hidden="true"></div>
     <div class="settings-layout wide pred-layout">
         <?php renderFlash(); ?>
 
@@ -2041,7 +2042,84 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             return el;
         };
 
+        /* ── Crosshair tooltip (mirrors the dashboard chart) ────── */
+        const tooltip = document.getElementById('price-tooltip');
+        // Re-assigned by drawTimeline so hideTooltip also drops the crosshair.
+        let hideCrosshair = () => {};
+
+        function positionTooltip(clientX, clientY) {
+            tooltip.style.left = (clientX + 14) + 'px';
+            tooltip.style.top  = (clientY - 14) + 'px';
+            // Clamp to the viewport after paint, once the size is known.
+            requestAnimationFrame(() => {
+                const r = tooltip.getBoundingClientRect();
+                if (r.right  > window.innerWidth  - 8) tooltip.style.left = Math.max(8, window.innerWidth  - r.width  - 8) + 'px';
+                if (r.bottom > window.innerHeight - 8) tooltip.style.top  = Math.max(8, window.innerHeight - r.height - 8) + 'px';
+            });
+        }
+
+        function hideTooltip() {
+            if (tooltip) tooltip.style.display = 'none';
+            hideCrosshair();
+        }
+
+        // Lifting the finger on the chart keeps the crosshair readable; touching
+        // anywhere else dismisses it.
+        document.addEventListener('touchend', (e) => {
+            if (e.target instanceof Element && e.target.closest('#pred-chart')) return;
+            hideTooltip();
+        });
+
+        const ttRow = (color, name, value, valueClass) =>
+            '<div class="tt-row">'
+            + (color ? '<span class="legend-dot" style="background:' + color + '"></span>' : '')
+            + '<span class="tt-name">' + esc(name) + '</span>'
+            + '<span class="tt-val' + (valueClass ? ' ' + valueClass : '') + '"'
+            + (color ? ' style="color:' + color + '"' : '') + '>' + esc(value) + '</span>'
+            + '</div>';
+
+        // Predicted / actual / error / sample-count block shared by both views.
+        function ttBody(q, iso) {
+            const t = T();
+            const err = q.a - q.p;
+            const good = Math.abs(err * 100) <= 1.0;
+            return '<div class="tt-meta">' + esc(fmtDateTime(iso)) + '</div>'
+                + ttRow(C_PRED, t.predLegendPredicted, fmtEur(q.p) + ' €')
+                + ttRow(C_ACTUAL, t.predLegendActual, fmtEur(q.a) + ' €')
+                + ttRow(null, t.predColError, fmtSignedCt(err), good ? 'pred-err-good' : 'pred-err-bad')
+                + ttRow(null, t.predColCount, fmtInt(q.n));
+        }
+
+        // Transparent hit area over the plot area; hands pointer and touch
+        // positions to the view's own hover handler.
+        function attachHover(c, onPoint) {
+            const overlay = mk('rect', {
+                x: c.m.left, y: c.m.top, width: c.iW, height: c.iH,
+                fill: 'transparent', style: 'cursor:crosshair',
+            });
+            overlay.addEventListener('mousemove', (e) => onPoint(e.clientX, e.clientY));
+            overlay.addEventListener('mouseleave', hideTooltip);
+            const onTouch = (e) => {
+                e.preventDefault();
+                const touch = e.touches[0];
+                if (touch) onPoint(touch.clientX, touch.clientY);
+            };
+            overlay.addEventListener('touchstart', onTouch, { passive: false });
+            overlay.addEventListener('touchmove', onTouch, { passive: false });
+        }
+
+        // Pointer position in viewBox units (the viewBox is 1:1 with CSS pixels).
+        function svgPoint(clientX, clientY, c) {
+            const rect = chartEl.getBoundingClientRect();
+            const scale = rect.width ? c.W / rect.width : 1;
+            return { x: (clientX - rect.left) * scale, y: (clientY - rect.top) * scale };
+        }
+
         function renderChart() {
+            // The old crosshair line is about to be discarded with the SVG
+            // contents, so drop the tooltip that belonged to it first.
+            hideTooltip();
+            hideCrosshair = () => {};
             chartEl.innerHTML = '';
             legendEl.innerHTML = '';
             const series = (data && data.series) || [];
@@ -2071,13 +2149,13 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             mk('rect', { x: 0, y: 0, width: W, height: H, fill: bg });
 
             const font = "'DM Mono', monospace";
-            if (view === 'scatter') drawScatter(series, { W, H, m, iW, iH, grid, axis, tick, label, font });
-            else drawTimeline(series, { W, H, m, iW, iH, grid, axis, tick, label, font });
+            if (view === 'scatter') drawScatter(series, { W, H, m, iW, iH, grid, axis, tick, label, font, light });
+            else drawTimeline(series, { W, H, m, iW, iH, grid, axis, tick, label, font, light });
             drawLegend();
         }
 
         function drawTimeline(series, c) {
-            const pts = series.map((d) => ({ x: Date.parse(d.t), p: d.p, a: d.a }));
+            const pts = series.map((d) => ({ x: Date.parse(d.t), p: d.p, a: d.a, n: d.n }));
             let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
             for (const q of pts) {
                 if (q.x < minX) minX = q.x;
@@ -2117,10 +2195,58 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
 
             mk('polyline', { points: pts.map((q) => px(q.x).toFixed(1) + ',' + py(q.p).toFixed(1)).join(' '), fill: 'none', stroke: C_PRED, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' });
             mk('polyline', { points: pts.map((q) => px(q.x).toFixed(1) + ',' + py(q.a).toFixed(1)).join(' '), fill: 'none', stroke: C_ACTUAL, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' });
+
+            if (!tooltip) return;
+
+            // Crosshair: a thin vertical line follows the pointer/finger and the
+            // tooltip lists the values of the target hour it snapped to.
+            const crossLine = mk('line', {
+                x1: 0, x2: 0, y1: c.m.top, y2: c.H - c.m.bottom,
+                stroke: c.light ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.5)',
+                'stroke-width': 1, 'stroke-dasharray': '4 3',
+                opacity: 0, 'pointer-events': 'none',
+            });
+            const markPred = mk('circle', { cx: 0, cy: 0, r: 3.5, fill: C_PRED, opacity: 0, 'pointer-events': 'none' });
+            const markAct  = mk('circle', { cx: 0, cy: 0, r: 3.5, fill: C_ACTUAL, opacity: 0, 'pointer-events': 'none' });
+
+            const showCrosshair = (clientX, clientY) => {
+                let sx = svgPoint(clientX, clientY, c).x;
+                sx = Math.max(c.m.left, Math.min(c.W - c.m.right, sx));
+                const at = minX + ((sx - c.m.left) / c.iW) * (maxX - minX);
+
+                // Snap to the nearest target hour so the line sits on data.
+                let lo = 0, hi = pts.length - 1;
+                while (lo < hi) {
+                    const mid = (lo + hi) >> 1;
+                    if (pts[mid].x < at) lo = mid + 1; else hi = mid;
+                }
+                let idx = lo;
+                if (idx > 0 && at - pts[idx - 1].x < pts[idx].x - at) idx -= 1;
+
+                const q = pts[idx];
+                const xp = px(q.x);
+                crossLine.setAttribute('x1', xp);
+                crossLine.setAttribute('x2', xp);
+                crossLine.setAttribute('opacity', 1);
+                markPred.setAttribute('cx', xp); markPred.setAttribute('cy', py(q.p)); markPred.setAttribute('opacity', 1);
+                markAct.setAttribute('cx', xp);  markAct.setAttribute('cy', py(q.a));  markAct.setAttribute('opacity', 1);
+
+                tooltip.innerHTML = ttBody(q, series[idx].t);
+                tooltip.style.display = 'block';
+                positionTooltip(clientX, clientY);
+            };
+
+            hideCrosshair = () => {
+                crossLine.setAttribute('opacity', 0);
+                markPred.setAttribute('opacity', 0);
+                markAct.setAttribute('opacity', 0);
+            };
+
+            attachHover(c, showCrosshair);
         }
 
         function drawScatter(series, c) {
-            const pts = series.map((d) => ({ p: d.p, a: d.a }));
+            const pts = series.map((d) => ({ t: d.t, p: d.p, a: d.a, n: d.n }));
             let lo = Infinity, hi = -Infinity;
             for (const q of pts) { if (q.p < lo) lo = q.p; if (q.p > hi) hi = q.p; if (q.a < lo) lo = q.a; if (q.a > hi) hi = q.a; }
             const pad = Math.max((hi - lo) * 0.08, 0.02);
@@ -2145,6 +2271,61 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             mk('text', { x: c.m.left + c.iW / 2, y: c.H - 6, 'text-anchor': 'middle', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = T().predAxisPredicted;
             const yc = c.m.top + c.iH / 2;
             mk('text', { x: 14, y: yc, 'text-anchor': 'middle', 'font-size': 11, 'font-family': c.font, fill: c.label, transform: 'rotate(-90 14 ' + yc + ')' }).textContent = T().predAxisActual;
+
+            if (!tooltip) return;
+
+            // Per-point hover: ring the nearest target hour and drop dashed
+            // guides to both axes so the pair can be read off the scales.
+            const screen = pts.map((q) => ({ x: px(q.p), y: py(q.a) }));
+            const guide = () => mk('line', {
+                x1: 0, y1: 0, x2: 0, y2: 0,
+                stroke: c.light ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.5)',
+                'stroke-width': 1, 'stroke-dasharray': '4 3',
+                opacity: 0, 'pointer-events': 'none',
+            });
+            const guideX = guide();
+            const guideY = guide();
+            const ring = mk('circle', {
+                cx: 0, cy: 0, r: 6, fill: 'none', stroke: C_PRED,
+                'stroke-width': 1.5, opacity: 0, 'pointer-events': 'none',
+            });
+
+            // Points are sparse in places, so a reading is only shown when the
+            // pointer is actually near one — roughly a fingertip's reach.
+            const HIT_R2 = 30 * 30;
+
+            const showPoint = (clientX, clientY) => {
+                const at = svgPoint(clientX, clientY, c);
+                let best = -1, bestDist = Infinity;
+                for (let i = 0; i < screen.length; i++) {
+                    const dx = screen[i].x - at.x, dy = screen[i].y - at.y;
+                    const dist = dx * dx + dy * dy;
+                    if (dist < bestDist) { bestDist = dist; best = i; }
+                }
+                if (best < 0 || bestDist > HIT_R2) { hideTooltip(); return; }
+
+                const s = screen[best];
+                guideX.setAttribute('x1', c.m.left); guideX.setAttribute('y1', s.y);
+                guideX.setAttribute('x2', s.x);      guideX.setAttribute('y2', s.y);
+                guideY.setAttribute('x1', s.x);      guideY.setAttribute('y1', s.y);
+                guideY.setAttribute('x2', s.x);      guideY.setAttribute('y2', c.H - c.m.bottom);
+                ring.setAttribute('cx', s.x);        ring.setAttribute('cy', s.y);
+                guideX.setAttribute('opacity', 1);
+                guideY.setAttribute('opacity', 1);
+                ring.setAttribute('opacity', 1);
+
+                tooltip.innerHTML = ttBody(pts[best], pts[best].t);
+                tooltip.style.display = 'block';
+                positionTooltip(clientX, clientY);
+            };
+
+            hideCrosshair = () => {
+                guideX.setAttribute('opacity', 0);
+                guideY.setAttribute('opacity', 0);
+                ring.setAttribute('opacity', 0);
+            };
+
+            attachHover(c, showPoint);
         }
 
         function drawLegend() {
