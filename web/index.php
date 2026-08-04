@@ -1628,6 +1628,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         .pred-legend-diag { width: 16px; height: 0; border-top: 2px dashed var(--muted); display: inline-block; }
         .stat-value.pred-small { font-size: 1.15rem; }
     </style>
+    <div id="price-tooltip" role="tooltip" aria-hidden="true"></div>
     <div class="settings-layout wide pred-layout">
         <?php renderFlash(); ?>
 
@@ -2041,7 +2042,39 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             return el;
         };
 
+        /* ── Crosshair tooltip (mirrors the dashboard chart) ────── */
+        const tooltip = document.getElementById('price-tooltip');
+        // Re-assigned by drawTimeline so hideTooltip also drops the crosshair.
+        let hideCrosshair = () => {};
+
+        function positionTooltip(clientX, clientY) {
+            tooltip.style.left = (clientX + 14) + 'px';
+            tooltip.style.top  = (clientY - 14) + 'px';
+            // Clamp to the viewport after paint, once the size is known.
+            requestAnimationFrame(() => {
+                const r = tooltip.getBoundingClientRect();
+                if (r.right  > window.innerWidth  - 8) tooltip.style.left = Math.max(8, window.innerWidth  - r.width  - 8) + 'px';
+                if (r.bottom > window.innerHeight - 8) tooltip.style.top  = Math.max(8, window.innerHeight - r.height - 8) + 'px';
+            });
+        }
+
+        function hideTooltip() {
+            if (tooltip) tooltip.style.display = 'none';
+            hideCrosshair();
+        }
+
+        // Lifting the finger on the chart keeps the crosshair readable; touching
+        // anywhere else dismisses it.
+        document.addEventListener('touchend', (e) => {
+            if (e.target instanceof Element && e.target.closest('#pred-chart')) return;
+            hideTooltip();
+        });
+
         function renderChart() {
+            // The old crosshair line is about to be discarded with the SVG
+            // contents, so drop the tooltip that belonged to it first.
+            hideTooltip();
+            hideCrosshair = () => {};
             chartEl.innerHTML = '';
             legendEl.innerHTML = '';
             const series = (data && data.series) || [];
@@ -2071,13 +2104,13 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             mk('rect', { x: 0, y: 0, width: W, height: H, fill: bg });
 
             const font = "'DM Mono', monospace";
-            if (view === 'scatter') drawScatter(series, { W, H, m, iW, iH, grid, axis, tick, label, font });
-            else drawTimeline(series, { W, H, m, iW, iH, grid, axis, tick, label, font });
+            if (view === 'scatter') drawScatter(series, { W, H, m, iW, iH, grid, axis, tick, label, font, light });
+            else drawTimeline(series, { W, H, m, iW, iH, grid, axis, tick, label, font, light });
             drawLegend();
         }
 
         function drawTimeline(series, c) {
-            const pts = series.map((d) => ({ x: Date.parse(d.t), p: d.p, a: d.a }));
+            const pts = series.map((d) => ({ x: Date.parse(d.t), p: d.p, a: d.a, n: d.n }));
             let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
             for (const q of pts) {
                 if (q.x < minX) minX = q.x;
@@ -2117,6 +2150,83 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
 
             mk('polyline', { points: pts.map((q) => px(q.x).toFixed(1) + ',' + py(q.p).toFixed(1)).join(' '), fill: 'none', stroke: C_PRED, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' });
             mk('polyline', { points: pts.map((q) => px(q.x).toFixed(1) + ',' + py(q.a).toFixed(1)).join(' '), fill: 'none', stroke: C_ACTUAL, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' });
+
+            if (!tooltip) return;
+
+            // Crosshair: a thin vertical line follows the pointer/finger and the
+            // tooltip lists the values of the target hour it snapped to.
+            const crossLine = mk('line', {
+                x1: 0, x2: 0, y1: c.m.top, y2: c.H - c.m.bottom,
+                stroke: c.light ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.5)',
+                'stroke-width': 1, 'stroke-dasharray': '4 3',
+                opacity: 0, 'pointer-events': 'none',
+            });
+            const markPred = mk('circle', { cx: 0, cy: 0, r: 3.5, fill: C_PRED, opacity: 0, 'pointer-events': 'none' });
+            const markAct  = mk('circle', { cx: 0, cy: 0, r: 3.5, fill: C_ACTUAL, opacity: 0, 'pointer-events': 'none' });
+
+            const ttRow = (color, name, value, valueClass) =>
+                '<div class="tt-row">'
+                + (color ? '<span class="legend-dot" style="background:' + color + '"></span>' : '')
+                + '<span class="tt-name">' + esc(name) + '</span>'
+                + '<span class="tt-val' + (valueClass ? ' ' + valueClass : '') + '"'
+                + (color ? ' style="color:' + color + '"' : '') + '>' + esc(value) + '</span>'
+                + '</div>';
+
+            const showCrosshair = (clientX, clientY) => {
+                const rect = chartEl.getBoundingClientRect();
+                let sx = ((clientX - rect.left) / rect.width) * c.W;
+                sx = Math.max(c.m.left, Math.min(c.W - c.m.right, sx));
+                const at = minX + ((sx - c.m.left) / c.iW) * (maxX - minX);
+
+                // Snap to the nearest target hour so the line sits on data.
+                let lo = 0, hi = pts.length - 1;
+                while (lo < hi) {
+                    const mid = (lo + hi) >> 1;
+                    if (pts[mid].x < at) lo = mid + 1; else hi = mid;
+                }
+                let idx = lo;
+                if (idx > 0 && at - pts[idx - 1].x < pts[idx].x - at) idx -= 1;
+
+                const q = pts[idx];
+                const xp = px(q.x);
+                crossLine.setAttribute('x1', xp);
+                crossLine.setAttribute('x2', xp);
+                crossLine.setAttribute('opacity', 1);
+                markPred.setAttribute('cx', xp); markPred.setAttribute('cy', py(q.p)); markPred.setAttribute('opacity', 1);
+                markAct.setAttribute('cx', xp);  markAct.setAttribute('cy', py(q.a));  markAct.setAttribute('opacity', 1);
+
+                const t = T();
+                const err = q.a - q.p;
+                const good = Math.abs(err * 100) <= 1.0;
+                tooltip.innerHTML =
+                    '<div class="tt-meta">' + esc(fmtDateTime(series[idx].t)) + '</div>'
+                    + ttRow(C_PRED, t.predLegendPredicted, fmtEur(q.p) + ' €')
+                    + ttRow(C_ACTUAL, t.predLegendActual, fmtEur(q.a) + ' €')
+                    + ttRow(null, t.predColError, fmtSignedCt(err), good ? 'pred-err-good' : 'pred-err-bad')
+                    + ttRow(null, t.predColCount, fmtInt(q.n));
+                tooltip.style.display = 'block';
+                positionTooltip(clientX, clientY);
+            };
+
+            hideCrosshair = () => {
+                crossLine.setAttribute('opacity', 0);
+                markPred.setAttribute('opacity', 0);
+                markAct.setAttribute('opacity', 0);
+            };
+
+            const overlay = mk('rect', {
+                x: c.m.left, y: c.m.top, width: c.iW, height: c.iH,
+                fill: 'transparent', style: 'cursor:crosshair',
+            });
+            overlay.addEventListener('mousemove', (e) => showCrosshair(e.clientX, e.clientY));
+            overlay.addEventListener('mouseleave', hideTooltip);
+            const onTouch = (e) => {
+                e.preventDefault();
+                const touch = e.touches[0];
+                if (touch) showCrosshair(touch.clientX, touch.clientY);
+            };
+            overlay.addEventListener('touchstart', onTouch, { passive: false });
+            overlay.addEventListener('touchmove', onTouch, { passive: false });
         }
 
         function drawScatter(series, c) {
