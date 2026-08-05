@@ -2111,6 +2111,160 @@ func TestRunCompactCompactsExistingSnapshots(t *testing.T) {
 	}
 }
 
+// TestMigratePredictionsAccuracyIndexBackfills covers the upgrade path: a
+// database created before the index existed must gain it on migrate. MySQL is
+// the case that needs it (its inline index declaration no-ops on an existing
+// table), and dropping the index from a SQLite schema reproduces that state.
+func TestMigratePredictionsAccuracyIndexBackfills(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accuracy-index.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `DROP INDEX idx_price_predictions_accuracy`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+
+	// migrateSchema alone, not initSchema: ensureSchema would recreate the
+	// index through CREATE INDEX IF NOT EXISTS and hide a broken migration.
+	result, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("migrateSchema: %v", err)
+	}
+	if !containsString(result.Applied, "price_predictions.idx_price_predictions_accuracy") {
+		t.Fatalf("applied migrations = %v, want price_predictions.idx_price_predictions_accuracy", result.Applied)
+	}
+	hasIndex, err := tableHasIndex(ctx, db, dialectSQLite, "price_predictions", "idx_price_predictions_accuracy")
+	if err != nil {
+		t.Fatalf("tableHasIndex: %v", err)
+	}
+	if !hasIndex {
+		t.Fatal("expected idx_price_predictions_accuracy after migration")
+	}
+
+	// Idempotent: a second pass must not report or attempt the change again.
+	again, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("migrateSchema second pass: %v", err)
+	}
+	if containsString(again.Applied, "price_predictions.idx_price_predictions_accuracy") {
+		t.Fatalf("second migrate re-applied the index: %v", again.Applied)
+	}
+}
+
+func TestTableHasIndexReportsMissingIndex(t *testing.T) {
+	ctx := context.Background()
+	db, err := openDB(filepath.Join(t.TempDir(), "index-probe.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	has, err := tableHasIndex(ctx, db, dialectSQLite, "price_predictions", "idx_price_predictions_nonexistent")
+	if err != nil {
+		t.Fatalf("tableHasIndex: %v", err)
+	}
+	if has {
+		t.Fatal("expected a made-up index name to be reported missing")
+	}
+}
+
+// TestAccuracyPageAggregatesStayIndexOnly pins the reason
+// idx_price_predictions_accuracy is shaped the way it is. The admin accuracy
+// page runs several aggregate passes over the same (fuel, target_start range)
+// slice; each must be answerable from the index alone. Widening what the page
+// selects without widening the index turns these back into table scans over
+// millions of rows, which is exactly the regression this guards.
+func TestAccuracyPageAggregatesStayIndexOnly(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accuracy-plan.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	// The planner needs to believe the table is large enough that a covering
+	// index beats a scan; sqlite_stat1 is how it learns that without the test
+	// having to insert millions of rows.
+	if _, err := db.ExecContext(ctx, `ANALYZE`); err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES
+			('price_predictions', 'idx_price_predictions_accuracy', '2000000 400000 6000 2 1 1 1 1 1'),
+			('price_predictions', 'idx_price_predictions_station_fuel_target', '2000000 20000 7000 2'),
+			('price_predictions', 'idx_price_predictions_due', '2000000 700000 700000 3'),
+			('price_predictions', 'idx_price_predictions_run', '2000000 500')
+	`); err != nil {
+		t.Fatalf("seed stats: %v", err)
+	}
+	// Reopen so the planner loads the seeded statistics.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+
+	where := `pp.actual_price IS NOT NULL AND pp.fuel = ? AND pp.target_start >= ? AND pp.target_start <= ?`
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"summary", `SELECT COUNT(*), COUNT(DISTINCT pp.station_id), AVG(ABS(pp.error)), AVG(pp.error),
+			AVG(pp.error * pp.error), MIN(pp.error), MAX(pp.error)
+			FROM price_predictions pp WHERE ` + where},
+		{"series", `SELECT pp.target_start, AVG(pp.predicted_price), AVG(pp.actual_price), COUNT(*)
+			FROM price_predictions pp WHERE ` + where + ` GROUP BY pp.target_start ORDER BY pp.target_start ASC`},
+		{"latest_per_window", `SELECT COUNT(*), AVG(ABS(pp.error)) FROM price_predictions pp JOIN (
+				SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id
+				FROM price_predictions pp WHERE ` + where + ` GROUP BY pp.station_id, pp.target_start
+			) latest ON latest.station_id = pp.station_id AND latest.target_start = pp.target_start
+				AND latest.run_id = pp.run_id`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, err := db.QueryContext(ctx, `EXPLAIN QUERY PLAN `+tc.query,
+				"diesel", "2026-07-01T00:00:00Z", "2026-07-15T23:59:59Z")
+			if err != nil {
+				t.Fatalf("explain: %v", err)
+			}
+			defer rows.Close()
+			var plan []string
+			for rows.Next() {
+				var id, parent, notUsed int
+				var detail string
+				if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+					t.Fatalf("scan plan: %v", err)
+				}
+				plan = append(plan, detail)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("plan rows: %v", err)
+			}
+			joined := strings.Join(plan, "\n")
+			if !strings.Contains(joined, "COVERING INDEX idx_price_predictions_accuracy") {
+				t.Fatalf("query is not answered from the covering index; plan:\n%s", joined)
+			}
+			if strings.Contains(joined, "SCAN price_predictions") {
+				t.Fatalf("query still scans the table; plan:\n%s", joined)
+			}
+		})
+	}
+}
+
 func TestRunMigrateAppliesLegacySchemaChanges(t *testing.T) {
 	dbPath := seedLegacyFixtureDB(t)
 
