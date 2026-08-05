@@ -185,6 +185,58 @@ function gasolineTableExists(PDO $pdo, string $driver, string $table): bool
     }
 }
 
+function gasolineIndexExists(PDO $pdo, string $driver, string $table, string $index): bool
+{
+    try {
+        if ($driver === 'mysql') {
+            $stmt = $pdo->prepare(
+                'SELECT COUNT(*) AS n FROM information_schema.statistics
+                 WHERE table_schema = DATABASE() AND table_name = :t AND index_name = :i'
+            );
+        } else {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND tbl_name = :t AND name = :i"
+            );
+        }
+        $stmt->bindValue(':t', $table);
+        $stmt->bindValue(':i', $index);
+        $stmt->execute();
+        $row = $stmt->fetch();
+        return (int) ($row['n'] ?? 0) > 0;
+    } catch (Throwable $e) {
+        error_log('gasoline index check error: ' . $e->getMessage());
+        return false;
+    }
+}
+
+// gasolineAccuracyIndexHint returns the index hint the accuracy page's aggregate
+// queries carry, or '' when it must not be used.
+//
+// Hinting is a last resort and it is here on measurement, not principle. Those
+// queries are all covered by idx_price_predictions_accuracy, but both engines
+// prefer the narrower idx_price_predictions_due, which leads with fuel too and
+// is cheaper per row — and then they fetch a quarter of a million rows from the
+// table. On the live MySQL, forcing the covering index measured 66-73% faster
+// per query with byte-identical results; refreshing the statistics the
+// optimizer reasons from (ANALYZE TABLE, and a histogram on target_start) did
+// not change its choice.
+//
+// The hint is omitted when the index is absent, so a database that has not run
+// `gasoline migrate` still renders the page instead of erroring on an unknown
+// key. Re-check the decision with `gasoline doctor --try-index
+// idx_price_predictions_accuracy`, which times each query both ways: if the
+// forced plan stops winning, drop the hint rather than keeping it on faith.
+function gasolineAccuracyIndexHint(PDO $pdo, string $driver): string
+{
+    if (!gasolineIndexExists($pdo, $driver, 'price_predictions', 'idx_price_predictions_accuracy')) {
+        return '';
+    }
+    if ($driver === 'mysql') {
+        return 'FORCE INDEX (idx_price_predictions_accuracy)';
+    }
+    return 'INDEXED BY idx_price_predictions_accuracy';
+}
+
 function gasolineSchemaReady(PDO $pdo, string $driver): bool
 {
     try {
@@ -2862,6 +2914,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         $driver = $dbDriver;
         // Shared WHERE + params reused across the aggregate, breakdown, series and
         // raw-row queries so every panel reflects exactly the same filtered set.
+        // Aggregate queries below read `$ppHinted` instead of naming the table
+        // directly; see gasolineAccuracyIndexHint for why they carry a hint and
+        // how to re-check that it still earns its place. `series` and the raw-row
+        // query keep the plain reference: measured on the live database the hint
+        // changed them by +1% and -2%, so there is nothing to buy there and the
+        // optimizer is left free.
+        $ppHint = gasolineAccuracyIndexHint($pdo, $driver);
+        $ppTable = 'price_predictions pp ';
+        $ppHinted = $ppHint === '' ? $ppTable : $ppTable . $ppHint . ' ';
         $joinRuns = $paCity !== '' ? 'JOIN prediction_runs pr ON pr.id = pp.run_id ' : '';
         $where = 'pp.actual_price IS NOT NULL AND pp.fuel = :fuel AND pp.target_start >= :from AND pp.target_start <= :to';
         $params = [':fuel' => $paFuel, ':from' => $fromTs, ':to' => $toTs];
@@ -2886,7 +2947,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
             . 'MIN(pp.error) AS min_err, MAX(pp.error) AS max_err, '
             . 'SUM(CASE WHEN ABS(pp.error) <= 0.01 THEN 1 ELSE 0 END) AS within1, '
             . 'SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 '
-            . 'FROM price_predictions pp ' . $joinRuns
+            . 'FROM ' . $ppHinted . $joinRuns
             . 'WHERE ' . $where
         );
         $bind($aggStmt);
@@ -2938,7 +2999,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         //     driver's willingness to reuse a named placeholder.
         $latestJoin = 'JOIN ('
             . 'SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id '
-            . 'FROM price_predictions pp ' . $joinRuns
+            . 'FROM ' . $ppHinted . $joinRuns
             . 'WHERE ' . $where
             . ' GROUP BY pp.station_id, pp.target_start'
             . ') latest ON latest.station_id = pp.station_id'
@@ -2948,7 +3009,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
             'SELECT COUNT(*) AS n, '
             . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, '
             . 'SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 '
-            . 'FROM price_predictions pp ' . $latestJoin
+            . 'FROM ' . $ppHinted . $latestJoin
             . ' WHERE pp.fuel = :outer_fuel'
         );
         $latestStmt->bindValue(':outer_fuel', $paFuel);
@@ -2969,7 +3030,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         $confStmt = $pdo->prepare(
             'SELECT pp.confidence AS confidence, COUNT(*) AS n, '
             . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias '
-            . 'FROM price_predictions pp ' . $joinRuns
+            . 'FROM ' . $ppHinted . $joinRuns
             . 'WHERE ' . $where . ' GROUP BY pp.confidence'
         );
         $bind($confStmt);
@@ -2997,7 +3058,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         $leadStmt = $pdo->prepare(
             'SELECT ' . $leadBucket . ' AS bucket, COUNT(*) AS n, '
             . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, MIN(pp.lead_minutes) AS lead_floor '
-            . 'FROM price_predictions pp ' . $joinRuns
+            . 'FROM ' . $ppHinted . $joinRuns
             . 'WHERE ' . $where . ' GROUP BY ' . $leadBucket
         );
         $bind($leadStmt);
@@ -3024,7 +3085,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         $hourStmt = $pdo->prepare(
             'SELECT ' . $hourExpr . ' AS hour, COUNT(*) AS n, '
             . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias '
-            . 'FROM price_predictions pp ' . $joinRuns
+            . 'FROM ' . $ppHinted . $joinRuns
             . 'WHERE ' . $where . ' GROUP BY ' . $hourExpr . ' ORDER BY hour ASC'
         );
         $bind($hourStmt);

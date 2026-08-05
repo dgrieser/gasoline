@@ -185,19 +185,55 @@ type accuracyQuerySpec struct {
 // action=prediction_accuracy handler. Keep the SQL shapes in step with that
 // handler: the numbering matches its section comments, and
 // TestDoctorAccuracyQueriesMatchViewer fails if the two drift apart.
-func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec {
-	return accuracyQuerySpecsHinted(f, hasDecisions, "")
+// accuracyQueryContext is everything that shapes the page's SQL: the filters,
+// the dialect (hint syntax differs), whether the decisions table exists, and
+// whether the covering index is there to be hinted at.
+type accuracyQueryContext struct {
+	Filters      doctorFilters
+	Dialect      dialect
+	HasDecisions bool
+	// AccuracyIndexPresent mirrors the page's own guard: with the index absent
+	// the page emits no hint, because forcing an unknown key errors.
+	AccuracyIndexPresent bool
+	// ForceIndex overrides the page's per-query hint policy and forces this
+	// index on every price_predictions query. Set only by --try-index.
+	ForceIndex string
 }
 
-// accuracyQuerySpecsHinted is accuracyQuerySpecs with an optional index hint
-// spliced in after every price_predictions reference. The hint is a diagnostic
-// lever only — `doctor --try-index` uses it to measure what a different index
-// choice would cost, so an operator can decide with numbers instead of a guess.
-// The page itself never hints.
-func accuracyQuerySpecsHinted(f doctorFilters, hasDecisions bool, hint string) []accuracyQuerySpec {
-	predictions := "price_predictions pp "
-	if hint != "" {
-		predictions += hint + " "
+// pageHintedQueries are the queries the accuracy page forces
+// idx_price_predictions_accuracy on (see gasolineAccuracyIndexHint in
+// web/index.php). series and rows are deliberately absent: measured on the live
+// database the hint moved them by +1% and -2%, so they keep the plain reference
+// and leave the optimizer free.
+var pageHintedQueries = map[string]bool{
+	"summary":        true,
+	"summary_latest": true,
+	"by_confidence":  true,
+	"by_lead":        true,
+	"by_hour":        true,
+}
+
+// accuracyQuerySpecsHinted builds the page's queries, optionally overriding
+// which index they force.
+//
+// With an empty override the SQL mirrors the page exactly, hints included, so
+// doctor's baseline is what a page load actually costs. A non-empty override
+// forces that index on every price_predictions query instead — this is what
+// `doctor --try-index` measures against the baseline, and it replaces the
+// page's own hint rather than stacking with it.
+func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
+	f := qc.Filters
+	hasDecisions := qc.HasDecisions
+	plain := "price_predictions pp "
+	// predictionsFor resolves the table reference for one query by name.
+	predictionsFor := func(name string) string {
+		if qc.ForceIndex != "" {
+			return plain + indexHintSyntax(qc.Dialect, qc.ForceIndex) + " "
+		}
+		if pageHintedQueries[name] && qc.AccuracyIndexPresent {
+			return plain + indexHintSyntax(qc.Dialect, "idx_price_predictions_accuracy") + " "
+		}
+		return plain
 	}
 	joinRuns := ""
 	where := "pp.actual_price IS NOT NULL AND pp.fuel = ? AND pp.target_start >= ? AND pp.target_start <= ?"
@@ -238,7 +274,7 @@ func accuracyQuerySpecsHinted(f doctorFilters, hasDecisions bool, hint string) [
 				"MIN(pp.error) AS min_err, MAX(pp.error) AS max_err, " +
 				"SUM(CASE WHEN ABS(pp.error) <= 0.01 THEN 1 ELSE 0 END) AS within1, " +
 				"SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 " +
-				"FROM " + predictions + joinRuns + "WHERE " + where,
+				"FROM " + predictionsFor("summary") + joinRuns + "WHERE " + where,
 			args:  argsFor(1),
 			table: "price_predictions",
 			alias: "pp",
@@ -248,9 +284,9 @@ func accuracyQuerySpecsHinted(f doctorFilters, hasDecisions bool, hint string) [
 			purpose: "latest-run-per-window tiles (added in #44)",
 			sql: "SELECT COUNT(*) AS n, AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, " +
 				"SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 " +
-				"FROM " + predictions + "JOIN (" +
+				"FROM " + predictionsFor("summary_latest") + "JOIN (" +
 				"SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id " +
-				"FROM " + predictions + joinRuns + "WHERE " + where +
+				"FROM " + predictionsFor("summary_latest") + joinRuns + "WHERE " + where +
 				" GROUP BY pp.station_id, pp.target_start" +
 				") latest ON latest.station_id = pp.station_id" +
 				" AND latest.target_start = pp.target_start" +
@@ -267,7 +303,7 @@ func accuracyQuerySpecsHinted(f doctorFilters, hasDecisions bool, hint string) [
 			purpose: "accuracy by confidence tier",
 			sql: "SELECT pp.confidence AS confidence, COUNT(*) AS n, " +
 				"AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias " +
-				"FROM " + predictions + joinRuns + "WHERE " + where + " GROUP BY pp.confidence",
+				"FROM " + predictionsFor("by_confidence") + joinRuns + "WHERE " + where + " GROUP BY pp.confidence",
 			args:  argsFor(1),
 			table: "price_predictions",
 			alias: "pp",
@@ -277,7 +313,7 @@ func accuracyQuerySpecsHinted(f doctorFilters, hasDecisions bool, hint string) [
 			purpose: "accuracy by lead-time bucket",
 			sql: "SELECT " + leadBucket + " AS bucket, COUNT(*) AS n, " +
 				"AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, MIN(pp.lead_minutes) AS lead_floor " +
-				"FROM " + predictions + joinRuns + "WHERE " + where + " GROUP BY " + leadBucket,
+				"FROM " + predictionsFor("by_lead") + joinRuns + "WHERE " + where + " GROUP BY " + leadBucket,
 			args:  argsFor(1),
 			table: "price_predictions",
 			alias: "pp",
@@ -287,7 +323,7 @@ func accuracyQuerySpecsHinted(f doctorFilters, hasDecisions bool, hint string) [
 			purpose: "accuracy by target hour (UTC)",
 			sql: "SELECT " + hourExpr + " AS hour, COUNT(*) AS n, " +
 				"AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias " +
-				"FROM " + predictions + joinRuns + "WHERE " + where +
+				"FROM " + predictionsFor("by_hour") + joinRuns + "WHERE " + where +
 				" GROUP BY " + hourExpr + " ORDER BY hour ASC",
 			args:  argsFor(1),
 			table: "price_predictions",
@@ -297,7 +333,7 @@ func accuracyQuerySpecsHinted(f doctorFilters, hasDecisions bool, hint string) [
 			name:    "series",
 			purpose: "predicted-vs-actual timeline",
 			sql: "SELECT pp.target_start AS t, AVG(pp.predicted_price) AS p, AVG(pp.actual_price) AS a, COUNT(*) AS n " +
-				"FROM " + predictions + joinRuns + "WHERE " + where +
+				"FROM " + predictionsFor("series") + joinRuns + "WHERE " + where +
 				" GROUP BY pp.target_start ORDER BY pp.target_start ASC",
 			args:  argsFor(1),
 			table: "price_predictions",
@@ -312,7 +348,7 @@ func accuracyQuerySpecsHinted(f doctorFilters, hasDecisions bool, hint string) [
 				"FROM (" +
 				"SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, " +
 				"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion " +
-				"FROM " + predictions + joinRuns + "WHERE " + where +
+				"FROM " + predictionsFor("rows") + joinRuns + "WHERE " + where +
 				" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001" +
 				") page " +
 				"JOIN prediction_runs pr ON pr.id = page.run_id " +
@@ -821,15 +857,31 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 			hasDecisions = true
 		}
 	}
+	accuracyIndexPresent := false
+	for _, idx := range indexes {
+		if idx.Name == "idx_price_predictions_accuracy" && idx.Present {
+			accuracyIndexPresent = true
+		}
+	}
 
 	if !opts.SkipQueries {
+		qc := accuracyQueryContext{
+			Filters:      opts.Filters,
+			Dialect:      d,
+			HasDecisions: hasDecisions,
+			// Faithfulness matters more than optimism here: if the index is
+			// missing, the page emits no hint, so neither does doctor.
+			AccuracyIndexPresent: accuracyIndexPresent,
+		}
 		hinted := map[string]accuracyQuerySpec{}
 		if opts.TryIndex != "" {
-			for _, spec := range accuracyQuerySpecsHinted(opts.Filters, hasDecisions, indexHintSyntax(d, opts.TryIndex)) {
+			forced := qc
+			forced.ForceIndex = opts.TryIndex
+			for _, spec := range accuracyQuerySpecsFor(forced) {
 				hinted[spec.name] = spec
 			}
 		}
-		for _, spec := range accuracyQuerySpecs(opts.Filters, hasDecisions) {
+		for _, spec := range accuracyQuerySpecsFor(qc) {
 			q := doctorQuery{Name: spec.name, Purpose: spec.purpose, SQL: spec.sql}
 
 			q.Table = spec.table
@@ -939,15 +991,16 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 		case !q.CoveringHit:
 			info("query %s uses %s but still reads table rows", q.Name, q.UsesIndex)
 		}
-		// An index the planner weighed and passed over, on a query that is slow
-		// and not covering, is the signature of stale statistics rather than a
-		// wrong index — and refreshing them is cheap, so it is worth naming.
-		if q.UsesIndex != "" && !q.CoveringHit {
+		// An index the planner weighed and passed over, on a query that is not
+		// covering, is worth naming — but only as something to measure. On the
+		// live database this pattern survived both ANALYZE TABLE and a
+		// histogram on target_start, so pointing at stale statistics would have
+		// been a confident wrong answer; --try-index settles it instead.
+		if q.UsesIndex != "" && !q.CoveringHit && q.Hinted == nil {
 			for _, candidate := range q.Considered {
 				if candidate == "idx_price_predictions_accuracy" {
-					warn("query %s chose %s over %s, which covers it — the optimizer's statistics "+
-						"may be stale; refresh them with `ANALYZE TABLE %s`",
-						q.Name, q.UsesIndex, candidate, q.Table)
+					info("query %s chose %s over %s, which covers it — measure the difference "+
+						"with `--try-index %s`", q.Name, q.UsesIndex, candidate, candidate)
 				}
 			}
 		}
