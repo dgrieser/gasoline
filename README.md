@@ -372,7 +372,22 @@ gasoline doctor -o json | jq '.findings'            # machine-readable
 
 Its filter flags (`--fuel`, `--city`, `--confidence`, `--range`, or `--from`/`--to`) mirror the page's own controls, so you can reproduce exactly the filter that felt slow in the browser. Each query line ends in a verdict: `covering <index>` means the query was answered from an index alone, a bare index name means it used that index but still fetched table rows, and `TABLE SCAN` means it read the whole table. The `findings` section collects the actionable parts — a missing index, a query over `--slow-ms` (default 1000), a table scan.
 
-When a query is slow but the index it needs exists, the usual cause is the optimizer passing that index over. `doctor` reports the index MySQL actually committed to (its `key`), not the ones it merely weighed, and warns when it chose a non-covering index while the covering one was among the candidates — that pattern generally means the table's statistics are stale, and `ANALYZE TABLE price_predictions` is the cheap fix. It is a suggestion, not a diagnosis: `doctor` cannot see why the optimizer decided what it did.
+When a query is slow but the index it needs exists, the usual cause is the optimizer passing that index over. `doctor` reports the index MySQL actually committed to (its `key`), not the ones it merely weighed, and warns when it chose a non-covering index while the covering one was among the candidates.
+
+`--try-index` settles that case with a measurement instead of a guess. It re-runs every `price_predictions` query a second time with the named index forced and prints both timings side by side:
+
+```bash
+gasoline doctor --try-index idx_price_predictions_accuracy
+```
+
+```
+  by_confidence       3627.4 ms      3 rows  idx_price_predictions_station_fuel_target
+    forced:           1827.7 ms      3 rows  covering idx_price_predictions_accuracy  (-50%)
+```
+
+It ends with a verdict — whether forcing the index would be faster, slower, or much the same. This stays read-only: the hint applies to that one run, never to the page. Because an index hint changes the plan and not the answer, `doctor` compares row counts between the two runs and tells you to disregard the timings if they ever disagree.
+
+If forcing the covering index is much faster, the optimizer is mis-costing it on its own, and the usual remedies are refreshing the statistics it reasons from — `ANALYZE TABLE price_predictions`, or `ANALYZE TABLE price_predictions UPDATE HISTOGRAM ON target_start` when the range estimate is the part that looks wrong (a `filtered` value pinned near 10% in the plan is the tell).
 
 Notes on reading the output:
 

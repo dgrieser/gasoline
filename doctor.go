@@ -148,6 +148,20 @@ type doctorQuery struct {
 	FullScan    bool     `json:"full_scan"`
 	Error       string   `json:"error,omitempty"`
 	Skipped     bool     `json:"skipped"`
+	// Hinted is the same query re-run with an index forced, present only under
+	// --try-index. It answers "would a different index choice actually be
+	// faster here" with a measurement rather than a guess.
+	Hinted *doctorQueryHint `json:"hinted,omitempty"`
+}
+
+type doctorQueryHint struct {
+	Index       string   `json:"index"`
+	DurationMS  float64  `json:"duration_ms"`
+	Rows        int      `json:"rows"`
+	Plan        []string `json:"plan"`
+	UsesIndex   string   `json:"uses_index"`
+	CoveringHit bool     `json:"covering"`
+	Error       string   `json:"error,omitempty"`
 }
 
 type doctorFinding struct {
@@ -172,6 +186,19 @@ type accuracyQuerySpec struct {
 // handler: the numbering matches its section comments, and
 // TestDoctorAccuracyQueriesMatchViewer fails if the two drift apart.
 func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec {
+	return accuracyQuerySpecsHinted(f, hasDecisions, "")
+}
+
+// accuracyQuerySpecsHinted is accuracyQuerySpecs with an optional index hint
+// spliced in after every price_predictions reference. The hint is a diagnostic
+// lever only — `doctor --try-index` uses it to measure what a different index
+// choice would cost, so an operator can decide with numbers instead of a guess.
+// The page itself never hints.
+func accuracyQuerySpecsHinted(f doctorFilters, hasDecisions bool, hint string) []accuracyQuerySpec {
+	predictions := "price_predictions pp "
+	if hint != "" {
+		predictions += hint + " "
+	}
 	joinRuns := ""
 	where := "pp.actual_price IS NOT NULL AND pp.fuel = ? AND pp.target_start >= ? AND pp.target_start <= ?"
 	args := []any{f.Fuel, f.From, f.To}
@@ -211,7 +238,7 @@ func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec 
 				"MIN(pp.error) AS min_err, MAX(pp.error) AS max_err, " +
 				"SUM(CASE WHEN ABS(pp.error) <= 0.01 THEN 1 ELSE 0 END) AS within1, " +
 				"SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 " +
-				"FROM price_predictions pp " + joinRuns + "WHERE " + where,
+				"FROM " + predictions + joinRuns + "WHERE " + where,
 			args:  argsFor(1),
 			table: "price_predictions",
 			alias: "pp",
@@ -221,9 +248,9 @@ func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec 
 			purpose: "latest-run-per-window tiles (added in #44)",
 			sql: "SELECT COUNT(*) AS n, AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, " +
 				"SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 " +
-				"FROM price_predictions pp JOIN (" +
+				"FROM " + predictions + "JOIN (" +
 				"SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id " +
-				"FROM price_predictions pp " + joinRuns + "WHERE " + where +
+				"FROM " + predictions + joinRuns + "WHERE " + where +
 				" GROUP BY pp.station_id, pp.target_start" +
 				") latest ON latest.station_id = pp.station_id" +
 				" AND latest.target_start = pp.target_start" +
@@ -240,7 +267,7 @@ func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec 
 			purpose: "accuracy by confidence tier",
 			sql: "SELECT pp.confidence AS confidence, COUNT(*) AS n, " +
 				"AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias " +
-				"FROM price_predictions pp " + joinRuns + "WHERE " + where + " GROUP BY pp.confidence",
+				"FROM " + predictions + joinRuns + "WHERE " + where + " GROUP BY pp.confidence",
 			args:  argsFor(1),
 			table: "price_predictions",
 			alias: "pp",
@@ -250,7 +277,7 @@ func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec 
 			purpose: "accuracy by lead-time bucket",
 			sql: "SELECT " + leadBucket + " AS bucket, COUNT(*) AS n, " +
 				"AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, MIN(pp.lead_minutes) AS lead_floor " +
-				"FROM price_predictions pp " + joinRuns + "WHERE " + where + " GROUP BY " + leadBucket,
+				"FROM " + predictions + joinRuns + "WHERE " + where + " GROUP BY " + leadBucket,
 			args:  argsFor(1),
 			table: "price_predictions",
 			alias: "pp",
@@ -260,7 +287,7 @@ func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec 
 			purpose: "accuracy by target hour (UTC)",
 			sql: "SELECT " + hourExpr + " AS hour, COUNT(*) AS n, " +
 				"AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias " +
-				"FROM price_predictions pp " + joinRuns + "WHERE " + where +
+				"FROM " + predictions + joinRuns + "WHERE " + where +
 				" GROUP BY " + hourExpr + " ORDER BY hour ASC",
 			args:  argsFor(1),
 			table: "price_predictions",
@@ -270,7 +297,7 @@ func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec 
 			name:    "series",
 			purpose: "predicted-vs-actual timeline",
 			sql: "SELECT pp.target_start AS t, AVG(pp.predicted_price) AS p, AVG(pp.actual_price) AS a, COUNT(*) AS n " +
-				"FROM price_predictions pp " + joinRuns + "WHERE " + where +
+				"FROM " + predictions + joinRuns + "WHERE " + where +
 				" GROUP BY pp.target_start ORDER BY pp.target_start ASC",
 			args:  argsFor(1),
 			table: "price_predictions",
@@ -285,7 +312,7 @@ func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec 
 				"FROM (" +
 				"SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, " +
 				"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion " +
-				"FROM price_predictions pp " + joinRuns + "WHERE " + where +
+				"FROM " + predictions + joinRuns + "WHERE " + where +
 				" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001" +
 				") page " +
 				"JOIN prediction_runs pr ON pr.id = page.run_id " +
@@ -796,6 +823,12 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 	}
 
 	if !opts.SkipQueries {
+		hinted := map[string]accuracyQuerySpec{}
+		if opts.TryIndex != "" {
+			for _, spec := range accuracyQuerySpecsHinted(opts.Filters, hasDecisions, indexHintSyntax(d, opts.TryIndex)) {
+				hinted[spec.name] = spec
+			}
+		}
 		for _, spec := range accuracyQuerySpecs(opts.Filters, hasDecisions) {
 			q := doctorQuery{Name: spec.name, Purpose: spec.purpose, SQL: spec.sql}
 
@@ -816,6 +849,12 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 				q.Error = err.Error()
 			}
 			q.Rows = count
+
+			// Only price_predictions queries can be steered by the hint; the
+			// decisions query reads a different table.
+			if alt, ok := hinted[spec.name]; ok && spec.table == "price_predictions" {
+				q.Hinted = measureHinted(ctx, db, d, alt, opts, indexesByTable[spec.table])
+			}
 			result.Queries = append(result.Queries, q)
 		}
 	} else {
@@ -917,6 +956,40 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 		info("accuracy page SQL total %.0f ms; slowest %s at %.0f ms", total, slowest.Name, slowest.DurationMS)
 	}
 
+	// --try-index only pays off if it produces a verdict, so state one.
+	if opts.TryIndex != "" {
+		var hintedTotal, comparable float64
+		var mismatch bool
+		for _, q := range r.Queries {
+			h := q.Hinted
+			if h == nil || h.Error != "" {
+				continue
+			}
+			if h.Rows != q.Rows {
+				mismatch = true
+			}
+			comparable += q.DurationMS
+			hintedTotal += h.DurationMS
+		}
+		switch {
+		case mismatch:
+			warn("forcing %s changed a query's row count — the comparison is not measuring "+
+				"the same work, so ignore its timings", opts.TryIndex)
+		case comparable == 0:
+			info("no query could be compared with %s forced", opts.TryIndex)
+		case hintedTotal < comparable*0.8:
+			warn("forcing %s would cut those queries from %.0f ms to %.0f ms (%.0f%% less) — "+
+				"the optimizer is picking the slower index on its own",
+				opts.TryIndex, comparable, hintedTotal, (comparable-hintedTotal)/comparable*100)
+		case hintedTotal > comparable*1.2:
+			info("forcing %s is slower (%.0f ms vs %.0f ms); the optimizer's choice is the better one",
+				opts.TryIndex, hintedTotal, comparable)
+		default:
+			info("forcing %s makes little difference (%.0f ms vs %.0f ms)",
+				opts.TryIndex, hintedTotal, comparable)
+		}
+	}
+
 	for _, t := range r.Tables {
 		if t.Missing {
 			info("table %s does not exist yet", t.Name)
@@ -929,7 +1002,11 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 }
 
 type doctorOptions struct {
-	Filters     doctorFilters
+	Filters doctorFilters
+	// TryIndex names an index to force on price_predictions for a second,
+	// side-by-side timing of every query. Read-only: it changes nothing but
+	// what this one run measures.
+	TryIndex    string
 	SkipQueries bool
 	Analyze     bool
 	ShowSQL     bool
@@ -954,6 +1031,7 @@ func runDoctor(args []string) error {
 	from := fs.String("from", "", "Range start as YYYY-MM-DD (needs --to)")
 	to := fs.String("to", "", "Range end as YYYY-MM-DD (needs --from)")
 	skipQueries := fs.Bool("skip-queries", false, "Only report schema, sizes and indexes; do not run the accuracy-page queries")
+	tryIndex := fs.String("try-index", "", "Also time every price_predictions query with this index forced, to measure what a different index choice would cost (read-only)")
 	analyze := fs.Bool("analyze", false, "Use EXPLAIN ANALYZE for real per-step timings (MySQL 8.0.18+; ignored on SQLite)")
 	explain := fs.Bool("explain", false, "Print the full query plan for each query")
 	showSQL := fs.Bool("sql", false, "Print the SQL of each query")
@@ -1002,6 +1080,7 @@ func runDoctor(args []string) error {
 			From:       fromTS,
 			To:         toTS,
 		},
+		TryIndex:    strings.TrimSpace(*tryIndex),
 		SkipQueries: *skipQueries,
 		Analyze:     *analyze,
 		ShowSQL:     *showSQL,
@@ -1087,6 +1166,23 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 			note = q.UsesIndex
 		}
 		fmt.Fprintf(stdout, "  %-16s %9.1f ms %6d rows  %s\n", q.Name, q.DurationMS, q.Rows, note)
+		if h := q.Hinted; h != nil {
+			hintNote := h.UsesIndex
+			switch {
+			case h.Error != "":
+				hintNote = "failed: " + h.Error
+			case h.UsesIndex != "" && h.CoveringHit:
+				hintNote = "covering " + h.UsesIndex
+			case h.UsesIndex == "":
+				hintNote = "hint not taken"
+			}
+			delta := ""
+			if h.Error == "" && h.DurationMS > 0 {
+				delta = fmt.Sprintf("  (%+.0f%%)", (h.DurationMS-q.DurationMS)/q.DurationMS*100)
+			}
+			fmt.Fprintf(stdout, "  %-16s %9.1f ms %6d rows  %s%s\n",
+				"  forced:", h.DurationMS, h.Rows, hintNote, delta)
+		}
 		if opts.ShowSQL {
 			fmt.Fprintf(stdout, "      sql: %s\n", q.SQL)
 		}
@@ -1157,5 +1253,43 @@ func consideredIndexes(cells []map[string]string, alias, chosen string) []string
 		}
 	}
 	sort.Strings(out)
+	return out
+}
+
+// indexHintSyntax renders a "use this index" hint for the dialect. MySQL's
+// FORCE INDEX makes the optimizer prefer the index over a table scan; SQLite's
+// INDEXED BY is stricter and errors when the index cannot serve the query,
+// which is itself a useful answer.
+func indexHintSyntax(d dialect, index string) string {
+	if index == "" {
+		return ""
+	}
+	if d == dialectMySQL {
+		return "FORCE INDEX (" + index + ")"
+	}
+	return "INDEXED BY " + index
+}
+
+// measureHinted times one query with the index forced, for comparison against
+// how the page actually runs it. A hint cannot change results, so a differing
+// row count means the comparison is not measuring the same work and the caller
+// is told rather than shown a misleading speedup.
+func measureHinted(ctx context.Context, db *sql.DB, d dialect, spec accuracyQuerySpec, opts doctorOptions, indexNames []string) *doctorQueryHint {
+	out := &doctorQueryHint{Index: opts.TryIndex}
+	plan, cells, err := explainPlan(ctx, db, d, spec.sql, spec.args, opts.Analyze)
+	if err != nil {
+		out.Error = err.Error()
+		return out
+	}
+	out.Plan = plan
+	out.UsesIndex, out.CoveringHit, _ = classifyPlan(plan, cells, d, indexNames, spec.alias)
+
+	started := time.Now()
+	count, err := countQueryRows(ctx, db, spec.sql, spec.args)
+	out.DurationMS = float64(time.Since(started).Microseconds()) / 1000
+	if err != nil {
+		out.Error = err.Error()
+	}
+	out.Rows = count
 	return out
 }
