@@ -543,6 +543,8 @@ func run(args []string) error {
 		return runRename(args[1:])
 	case "merge-stations":
 		return runMergeStations(args[1:])
+	case "doctor":
+		return runDoctor(args[1:])
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "gasoline %s (commit %s, built %s)\n", version, commit, date)
 		return nil
@@ -570,6 +572,8 @@ Commands:
   notify        send Pushover notifications to configured web users
   rename        set a persistent display-name override for a station
   merge-stations merge duplicate station identities into one canonical station
+  doctor        inspect a live database read-only: table sizes, indexes, and
+                timings plus query plans for the admin accuracy page's SQL
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
   version       print build version information
@@ -600,6 +604,9 @@ Examples:
   gasoline rename --clear <station-id>
   gasoline merge-stations --detect
   gasoline merge-stations --into <canonical-id> <duplicate-id> [<duplicate-id>...]
+  gasoline doctor
+  gasoline doctor --explain --analyze --db-driver mysql
+  gasoline doctor --skip-queries --output json
   gasoline import cities DE
   gasoline clear cities`)
 }
