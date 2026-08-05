@@ -3487,6 +3487,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migrateUsersNotifySuggestEnabled(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migratePredictionsAccuracyIndex(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migrateSeedDefaultSettings(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -3556,6 +3559,46 @@ func migratePredictionsAppliedCorrection(ctx context.Context, tx *sql.Tx, d dial
 		return err
 	}
 	result.Applied = append(result.Applied, "price_predictions.applied_correction")
+	return nil
+}
+
+// migratePredictionsAccuracyIndex backfills the covering index the admin
+// accuracy page's aggregates rely on (see schemaStatements). New databases get
+// it from the schema; existing ones need the ALTER because MySQL declares the
+// index inline in a CREATE TABLE IF NOT EXISTS that no-ops on an existing
+// table. SQLite normally arrives here already satisfied — its CREATE INDEX IF
+// NOT EXISTS runs in ensureSchema — so the check keeps this a no-op there and
+// the CREATE form below only matters when migrate runs on its own.
+//
+// Every column the index names has existed since price_predictions was
+// created, so there is no ordering constraint against the column migrations
+// above.
+//
+// On a large price_predictions this builds for a while. InnoDB adds a
+// secondary index in place without blocking reads or writes, so a persist run
+// racing the migration is safe; it just contends for IO.
+func migratePredictionsAccuracyIndex(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasIndex, err := tableHasIndex(ctx, tx, d, "price_predictions", "idx_price_predictions_accuracy")
+	if err != nil {
+		return err
+	}
+	if hasIndex {
+		return nil
+	}
+	stmt := `CREATE INDEX idx_price_predictions_accuracy
+		ON price_predictions(fuel, target_start, station_id, run_id,
+			error, actual_price, predicted_price, confidence, lead_minutes)`
+	if d == dialectMySQL {
+		stmt = `ALTER TABLE price_predictions
+			ADD INDEX idx_price_predictions_accuracy (
+				fuel, target_start, station_id, run_id,
+				error, actual_price, predicted_price, confidence, lead_minutes
+			)`
+	}
+	if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "price_predictions.idx_price_predictions_accuracy")
 	return nil
 }
 
@@ -3830,6 +3873,50 @@ func tableHasColumn(ctx context.Context, q queryer, d dialect, tableName, column
 			return false, err
 		}
 		if name == columnName {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// tableHasIndex reports whether tableName carries an index of the given name.
+// Index names are per-table in MySQL and global in SQLite; matching on both
+// table and name is correct under either rule.
+func tableHasIndex(ctx context.Context, q queryer, d dialect, tableName, indexName string) (bool, error) {
+	if d == dialectMySQL {
+		var count int
+		row := q.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM information_schema.statistics
+			WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?
+		`, tableName, indexName)
+		if err := row.Scan(&count); err != nil {
+			return false, err
+		}
+		return count > 0, nil
+	}
+
+	rows, err := q.QueryContext(ctx, fmt.Sprintf("PRAGMA index_list(%s)", tableName))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			seq     int
+			name    string
+			unique  int
+			origin  string
+			partial int
+		)
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return false, err
+		}
+		if name == indexName {
 			return true, nil
 		}
 	}

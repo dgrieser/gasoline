@@ -244,6 +244,8 @@ Administrators can store the operational configuration in the database via the w
 
 Run `gasoline migrate` once to create the tables and seed the settings with the built-in defaults. Seeding never overwrites existing rows, so an install that already stores `history_days = 21` keeps it until an admin changes it (the built-in default is now 30 days).
 
+`migrate` also backfills the covering index the admin **Prediction accuracy** page aggregates over (`idx_price_predictions_accuracy`). On an install that has already accrued a large `price_predictions` table this is the one migration step that takes a noticeable while — tens of seconds per few million rows — and it grows the database by roughly the size of the table's own data. MySQL builds the index in place without blocking reads or writes, so a `suggest --persist` run may overlap it.
+
 Send Pushover notifications to the web UI's users:
 
 ```bash

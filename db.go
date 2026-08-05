@@ -311,6 +311,15 @@ func openMySQL(ctx context.Context, dsn string) (*sql.DB, error) {
 // logical schema is identical; only column types and index syntax differ
 // (MySQL needs bounded VARCHARs for indexed columns and does not support
 // CREATE INDEX IF NOT EXISTS, so indexes are declared inline).
+//
+// idx_price_predictions_accuracy deserves a note: it exists solely for the
+// admin accuracy page, which runs seven aggregate passes over the same
+// (fuel, target_start range) slice of price_predictions. Its leading columns
+// are that filter; station_id and run_id follow because the latest-run-
+// per-window panel groups and self-joins on them; the trailing payload
+// columns are there to make every one of those aggregate passes index-only,
+// so a page load never falls back to reading millions of table rows. Adding
+// or removing a column read by that page means revisiting this index.
 func schemaStatements(d dialect) []string {
 	if d == dialectMySQL {
 		return []string{
@@ -427,6 +436,10 @@ func schemaStatements(d dialect) []string {
 				evaluated_at VARCHAR(64),
 				INDEX idx_price_predictions_station_fuel_target (station_id, fuel, target_start DESC),
 				INDEX idx_price_predictions_due (fuel, evaluated_at, target_end),
+				INDEX idx_price_predictions_accuracy (
+					fuel, target_start, station_id, run_id,
+					error, actual_price, predicted_price, confidence, lead_minutes
+				),
 				FOREIGN KEY (run_id) REFERENCES prediction_runs(id),
 				FOREIGN KEY (station_id) REFERENCES stations(id)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
@@ -585,6 +598,9 @@ func schemaStatements(d dialect) []string {
 			ON price_predictions(fuel, evaluated_at, target_end)`,
 		`CREATE INDEX IF NOT EXISTS idx_price_predictions_run
 			ON price_predictions(run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_price_predictions_accuracy
+			ON price_predictions(fuel, target_start, station_id, run_id,
+				error, actual_price, predicted_price, confidence, lead_minutes)`,
 		`CREATE TABLE IF NOT EXISTS price_check_decisions (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			run_id INTEGER NOT NULL,
