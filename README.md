@@ -244,7 +244,7 @@ Administrators can store the operational configuration in the database via the w
 
 Run `gasoline migrate` once to create the tables and seed the settings with the built-in defaults. Seeding never overwrites existing rows, so an install that already stores `history_days = 21` keeps it until an admin changes it (the built-in default is now 30 days).
 
-`migrate` also backfills the covering index the admin **Prediction accuracy** page aggregates over (`idx_price_predictions_accuracy`). On an install that has already accrued a large `price_predictions` table this is the one migration step that takes a noticeable while — tens of seconds per few million rows — and it grows the database by roughly the size of the table's own data. MySQL builds the index in place without blocking reads or writes, so a `suggest --persist` run may overlap it.
+`migrate` also backfills the covering index the admin **Prediction accuracy** page aggregates over (`idx_price_predictions_accuracy`); `gasoline doctor` reports whether it is present, see [Diagnosing a slow database](#diagnosing-a-slow-database-gasoline-doctor). On an install that has already accrued a large `price_predictions` table this is the one migration step that takes a noticeable while — tens of seconds per few million rows — and it grows the database by roughly the size of the table's own data. MySQL builds the index in place without blocking reads or writes, so a `suggest --persist` run may overlap it.
 
 Send Pushover notifications to the web UI's users:
 
@@ -356,6 +356,28 @@ Prefer cron? `examples/cron/gasoline-update.cron` holds a ready-to-use line — 
 Use `--limit 0` with `list stations` or `list history` to return all matching rows.
 
 The grouped commands above are the canonical interface shown by `gasoline help`. The older top-level forms `cities`, `stations`, `history`, and `import-cities` are still accepted as aliases.
+
+### Diagnosing a slow database (`gasoline doctor`)
+
+`gasoline doctor` inspects a live database without changing it. It reports table sizes, every index with its key columns and on-disk size, and then — the reason it exists — runs each query behind the admin **Prediction accuracy** page, timing it and showing what the planner did with it:
+
+```bash
+gasoline doctor                                     # default 14-day window, fuel diesel
+gasoline doctor --db-driver mysql --explain         # print the full plan per query
+gasoline doctor --analyze                           # real per-step timings (MySQL 8.0.18+)
+gasoline doctor --range 30d --city Berlin           # reproduce a specific page filter
+gasoline doctor --skip-queries                      # schema, sizes and indexes only
+gasoline doctor -o json | jq '.findings'            # machine-readable
+```
+
+Its filter flags (`--fuel`, `--city`, `--confidence`, `--range`, or `--from`/`--to`) mirror the page's own controls, so you can reproduce exactly the filter that felt slow in the browser. Each query line ends in a verdict: `covering <index>` means the query was answered from an index alone, a bare index name means it used that index but still fetched table rows, and `TABLE SCAN` means it read the whole table. The `findings` section collects the actionable parts — a missing index, a query over `--slow-ms` (default 1000), a table scan.
+
+Notes on reading the output:
+
+- `doctor` never creates or migrates the schema. On a database that has not been migrated it reports the missing tables and indexes rather than quietly fixing them — run `gasoline migrate` for that.
+- Row counts are exact on SQLite and InnoDB estimates on MySQL, which can be off by a large factor; the text output prefixes the estimates with `~`.
+- Per-index sizes need `mysql.innodb_index_stats` on MySQL and the optional `dbstat` module on SQLite. Where the account or build lacks them the sizes are simply omitted.
+- Timings include running each query for real, so on a large database `doctor` costs about what one page load costs. Use `--skip-queries` when you only want the schema picture.
 
 ## Output Formats
 
