@@ -372,9 +372,12 @@ gasoline doctor -o json | jq '.findings'            # machine-readable
 
 Its filter flags (`--fuel`, `--city`, `--confidence`, `--range`, or `--from`/`--to`) mirror the page's own controls, so you can reproduce exactly the filter that felt slow in the browser. Each query line ends in a verdict: `covering <index>` means the query was answered from an index alone, a bare index name means it used that index but still fetched table rows, and `TABLE SCAN` means it read the whole table. The `findings` section collects the actionable parts — a missing index, a query over `--slow-ms` (default 1000), a table scan.
 
+When a query is slow but the index it needs exists, the usual cause is the optimizer passing that index over. `doctor` reports the index MySQL actually committed to (its `key`), not the ones it merely weighed, and warns when it chose a non-covering index while the covering one was among the candidates — that pattern generally means the table's statistics are stale, and `ANALYZE TABLE price_predictions` is the cheap fix. It is a suggestion, not a diagnosis: `doctor` cannot see why the optimizer decided what it did.
+
 Notes on reading the output:
 
 - `doctor` never creates or migrates the schema. On a database that has not been migrated it reports the missing tables and indexes rather than quietly fixing them — run `gasoline migrate` for that.
+- A `TABLE SCAN` verdict on a small table is reported as information, not a warning: below roughly 100k rows a scan is often the cheapest plan, and flagging it buries the findings that matter.
 - Row counts are exact on SQLite and InnoDB estimates on MySQL, which can be off by a large factor; the text output prefixes the estimates with `~`.
 - Per-index sizes need `mysql.innodb_index_stats` on MySQL and the optional `dbstat` module on SQLite. Where the account or build lacks them the sizes are simply omitted.
 - Timings include running each query for real, so on a large database `doctor` costs about what one page load costs. Use `--skip-queries` when you only want the schema picture.

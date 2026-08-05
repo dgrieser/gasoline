@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -332,7 +333,7 @@ func TestClassifyPlanScopesVerdictsToTheDrivingTable(t *testing.T) {
 			"SCAN latest",
 			"SEARCH pp USING COVERING INDEX idx_price_predictions_accuracy (target_start=? AND station_id=?)",
 		}
-		uses, covering, fullScan := classifyPlan(plan, dialectSQLite, indexes, "pp")
+		uses, covering, fullScan := classifyPlan(plan, nil, dialectSQLite, indexes, "pp")
 		if uses != "idx_price_predictions_accuracy" || !covering {
 			t.Fatalf("uses=%q covering=%v, want the accuracy index, covering", uses, covering)
 		}
@@ -348,7 +349,7 @@ func TestClassifyPlanScopesVerdictsToTheDrivingTable(t *testing.T) {
 			"SEARCH pr USING INTEGER PRIMARY KEY (rowid=?)",
 			"USE TEMP B-TREE FOR ORDER BY",
 		}
-		uses, covering, fullScan := classifyPlan(plan, dialectSQLite, indexes, "pp")
+		uses, covering, fullScan := classifyPlan(plan, nil, dialectSQLite, indexes, "pp")
 		if uses != "idx_price_predictions_station_fuel_target" {
 			t.Fatalf("uses = %q, want the station index", uses)
 		}
@@ -362,7 +363,7 @@ func TestClassifyPlanScopesVerdictsToTheDrivingTable(t *testing.T) {
 
 	t.Run("sqlite genuine table scan", func(t *testing.T) {
 		plan := []string{"SCAN pp", "USE TEMP B-TREE FOR GROUP BY"}
-		uses, _, fullScan := classifyPlan(plan, dialectSQLite, indexes, "pp")
+		uses, _, fullScan := classifyPlan(plan, nil, dialectSQLite, indexes, "pp")
 		if uses != "" {
 			t.Fatalf("uses = %q, want none", uses)
 		}
@@ -371,42 +372,100 @@ func TestClassifyPlanScopesVerdictsToTheDrivingTable(t *testing.T) {
 		}
 	})
 
-	t.Run("mysql covering read", func(t *testing.T) {
-		plan := []string{
-			"id=1 select_type=SIMPLE table=pp type=range key=idx_price_predictions_accuracy rows=412000 Extra=Using where; Using index",
+	// The MySQL fixtures below are real EXPLAIN rows from the production
+	// database, which is where the two bugs these cases pin were found: the
+	// verdict was read out of the rendered text, so `possible_keys` was
+	// mistaken for the chosen index and `select_type=PRIMARY` was mistaken for
+	// the PRIMARY key.
+	t.Run("mysql reports the chosen key, not a candidate", func(t *testing.T) {
+		cells := []map[string]string{{
+			"id": "1", "select_type": "SIMPLE", "table": "pp", "type": "ref",
+			"possible_keys": "idx_price_predictions_due,idx_price_predictions_accuracy",
+			"key":           "idx_price_predictions_due",
+			"key_len":       "66", "ref": "const", "rows": "251558", "Extra": "Using where",
+		}}
+		uses, covering, fullScan := classifyPlan(nil, cells, dialectMySQL, indexes, "pp")
+		if uses != "idx_price_predictions_due" {
+			t.Fatalf("uses = %q, want the key MySQL committed to, not a candidate", uses)
 		}
-		uses, covering, fullScan := classifyPlan(plan, dialectMySQL, indexes, "pp")
+		if covering || fullScan {
+			t.Fatalf("covering=%v fullScan=%v, want neither", covering, fullScan)
+		}
+	})
+
+	t.Run("mysql select_type=PRIMARY is not an index", func(t *testing.T) {
+		cells := []map[string]string{
+			{"id": "1", "select_type": "PRIMARY", "table": "<derived2>", "type": "ALL", "rows": "25150"},
+			{"id": "1", "select_type": "PRIMARY", "table": "pp", "type": "ref",
+				"possible_keys": "idx_price_predictions_station_fuel_target,run_id",
+				"key":           "idx_price_predictions_station_fuel_target",
+				"key_len":       "258", "ref": "latest.station_id", "rows": "184",
+				"Extra": "Using index condition; Using where"},
+			{"id": "2", "select_type": "DERIVED", "table": "pp", "type": "ref",
+				"key": "idx_price_predictions_due", "rows": "251558",
+				"Extra": "Using where; Using temporary"},
+		}
+		uses, covering, fullScan := classifyPlan(nil, cells, dialectMySQL, indexes, "pp")
+		if uses != "idx_price_predictions_station_fuel_target" {
+			t.Fatalf("uses = %q, want the station index; \"PRIMARY\" here is a select_type", uses)
+		}
+		if covering {
+			t.Fatal("\"Using index condition\" still reads rows and is not a covering read")
+		}
+		if fullScan {
+			t.Fatal("type=ALL on <derived2> is the materialised subquery, not price_predictions")
+		}
+	})
+
+	t.Run("mysql covering read", func(t *testing.T) {
+		cells := []map[string]string{{
+			"id": "1", "select_type": "SIMPLE", "table": "pp", "type": "ref",
+			"key": "idx_price_predictions_accuracy", "rows": "251558",
+			"Extra": "Using where; Using index",
+		}}
+		uses, covering, fullScan := classifyPlan(nil, cells, dialectMySQL, indexes, "pp")
 		if uses != "idx_price_predictions_accuracy" || !covering || fullScan {
 			t.Fatalf("uses=%q covering=%v fullScan=%v, want accuracy index, covering, no scan", uses, covering, fullScan)
 		}
 	})
 
 	t.Run("mysql full scan", func(t *testing.T) {
-		plan := []string{"id=1 select_type=SIMPLE table=pp type=ALL rows=9700000 Extra=Using where"}
-		_, _, fullScan := classifyPlan(plan, dialectMySQL, indexes, "pp")
+		cells := []map[string]string{{
+			"id": "1", "select_type": "SIMPLE", "table": "d", "type": "ALL",
+			"possible_keys": "idx_price_check_decisions_due", "rows": "5677",
+			"Extra": "Using where; Using temporary",
+		}}
+		uses, _, fullScan := classifyPlan(nil, cells, dialectMySQL, indexes, "d")
 		if !fullScan {
 			t.Fatal("type=ALL on the driving table is a full scan")
 		}
-	})
-
-	t.Run("mysql index condition is not covering", func(t *testing.T) {
-		plan := []string{
-			"id=1 select_type=SIMPLE table=pp type=range key=idx_price_predictions_due Extra=Using index condition",
-		}
-		_, covering, _ := classifyPlan(plan, dialectMySQL, indexes, "pp")
-		if covering {
-			t.Fatal("\"Using index condition\" still reads rows and is not a covering read")
+		if uses != "" {
+			t.Fatalf("uses = %q, want none: a full scan uses no index", uses)
 		}
 	})
 
 	t.Run("mysql scan of another table is ignored", func(t *testing.T) {
-		plan := []string{
-			"id=1 select_type=SIMPLE table=s type=ALL rows=90",
-			"id=1 select_type=SIMPLE table=pp type=ref key=idx_price_predictions_station_fuel_target rows=40",
+		cells := []map[string]string{
+			{"id": "1", "select_type": "SIMPLE", "table": "s", "type": "ALL", "rows": "360",
+				"Extra": "Using temporary; Using filesort"},
+			{"id": "1", "select_type": "SIMPLE", "table": "pp", "type": "ref",
+				"key": "idx_price_predictions_station_fuel_target", "rows": "184",
+				"Extra": "Using index condition; Using where"},
 		}
-		_, _, fullScan := classifyPlan(plan, dialectMySQL, indexes, "pp")
+		_, _, fullScan := classifyPlan(nil, cells, dialectMySQL, indexes, "pp")
 		if fullScan {
 			t.Fatal("a scan of the stations table must not be blamed on price_predictions")
+		}
+	})
+
+	t.Run("mysql explain analyze falls back to text", func(t *testing.T) {
+		plan := []string{
+			"-> Aggregate: count(0)",
+			"    -> Index range scan on pp using idx_price_predictions_accuracy, with index condition",
+		}
+		uses, _, _ := classifyPlan(plan, nil, dialectMySQL, indexes, "pp")
+		if uses != "idx_price_predictions_accuracy" {
+			t.Fatalf("uses = %q, want the accuracy index from the text form", uses)
 		}
 	})
 }
@@ -432,6 +491,10 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 			"MAX(pp.run_id)",
 			"GROUP BY pp.station_id, pp.target_start",
 			"latest.run_id = pp.run_id",
+			// The outer fuel predicate is what makes the covering index usable
+			// for the join; losing it silently costs ~18 s on the live
+			// database, so both sides must keep it.
+			"WHERE pp.fuel = ",
 		},
 		"by_confidence": {"GROUP BY pp.confidence"},
 		"by_lead": {
@@ -440,7 +503,15 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 		},
 		"by_hour": {"SUBSTR(pp.target_start, 12, 2)"},
 		"series":  {"AVG(pp.predicted_price)", "GROUP BY pp.target_start"},
-		"rows":    {"COALESCE(s.name_override, s.name)", "ORDER BY pp.target_start DESC, pp.station_id ASC"},
+		"rows": {
+			"COALESCE(s.name_override, s.name)",
+			"ORDER BY pp.target_start DESC, pp.station_id ASC",
+			// Filter, order and cap must stay inside the derived table, ahead
+			// of the metadata joins.
+			") page ",
+			"JOIN prediction_runs pr ON pr.id = page.run_id",
+			"JOIN stations s ON s.id = page.station_id",
+		},
 		"decisions": {
 			"SUM(CASE WHEN d.regret <= 0.01 THEN 1 ELSE 0 END)",
 			"GROUP BY d.recommendation",
@@ -508,5 +579,282 @@ func TestFormatCountAndBytes(t *testing.T) {
 		if got := formatBytes(in); got != want {
 			t.Errorf("formatBytes(%d) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// legacyAccuracySQL is the pre-optimization form of the two queries this
+// branch rewrote, kept verbatim so the rewrites can be proven equivalent
+// rather than argued to be. The summary_latest outer query had no WHERE, and
+// the rows query joined the metadata tables before filtering, ordering and
+// capping.
+func legacyAccuracySQL(f doctorFilters) map[string]accuracyQuerySpec {
+	joinRuns := ""
+	where := "pp.actual_price IS NOT NULL AND pp.fuel = ? AND pp.target_start >= ? AND pp.target_start <= ?"
+	args := []any{f.Fuel, f.From, f.To}
+	if f.City != "" {
+		joinRuns = "JOIN prediction_runs pr ON pr.id = pp.run_id "
+		where += " AND pr.city_name = ?"
+		args = append(args, f.City)
+	}
+	if f.Confidence == "medium_high" {
+		where += " AND pp.confidence IN ('medium', 'high')"
+	}
+	return map[string]accuracyQuerySpec{
+		"summary_latest": {
+			sql: "SELECT COUNT(*) AS n, AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, " +
+				"SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 " +
+				"FROM price_predictions pp JOIN (" +
+				"SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id " +
+				"FROM price_predictions pp " + joinRuns + "WHERE " + where +
+				" GROUP BY pp.station_id, pp.target_start" +
+				") latest ON latest.station_id = pp.station_id" +
+				" AND latest.target_start = pp.target_start" +
+				" AND latest.run_id = pp.run_id",
+			args: args,
+		},
+		"rows": {
+			sql: "SELECT pp.station_id, pp.fuel, pr.run_at, pp.target_start, pp.target_end, " +
+				"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion, " +
+				"COALESCE(s.name_override, s.name) AS name, s.brand, s.street, s.house_number, s.post_code, s.place " +
+				"FROM price_predictions pp " +
+				"JOIN prediction_runs pr ON pr.id = pp.run_id " +
+				"JOIN stations s ON s.id = pp.station_id " +
+				"WHERE " + where +
+				" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001",
+			args: args,
+		},
+	}
+}
+
+// queryRowStrings returns every row as one comparable string, sorted. Sorting
+// makes the comparison a multiset test: rows tied on (target_start,
+// station_id) — and every window has several, one per hourly run — have no
+// defined order in either form of the query, so their sequence is not part of
+// what the rewrite must preserve. Row content and multiplicity are.
+func queryRowStrings(t *testing.T, db *sql.DB, spec accuracyQuerySpec) []string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), spec.sql, spec.args...)
+	if err != nil {
+		t.Fatalf("query: %v\nsql=%s", err, spec.sql)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("columns: %v", err)
+	}
+	var out []string
+	for rows.Next() {
+		cells := make([]sql.NullString, len(columns))
+		targets := make([]any, len(columns))
+		for i := range cells {
+			targets[i] = &cells[i]
+		}
+		if err := rows.Scan(targets...); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		var parts []string
+		for i, c := range cells {
+			parts = append(parts, columns[i]+"="+c.String)
+		}
+		out = append(out, strings.Join(parts, "|"))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// seedEquivalenceDB builds the cases that could break the rewrites: two fuels
+// (so the outer fuel predicate has something to wrongly exclude), two cities
+// (so the city filter is exercised), several runs per target window (so
+// "latest run" is a real choice), all three confidences, and unevaluated rows
+// that the filter must keep excluding.
+func seedEquivalenceDB(t *testing.T) *sql.DB {
+	t.Helper()
+	ctx := context.Background()
+	db, err := openDB(filepath.Join(t.TempDir(), "equiv.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	stations := []string{"st-a", "st-b", "st-c"}
+	for i, id := range stations {
+		if _, err := db.ExecContext(ctx, `INSERT INTO stations
+			(id, name, name_override, brand, street, house_number, post_code, place, lat, lng, first_seen_at, last_seen_at)
+			VALUES (?, ?, ?, 'Brand', 'Street', '1', 12345, 'Town', ?, 13.0, '', '')`,
+			id, "Name "+id, map[bool]any{true: "Override " + id, false: nil}[i == 1],
+			52.0+float64(i)/100); err != nil {
+			t.Fatalf("insert station: %v", err)
+		}
+	}
+	base := time.Date(2026, 7, 10, 6, 0, 0, 0, time.UTC)
+	confs := []string{"low", "medium", "high"}
+	n := 0
+	for _, city := range []string{"Berlin", "Hamburg"} {
+		for _, fuel := range []string{"diesel", "e5"} {
+			for run := 0; run < 3; run++ {
+				runAt := base.Add(time.Duration(run) * time.Hour)
+				res, err := db.ExecContext(ctx, `INSERT INTO prediction_runs
+					(run_at, city_name, fuel, range_km, history_days, predict_days)
+					VALUES (?, ?, ?, 5, 30, 3)`, runAt.Format(time.RFC3339), city, fuel)
+				if err != nil {
+					t.Fatalf("insert run: %v", err)
+				}
+				runID, _ := res.LastInsertId()
+				for si, station := range stations {
+					for lead := 1; lead <= 4; lead++ {
+						// Overlapping grids: successive runs re-predict the
+						// same absolute target hours, which is what makes the
+						// latest-run dedup meaningful.
+						target := base.Add(time.Duration(lead) * time.Hour)
+						predicted := 1.70 + float64(lead)/100 + float64(run)/1000
+						n++
+						// Leave every seventh row unevaluated.
+						if n%7 == 0 {
+							if _, err := db.ExecContext(ctx, `INSERT INTO price_predictions
+								(run_id, station_id, fuel, target_start, target_end, predicted_price, confidence,
+								 sample_count, is_suggestion, lead_minutes, applied_correction, actual_price, error, evaluated_at)
+								VALUES (?, ?, ?, ?, ?, ?, ?, 20, 0, ?, 0.0, NULL, NULL, NULL)`,
+								runID, station, fuel, target.Format(time.RFC3339),
+								target.Add(time.Hour).Format(time.RFC3339), predicted,
+								confs[(si+lead)%len(confs)], lead*60); err != nil {
+								t.Fatalf("insert unevaluated: %v", err)
+							}
+							continue
+						}
+						actual := predicted + float64((n%5)-2)/100
+						if _, err := db.ExecContext(ctx, `INSERT INTO price_predictions
+							(run_id, station_id, fuel, target_start, target_end, predicted_price, confidence,
+							 sample_count, is_suggestion, lead_minutes, applied_correction, actual_price, error, evaluated_at)
+							VALUES (?, ?, ?, ?, ?, ?, ?, 20, ?, ?, 0.0, ?, ?, ?)`,
+							runID, station, fuel, target.Format(time.RFC3339),
+							target.Add(time.Hour).Format(time.RFC3339), predicted,
+							confs[(si+lead)%len(confs)], n%2, lead*60, actual, actual-predicted,
+							target.Add(2*time.Hour).Format(time.RFC3339)); err != nil {
+							t.Fatalf("insert prediction: %v", err)
+						}
+					}
+				}
+			}
+		}
+	}
+	return db
+}
+
+// TestAccuracyQueryRewritesPreserveResults is the safety net for the two
+// queries this branch rewrote for speed. Both rewrites are supposed to be pure
+// optimizations — the outer fuel predicate is implied by the join keys, and
+// filtering before the metadata joins cannot change which rows survive — so
+// every filter combination must return exactly what the old SQL returned.
+func TestAccuracyQueryRewritesPreserveResults(t *testing.T) {
+	db := seedEquivalenceDB(t)
+	defer db.Close()
+
+	filterCases := []doctorFilters{
+		{Fuel: "diesel", Confidence: "all", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		{Fuel: "e5", Confidence: "all", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		{Fuel: "diesel", Confidence: "medium_high", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		{Fuel: "diesel", Confidence: "all", City: "Berlin", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		{Fuel: "diesel", Confidence: "medium_high", City: "Hamburg", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		// A window that selects a subset, so the range bound is exercised too.
+		{Fuel: "diesel", Confidence: "all", From: "2026-07-10T00:00:00Z", To: "2026-07-10T08:59:59Z"},
+		// A window that selects nothing at all.
+		{Fuel: "diesel", Confidence: "all", From: "2026-01-01T00:00:00Z", To: "2026-01-02T23:59:59Z"},
+	}
+
+	for _, filters := range filterCases {
+		label := filters.Fuel + "/" + filters.Confidence + "/" + filters.City + "/" + filters.From
+		t.Run(label, func(t *testing.T) {
+			legacy := legacyAccuracySQL(filters)
+			current := map[string]accuracyQuerySpec{}
+			for _, spec := range accuracyQuerySpecs(filters, true) {
+				current[spec.name] = spec
+			}
+
+			for _, name := range []string{"summary_latest", "rows"} {
+				before := queryRowStrings(t, db, legacy[name])
+				after := queryRowStrings(t, db, current[name])
+				if len(before) != len(after) {
+					t.Fatalf("%s returns %d rows, was %d", name, len(after), len(before))
+				}
+				for i := range before {
+					if before[i] != after[i] {
+						t.Fatalf("%s row %d changed:\n old: %s\n new: %s", name, i, before[i], after[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestAccuracyRowsRewriteRespectsTheCap checks the part of the rows rewrite
+// that moved: the LIMIT now applies inside the derived table, so it must still
+// cap the result and still keep the newest targets rather than an arbitrary
+// slice.
+func TestAccuracyRowsRewriteRespectsTheCap(t *testing.T) {
+	ctx := context.Background()
+	db, err := openDB(filepath.Join(t.TempDir(), "cap.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO stations
+		(id, name, lat, lng, first_seen_at, last_seen_at) VALUES ('st', 'Station', 52.0, 13.0, '', '')`); err != nil {
+		t.Fatalf("insert station: %v", err)
+	}
+	res, err := db.ExecContext(ctx, `INSERT INTO prediction_runs
+		(run_at, city_name, fuel, range_km, history_days, predict_days)
+		VALUES ('2026-07-01T00:00:00Z', 'Berlin', 'diesel', 5, 30, 3)`)
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	runID, _ := res.LastInsertId()
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	const total = 1200
+	for i := 0; i < total; i++ {
+		target := base.Add(time.Duration(i) * time.Hour)
+		if _, err := db.ExecContext(ctx, `INSERT INTO price_predictions
+			(run_id, station_id, fuel, target_start, target_end, predicted_price, confidence,
+			 sample_count, is_suggestion, lead_minutes, applied_correction, actual_price, error, evaluated_at)
+			VALUES (?, 'st', 'diesel', ?, ?, 1.7, 'medium', 20, 0, 60, 0.0, 1.71, 0.01, ?)`,
+			runID, target.Format(time.RFC3339), target.Add(time.Hour).Format(time.RFC3339),
+			target.Format(time.RFC3339)); err != nil {
+			t.Fatalf("insert prediction: %v", err)
+		}
+	}
+
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-01-01T00:00:00Z", To: "2027-01-01T23:59:59Z"}
+	var rowsSpec accuracyQuerySpec
+	for _, spec := range accuracyQuerySpecs(filters, false) {
+		if spec.name == "rows" {
+			rowsSpec = spec
+		}
+	}
+	got := queryRowStrings(t, db, rowsSpec)
+	if len(got) != 1001 {
+		t.Fatalf("rows returned %d, want the 1001 cap", len(got))
+	}
+	// The cap must keep the newest targets: the oldest included target is
+	// 1001 hours back from the newest, not from the start of the data.
+	newest := base.Add(time.Duration(total-1) * time.Hour)
+	oldestKept := newest.Add(-1000 * time.Hour).Format(time.RFC3339)
+	var found bool
+	for _, row := range got {
+		if strings.Contains(row, "target_start="+oldestKept) {
+			found = true
+		}
+		if strings.Contains(row, "target_start="+base.Format(time.RFC3339)) {
+			t.Fatal("cap kept the oldest target; it must keep the newest")
+		}
+	}
+	if !found {
+		t.Fatalf("expected the 1001st-newest target %s to be included", oldestKept)
 	}
 }
