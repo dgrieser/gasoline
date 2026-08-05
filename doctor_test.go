@@ -858,3 +858,189 @@ func TestAccuracyRowsRewriteRespectsTheCap(t *testing.T) {
 		t.Fatalf("expected the 1001st-newest target %s to be included", oldestKept)
 	}
 }
+
+func TestIndexHintSyntax(t *testing.T) {
+	if got := indexHintSyntax(dialectMySQL, "idx_x"); got != "FORCE INDEX (idx_x)" {
+		t.Errorf("mysql hint = %q", got)
+	}
+	if got := indexHintSyntax(dialectSQLite, "idx_x"); got != "INDEXED BY idx_x" {
+		t.Errorf("sqlite hint = %q", got)
+	}
+	if got := indexHintSyntax(dialectMySQL, ""); got != "" {
+		t.Errorf("empty index must produce no hint, got %q", got)
+	}
+}
+
+// TestHintedSpecsCoverEveryPredictionsReference matters because a hint applied
+// to only some references would measure a half-hinted plan and report a
+// misleading speedup. summary_latest reads price_predictions twice.
+func TestHintedSpecsCoverEveryPredictionsReference(t *testing.T) {
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	hint := indexHintSyntax(dialectSQLite, "idx_price_predictions_accuracy")
+
+	plain := map[string]accuracyQuerySpec{}
+	for _, spec := range accuracyQuerySpecs(filters, true) {
+		plain[spec.name] = spec
+	}
+	for _, spec := range accuracyQuerySpecsHinted(filters, true, hint) {
+		if spec.table != "price_predictions" {
+			if strings.Contains(spec.sql, hint) {
+				t.Errorf("%s reads %s and must not be hinted", spec.name, spec.table)
+			}
+			continue
+		}
+		want := strings.Count(plain[spec.name].sql, "price_predictions pp")
+		if got := strings.Count(spec.sql, hint); got != want {
+			t.Errorf("%s hints %d of %d price_predictions references:\n%s", spec.name, got, want, spec.sql)
+		}
+		if plain[spec.name].sql == spec.sql {
+			t.Errorf("%s was not hinted at all", spec.name)
+		}
+	}
+	// The page's own SQL must never carry a hint.
+	for _, spec := range accuracyQuerySpecs(filters, true) {
+		if strings.Contains(spec.sql, "INDEXED BY") || strings.Contains(spec.sql, "FORCE INDEX") {
+			t.Errorf("unhinted spec %s contains a hint:\n%s", spec.name, spec.sql)
+		}
+	}
+}
+
+// TestHintedQueriesReturnIdenticalResults is the safety property behind
+// --try-index: an index hint changes the plan, never the answer. If it did
+// change the answer, the timing comparison would be meaningless.
+func TestHintedQueriesReturnIdenticalResults(t *testing.T) {
+	db := seedEquivalenceDB(t)
+	defer db.Close()
+	// The hint can only be honored where the index exists.
+	if _, err := db.ExecContext(context.Background(), `ANALYZE`); err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	hint := indexHintSyntax(dialectSQLite, "idx_price_predictions_accuracy")
+	plain := map[string]accuracyQuerySpec{}
+	for _, spec := range accuracyQuerySpecs(filters, true) {
+		plain[spec.name] = spec
+	}
+	for _, spec := range accuracyQuerySpecsHinted(filters, true, hint) {
+		if spec.table != "price_predictions" {
+			continue
+		}
+		t.Run(spec.name, func(t *testing.T) {
+			before := queryRowStrings(t, db, plain[spec.name])
+			after := queryRowStrings(t, db, spec)
+			if len(before) != len(after) {
+				t.Fatalf("hinted %s returns %d rows, unhinted %d", spec.name, len(after), len(before))
+			}
+			for i := range before {
+				if before[i] != after[i] {
+					t.Fatalf("hinted %s row %d differs:\n plain: %s\n hint:  %s",
+						spec.name, i, before[i], after[i])
+				}
+			}
+		})
+	}
+}
+
+func TestRunDoctorTryIndexReportsBothTimings(t *testing.T) {
+	dbPath, db := seedDoctorDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--from", "2026-07-01", "--to", "2026-07-31",
+			"--try-index", "idx_price_predictions_accuracy", "--output", "json"})
+	})
+	var result doctorResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+
+	var hintedCount int
+	for _, q := range result.Queries {
+		if q.Table != "price_predictions" {
+			if q.Hinted != nil {
+				t.Errorf("query %s reads %s and must not be hinted", q.Name, q.Table)
+			}
+			continue
+		}
+		if q.Hinted == nil {
+			t.Fatalf("query %s has no hinted comparison", q.Name)
+		}
+		hintedCount++
+		if q.Hinted.Error != "" {
+			t.Fatalf("hinted %s failed: %s", q.Name, q.Hinted.Error)
+		}
+		if q.Hinted.Index != "idx_price_predictions_accuracy" {
+			t.Errorf("hinted %s records index %q", q.Name, q.Hinted.Index)
+		}
+		// The property that makes the comparison trustworthy.
+		if q.Hinted.Rows != q.Rows {
+			t.Errorf("hinted %s returned %d rows, unhinted %d", q.Name, q.Hinted.Rows, q.Rows)
+		}
+	}
+	if hintedCount == 0 {
+		t.Fatal("no query was compared")
+	}
+	var verdict bool
+	for _, f := range result.Findings {
+		if strings.Contains(f.Message, "idx_price_predictions_accuracy") &&
+			(strings.Contains(f.Message, "would cut") || strings.Contains(f.Message, "little difference") ||
+				strings.Contains(f.Message, "is slower")) {
+			verdict = true
+		}
+	}
+	if !verdict {
+		t.Fatalf("--try-index produced no verdict; findings=%v", result.Findings)
+	}
+
+	// Without the flag there must be no comparison at all.
+	plainOutput := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--from", "2026-07-01", "--to", "2026-07-31", "--output", "json"})
+	})
+	var plainResult doctorResult
+	if err := json.Unmarshal([]byte(plainOutput), &plainResult); err != nil {
+		t.Fatalf("unmarshal plain: %v", err)
+	}
+	for _, q := range plainResult.Queries {
+		if q.Hinted != nil {
+			t.Fatalf("query %s was hinted without --try-index", q.Name)
+		}
+	}
+}
+
+// TestRunDoctorTryIndexSurvivesUnusableIndex keeps a bad --try-index value from
+// taking the whole report down: the per-query error is the answer.
+func TestRunDoctorTryIndexSurvivesUnusableIndex(t *testing.T) {
+	dbPath, db := seedDoctorDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	output := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--from", "2026-07-01", "--to", "2026-07-31",
+			"--try-index", "idx_does_not_exist", "--output", "json"})
+	})
+	var result doctorResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	var reported bool
+	for _, q := range result.Queries {
+		if q.Table != "price_predictions" {
+			continue
+		}
+		// The unhinted measurement must still have succeeded.
+		if q.Error != "" {
+			t.Fatalf("query %s broke because of a bad --try-index: %s", q.Name, q.Error)
+		}
+		if q.Hinted != nil && q.Hinted.Error != "" {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatal("a nonexistent --try-index must be reported as a per-query error")
+	}
+}
