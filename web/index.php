@@ -2922,6 +2922,20 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         //     leads and is dominated by long-lead rows; the freshest
         //     prediction per window is what a user acting on current output
         //     experiences. Both views are shown side by side.
+        //
+        //     The outer query repeats `fuel` even though the join keys already
+        //     pin it: a prediction row and its run always carry the same fuel
+        //     (see persistPredictions), so run_id determines it and the
+        //     predicate cannot change the result. It exists to make
+        //     idx_price_predictions_accuracy usable — its leading column is
+        //     fuel, so without a fuel predicate the outer lookup cannot use the
+        //     index at all and MySQL falls back to matching station_id alone,
+        //     then filtering ~180 rows per joined window by hand. Measured on
+        //     the live database that was 18.9 s of a 26 s page; with the
+        //     predicate all four of (fuel, target_start, station_id, run_id)
+        //     are equalities and the lookup is a single index-only probe.
+        //     Bind it under its own name so the query never depends on a
+        //     driver's willingness to reuse a named placeholder.
         $latestJoin = 'JOIN ('
             . 'SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id '
             . 'FROM price_predictions pp ' . $joinRuns
@@ -2935,7 +2949,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
             . 'AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, '
             . 'SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 '
             . 'FROM price_predictions pp ' . $latestJoin
+            . ' WHERE pp.fuel = :outer_fuel'
         );
+        $latestStmt->bindValue(':outer_fuel', $paFuel);
         $bind($latestStmt);
         $latestStmt->execute();
         $latestAgg = $latestStmt->fetch() ?: [];
@@ -3086,15 +3102,31 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
 
         // 4) Raw rows for the table — newest target first, capped. Station metadata
         //    is sent once keyed by id (mirrors the ?action=data slim-row shape).
+        //
+        //    The filter, ordering and cap are applied in a derived table before
+        //    the metadata joins. Joined directly, the optimizer is free to drive
+        //    the query from stations and probe price_predictions per station:
+        //    measured on the live database it scanned all 360 stations, examined
+        //    ~180 prediction rows each, then sorted the lot — 2.4 s to return
+        //    1001 rows. Selecting the capped page first bounds both joins to
+        //    those rows. Both joins are on primary keys of mandatory foreign
+        //    keys, so neither can drop or duplicate a row, and the outer ORDER
+        //    BY repeats the inner one because a derived table's order is not
+        //    guaranteed to survive a join.
         $rowsStmt = $pdo->prepare(
-            'SELECT pp.station_id, pp.fuel, pr.run_at, pp.target_start, pp.target_end, '
-            . 'pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion, '
+            'SELECT page.station_id, page.fuel, pr.run_at, page.target_start, page.target_end, '
+            . 'page.predicted_price, page.actual_price, page.error, page.confidence, page.lead_minutes, page.is_suggestion, '
             . 'COALESCE(s.name_override, s.name) AS name, s.brand, s.street, s.house_number, s.post_code, s.place '
-            . 'FROM price_predictions pp '
-            . 'JOIN prediction_runs pr ON pr.id = pp.run_id '
-            . 'JOIN stations s ON s.id = pp.station_id '
+            . 'FROM ('
+            . 'SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, '
+            . 'pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion '
+            . 'FROM price_predictions pp ' . $joinRuns
             . 'WHERE ' . $where
             . ' ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT ' . ($rawTableLimit + 1)
+            . ') page '
+            . 'JOIN prediction_runs pr ON pr.id = page.run_id '
+            . 'JOIN stations s ON s.id = page.station_id '
+            . ' ORDER BY page.target_start DESC, page.station_id ASC'
         );
         $bind($rowsStmt);
         $rowsStmt->execute();

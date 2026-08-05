@@ -133,12 +133,17 @@ type doctorQuery struct {
 	Purpose string `json:"purpose"`
 	// Table is the large table the query drives from, which is what the
 	// full-scan and index verdicts are about.
-	Table       string   `json:"table"`
-	SQL         string   `json:"sql"`
-	DurationMS  float64  `json:"duration_ms"`
-	Rows        int      `json:"rows"`
-	Plan        []string `json:"plan"`
-	UsesIndex   string   `json:"uses_index"`
+	Table      string   `json:"table"`
+	SQL        string   `json:"sql"`
+	DurationMS float64  `json:"duration_ms"`
+	Rows       int      `json:"rows"`
+	Plan       []string `json:"plan"`
+	UsesIndex  string   `json:"uses_index"`
+	// Considered are the indexes the planner weighed but did not choose
+	// (MySQL's possible_keys). A better index sitting unchosen here usually
+	// means the optimizer's statistics are stale rather than that the index is
+	// wrong, which is worth telling an operator apart.
+	Considered  []string `json:"considered"`
 	CoveringHit bool     `json:"covering"`
 	FullScan    bool     `json:"full_scan"`
 	Error       string   `json:"error,omitempty"`
@@ -222,8 +227,11 @@ func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec 
 				" GROUP BY pp.station_id, pp.target_start" +
 				") latest ON latest.station_id = pp.station_id" +
 				" AND latest.target_start = pp.target_start" +
-				" AND latest.run_id = pp.run_id",
-			args:  argsFor(1),
+				" AND latest.run_id = pp.run_id" +
+				// Redundant by the join keys, but it is what makes the
+				// covering index usable for the outer lookup; see the page.
+				" WHERE pp.fuel = ?",
+			args:  append(argsFor(1), f.Fuel),
 			table: "price_predictions",
 			alias: "pp",
 		},
@@ -271,14 +279,18 @@ func accuracyQuerySpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec 
 		{
 			name:    "rows",
 			purpose: "raw evaluated rows for the table (capped)",
-			sql: "SELECT pp.station_id, pp.fuel, pr.run_at, pp.target_start, pp.target_end, " +
-				"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion, " +
+			sql: "SELECT page.station_id, page.fuel, pr.run_at, page.target_start, page.target_end, " +
+				"page.predicted_price, page.actual_price, page.error, page.confidence, page.lead_minutes, page.is_suggestion, " +
 				"COALESCE(s.name_override, s.name) AS name, s.brand, s.street, s.house_number, s.post_code, s.place " +
-				"FROM price_predictions pp " +
-				"JOIN prediction_runs pr ON pr.id = pp.run_id " +
-				"JOIN stations s ON s.id = pp.station_id " +
-				"WHERE " + where +
-				" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001",
+				"FROM (" +
+				"SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, " +
+				"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion " +
+				"FROM price_predictions pp " + joinRuns + "WHERE " + where +
+				" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001" +
+				") page " +
+				"JOIN prediction_runs pr ON pr.id = page.run_id " +
+				"JOIN stations s ON s.id = page.station_id " +
+				" ORDER BY page.target_start DESC, page.station_id ASC",
 			args:  argsFor(1),
 			table: "price_predictions",
 			alias: "pp",
@@ -590,11 +602,15 @@ func indexSizes(ctx context.Context, q queryer, d dialect, table string) map[str
 	return out
 }
 
-// explainPlan runs EXPLAIN and renders it without assuming a column layout:
-// SQLite returns four fixed columns, MySQL a dozen that vary by version, and
-// EXPLAIN ANALYZE a single text blob. Reading the result set's own column
-// names keeps all three readable.
-func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args []any, analyze bool) ([]string, error) {
+// explainPlan runs EXPLAIN and returns a rendered form for display plus, where
+// the engine answers in a table, the parsed cells. Classification reads the
+// cells, so a verdict comes from the actual key/type/Extra fields instead of
+// substring-matching the rendered row — that row also carries possible_keys
+// and select_type, and matching those reports the wrong index.
+//
+// No column layout is assumed: SQLite returns four fixed columns, MySQL a
+// dozen that vary by version, and EXPLAIN ANALYZE a single text blob.
+func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args []any, analyze bool) ([]string, []map[string]string, error) {
 	prefix := "EXPLAIN QUERY PLAN "
 	if d == dialectMySQL {
 		prefix = "EXPLAIN "
@@ -604,15 +620,16 @@ func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args 
 	}
 	rows, err := db.QueryContext(ctx, prefix+query, args...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 
 	columns, err := rows.Columns()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var out []string
+	var parsed []map[string]string
 	for rows.Next() {
 		cells := make([]sql.NullString, len(columns))
 		targets := make([]any, len(columns))
@@ -620,7 +637,7 @@ func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args 
 			targets[i] = &cells[i]
 		}
 		if err := rows.Scan(targets...); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// SQLite's plan is one meaningful column; printing it bare reads far
 		// better than labelling it.
@@ -628,21 +645,37 @@ func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args 
 			out = append(out, cells[3].String)
 			continue
 		}
-		// EXPLAIN ANALYZE returns a multi-line blob; keep its own line breaks.
+		// EXPLAIN ANALYZE returns a multi-line blob; keep its own line breaks
+		// and leave the cells empty so classification falls back to text.
 		if len(columns) == 1 {
 			out = append(out, strings.Split(strings.TrimRight(cells[0].String, "\n"), "\n")...)
 			continue
 		}
+		row := make(map[string]string, len(columns))
 		var parts []string
 		for i, c := range cells {
 			if !c.Valid || c.String == "" {
 				continue
 			}
+			row[columns[i]] = c.String
 			parts = append(parts, columns[i]+"="+c.String)
 		}
+		parsed = append(parsed, row)
 		out = append(out, strings.Join(parts, " "))
 	}
-	return out, rows.Err()
+	return out, parsed, rows.Err()
+}
+
+// mysqlExtraHas reports whether MySQL's semicolon-separated Extra column holds
+// a note exactly. Substring matching cannot tell "Using index" (a covering
+// read) from "Using index condition", which still fetches rows.
+func mysqlExtraHas(extra, note string) bool {
+	for _, part := range strings.Split(extra, ";") {
+		if strings.TrimSpace(part) == note {
+			return true
+		}
+	}
+	return false
 }
 
 // classifyPlan pulls the two facts that decide whether the accuracy page is
@@ -653,7 +686,28 @@ func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args 
 // from, because these plans also touch things whose scans are harmless — a
 // materialised subquery ("SCAN latest"), or the 90-row stations table
 // ("SCAN s"). Reading the plan as one blob reports those as table scans.
-func classifyPlan(plan []string, d dialect, indexNames []string, alias string) (uses string, covering bool, fullScan bool) {
+func classifyPlan(plan []string, cells []map[string]string, d dialect, indexNames []string, alias string) (uses string, covering bool, fullScan bool) {
+	// MySQL answers in a table, so read the fields rather than the text. `key`
+	// is the index it committed to; `possible_keys` is only what it considered
+	// and must never be reported as the choice.
+	if d == dialectMySQL && len(cells) > 0 {
+		for _, row := range cells {
+			if alias != "" && row["table"] != alias {
+				continue
+			}
+			if uses == "" {
+				uses = row["key"]
+			}
+			if mysqlExtraHas(row["Extra"], "Using index") {
+				covering = true
+			}
+			if row["type"] == "ALL" {
+				fullScan = true
+			}
+		}
+		return uses, covering, fullScan
+	}
+
 	for _, line := range plan {
 		if !planLineTouches(line, d, alias) {
 			continue
@@ -664,9 +718,7 @@ func classifyPlan(plan []string, d dialect, indexNames []string, alias string) (
 			}
 		}
 		if d == dialectMySQL {
-			// MySQL reports a covering read as a bare "Using index" in Extra;
-			// "Using index condition" is a different thing and still fetches
-			// rows. type=ALL is the full scan.
+			// EXPLAIN ANALYZE fallback: no cells to read, so match the text.
 			if strings.Contains(line, "Using index") && !strings.Contains(line, "Using index condition") {
 				covering = true
 			}
@@ -691,7 +743,10 @@ func planLineTouches(line string, d dialect, alias string) bool {
 	if alias == "" {
 		return true
 	}
-	if d == dialectMySQL {
+	// A rendered classic-EXPLAIN row names its table in a field. EXPLAIN
+	// ANALYZE's tree form has no such field and writes "... on pp using ...",
+	// so fall through to word matching there.
+	if d == dialectMySQL && strings.Contains(line, "table=") {
 		return strings.Contains(line, "table="+alias+" ") || strings.HasSuffix(line, "table="+alias)
 	}
 	// SQLite writes "SEARCH pp USING ..." / "SCAN pp", so the alias appears as
@@ -745,12 +800,13 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 			q := doctorQuery{Name: spec.name, Purpose: spec.purpose, SQL: spec.sql}
 
 			q.Table = spec.table
-			plan, err := explainPlan(ctx, db, d, spec.sql, spec.args, opts.Analyze)
+			plan, cells, err := explainPlan(ctx, db, d, spec.sql, spec.args, opts.Analyze)
 			if err != nil {
 				q.Error = err.Error()
 			} else {
 				q.Plan = plan
-				q.UsesIndex, q.CoveringHit, q.FullScan = classifyPlan(plan, d, indexesByTable[spec.table], spec.alias)
+				q.UsesIndex, q.CoveringHit, q.FullScan = classifyPlan(plan, cells, d, indexesByTable[spec.table], spec.alias)
+				q.Considered = consideredIndexes(cells, spec.alias, q.UsesIndex)
 			}
 
 			started := time.Now()
@@ -806,6 +862,16 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 		}
 	}
 
+	// scanWorthWarningAbout keeps a full scan from being reported as a problem
+	// when the table is small enough that scanning it is the right plan. On a
+	// few thousand rows the optimizer routinely prefers a scan to an index, and
+	// warning about it buries the findings that matter.
+	const scanRowsThreshold = 100_000
+	rowsByTable := map[string]int64{}
+	for _, t := range r.Tables {
+		rowsByTable[t.Name] = t.Rows
+	}
+
 	var slowest doctorQuery
 	var total float64
 	for _, q := range r.Queries {
@@ -823,12 +889,28 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 		if q.DurationMS >= opts.SlowMS {
 			warn("query %s took %.0f ms (%s)", q.Name, q.DurationMS, q.Purpose)
 		}
-		if q.FullScan {
-			warn("query %s scans %s instead of using an index", q.Name, q.Table)
-		} else if q.UsesIndex == "" {
+		switch {
+		case q.FullScan && (rowsByTable[q.Table] >= scanRowsThreshold || q.DurationMS >= opts.SlowMS):
+			warn("query %s scans %s (%s rows) instead of using an index",
+				q.Name, q.Table, formatCount(rowsByTable[q.Table]))
+		case q.FullScan:
+			info("query %s scans %s, which is small enough for that to be reasonable", q.Name, q.Table)
+		case q.UsesIndex == "":
 			info("query %s uses no %s index (plan: %s)", q.Name, q.Table, strings.Join(q.Plan, " | "))
-		} else if !q.CoveringHit {
+		case !q.CoveringHit:
 			info("query %s uses %s but still reads table rows", q.Name, q.UsesIndex)
+		}
+		// An index the planner weighed and passed over, on a query that is slow
+		// and not covering, is the signature of stale statistics rather than a
+		// wrong index — and refreshing them is cheap, so it is worth naming.
+		if q.UsesIndex != "" && !q.CoveringHit {
+			for _, candidate := range q.Considered {
+				if candidate == "idx_price_predictions_accuracy" {
+					warn("query %s chose %s over %s, which covers it — the optimizer's statistics "+
+						"may be stale; refresh them with `ANALYZE TABLE %s`",
+						q.Name, q.UsesIndex, candidate, q.Table)
+				}
+			}
 		}
 	}
 	if total > 0 {
@@ -1053,4 +1135,27 @@ func formatBytes(n int64) string {
 		}
 	}
 	return fmt.Sprintf("%.1f PB", value)
+}
+
+// consideredIndexes lists the indexes MySQL weighed for the driving table and
+// did not pick. SQLite's plan does not expose the alternatives, so this is
+// empty there.
+func consideredIndexes(cells []map[string]string, alias, chosen string) []string {
+	var out []string
+	seen := map[string]bool{chosen: true}
+	for _, row := range cells {
+		if alias != "" && row["table"] != alias {
+			continue
+		}
+		for _, name := range strings.Split(row["possible_keys"], ",") {
+			name = strings.TrimSpace(name)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
