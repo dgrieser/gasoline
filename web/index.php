@@ -4759,6 +4759,13 @@ function renderDocumentHead(string $titleSuffix): void
             color: var(--muted);
         }
 
+        /* The "none predicted" line stands in for a whole key/value row, so it
+           spans the full width and keeps to a single line. */
+        .sd-key-alone {
+            padding-top: 0;
+            line-height: 1.35;
+        }
+
         .sd-windows { display: grid; gap: 0.35rem; }
 
         .sd-window {
@@ -5768,6 +5775,7 @@ const translations = {
         sdLastUpdate: 'Last update',
         sdNoPrices: 'No price snapshot for this station in the selected range.',
         sdUpcoming: 'Upcoming fill-up windows',
+        sdNoUpcoming: 'No upcoming fill-up windows',
         sdNavigate: 'Navigate with Google Maps',
         sdClose: 'Close',
         rangeAll: 'All',
@@ -6050,6 +6058,7 @@ const translations = {
         sdLastUpdate: 'Letzte Aktualisierung',
         sdNoPrices: 'Kein Preis-Snapshot für diese Tankstelle im gewählten Zeitraum.',
         sdUpcoming: 'Kommende Tankfenster',
+        sdNoUpcoming: 'Keine kommenden Tankfenster',
         sdNavigate: 'Mit Google Maps navigieren',
         sdClose: 'Schließen',
         rangeAll: 'Alle',
@@ -7610,7 +7619,9 @@ function stationDialogHtml(stationId) {
             (windows
                 ? `<div class="sd-row"><span class="sd-key">${h(t.sdUpcoming)}</span>` +
                   `<span class="sd-val"><span class="sd-windows">${windows}</span></span></div>`
-                : '') +
+                // Say so rather than dropping the section, so its absence reads
+                // as "none predicted" instead of "sometimes there, sometimes not".
+                : `<div class="sd-key sd-key-alone">${h(t.sdNoUpcoming)}</div>`) +
             `<a class="sd-nav" href="${h(googleMapsUrl(meta, name))}" target="_blank" rel="noopener noreferrer">` +
                 `${ICON_NAV}<span>${h(t.sdNavigate)}</span>` +
             `</a>` +
