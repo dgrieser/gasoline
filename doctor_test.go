@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -231,18 +232,80 @@ func TestRunDoctorFlagsMissingIndex(t *testing.T) {
 	}
 }
 
+// TestRunDoctorRefusesToCreateADatabase covers the no-argument case. Opening a
+// SQLite path creates the file, which every other command wants; here it would
+// leave a stray empty database behind and answer "every table is absent" when
+// the real answer is that there is no database at that path.
+func TestRunDoctorRefusesToCreateADatabase(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "nope.db")
+	err := run([]string{"doctor", "--db", missing})
+	if err == nil {
+		t.Fatal("expected an error for a database that does not exist")
+	}
+	if !strings.Contains(err.Error(), "no database at") {
+		t.Fatalf("error = %q, want it to name the missing database", err.Error())
+	}
+	if _, statErr := os.Stat(missing); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatal("doctor created the database file it was asked to inspect")
+	}
+	if entries, readErr := os.ReadDir(dir); readErr != nil {
+		t.Fatalf("readdir: %v", readErr)
+	} else if len(entries) != 0 {
+		t.Fatalf("doctor left %d files behind", len(entries))
+	}
+}
+
+// TestRunDoctorSkipsQueriesWithoutTheTable keeps an un-migrated database from
+// producing the same missing-table error once per query, which buries the one
+// finding that matters.
+func TestRunDoctorSkipsQueriesWithoutTheTable(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "bare.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE unrelated (x INTEGER)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--output", "json"})
+	})
+	var result doctorResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	if len(result.Queries) != 1 {
+		t.Fatalf("got %d query entries, want a single skipped one", len(result.Queries))
+	}
+	if !result.Queries[0].Skipped {
+		t.Fatalf("query %s ran without price_predictions", result.Queries[0].Name)
+	}
+	if !strings.Contains(result.Queries[0].Purpose, "price_predictions does not exist") {
+		t.Fatalf("skip reason = %q, want it to name the missing table", result.Queries[0].Purpose)
+	}
+	for _, q := range result.Queries {
+		if q.Error != "" {
+			t.Fatalf("skipped query still reported an error: %s", q.Error)
+		}
+	}
+}
+
 // TestRunDoctorLeavesDatabaseUntouched pins doctor as read-only. It must not
 // create or migrate the schema: an operator diagnosing a database should not
 // have it changed under them, and a missing table is itself a finding.
 func TestRunDoctorLeavesDatabaseUntouched(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "empty.db")
-	db, err := openDB(dbPath)
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+	// A zero-byte file is a valid, schemaless SQLite database — the case where
+	// the database is really there and really empty, as opposed to absent.
+	if err := os.WriteFile(dbPath, nil, 0o644); err != nil {
+		t.Fatalf("create empty db: %v", err)
 	}
 
 	output := captureStdout(t, func() error {
