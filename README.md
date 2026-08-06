@@ -391,7 +391,7 @@ If forcing the covering index is much faster, the optimizer is mis-costing it. R
 
 Notes on reading the output:
 
-- `doctor` never creates or migrates the schema. On a database that has not been migrated it reports the missing tables and indexes rather than quietly fixing them — run `gasoline migrate` for that.
+- `doctor` never creates or migrates anything — not the schema, and not the database. Run without arguments it uses the same SQLite path or MySQL settings as every other command (`--db`, `GASOLINE_DB_PATH`, `--db-driver mysql`, …); if that SQLite file does not exist it says so and stops, rather than leaving an empty database behind and reporting every table as absent. On a database that exists but has not been migrated it reports the missing tables and indexes and skips the query timings — run `gasoline migrate` for that.
 - A `TABLE SCAN` verdict on a small table is reported as information, not a warning: below roughly 100k rows a scan is often the cheapest plan, and flagging it buries the findings that matter.
 - Row counts are exact on SQLite and InnoDB estimates on MySQL, which can be off by a large factor; the text output prefixes the estimates with `~`.
 - Per-index sizes need `mysql.innodb_index_stats` on MySQL and the optional `dbstat` module on SQLite. Where the account or build lacks them the sizes are simply omitted.

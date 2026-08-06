@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -863,8 +864,23 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 			accuracyIndexPresent = true
 		}
 	}
+	hasPredictions := false
+	for _, t := range tables {
+		if t.Name == "price_predictions" && !t.Missing {
+			hasPredictions = true
+		}
+	}
 
-	if !opts.SkipQueries {
+	// Without the table there is nothing to time, and running the queries anyway
+	// would report the same missing-table error eight times over the one finding
+	// that matters.
+	if !opts.SkipQueries && !hasPredictions {
+		result.Queries = append(result.Queries, doctorQuery{
+			Name:    "accuracy_page",
+			Purpose: "skipped: price_predictions does not exist — run `gasoline migrate`",
+			Skipped: true,
+		})
+	} else if !opts.SkipQueries {
 		qc := accuracyQueryContext{
 			Filters:      opts.Filters,
 			Dialect:      d,
@@ -1113,6 +1129,19 @@ func runDoctor(args []string) error {
 	fromTS, toTS, err := resolveDoctorRange(*rangeName, *from, *to, time.Now())
 	if err != nil {
 		return err
+	}
+
+	// Opening a SQLite path creates the file, which every other command wants
+	// and this one must not: doctor is a diagnostic, and conjuring an empty
+	// database would both leave a stray file behind and answer "everything is
+	// absent" when the truth is that there is no database at this path.
+	if dbCfg.Driver != dialectMySQL {
+		if _, statErr := os.Stat(dbCfg.Path); errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("no database at %s — pass --db, set GASOLINE_DB_PATH, "+
+				"or select MySQL with --db-driver mysql", dbCfg.Path)
+		} else if statErr != nil {
+			return statErr
+		}
 	}
 
 	ctx := context.Background()
