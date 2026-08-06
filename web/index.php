@@ -3301,8 +3301,11 @@ function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
                 COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
                 TRIM(COALESCE(s.street, '')) AS street,
                 TRIM(COALESCE(s.house_number, '')) AS house_number,
+                s.post_code,
                 TRIM(COALESCE(s.place, '')) AS place,
-                s.last_seen_at
+                s.last_seen_at,
+                s.lat,
+                s.lng
             FROM stations s
             ORDER BY COALESCE(s.name_override, s.name) ASC, s.id ASC
             SQL
@@ -3320,6 +3323,7 @@ function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
             COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand,
             TRIM(COALESCE(s.street, '')) AS street,
             TRIM(COALESCE(s.house_number, '')) AS house_number,
+            s.post_code,
             TRIM(COALESCE(s.place, '')) AS place,
             s.last_seen_at,
             s.lat,
@@ -3620,6 +3624,11 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
                     (string) $station['house_number'],
                 ]))),
                 'place' => trim((string) ($station['place'] ?? '')),
+                'zip' => ($station['post_code'] ?? null) !== null ? (string) $station['post_code'] : '',
+                // Coordinates power the client-side Google Maps navigation link
+                // in the station detail dialog (no persisted link needed).
+                'lat' => isset($station['lat']) ? (float) $station['lat'] : null,
+                'lng' => isset($station['lng']) ? (float) $station['lng'] : null,
                 'dist' => isset($distances[$id]) ? round($distances[$id], 3) : null,
             ];
         }
@@ -4489,9 +4498,318 @@ function renderDocumentHead(string $titleSuffix): void
             color: var(--muted);
         }
 
+        /* ── Clickable station references inside the price cards ─── */
+        /* Every station mentioned in the four cards is a button opening the
+           station detail dialog; the resets keep the card layout untouched. */
+        .station-btn,
+        .station-rank-btn {
+            appearance: none;
+            background: transparent;
+            border: none;
+            color: inherit;
+            text-align: left;
+            cursor: pointer;
+            border-radius: 8px;
+            transition: background 0.15s ease, box-shadow 0.15s ease;
+        }
+
+        /* The block button carries no text of its own — every line inside it is
+           a .cheapest-station span — so it just drops the UA button font. */
+        .station-btn {
+            display: block;
+            font: inherit;
+            width: calc(100% + 0.6rem);
+            padding: 0.2rem 0.3rem;
+            margin: -0.2rem -0.3rem;
+        }
+
+        /* No font reset here: the row keeps .rank-row's mono font, and a
+           `font: inherit` would out-order that rule and enlarge the text.
+           The padding gives the hover pill some body; the matching negative
+           margin keeps the row's layout height exactly as it was. */
+        .station-rank-btn {
+            width: calc(100% + 0.6rem);
+            padding: 0.15rem 0.3rem;
+            margin: -0.15rem -0.3rem;
+        }
+
+        .station-btn:hover,
+        .station-rank-btn:hover {
+            background: var(--surface-hi);
+        }
+
+        .station-btn:focus-visible,
+        .station-rank-btn:focus-visible {
+            outline: 2px solid var(--amber);
+            outline-offset: 1px;
+            background: var(--surface-hi);
+        }
+
+        /* The name line needs flex so the trailing icon survives the ellipsis. */
+        .sd-name-line {
+            display: flex;
+            align-items: center;
+            min-width: 0;
+        }
+
+        .sd-name-text {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .sd-addr-line {
+            display: block;
+            opacity: 0.6;
+        }
+
+        .station-btn-icon {
+            flex-shrink: 0;
+            margin-left: 0.4rem;
+            color: var(--muted);
+            opacity: 0.55;
+            transition: opacity 0.15s ease, color 0.15s ease;
+        }
+
+        .station-btn:hover .station-btn-icon,
+        .station-btn:focus-visible .station-btn-icon {
+            opacity: 1;
+            color: var(--amber);
+        }
+
+        /* ── Station detail dialog ─────────────────────────────── */
+        .station-dialog {
+            width: min(470px, calc(100vw - 1.5rem));
+            /* The global `* { margin: 0 }` reset drops the UA's auto margins,
+               which is what centres a modal dialog — restore them here. */
+            margin: auto;
+            max-height: calc(100dvh - 2rem);
+            padding: 0;
+            border: 1px solid var(--border-hi);
+            border-radius: 18px;
+            background: var(--surface);
+            color: var(--ink);
+            box-shadow: 0 30px 70px rgba(0,0,0,0.55);
+            overflow: hidden auto;
+        }
+
+        .station-dialog::backdrop {
+            background: rgba(6,7,10,0.62);
+            backdrop-filter: blur(3px);
+        }
+
+        @keyframes sd-in {
+            from { opacity: 0; transform: translateY(12px) scale(0.98); }
+            to   { opacity: 1; transform: none; }
+        }
+
+        .station-dialog[open] { animation: sd-in 0.18s ease both; }
+
+        @media (prefers-reduced-motion: reduce) {
+            .station-dialog[open] { animation: none; }
+        }
+
+        .sd-head {
+            position: relative;
+            padding: 1.15rem 3.1rem 1.1rem 1.25rem;
+            border-bottom: 1px solid var(--border);
+            background:
+                radial-gradient(130% 150% at 0% 0%, var(--amber-dim) 0%, transparent 62%),
+                var(--surface-hi);
+        }
+
+        .sd-kicker {
+            font-family: var(--mono);
+            font-size: 0.62rem;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        .sd-name {
+            display: flex;
+            /* flex-start keeps the colour dot on the first line when a long
+               station name wraps. */
+            align-items: flex-start;
+            gap: 0.5rem;
+            margin-top: 0.35rem;
+            font-size: 1.1rem;
+            font-weight: 700;
+            line-height: 1.3;
+            letter-spacing: -0.01em;
+        }
+
+        .sd-name .legend-dot { margin-top: 0.45rem; }
+
+        .sd-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.4rem;
+            margin-top: 0.65rem;
+        }
+
+        .sd-tag {
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            padding: 0.22rem 0.55rem;
+            border-radius: 999px;
+            border: 1px solid var(--border-hi);
+            background: var(--surface);
+            color: var(--muted);
+            white-space: nowrap;
+        }
+
+        .sd-tag.is-open   { color: var(--e10); border-color: rgba(52,211,153,0.35);  background: rgba(52,211,153,0.10); }
+        .sd-tag.is-closed { color: var(--red); border-color: rgba(248,113,113,0.30); background: rgba(248,113,113,0.08); }
+
+        .sd-tag .sd-tag-dot {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+            margin-right: 0.4rem;
+            vertical-align: middle;
+        }
+
+        .sd-close {
+            position: absolute;
+            top: 0.85rem;
+            right: 0.85rem;
+            width: 30px;
+            height: 30px;
+            display: grid;
+            place-items: center;
+            border-radius: 9px;
+            border: 1px solid var(--border-hi);
+            background: var(--surface);
+            color: var(--muted);
+            cursor: pointer;
+            transition: color 0.15s, border-color 0.15s;
+        }
+
+        .sd-close:hover { color: var(--ink); border-color: var(--amber); }
+        .sd-close:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+        .sd-prices {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1px;
+            background: var(--border);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sd-price {
+            background: var(--surface);
+            padding: 0.8rem 1rem;
+        }
+
+        .sd-price-label {
+            font-family: var(--mono);
+            font-size: 0.62rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            margin-bottom: 0.3rem;
+        }
+
+        .sd-price-value {
+            font-family: var(--mono);
+            font-size: 1.1rem;
+            font-weight: 500;
+            line-height: 1;
+            letter-spacing: -0.02em;
+        }
+
+        .sd-price.empty .sd-price-label,
+        .sd-price.empty .sd-price-value { color: var(--muted); opacity: 0.6; }
+
+        .sd-body {
+            padding: 1.05rem 1.25rem 1.25rem;
+            display: grid;
+            gap: 0.75rem;
+        }
+
+        .sd-row {
+            display: grid;
+            grid-template-columns: 6.6rem minmax(0, 1fr);
+            gap: 0.75rem;
+            align-items: start;
+        }
+
+        .sd-key {
+            font-family: var(--mono);
+            font-size: 0.64rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--muted);
+            padding-top: 0.12rem;
+        }
+
+        .sd-val {
+            font-family: var(--mono);
+            font-size: 0.8rem;
+            color: var(--ink);
+            overflow-wrap: anywhere;
+        }
+
+        .sd-note {
+            font-family: var(--mono);
+            font-size: 0.75rem;
+            color: var(--muted);
+        }
+
+        /* The "none predicted" line stands in for a whole key/value row, so it
+           spans the full width and keeps to a single line. */
+        .sd-key-alone {
+            padding-top: 0;
+            line-height: 1.35;
+        }
+
+        .sd-windows { display: grid; gap: 0.35rem; }
+
+        .sd-window {
+            display: flex;
+            align-items: baseline;
+            gap: 0.6rem;
+            font-family: var(--mono);
+            font-size: 0.75rem;
+        }
+
+        .sd-window-fuel { color: var(--muted); flex-shrink: 0; width: 3.2rem; }
+        .sd-window-time { color: var(--ink); flex: 1; min-width: 0; }
+        .sd-window-price { font-weight: 500; flex-shrink: 0; }
+
+        .sd-nav {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-top: 0.2rem;
+            padding: 0.75rem 1rem;
+            border-radius: 11px;
+            border: 1px solid rgba(0,0,0,0.18);
+            background: linear-gradient(180deg, #ffc85f 0%, var(--amber) 100%);
+            color: #2a1c02;
+            font-size: 0.85rem;
+            font-weight: 700;
+            text-decoration: none;
+            box-shadow: 0 8px 20px var(--amber-glow);
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+        }
+
+        .sd-nav:hover { transform: translateY(-1px); box-shadow: 0 12px 26px var(--amber-glow); }
+        .sd-nav:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; }
+
+        @media (prefers-reduced-motion: reduce) {
+            .sd-nav:hover { transform: none; }
+        }
+
         @media (max-width: 560px) {
             .cheapest-grid,
             .cheapest-grid.two-col { grid-template-columns: 1fr; }
+            .sd-price { padding: 0.7rem 0.6rem; }
+            .sd-row { grid-template-columns: 1fr; gap: 0.15rem; }
         }
 
         /* ── Chart card ────────────────────────────────────────── */
@@ -5325,6 +5643,10 @@ function renderDocumentHead(string $titleSuffix): void
             align-items: start;
         }
         html[data-theme="light"] .menu-panel { box-shadow: 0 14px 36px rgba(0, 0, 0, 0.15); }
+
+        html[data-theme="light"] .station-dialog { box-shadow: 0 24px 60px rgba(0, 0, 0, 0.18); }
+        html[data-theme="light"] .station-dialog::backdrop { background: rgba(28, 28, 30, 0.32); }
+        html[data-theme="light"] .sd-nav { color: #241800; border-color: rgba(0, 0, 0, 0.12); }
         @media (max-width: 560px) {
             .settings-card { padding: 1.1rem 1rem; }
             .inline-form input[type="text"] { min-width: 0; flex: 1 1 10rem; }
@@ -5445,6 +5767,17 @@ const translations = {
         predictionsTitle: 'Recommended fill-ups',
         predictionsNoData: 'No upcoming predictions in the database for these stations.',
         predictionsAsOf: 'as of {time}',
+        sdHint: 'Show station details',
+        sdTitle: 'Station details',
+        sdCurrentPrices: 'Current prices',
+        sdAddress: 'Address',
+        sdDistance: 'Distance',
+        sdLastUpdate: 'Last update',
+        sdNoPrices: 'No price snapshot for this station in the selected range.',
+        sdUpcoming: 'Upcoming fill-up windows',
+        sdNoUpcoming: 'No upcoming fill-up windows',
+        sdNavigate: 'Navigate with Google Maps',
+        sdClose: 'Close',
         rangeAll: 'All',
         range30d: '30d',
         range14d: '14d',
@@ -5717,6 +6050,17 @@ const translations = {
         predictionsTitle: 'Tankempfehlungen',
         predictionsNoData: 'Keine kommenden Vorhersagen für diese Tankstellen in der Datenbank.',
         predictionsAsOf: 'Stand {time}',
+        sdHint: 'Details zur Tankstelle anzeigen',
+        sdTitle: 'Tankstellen-Details',
+        sdCurrentPrices: 'Aktuelle Preise',
+        sdAddress: 'Adresse',
+        sdDistance: 'Entfernung',
+        sdLastUpdate: 'Letzte Aktualisierung',
+        sdNoPrices: 'Kein Preis-Snapshot für diese Tankstelle im gewählten Zeitraum.',
+        sdUpcoming: 'Kommende Tankfenster',
+        sdNoUpcoming: 'Keine kommenden Tankfenster',
+        sdNavigate: 'Mit Google Maps navigieren',
+        sdClose: 'Schließen',
         rangeAll: 'Alle',
         range30d: '30d',
         range14d: '14d',
@@ -6108,6 +6452,8 @@ renderDocumentHead('Price History');
 ?>
 <body>
 <div id="price-tooltip" role="tooltip" aria-hidden="true"></div>
+<!-- Station detail dialog; filled in by openStationDialog() on click/tap. -->
+<dialog id="station-dialog" class="station-dialog" aria-labelledby="sd-name"></dialog>
 <main class="page">
 
 <?php renderHeader($currentUser, 'dashboard'); ?>
@@ -6912,6 +7258,46 @@ const cheapestRangeCard = document.getElementById('cheapest-range-card');
 const highestCard       = document.getElementById('highest-card');
 const predictionsCard   = document.getElementById('predictions-card');
 
+const FUEL_CSS_COLORS = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
+
+/* ── Clickable station references ──────────────────────────────── */
+// Every station named in the four price cards opens the detail dialog, so the
+// name lines and the ranked runner-up rows are rendered as buttons.
+const ICON_STATION_INFO = `<svg class="station-btn-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>`;
+
+function stationDot(stationName, fuel, extra) {
+    return `<span class="legend-dot" style="background:${stationFuelColor(stationName, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem${extra || ''}"></span>`;
+}
+
+// Big station block of a card cell: name line plus the optional address line,
+// wrapped in one button that opens the station dialog.
+function stationBlock(stationId, stationName, fuel, address) {
+    const t = translations[currentLang];
+    return `<button type="button" class="station-btn" data-station-id="${h(stationId)}"` +
+        ` title="${h(t.sdHint)}" aria-label="${h(t.sdHint + ': ' + stationName)}">` +
+        `<span class="cheapest-station sd-name-line">` +
+            stationDot(stationName, fuel) +
+            `<span class="sd-name-text">${h(stationName)}</span>` +
+            ICON_STATION_INFO +
+        `</span>` +
+        (address ? `<span class="cheapest-station sd-addr-line">${h(address)}</span>` : '') +
+    `</button>`;
+}
+
+// Compact ranked row (runners-up / extra prediction windows), also clickable.
+// `stationName` drives the colour dot, `label` is the (possibly distance-
+// suffixed) text shown to the user.
+function stationRankRow(stationId, stationName, label, fuel, priceText, trailingHtml, titleText) {
+    const t = translations[currentLang];
+    return `<button type="button" class="rank-row station-rank-btn" data-station-id="${h(stationId)}"` +
+        ` title="${h(titleText ? titleText + ' — ' + t.sdHint : t.sdHint)}"` +
+        ` aria-label="${h(t.sdHint + ': ' + label)}">` +
+        `<span class="rank-price" style="color:${FUEL_CSS_COLORS[fuel]}">${h(priceText)}</span>` +
+        `<span class="rank-station">${stationDot(stationName, fuel)}${h(label)}</span>` +
+        (trailingHtml || '') +
+    `</button>`;
+}
+
 function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
     if (!el) return;
     const fuels      = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
@@ -6952,8 +7338,7 @@ function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
                         `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(station, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(station)}</div>` +
-                        (address ? `<div class="cheapest-station" style="opacity:0.6">${h(address)}</div>` : '') +
+                        stationBlock(station_id, station, fuel, address) +
                         `<div class="cheapest-time">${h(formatDateTime(recorded_at))}</div>` +
                     `</div>`;
                 }).join('') +
@@ -6967,13 +7352,18 @@ function rangeTitle(prefix) {
     return `${prefix} — ${t[rangeKey]}`;
 }
 
-function latestRows() {
+// Newest snapshot per station id, keyed by station id.
+function latestRowById() {
     const byStation = new Map();
     for (const row of chartData) {
         const prev = byStation.get(row.station_id);
         if (!prev || row._ts > prev._ts) byStation.set(row.station_id, row);
     }
-    return [...byStation.values()];
+    return byStation;
+}
+
+function latestRows() {
+    return [...latestRowById().values()];
 }
 
 // Top 5 cheapest stations right now, per fuel: the best price rendered like
@@ -7010,17 +7400,19 @@ function renderCheapest() {
                     const addressParts = [best.street, best.place].filter(Boolean);
                     const bestDist = stationDistancesById[best.station_id] ?? null;
                     if (bestDist !== null) addressParts.push(`${bestDist.toFixed(1)} km`);
-                    const runnersUp = top.slice(1).map((row) =>
-                        `<div class="rank-row" title="${h(formatDateTime(row.recorded_at))}">` +
-                            `<span class="rank-price" style="color:${fuelColors[fuel]}">${row[fuel].toFixed(3)}</span>` +
-                            `<span class="rank-station"><span class="legend-dot" style="background:${stationFuelColor(row.station_name, fuel)};display:inline-block;margin-right:0.4rem"></span>${h(row.station_name + distSuffix(row))}</span>` +
-                        `</div>`
-                    ).join('');
+                    const runnersUp = top.slice(1).map((row) => stationRankRow(
+                        row.station_id,
+                        row.station_name,
+                        row.station_name + distSuffix(row),
+                        fuel,
+                        row[fuel].toFixed(3),
+                        '',
+                        formatDateTime(row.recorded_at)
+                    )).join('');
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
                         `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${best[fuel].toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                        `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(best.station_name, fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(best.station_name)}</div>` +
-                        (addressParts.length ? `<div class="cheapest-station" style="opacity:0.6">${h(addressParts.join(', '))}</div>` : '') +
+                        stationBlock(best.station_id, best.station_name, fuel, addressParts.join(', ')) +
                         `<div class="cheapest-time">${h(formatDateTime(best.recorded_at))}</div>` +
                         (runnersUp ? `<div class="rank-list">${runnersUp}</div>` : '') +
                     `</div>`;
@@ -7106,19 +7498,18 @@ function renderPredictions() {
                         const best = dayWindows[0];
                         const bestName = nameById(best.s);
                         const bestAddr = addressById(best.s);
-                        const runners = dayWindows.slice(1).map((p) => {
-                            const name = nameById(p.s) + distSuffix(p.s);
-                            return `<div class="rank-row">` +
-                                `<span class="rank-price" style="color:${fuelColors[fuel]}">${p.price.toFixed(3)}</span>` +
-                                `<span class="rank-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(p.s), fuel)};display:inline-block;margin-right:0.4rem"></span>${h(name)}</span>` +
-                                `<span class="pred-time">${h(windowLabel(p))}</span>` +
-                            `</div>`;
-                        }).join('');
+                        const runners = dayWindows.slice(1).map((p) => stationRankRow(
+                            p.s,
+                            nameById(p.s),
+                            nameById(p.s) + distSuffix(p.s),
+                            fuel,
+                            p.price.toFixed(3),
+                            `<span class="pred-time">${h(windowLabel(p))}</span>`
+                        )).join('');
                         return `<div class="pred-day">${h(dayLabel(best.start))}</div>` +
                             `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${best.price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
                             `<div class="cheapest-time">${h(windowLabel(best))}</div>` +
-                            `<div class="cheapest-station"><span class="legend-dot" style="background:${stationFuelColor(nameById(best.s), fuel)};display:inline-block;flex-shrink:0;margin-right:0.4rem"></span>${h(bestName)}</div>` +
-                            (bestAddr ? `<div class="cheapest-station" style="opacity:0.6">${h(bestAddr)}</div>` : '') +
+                            stationBlock(best.s, bestName, fuel, bestAddr) +
                             (runners ? `<div class="rank-list">${runners}</div>` : '');
                     }).join('');
 
@@ -7130,6 +7521,143 @@ function renderPredictions() {
                 }).join('') +
               `</div>`
         );
+}
+
+/* ── Station detail dialog ─────────────────────────────────────── */
+// Clicking/tapping any station in the four price cards opens this dialog: the
+// full record for that station (current prices, address, open state, upcoming
+// windows) plus a Google Maps navigation link built here in the UI — the link
+// is derived from the station's coordinates (or address) and never persisted.
+const stationDialog = document.getElementById('station-dialog');
+let openStationId = null;
+
+const ICON_CLOSE = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+const ICON_NAV   = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="3 11 22 2 13 21 11 13 3 11"/></svg>`;
+
+// Google Maps directions link: coordinates when we have them (most precise),
+// otherwise the postal address as a search string.
+function googleMapsUrl(meta, name) {
+    const base = 'https://www.google.com/maps/dir/?api=1&travelmode=driving&destination=';
+    const lat = typeof meta.lat === 'number' ? meta.lat : null;
+    const lng = typeof meta.lng === 'number' ? meta.lng : null;
+    if (lat !== null && lng !== null) {
+        return base + encodeURIComponent(lat.toFixed(6) + ',' + lng.toFixed(6));
+    }
+    const query = [name, meta.street, [meta.zip, meta.place].filter(Boolean).join(' ')]
+        .filter(Boolean).join(', ');
+    return base + encodeURIComponent(query);
+}
+
+function stationDialogHtml(stationId) {
+    const t       = translations[currentLang];
+    const meta    = predictionStationMeta[stationId] || {};
+    const name    = meta.name || stationId;
+    const latest  = latestRowById().get(stationId) || null;
+    const dist    = stationDistancesById[stationId] ?? null;
+    const addressLines = [meta.street, [meta.zip, meta.place].filter(Boolean).join(' ')].filter(Boolean);
+
+    const prices = ['e5', 'e10', 'diesel'].map((fuel) => {
+        const value = latest ? latest[fuel] : null;
+        const has   = value !== null && value !== undefined;
+        return `<div class="sd-price${has ? '' : ' empty'}">` +
+            `<div class="sd-price-label"${has ? ` style="color:${FUEL_CSS_COLORS[fuel]}"` : ''}>${fuelConfig[fuel].label}</div>` +
+            `<div class="sd-price-value"${has ? ` style="color:${FUEL_CSS_COLORS[fuel]}"` : ''}>` +
+                (has ? `${value.toFixed(3)} <span style="font-size:0.8rem;opacity:0.6">€</span>` : '—') +
+            `</div>` +
+        `</div>`;
+    }).join('');
+
+    const rows = [];
+    if (addressLines.length) {
+        rows.push([t.sdAddress, addressLines.map((line) => h(line)).join('<br>')]);
+    }
+    if (meta.brand) rows.push([t.brand, h(meta.brand)]);
+    if (dist !== null) rows.push([t.sdDistance, h(dist.toFixed(1) + ' km')]);
+    if (latest) rows.push([t.sdLastUpdate, h(formatDateTime(latest.recorded_at))]);
+
+    // Upcoming suggestion windows for this station (same source as the
+    // predictions card), so the dialog is complete when opened from there.
+    const windows = predictionData
+        .filter((p) => p.s === stationId)
+        .slice(0, 5)
+        .map((p) => {
+            const day = new Date(p.start).toLocaleDateString(_loc(), {
+                timeZone: _tz(), weekday: 'short', day: '2-digit', month: '2-digit',
+            });
+            return `<div class="sd-window">` +
+                `<span class="sd-window-fuel" style="color:${FUEL_CSS_COLORS[p.fuel]}">${fuelConfig[p.fuel].label}</span>` +
+                `<span class="sd-window-time">${h(day + ' · ' + formatTimeOnly(p.start) + '–' + formatTimeOnly(p.end))}</span>` +
+                `<span class="sd-window-price" style="color:${FUEL_CSS_COLORS[p.fuel]}">${h(p.price.toFixed(3))}</span>` +
+            `</div>`;
+        }).join('');
+
+    const openTag = latest
+        ? `<span class="sd-tag ${latest.is_open ? 'is-open' : 'is-closed'}">` +
+              `<span class="sd-tag-dot"></span>${h(latest.is_open ? t.openYes : t.openNo)}` +
+          `</span>`
+        : '';
+
+    return `<div class="sd-head">` +
+            `<button type="button" class="sd-close" data-sd-close aria-label="${h(t.sdClose)}" title="${h(t.sdClose)}">${ICON_CLOSE}</button>` +
+            `<div class="sd-kicker">${h(t.sdTitle)}</div>` +
+            `<h2 class="sd-name" id="sd-name">` +
+                stationDot(name, 'e10') +
+                `<span>${h(name)}</span>` +
+            `</h2>` +
+            `<div class="sd-tags">` +
+                openTag +
+                (dist !== null ? `<span class="sd-tag">${h(dist.toFixed(1) + ' km')}</span>` : '') +
+                (meta.brand ? `<span class="sd-tag">${h(meta.brand)}</span>` : '') +
+            `</div>` +
+        `</div>` +
+        `<div class="sd-prices">${prices}</div>` +
+        `<div class="sd-body">` +
+            (latest ? '' : `<div class="sd-note">${h(t.sdNoPrices)}</div>`) +
+            rows.map(([key, value]) =>
+                `<div class="sd-row"><span class="sd-key">${h(key)}</span><span class="sd-val">${value}</span></div>`
+            ).join('') +
+            (windows
+                ? `<div class="sd-row"><span class="sd-key">${h(t.sdUpcoming)}</span>` +
+                  `<span class="sd-val"><span class="sd-windows">${windows}</span></span></div>`
+                // Say so rather than dropping the section, so its absence reads
+                // as "none predicted" instead of "sometimes there, sometimes not".
+                : `<div class="sd-key sd-key-alone">${h(t.sdNoUpcoming)}</div>`) +
+            `<a class="sd-nav" href="${h(googleMapsUrl(meta, name))}" target="_blank" rel="noopener noreferrer">` +
+                `${ICON_NAV}<span>${h(t.sdNavigate)}</span>` +
+            `</a>` +
+        `</div>`;
+}
+
+function openStationDialog(stationId) {
+    if (!stationDialog || !stationId) return;
+    openStationId = stationId;
+    stationDialog.innerHTML = stationDialogHtml(stationId);
+    if (!stationDialog.open) stationDialog.showModal();
+}
+
+function closeStationDialog() {
+    if (stationDialog && stationDialog.open) stationDialog.close();
+}
+
+if (stationDialog) {
+    // Open: any station reference inside one of the four price cards.
+    document.addEventListener('click', (e) => {
+        const trigger = e.target instanceof Element
+            ? e.target.closest('.cheapest-card [data-station-id]')
+            : null;
+        if (trigger) openStationDialog(trigger.dataset.stationId);
+    });
+
+    stationDialog.addEventListener('click', (e) => {
+        // Close button, or a click on the backdrop area outside the panel.
+        if (e.target instanceof Element && e.target.closest('[data-sd-close]')) {
+            closeStationDialog();
+            return;
+        }
+        if (e.target === stationDialog) closeStationDialog();
+    });
+
+    stationDialog.addEventListener('close', () => { openStationId = null; });
 }
 
 /* applyLang lives in the shared script (renderCommonScript). */
@@ -7375,6 +7903,8 @@ function setStatDate(id, isoValue) {
 
 function applyData(payload) {
     if (retryWrap) retryWrap.hidden = true;
+    // Fresh data may not contain the station the dialog is showing.
+    closeStationDialog();
     const meta = payload.stations || {};
     // Expand slim rows back into the shape the existing renderers expect by
     // joining each row to its station metadata (sent once, keyed by id).
@@ -7494,6 +8024,8 @@ window.onLangChange = () => {
         renderHighest();
         if (chartEl) renderChart();
         updateShowMore(); // re-translate the "Show more (N)" button label
+        // The dialog is rendered imperatively, so re-render it while it is open.
+        if (openStationId) openStationDialog(openStationId);
     }
 };
 window.onThemeChange = () => {
