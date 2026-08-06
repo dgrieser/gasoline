@@ -4507,24 +4507,30 @@ function renderDocumentHead(string $titleSuffix): void
             background: transparent;
             border: none;
             color: inherit;
-            font: inherit;
             text-align: left;
             cursor: pointer;
             border-radius: 8px;
             transition: background 0.15s ease, box-shadow 0.15s ease;
         }
 
+        /* The block button carries no text of its own — every line inside it is
+           a .cheapest-station span — so it just drops the UA button font. */
         .station-btn {
             display: block;
+            font: inherit;
             width: calc(100% + 0.6rem);
             padding: 0.2rem 0.3rem;
             margin: -0.2rem -0.3rem;
         }
 
+        /* No font reset here: the row keeps .rank-row's mono font, and a
+           `font: inherit` would out-order that rule and enlarge the text.
+           The padding gives the hover pill some body; the matching negative
+           margin keeps the row's layout height exactly as it was. */
         .station-rank-btn {
             width: calc(100% + 0.6rem);
             padding: 0.15rem 0.3rem;
-            margin: 0 -0.3rem;
+            margin: -0.15rem -0.3rem;
         }
 
         .station-btn:hover,
