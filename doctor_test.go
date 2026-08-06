@@ -78,6 +78,29 @@ func seedDoctorDB(t *testing.T) (string, *sql.DB) {
 	return dbPath, db
 }
 
+// pageSpecs builds the queries as the page runs them: hints included, since the
+// covering index exists on any migrated database.
+func pageSpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec {
+	return accuracyQuerySpecsFor(accuracyQueryContext{
+		Filters: f, Dialect: dialectSQLite, HasDecisions: hasDecisions, AccuracyIndexPresent: true,
+	})
+}
+
+// unhintedSpecs builds them as a database without the covering index gets them.
+func unhintedSpecs(f doctorFilters, hasDecisions bool) []accuracyQuerySpec {
+	return accuracyQuerySpecsFor(accuracyQueryContext{
+		Filters: f, Dialect: dialectSQLite, HasDecisions: hasDecisions, AccuracyIndexPresent: false,
+	})
+}
+
+// forcedSpecs builds them the way --try-index does.
+func forcedSpecs(f doctorFilters, hasDecisions bool, index string) []accuracyQuerySpec {
+	return accuracyQuerySpecsFor(accuracyQueryContext{
+		Filters: f, Dialect: dialectSQLite, HasDecisions: hasDecisions,
+		AccuracyIndexPresent: true, ForceIndex: index,
+	})
+}
+
 func TestRunDoctorReportsTablesIndexesAndQueries(t *testing.T) {
 	dbPath, db := seedDoctorDB(t)
 	if err := db.Close(); err != nil {
@@ -519,7 +542,7 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 	}
 
 	specs := map[string]accuracyQuerySpec{}
-	for _, spec := range accuracyQuerySpecs(doctorFilters{Fuel: "diesel", Confidence: "all",
+	for _, spec := range pageSpecs(doctorFilters{Fuel: "diesel", Confidence: "all",
 		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}, true) {
 		specs[spec.name] = spec
 	}
@@ -549,11 +572,11 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 			t.Errorf("web/index.php no longer contains the shared filter fragment %q", sig)
 		}
 	}
-	mediumHigh := accuracyQuerySpecs(doctorFilters{Fuel: "diesel", Confidence: "medium_high"}, false)
+	mediumHigh := pageSpecs(doctorFilters{Fuel: "diesel", Confidence: "medium_high"}, false)
 	if !strings.Contains(mediumHigh[0].sql, "pp.confidence IN ('medium', 'high')") {
 		t.Error("doctor ignores --confidence medium_high")
 	}
-	withCity := accuracyQuerySpecs(doctorFilters{Fuel: "diesel", Confidence: "all", City: "Berlin"}, false)
+	withCity := pageSpecs(doctorFilters{Fuel: "diesel", Confidence: "all", City: "Berlin"}, false)
 	if !strings.Contains(withCity[0].sql, "JOIN prediction_runs pr ON pr.id = pp.run_id") ||
 		!strings.Contains(withCity[0].sql, "pr.city_name = ?") {
 		t.Errorf("doctor ignores --city:\n%s", withCity[0].sql)
@@ -770,7 +793,7 @@ func TestAccuracyQueryRewritesPreserveResults(t *testing.T) {
 		t.Run(label, func(t *testing.T) {
 			legacy := legacyAccuracySQL(filters)
 			current := map[string]accuracyQuerySpec{}
-			for _, spec := range accuracyQuerySpecs(filters, true) {
+			for _, spec := range pageSpecs(filters, true) {
 				current[spec.name] = spec
 			}
 
@@ -832,7 +855,7 @@ func TestAccuracyRowsRewriteRespectsTheCap(t *testing.T) {
 	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
 		From: "2026-01-01T00:00:00Z", To: "2027-01-01T23:59:59Z"}
 	var rowsSpec accuracyQuerySpec
-	for _, spec := range accuracyQuerySpecs(filters, false) {
+	for _, spec := range pageSpecs(filters, false) {
 		if spec.name == "rows" {
 			rowsSpec = spec
 		}
@@ -871,76 +894,153 @@ func TestIndexHintSyntax(t *testing.T) {
 	}
 }
 
-// TestHintedSpecsCoverEveryPredictionsReference matters because a hint applied
-// to only some references would measure a half-hinted plan and report a
-// misleading speedup. summary_latest reads price_predictions twice.
-func TestHintedSpecsCoverEveryPredictionsReference(t *testing.T) {
+// TestPageHintsExactlyTheMeasuredQueries pins the hint policy. Hinting is a
+// last resort justified by measurement, so the set of queries carrying one is
+// part of the decision, not an implementation detail: series and rows measured
+// +1% and -2% on the live database and must stay unhinted.
+func TestPageHintsExactlyTheMeasuredQueries(t *testing.T) {
 	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
 		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
 	hint := indexHintSyntax(dialectSQLite, "idx_price_predictions_accuracy")
 
-	plain := map[string]accuracyQuerySpec{}
-	for _, spec := range accuracyQuerySpecs(filters, true) {
-		plain[spec.name] = spec
+	wantHinted := map[string]bool{
+		"summary": true, "summary_latest": true,
+		"by_confidence": true, "by_lead": true, "by_hour": true,
 	}
-	for _, spec := range accuracyQuerySpecsHinted(filters, true, hint) {
-		if spec.table != "price_predictions" {
-			if strings.Contains(spec.sql, hint) {
-				t.Errorf("%s reads %s and must not be hinted", spec.name, spec.table)
+	seen := map[string]bool{}
+	for _, spec := range pageSpecs(filters, true) {
+		hinted := strings.Contains(spec.sql, hint)
+		seen[spec.name] = true
+		if wantHinted[spec.name] != hinted {
+			t.Errorf("%s hinted=%v, want %v:\n%s", spec.name, hinted, wantHinted[spec.name], spec.sql)
+		}
+		// A hint on only some references would leave the query running a plan
+		// nobody measured; summary_latest reads price_predictions twice.
+		if hinted {
+			refs := strings.Count(spec.sql, "price_predictions pp")
+			if got := strings.Count(spec.sql, hint); got != refs {
+				t.Errorf("%s hints %d of %d references:\n%s", spec.name, got, refs, spec.sql)
 			}
-			continue
-		}
-		want := strings.Count(plain[spec.name].sql, "price_predictions pp")
-		if got := strings.Count(spec.sql, hint); got != want {
-			t.Errorf("%s hints %d of %d price_predictions references:\n%s", spec.name, got, want, spec.sql)
-		}
-		if plain[spec.name].sql == spec.sql {
-			t.Errorf("%s was not hinted at all", spec.name)
 		}
 	}
-	// The page's own SQL must never carry a hint.
-	for _, spec := range accuracyQuerySpecs(filters, true) {
-		if strings.Contains(spec.sql, "INDEXED BY") || strings.Contains(spec.sql, "FORCE INDEX") {
-			t.Errorf("unhinted spec %s contains a hint:\n%s", spec.name, spec.sql)
+	for name := range wantHinted {
+		if !seen[name] {
+			t.Errorf("expected a %q query", name)
 		}
 	}
 }
 
-// TestHintedQueriesReturnIdenticalResults is the safety property behind
-// --try-index: an index hint changes the plan, never the answer. If it did
-// change the answer, the timing comparison would be meaningless.
+// TestUnhintedWithoutTheIndex covers the un-migrated database: the page checks
+// the index exists before hinting, because forcing an unknown key is an error
+// rather than a slow query.
+func TestUnhintedWithoutTheIndex(t *testing.T) {
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	for _, spec := range unhintedSpecs(filters, true) {
+		if strings.Contains(spec.sql, "INDEXED BY") || strings.Contains(spec.sql, "FORCE INDEX") {
+			t.Errorf("%s hints an index that does not exist:\n%s", spec.name, spec.sql)
+		}
+	}
+}
+
+// TestForceIndexReplacesThePageHint keeps --try-index honest: it must measure
+// the forced index alone, not stack a second hint onto the page's.
+func TestForceIndexReplacesThePageHint(t *testing.T) {
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	pageHint := indexHintSyntax(dialectSQLite, "idx_price_predictions_accuracy")
+	otherHint := indexHintSyntax(dialectSQLite, "idx_price_predictions_station_fuel_target")
+
+	for _, spec := range forcedSpecs(filters, true, "idx_price_predictions_station_fuel_target") {
+		if spec.table != "price_predictions" {
+			if strings.Contains(spec.sql, otherHint) {
+				t.Errorf("%s reads %s and must not be hinted", spec.name, spec.table)
+			}
+			continue
+		}
+		if strings.Contains(spec.sql, pageHint) {
+			t.Errorf("%s stacked the page hint with the forced one:\n%s", spec.name, spec.sql)
+		}
+		refs := strings.Count(spec.sql, "price_predictions pp")
+		if got := strings.Count(spec.sql, otherHint); got != refs {
+			t.Errorf("%s forces the index on %d of %d references:\n%s", spec.name, got, refs, spec.sql)
+		}
+	}
+}
+
+// TestHintedQueriesReturnIdenticalResults is the property the whole hint
+// decision rests on: forcing an index changes the plan, never the answer.
 func TestHintedQueriesReturnIdenticalResults(t *testing.T) {
 	db := seedEquivalenceDB(t)
 	defer db.Close()
-	// The hint can only be honored where the index exists.
 	if _, err := db.ExecContext(context.Background(), `ANALYZE`); err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
 
-	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
-		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
-	hint := indexHintSyntax(dialectSQLite, "idx_price_predictions_accuracy")
-	plain := map[string]accuracyQuerySpec{}
-	for _, spec := range accuracyQuerySpecs(filters, true) {
-		plain[spec.name] = spec
+	filterCases := []doctorFilters{
+		{Fuel: "diesel", Confidence: "all", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		{Fuel: "diesel", Confidence: "medium_high", City: "Berlin", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		{Fuel: "e5", Confidence: "all", From: "2026-07-10T00:00:00Z", To: "2026-07-10T08:59:59Z"},
 	}
-	for _, spec := range accuracyQuerySpecsHinted(filters, true, hint) {
-		if spec.table != "price_predictions" {
-			continue
-		}
-		t.Run(spec.name, func(t *testing.T) {
-			before := queryRowStrings(t, db, plain[spec.name])
-			after := queryRowStrings(t, db, spec)
-			if len(before) != len(after) {
-				t.Fatalf("hinted %s returns %d rows, unhinted %d", spec.name, len(after), len(before))
+	for _, filters := range filterCases {
+		t.Run(filters.Fuel+"/"+filters.Confidence+"/"+filters.City, func(t *testing.T) {
+			plain := map[string]accuracyQuerySpec{}
+			for _, spec := range unhintedSpecs(filters, true) {
+				plain[spec.name] = spec
 			}
-			for i := range before {
-				if before[i] != after[i] {
-					t.Fatalf("hinted %s row %d differs:\n plain: %s\n hint:  %s",
-						spec.name, i, before[i], after[i])
+			// Both what the page now runs, and what --try-index forces.
+			variants := append(pageSpecs(filters, true),
+				forcedSpecs(filters, true, "idx_price_predictions_accuracy")...)
+			for _, spec := range variants {
+				if spec.table != "price_predictions" {
+					continue
+				}
+				before := queryRowStrings(t, db, plain[spec.name])
+				after := queryRowStrings(t, db, spec)
+				if len(before) != len(after) {
+					t.Fatalf("hinted %s returns %d rows, unhinted %d", spec.name, len(after), len(before))
+				}
+				for i := range before {
+					if before[i] != after[i] {
+						t.Fatalf("hinted %s row %d differs:\n plain: %s\n hint:  %s",
+							spec.name, i, before[i], after[i])
+					}
 				}
 			}
 		})
+	}
+}
+
+// TestViewerHintMatchesDoctor cross-checks the hint across the two
+// implementations: the page builds it in PHP, doctor in Go, and a mismatch
+// would make doctor measure a plan the page never runs.
+func TestViewerHintMatchesDoctor(t *testing.T) {
+	viewer, err := os.ReadFile(filepath.Join("web", "index.php"))
+	if err != nil {
+		t.Fatalf("read viewer: %v", err)
+	}
+	php := string(viewer)
+
+	for _, want := range []string{
+		indexHintSyntax(dialectMySQL, "idx_price_predictions_accuracy"),
+		indexHintSyntax(dialectSQLite, "idx_price_predictions_accuracy"),
+	} {
+		if !strings.Contains(php, want) {
+			t.Errorf("web/index.php does not emit the hint %q that doctor mirrors", want)
+		}
+	}
+	// The page must guard the hint on the index existing.
+	if !strings.Contains(php, "gasolineIndexExists") {
+		t.Error("web/index.php hints without checking the index exists")
+	}
+	// And it must apply it to exactly the queries doctor thinks it does. Six
+	// SQL references, because summary_latest reads price_predictions twice; the
+	// two unhinted queries keep naming the table directly.
+	if got := strings.Count(php, "$ppHinted ."); got != 6 {
+		t.Errorf("web/index.php splices $ppHinted into %d queries, want 6", got)
+	}
+	if got := strings.Count(php, "'FROM price_predictions pp ' . $joinRuns"); got != 2 {
+		t.Errorf("web/index.php has %d unhinted accuracy queries, want 2 (series and rows)", got)
 	}
 }
 
@@ -1042,5 +1142,43 @@ func TestRunDoctorTryIndexSurvivesUnusableIndex(t *testing.T) {
 	}
 	if !reported {
 		t.Fatal("a nonexistent --try-index must be reported as a per-query error")
+	}
+}
+
+// TestRunDoctorQueriesSurviveMissingAccuracyIndex is the safety case for
+// hinting the page's queries: on a database that has not run `gasoline
+// migrate`, the index named in the hint does not exist, and forcing an unknown
+// key is a hard error rather than a slow query. The page and doctor both have
+// to notice and fall back to unhinted SQL.
+func TestRunDoctorQueriesSurviveMissingAccuracyIndex(t *testing.T) {
+	ctx := context.Background()
+	dbPath, db := seedDoctorDB(t)
+	if _, err := db.ExecContext(ctx, `DROP INDEX idx_price_predictions_accuracy`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--from", "2026-07-01", "--to", "2026-07-31", "--output", "json"})
+	})
+	var result doctorResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	if len(result.Queries) == 0 {
+		t.Fatal("no queries ran")
+	}
+	for _, q := range result.Queries {
+		if q.Error != "" {
+			t.Fatalf("query %s failed without the index: %s", q.Name, q.Error)
+		}
+		if strings.Contains(q.SQL, "INDEXED BY") || strings.Contains(q.SQL, "FORCE INDEX") {
+			t.Fatalf("query %s hints an index that does not exist:\n%s", q.Name, q.SQL)
+		}
+		if q.Rows == 0 {
+			t.Fatalf("query %s returned nothing against seeded data", q.Name)
+		}
 	}
 }
