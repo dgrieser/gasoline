@@ -1864,14 +1864,15 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         const tz  = () => currentLang === 'de' ? 'Europe/Berlin' : 'UTC';
 
         function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
-        // Euro prices get the pump treatment (raised tenth-of-a-cent digit) and
-        // cents and percentages a sized-down decimal separator, so all of these
-        // return HTML. They take the separator itself from the shared helpers,
-        // so German shows a comma.
-        function fmtEurHtml(v) { return fmtPriceHtml(v); }
-        function fmtCtHtml(v) { const s = (v === null || v === undefined) ? null : fmtDecimalHtml(v * 100, 2); return s === null ? '—' : s + ' ct'; }
-        function fmtSignedCtHtml(v) { if (v === null || v === undefined) return '—'; const c = v * 100; const s = fmtDecimalHtml(c, 2); return s === null ? '—' : (c >= 0 ? '+' : '') + s + ' ct'; }
-        function fmtPctHtml(v) { const s = fmtDecimalHtml(v, 1); return s === null ? '—' : s + '%'; }
+        // Numbers on this page stay plain text. The stat tiles and the tables
+        // lay a cell's children out as their own columns for narrow screens, so
+        // a raised digit or a sized-down separator — both of which need a span —
+        // breaks out of the number and lands in a column of its own. The
+        // separator still follows the UI language, since that is text.
+        function fmtEur(v) { return fmtPriceText(v); }
+        function fmtCt(v) { const s = (v === null || v === undefined) ? null : fmtDecimal(v * 100, 2); return s === null ? '—' : s + ' ct'; }
+        function fmtSignedCt(v) { if (v === null || v === undefined) return '—'; const c = v * 100; const s = fmtDecimal(c, 2); return s === null ? '—' : (c >= 0 ? '+' : '') + s + ' ct'; }
+        function fmtPct(v) { const s = fmtDecimal(v, 1); return s === null ? '—' : s + '%'; }
         function fmtInt(v) { return Number(v || 0).toLocaleString(loc()); }
         function fmtDateTime(iso) { if (!iso) return '—'; return new Date(iso).toLocaleString(loc(), { timeZone: tz(), year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }); }
         function fmtDate(iso) { return new Date(iso).toLocaleDateString(loc(), { timeZone: tz(), month: 'short', day: '2-digit' }); }
@@ -1880,10 +1881,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         function fmtLead(min) { min = Number(min || 0); if (min < 60) return min + 'm'; const h = Math.floor(min / 60), m = min % 60; return m === 0 ? h + 'h' : h + 'h ' + m + 'm'; }
         function confLabel(c) { return T()['predConf_' + c] || c; }
 
-        function fillStat(id, fill) { const el = document.getElementById(id); if (!el) return; fill(el); el.classList.remove('skeleton'); el.removeAttribute('aria-busy'); }
-        function setStat(id, val) { fillStat(id, (el) => { el.textContent = val; }); }
-        // For the fmt*Html readouts, whose separator rides in a span.
-        function setStatHtml(id, html) { fillStat(id, (el) => { el.innerHTML = html; }); }
+        function setStat(id, val) { const el = document.getElementById(id); if (!el) return; el.textContent = val; el.classList.remove('skeleton'); el.removeAttribute('aria-busy'); }
 
         function buildUrl() {
             const u = new URL(location.origin + location.pathname);
@@ -1960,21 +1958,21 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             if (!s) { statIds.forEach((id) => setStat(id, '—')); return; }
             setStat('ps-count', fmtInt(s.count));
             setStat('ps-stations', fmtInt(s.stations));
-            setStatHtml('ps-mae', fmtCtHtml(s.mae));
-            setStatHtml('ps-bias', fmtSignedCtHtml(s.bias));
-            setStatHtml('ps-rmse', fmtCtHtml(s.rmse));
-            setStatHtml('ps-within1', fmtPctHtml(s.within1_pct));
-            setStatHtml('ps-within2', fmtPctHtml(s.within2_pct));
-            setStatHtml('ps-worst', fmtCtHtml(Math.max(Math.abs(s.min_error || 0), Math.abs(s.max_error || 0))));
+            setStat('ps-mae', fmtCt(s.mae));
+            setStat('ps-bias', fmtSignedCt(s.bias));
+            setStat('ps-rmse', fmtCt(s.rmse));
+            setStat('ps-within1', fmtPct(s.within1_pct));
+            setStat('ps-within2', fmtPct(s.within2_pct));
+            setStat('ps-worst', fmtCt(Math.max(Math.abs(s.min_error || 0), Math.abs(s.max_error || 0))));
             const l = data.summary_latest;
             if (!l) {
                 ['ps-l-count','ps-l-mae','ps-l-bias','ps-l-within2'].forEach((id) => setStat(id, '—'));
                 return;
             }
             setStat('ps-l-count', fmtInt(l.count));
-            setStatHtml('ps-l-mae', fmtCtHtml(l.mae));
-            setStatHtml('ps-l-bias', fmtSignedCtHtml(l.bias));
-            setStatHtml('ps-l-within2', fmtPctHtml(l.within2_pct));
+            setStat('ps-l-mae', fmtCt(l.mae));
+            setStat('ps-l-bias', fmtSignedCt(l.bias));
+            setStat('ps-l-within2', fmtPct(l.within2_pct));
         }
 
         function renderConf() {
@@ -1987,8 +1985,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 '<tr>'
                 + '<td data-label="' + esc(t.predColConf) + '">' + esc(confLabel(r.confidence)) + '</td>'
                 + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
-                + '<td data-label="' + esc(t.predStatMae) + '">' + fmtCtHtml(r.mae) + '</td>'
-                + '<td data-label="' + esc(t.predStatBias) + '">' + fmtSignedCtHtml(r.bias) + '</td>'
+                + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
+                + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -2010,8 +2008,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 '<tr>'
                 + '<td data-label="' + esc(t.predColBucket) + '">' + esc(r.bucket) + '</td>'
                 + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
-                + '<td data-label="' + esc(t.predStatMae) + '">' + fmtCtHtml(r.mae) + '</td>'
-                + '<td data-label="' + esc(t.predStatBias) + '">' + fmtSignedCtHtml(r.bias) + '</td>'
+                + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
+                + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -2025,8 +2023,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 '<tr>'
                 + '<td data-label="' + esc(t.predColHour) + '">' + esc(String(r.hour).padStart(2, '0') + ':00') + '</td>'
                 + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
-                + '<td data-label="' + esc(t.predStatMae) + '">' + fmtCtHtml(r.mae) + '</td>'
-                + '<td data-label="' + esc(t.predStatBias) + '">' + fmtSignedCtHtml(r.bias) + '</td>'
+                + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
+                + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -2047,9 +2045,9 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 '<tr>'
                 + '<td data-label="' + esc(t.predColRecommendation) + '">' + esc(recLabel(r.recommendation)) + '</td>'
                 + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
-                + '<td data-label="' + esc(t.predColRegret) + '">' + fmtCtHtml(r.avg_regret) + '</td>'
-                + '<td data-label="' + esc(t.predColHit1) + '">' + fmtPctHtml(r.within1_pct) + '</td>'
-                + '<td data-label="' + esc(t.predColHit2) + '">' + fmtPctHtml(r.within2_pct) + '</td>'
+                + '<td data-label="' + esc(t.predColRegret) + '">' + esc(fmtCt(r.avg_regret)) + '</td>'
+                + '<td data-label="' + esc(t.predColHit1) + '">' + esc(fmtPct(r.within1_pct)) + '</td>'
+                + '<td data-label="' + esc(t.predColHit2) + '">' + esc(fmtPct(r.within2_pct)) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -2065,9 +2063,9 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 + '<td class="td-muted" data-label="' + esc(t.predColRunAt) + '">' + esc(fmtDateTime(r.run_at)) + '</td>'
                 + '<td class="td-muted" data-label="' + esc(t.predColLead) + '">' + esc(fmtLead(r.lead)) + '</td>'
                 + '<td data-label="' + esc(t.predColConf) + '">' + esc(confLabel(r.conf)) + '</td>'
-                + '<td data-label="' + esc(t.predColPredicted) + '">' + fmtEurHtml(r.p) + '</td>'
-                + '<td data-label="' + esc(t.predColActual) + '">' + fmtEurHtml(r.a) + '</td>'
-                + '<td class="' + (good ? 'pred-err-good' : 'pred-err-bad') + '" data-label="' + esc(t.predColError) + '">' + fmtSignedCtHtml(r.err) + '</td>'
+                + '<td data-label="' + esc(t.predColPredicted) + '">' + esc(fmtEur(r.p)) + '</td>'
+                + '<td data-label="' + esc(t.predColActual) + '">' + esc(fmtEur(r.a)) + '</td>'
+                + '<td class="' + (good ? 'pred-err-good' : 'pred-err-bad') + '" data-label="' + esc(t.predColError) + '">' + esc(fmtSignedCt(r.err)) + '</td>'
                 + '</tr>';
         }
 
@@ -2147,9 +2145,9 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             const err = q.a - q.p;
             const good = Math.abs(err * 100) <= 1.0;
             return '<div class="tt-meta">' + esc(fmtDateTime(iso)) + '</div>'
-                + ttRowHtml(C_PRED, t.predLegendPredicted, fmtEurHtml(q.p) + ' €')
-                + ttRowHtml(C_ACTUAL, t.predLegendActual, fmtEurHtml(q.a) + ' €')
-                + ttRowHtml(null, t.predColError, fmtSignedCtHtml(err), good ? 'pred-err-good' : 'pred-err-bad')
+                + ttRow(C_PRED, t.predLegendPredicted, fmtEur(q.p) + ' €')
+                + ttRow(C_ACTUAL, t.predLegendActual, fmtEur(q.a) + ' €')
+                + ttRow(null, t.predColError, fmtSignedCt(err), good ? 'pred-err-good' : 'pred-err-bad')
                 + ttRow(null, t.predColCount, fmtInt(q.n));
         }
 
@@ -2236,7 +2234,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 const val = minY + ((maxY - minY) / 5) * i;
                 const yp = py(val);
                 mk('line', { x1: c.m.left, y1: yp, x2: c.W - c.m.right, y2: yp, stroke: c.grid, 'stroke-width': 1 });
-                fillSvgPrice(mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }), val, 11);
+                mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = fmtDecimal(val, 3);
             }
             const tickCount = Math.min(c.W < 560 ? 4 : 7, pts.length);
             for (let i = 0; i < tickCount; i++) {
@@ -2323,8 +2321,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 const yp = py(val), xp = px(val);
                 mk('line', { x1: c.m.left, y1: yp, x2: c.W - c.m.right, y2: yp, stroke: c.grid, 'stroke-width': 1 });
                 mk('line', { x1: xp, y1: c.m.top, x2: xp, y2: c.H - c.m.bottom, stroke: c.grid, 'stroke-width': 1 });
-                fillSvgDecimal(mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }), val, 2, 11);
-                fillSvgDecimal(mk('text', { x: xp, y: c.H - c.m.bottom + 14, 'text-anchor': 'middle', 'font-size': 10, 'font-family': c.font, fill: c.tick }), val, 2, 10);
+                mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = fmtDecimal(val, 2);
+                mk('text', { x: xp, y: c.H - c.m.bottom + 14, 'text-anchor': 'middle', 'font-size': 10, 'font-family': c.font, fill: c.tick }).textContent = fmtDecimal(val, 2);
             }
             mk('line', { x1: c.m.left, y1: c.H - c.m.bottom, x2: c.W - c.m.right, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
             mk('line', { x1: c.m.left, y1: c.m.top, x2: c.m.left, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
@@ -6369,6 +6367,11 @@ function formatTimeOnly(isoString) {
    the separator in a span for anything rendered as markup. SVG <text> gets
    a third treatment — tspans, since CSS classes cannot size a tspan's
    font relative to the label it sits in.
+
+   The prediction-accuracy page opts out and formats its numbers as plain
+   text throughout: its stat tiles and tables break a cell's children into
+   separate columns on narrow screens, which pulls a raised digit or a
+   sized-down separator out of the number it belongs to.
    ──────────────────────────────────────────────────────────────── */
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -6472,19 +6475,6 @@ function fillSvgPrice(textEl, v, fontSize, fallback) {
         'font-size': (fontSize * MILLI_SCALE).toFixed(2),
         dy: (-fontSize * MILLI_RISE).toFixed(2),
     });
-    return textEl;
-}
-
-// Plain fixed-decimal number in an SVG <text> — axis labels that are not
-// prices, so no raised digit, just the smaller separator.
-function fillSvgDecimal(textEl, v, digits, fontSize, fallback) {
-    const s = fmtDecimal(v, digits);
-    textEl.textContent = '';
-    if (s === null) {
-        textEl.textContent = fallback === undefined ? '—' : fallback;
-        return textEl;
-    }
-    fillSvgDigits(textEl, s, fontSize);
     return textEl;
 }
 
