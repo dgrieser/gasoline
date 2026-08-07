@@ -1865,12 +1865,13 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
 
         function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
         // Euro prices get the pump treatment (raised tenth-of-a-cent digit) and
-        // therefore return HTML; everything else is plain text. Both take the
-        // decimal separator from the shared helpers, so German shows a comma.
+        // cents and percentages a sized-down decimal separator, so all of these
+        // return HTML. They take the separator itself from the shared helpers,
+        // so German shows a comma.
         function fmtEurHtml(v) { return fmtPriceHtml(v); }
-        function fmtCt(v) { const s = (v === null || v === undefined) ? null : fmtDecimal(v * 100, 2); return s === null ? '—' : s + ' ct'; }
-        function fmtSignedCt(v) { if (v === null || v === undefined) return '—'; const c = v * 100; const s = fmtDecimal(c, 2); return s === null ? '—' : (c >= 0 ? '+' : '') + s + ' ct'; }
-        function fmtPct(v) { const s = fmtDecimal(v, 1); return s === null ? '—' : s + '%'; }
+        function fmtCtHtml(v) { const s = (v === null || v === undefined) ? null : fmtDecimalHtml(v * 100, 2); return s === null ? '—' : s + ' ct'; }
+        function fmtSignedCtHtml(v) { if (v === null || v === undefined) return '—'; const c = v * 100; const s = fmtDecimalHtml(c, 2); return s === null ? '—' : (c >= 0 ? '+' : '') + s + ' ct'; }
+        function fmtPctHtml(v) { const s = fmtDecimalHtml(v, 1); return s === null ? '—' : s + '%'; }
         function fmtInt(v) { return Number(v || 0).toLocaleString(loc()); }
         function fmtDateTime(iso) { if (!iso) return '—'; return new Date(iso).toLocaleString(loc(), { timeZone: tz(), year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }); }
         function fmtDate(iso) { return new Date(iso).toLocaleDateString(loc(), { timeZone: tz(), month: 'short', day: '2-digit' }); }
@@ -1879,7 +1880,10 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         function fmtLead(min) { min = Number(min || 0); if (min < 60) return min + 'm'; const h = Math.floor(min / 60), m = min % 60; return m === 0 ? h + 'h' : h + 'h ' + m + 'm'; }
         function confLabel(c) { return T()['predConf_' + c] || c; }
 
-        function setStat(id, val) { const el = document.getElementById(id); if (!el) return; el.textContent = val; el.classList.remove('skeleton'); el.removeAttribute('aria-busy'); }
+        function fillStat(id, fill) { const el = document.getElementById(id); if (!el) return; fill(el); el.classList.remove('skeleton'); el.removeAttribute('aria-busy'); }
+        function setStat(id, val) { fillStat(id, (el) => { el.textContent = val; }); }
+        // For the fmt*Html readouts, whose separator rides in a span.
+        function setStatHtml(id, html) { fillStat(id, (el) => { el.innerHTML = html; }); }
 
         function buildUrl() {
             const u = new URL(location.origin + location.pathname);
@@ -1956,21 +1960,21 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             if (!s) { statIds.forEach((id) => setStat(id, '—')); return; }
             setStat('ps-count', fmtInt(s.count));
             setStat('ps-stations', fmtInt(s.stations));
-            setStat('ps-mae', fmtCt(s.mae));
-            setStat('ps-bias', fmtSignedCt(s.bias));
-            setStat('ps-rmse', fmtCt(s.rmse));
-            setStat('ps-within1', fmtPct(s.within1_pct));
-            setStat('ps-within2', fmtPct(s.within2_pct));
-            setStat('ps-worst', fmtCt(Math.max(Math.abs(s.min_error || 0), Math.abs(s.max_error || 0))));
+            setStatHtml('ps-mae', fmtCtHtml(s.mae));
+            setStatHtml('ps-bias', fmtSignedCtHtml(s.bias));
+            setStatHtml('ps-rmse', fmtCtHtml(s.rmse));
+            setStatHtml('ps-within1', fmtPctHtml(s.within1_pct));
+            setStatHtml('ps-within2', fmtPctHtml(s.within2_pct));
+            setStatHtml('ps-worst', fmtCtHtml(Math.max(Math.abs(s.min_error || 0), Math.abs(s.max_error || 0))));
             const l = data.summary_latest;
             if (!l) {
                 ['ps-l-count','ps-l-mae','ps-l-bias','ps-l-within2'].forEach((id) => setStat(id, '—'));
                 return;
             }
             setStat('ps-l-count', fmtInt(l.count));
-            setStat('ps-l-mae', fmtCt(l.mae));
-            setStat('ps-l-bias', fmtSignedCt(l.bias));
-            setStat('ps-l-within2', fmtPct(l.within2_pct));
+            setStatHtml('ps-l-mae', fmtCtHtml(l.mae));
+            setStatHtml('ps-l-bias', fmtSignedCtHtml(l.bias));
+            setStatHtml('ps-l-within2', fmtPctHtml(l.within2_pct));
         }
 
         function renderConf() {
@@ -1983,8 +1987,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 '<tr>'
                 + '<td data-label="' + esc(t.predColConf) + '">' + esc(confLabel(r.confidence)) + '</td>'
                 + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
-                + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
-                + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
+                + '<td data-label="' + esc(t.predStatMae) + '">' + fmtCtHtml(r.mae) + '</td>'
+                + '<td data-label="' + esc(t.predStatBias) + '">' + fmtSignedCtHtml(r.bias) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -2006,8 +2010,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 '<tr>'
                 + '<td data-label="' + esc(t.predColBucket) + '">' + esc(r.bucket) + '</td>'
                 + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
-                + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
-                + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
+                + '<td data-label="' + esc(t.predStatMae) + '">' + fmtCtHtml(r.mae) + '</td>'
+                + '<td data-label="' + esc(t.predStatBias) + '">' + fmtSignedCtHtml(r.bias) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -2021,8 +2025,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 '<tr>'
                 + '<td data-label="' + esc(t.predColHour) + '">' + esc(String(r.hour).padStart(2, '0') + ':00') + '</td>'
                 + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
-                + '<td data-label="' + esc(t.predStatMae) + '">' + esc(fmtCt(r.mae)) + '</td>'
-                + '<td data-label="' + esc(t.predStatBias) + '">' + esc(fmtSignedCt(r.bias)) + '</td>'
+                + '<td data-label="' + esc(t.predStatMae) + '">' + fmtCtHtml(r.mae) + '</td>'
+                + '<td data-label="' + esc(t.predStatBias) + '">' + fmtSignedCtHtml(r.bias) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -2043,9 +2047,9 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 '<tr>'
                 + '<td data-label="' + esc(t.predColRecommendation) + '">' + esc(recLabel(r.recommendation)) + '</td>'
                 + '<td data-label="' + esc(t.predColCount) + '">' + fmtInt(r.count) + '</td>'
-                + '<td data-label="' + esc(t.predColRegret) + '">' + esc(fmtCt(r.avg_regret)) + '</td>'
-                + '<td data-label="' + esc(t.predColHit1) + '">' + esc(fmtPct(r.within1_pct)) + '</td>'
-                + '<td data-label="' + esc(t.predColHit2) + '">' + esc(fmtPct(r.within2_pct)) + '</td>'
+                + '<td data-label="' + esc(t.predColRegret) + '">' + fmtCtHtml(r.avg_regret) + '</td>'
+                + '<td data-label="' + esc(t.predColHit1) + '">' + fmtPctHtml(r.within1_pct) + '</td>'
+                + '<td data-label="' + esc(t.predColHit2) + '">' + fmtPctHtml(r.within2_pct) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -2063,7 +2067,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 + '<td data-label="' + esc(t.predColConf) + '">' + esc(confLabel(r.conf)) + '</td>'
                 + '<td data-label="' + esc(t.predColPredicted) + '">' + fmtEurHtml(r.p) + '</td>'
                 + '<td data-label="' + esc(t.predColActual) + '">' + fmtEurHtml(r.a) + '</td>'
-                + '<td class="' + (good ? 'pred-err-good' : 'pred-err-bad') + '" data-label="' + esc(t.predColError) + '">' + esc(fmtSignedCt(r.err)) + '</td>'
+                + '<td class="' + (good ? 'pred-err-good' : 'pred-err-bad') + '" data-label="' + esc(t.predColError) + '">' + fmtSignedCtHtml(r.err) + '</td>'
                 + '</tr>';
         }
 
@@ -2145,7 +2149,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             return '<div class="tt-meta">' + esc(fmtDateTime(iso)) + '</div>'
                 + ttRowHtml(C_PRED, t.predLegendPredicted, fmtEurHtml(q.p) + ' €')
                 + ttRowHtml(C_ACTUAL, t.predLegendActual, fmtEurHtml(q.a) + ' €')
-                + ttRow(null, t.predColError, fmtSignedCt(err), good ? 'pred-err-good' : 'pred-err-bad')
+                + ttRowHtml(null, t.predColError, fmtSignedCtHtml(err), good ? 'pred-err-good' : 'pred-err-bad')
                 + ttRow(null, t.predColCount, fmtInt(q.n));
         }
 
@@ -2319,8 +2323,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 const yp = py(val), xp = px(val);
                 mk('line', { x1: c.m.left, y1: yp, x2: c.W - c.m.right, y2: yp, stroke: c.grid, 'stroke-width': 1 });
                 mk('line', { x1: xp, y1: c.m.top, x2: xp, y2: c.H - c.m.bottom, stroke: c.grid, 'stroke-width': 1 });
-                mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = fmtDecimal(val, 2);
-                mk('text', { x: xp, y: c.H - c.m.bottom + 14, 'text-anchor': 'middle', 'font-size': 10, 'font-family': c.font, fill: c.tick }).textContent = fmtDecimal(val, 2);
+                fillSvgDecimal(mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }), val, 2, 11);
+                fillSvgDecimal(mk('text', { x: xp, y: c.H - c.m.bottom + 14, 'text-anchor': 'middle', 'font-size': 10, 'font-family': c.font, fill: c.tick }), val, 2, 10);
             }
             mk('line', { x1: c.m.left, y1: c.H - c.m.bottom, x2: c.W - c.m.right, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
             mk('line', { x1: c.m.left, y1: c.m.top, x2: c.m.left, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
@@ -4368,12 +4372,26 @@ function renderDocumentHead(string $titleSuffix): void
            value, scaled off the surrounding text so it works at every
            size from the big card price down to a table cell. Positioned
            rather than vertical-aligned so the raised glyph cannot grow
-           the line box and shift the layout around it. */
+           the line box and shift the layout around it.
+
+           DM Mono's digits are 0.72em tall, so flush tops would be
+           0.72 × (1 − 0.62) / 0.62 = 0.441em of lift. The offset is biased
+           past that: browsers round the resulting sub-pixel offset to whole
+           device pixels in either direction, and a raised digit reading a
+           pixel high passes for flush where one reading low looks dropped. */
         .price-milli {
             font-size: 0.62em;
             line-height: 1;
             position: relative;
-            top: -0.44em;
+            top: -0.48em;
+        }
+
+        /* The decimal separator comes down with it. At full size DM Mono's
+           comma is a heavy mark between the digits; smaller, it separates
+           without competing, and since the advance width shrinks with the
+           glyph the whole number tightens up. Kept on the baseline. */
+        .price-sep {
+            font-size: 0.7em;
         }
 
         /* ── Cheapest card ─────────────────────────────────────── */
@@ -6341,12 +6359,31 @@ function formatTimeOnly(isoString) {
 
    German pump boards show the tenth-of-a-cent digit raised and smaller
    (2.09⁹), so every three-decimal euro price in the UI is rendered that
-   way. The decimal separator follows the UI language: comma for de, dot
+   way, and the decimal separator is set a size smaller than the digits it
+   parts. The separator itself follows the UI language: comma for de, dot
    for en. Form inputs keep the dot, since that is what the server parses.
+
+   Every formatter comes in two flavours. The plain ones return text for
+   title attributes, aria labels and <option> labels, which cannot carry
+   markup and therefore keep a full-size separator; the *Html twins wrap
+   the separator in a span for anything rendered as markup. SVG <text> gets
+   a third treatment — tspans, since CSS classes cannot size a tspan's
+   font relative to the label it sits in.
    ──────────────────────────────────────────────────────────────── */
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
+// Kept in step with the .price-milli and .price-sep rules: the raised digit
+// at 0.62em lifted 0.48 of its own em (0.62 × 0.48 ≈ 0.30 of the full size),
+// and the separator at 0.7em.
+const MILLI_SCALE = 0.62;
+const MILLI_RISE  = 0.30;
+const SEP_SCALE   = 0.7;
+
 function decimalSeparator() { return currentLang === 'de' ? ',' : '.'; }
+
+// The separator, sized down. Digits and separators only, so nothing here
+// ever needs escaping.
+function separatorHtml() { return '<span class="price-sep">' + decimalSeparator() + '</span>'; }
 
 // Fixed-decimal number in the active locale's separator. Returns null for
 // anything that is not a finite number, so callers can pick their own dash.
@@ -6357,8 +6394,19 @@ function fmtDecimal(v, digits) {
     return n.toFixed(digits).replace('.', decimalSeparator());
 }
 
+// Same number with the separator sized down.
+function fmtDecimalHtml(v, digits) {
+    const s = fmtDecimal(v, digits);
+    return s === null ? null : s.replace(decimalSeparator(), separatorHtml());
+}
+
 function fmtDistanceKm(v) {
     const s = fmtDecimal(v, 1);
+    return s === null ? null : s + ' km';
+}
+
+function fmtDistanceKmHtml(v) {
+    const s = fmtDecimalHtml(v, 1);
     return s === null ? null : s + ' km';
 }
 
@@ -6379,16 +6427,39 @@ function fmtPriceText(v, fallback) {
     return p.head + p.milli;
 }
 
-// HTML with the third decimal raised. Digits and separators only, so the
-// result never needs escaping; the fallback is escaped by the caller.
+// HTML with the third decimal raised and the separator sized down. Digits
+// and separators only, so the result never needs escaping; the fallback is
+// escaped by the caller.
 function fmtPriceHtml(v, fallback) {
     const p = priceParts(v);
     if (p === null) return fallback === undefined ? '—' : fallback;
-    return p.head + '<span class="price-milli">' + p.milli + '</span>';
+    return p.head.replace(decimalSeparator(), separatorHtml())
+        + '<span class="price-milli">' + p.milli + '</span>';
 }
 
-// Same treatment inside an SVG <text>: two tspans, the second shrunk and
-// lifted off the baseline by the same proportions the CSS class uses.
+function svgTspan(textEl, text, attrs) {
+    const el = document.createElementNS(SVG_NS, 'tspan');
+    for (const name in (attrs || {})) el.setAttribute(name, attrs[name]);
+    el.textContent = text;
+    textEl.appendChild(el);
+    return el;
+}
+
+// Digits at label size with the separator sized down, as tspans. Splits on
+// the first separator only; the caller's string holds a single number.
+function fillSvgDigits(textEl, s, fontSize) {
+    const sep = decimalSeparator();
+    const at = s.indexOf(sep);
+    if (at < 0) { svgTspan(textEl, s); return; }
+    svgTspan(textEl, s.slice(0, at));
+    svgTspan(textEl, sep, { 'font-size': (fontSize * SEP_SCALE).toFixed(2) });
+    svgTspan(textEl, s.slice(at + 1));
+}
+
+// Same treatment inside an SVG <text>, where CSS classes cannot size a tspan
+// against its label: the tenth-of-a-cent digit shrunk and lifted off the
+// baseline by the proportions the CSS rules use, and the separator shrunk.
+// The raised digit goes last, so its dy needs no counterpart.
 function fillSvgPrice(textEl, v, fontSize, fallback) {
     const p = priceParts(v);
     textEl.textContent = '';
@@ -6396,14 +6467,24 @@ function fillSvgPrice(textEl, v, fontSize, fallback) {
         textEl.textContent = fallback === undefined ? '—' : fallback;
         return textEl;
     }
-    const head = document.createElementNS(SVG_NS, 'tspan');
-    head.textContent = p.head;
-    textEl.appendChild(head);
-    const milli = document.createElementNS(SVG_NS, 'tspan');
-    milli.setAttribute('font-size', (fontSize * 0.62).toFixed(2));
-    milli.setAttribute('dy', (-fontSize * 0.27).toFixed(2));
-    milli.textContent = p.milli;
-    textEl.appendChild(milli);
+    fillSvgDigits(textEl, p.head, fontSize);
+    svgTspan(textEl, p.milli, {
+        'font-size': (fontSize * MILLI_SCALE).toFixed(2),
+        dy: (-fontSize * MILLI_RISE).toFixed(2),
+    });
+    return textEl;
+}
+
+// Plain fixed-decimal number in an SVG <text> — axis labels that are not
+// prices, so no raised digit, just the smaller separator.
+function fillSvgDecimal(textEl, v, digits, fontSize, fallback) {
+    const s = fmtDecimal(v, digits);
+    textEl.textContent = '';
+    if (s === null) {
+        textEl.textContent = fallback === undefined ? '—' : fallback;
+        return textEl;
+    }
+    fillSvgDigits(textEl, s, fontSize);
     return textEl;
 }
 
@@ -6450,9 +6531,20 @@ function applyLang(lang) {
     });
     document.querySelectorAll('[data-dist-km]').forEach((el) => {
         const base = el.dataset.nameBase || '';
-        const dist = fmtDistanceKm(el.dataset.distKm);
+        // An <option> label cannot carry markup, so the station picker keeps
+        // the full-size separator.
+        if (el.tagName === 'OPTION') {
+            const plain = fmtDistanceKm(el.dataset.distKm);
+            if (plain === null) return;
+            el.textContent = base === '' ? plain : `${base} (${plain})`;
+            return;
+        }
+        const dist = fmtDistanceKmHtml(el.dataset.distKm);
         if (dist === null) return;
-        el.textContent = base === '' ? dist : `${base} (${dist})`;
+        // The station name goes in as text and the distance as markup, which
+        // saves escaping a name this script has no escaper for.
+        el.textContent = base === '' ? '' : base + ' ';
+        el.insertAdjacentHTML('beforeend', base === '' ? dist : `(${dist})`);
     });
     // Page-specific re-rendering (e.g. the dashboard chart) hooks in here.
     if (typeof window.onLangChange === 'function') window.onLangChange();
@@ -7388,8 +7480,9 @@ function stationDot(stationName, fuel, extra) {
 }
 
 // Big station block of a card cell: name line plus the optional address line,
-// wrapped in one button that opens the station dialog.
-function stationBlock(stationId, stationName, fuel, address) {
+// wrapped in one button that opens the station dialog. `addressHtml` arrives
+// as markup, since the distance in it carries a sized-down separator.
+function stationBlock(stationId, stationName, fuel, addressHtml) {
     const t = translations[currentLang];
     return `<button type="button" class="station-btn" data-station-id="${h(stationId)}"` +
         ` title="${h(t.sdHint)}" aria-label="${h(t.sdHint + ': ' + stationName)}">` +
@@ -7398,20 +7491,26 @@ function stationBlock(stationId, stationName, fuel, address) {
             `<span class="sd-name-text">${h(stationName)}</span>` +
             ICON_STATION_INFO +
         `</span>` +
-        (address ? `<span class="cheapest-station sd-addr-line">${h(address)}</span>` : '') +
+        (addressHtml ? `<span class="cheapest-station sd-addr-line">${addressHtml}</span>` : '') +
     `</button>`;
 }
 
 // Compact ranked row (runners-up / extra prediction windows), also clickable.
-// `stationName` drives the colour dot, `label` is the (possibly distance-
-// suffixed) text shown to the user, `price` the raw number to render.
-function stationRankRow(stationId, stationName, label, fuel, price, trailingHtml, titleText) {
+// `stationName` drives the colour dot and the label, `distKm` is appended to
+// that label when the reader has picked a location, `price` is the raw number
+// to render. The label is built twice over: as markup for the row, as text for
+// the aria label, which cannot carry the sized-down separator.
+function stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {
     const t = translations[currentLang];
+    const distText = fmtDistanceKm(distKm);
+    const distHtml = fmtDistanceKmHtml(distKm);
+    const label = stationName + (distText === null ? '' : ` (${distText})`);
+    const labelHtml = h(stationName) + (distHtml === null ? '' : ` (${distHtml})`);
     return `<button type="button" class="rank-row station-rank-btn" data-station-id="${h(stationId)}"` +
         ` title="${h(titleText ? titleText + ' — ' + t.sdHint : t.sdHint)}"` +
         ` aria-label="${h(t.sdHint + ': ' + fmtPriceText(price) + ' — ' + label)}">` +
         `<span class="rank-price" style="color:${FUEL_CSS_COLORS[fuel]}">${fmtPriceHtml(price)}</span>` +
-        `<span class="rank-station">${stationDot(stationName, fuel)}${h(label)}</span>` +
+        `<span class="rank-station">${stationDot(stationName, fuel)}${labelHtml}</span>` +
         (trailingHtml || '') +
     `</button>`;
 }
@@ -7447,10 +7546,12 @@ function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
             ? `<div class="cheapest-empty">${emptyMsg}</div>`
             : `<div class="cheapest-grid${colClass ? ' ' + colClass : ''}">` +
                 results.map(({ fuel, price, station_id, station, street, place, recorded_at }) => {
-                    const addressParts = [street, place].filter(Boolean);
+                    // Address line as markup: text parts escaped here, the
+                    // distance already formatted with its smaller separator.
+                    const addressParts = [street, place].filter(Boolean).map(h);
                     const selectedDistKm = stationDistancesById[station_id] ?? null;
                     if (selectedDistKm !== null) {
-                        addressParts.push(fmtDistanceKm(selectedDistKm));
+                        addressParts.push(fmtDistanceKmHtml(selectedDistKm));
                     }
                     const address = addressParts.length ? addressParts.join(', ') : '';
                     return `<div class="cheapest-cell">` +
@@ -7501,11 +7602,6 @@ function renderCheapest() {
         if (top.length) results.push({ fuel, top });
     }
 
-    const distSuffix = (row) => {
-        const dist = stationDistancesById[row.station_id] ?? null;
-        return dist !== null ? ` (${fmtDistanceKm(dist)})` : '';
-    };
-
     const colClass = results.length === 1 ? ' single' : results.length === 2 ? ' two-col' : '';
 
     cheapestCard.innerHTML =
@@ -7515,13 +7611,13 @@ function renderCheapest() {
             : `<div class="cheapest-grid${colClass}">` +
                 results.map(({ fuel, top }) => {
                     const best = top[0];
-                    const addressParts = [best.street, best.place].filter(Boolean);
+                    const addressParts = [best.street, best.place].filter(Boolean).map(h);
                     const bestDist = stationDistancesById[best.station_id] ?? null;
-                    if (bestDist !== null) addressParts.push(fmtDistanceKm(bestDist));
+                    if (bestDist !== null) addressParts.push(fmtDistanceKmHtml(bestDist));
                     const runnersUp = top.slice(1).map((row) => stationRankRow(
                         row.station_id,
                         row.station_name,
-                        row.station_name + distSuffix(row),
+                        stationDistancesById[row.station_id] ?? null,
                         fuel,
                         row[fuel],
                         '',
@@ -7563,17 +7659,15 @@ function renderPredictions() {
     const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
 
     const nameById = (id) => (predictionStationMeta[id] && predictionStationMeta[id].name) || id;
-    const distSuffix = (id) => {
-        const dist = stationDistancesById[id] ?? null;
-        return dist !== null ? ` (${fmtDistanceKm(dist)})` : '';
-    };
+    const distById = (id) => stationDistancesById[id] ?? null;
     // Address line for the top station, mirroring the top-5 card: street, place,
-    // then distance. Distance moves out of the name and into this line.
-    const addressById = (id) => {
+    // then distance. Distance moves out of the name and into this line. Markup,
+    // so the distance keeps its sized-down separator.
+    const addressHtmlById = (id) => {
         const meta = predictionStationMeta[id] || {};
-        const parts = [meta.street, meta.place].filter(Boolean);
-        const dist = stationDistancesById[id] ?? null;
-        if (dist !== null) parts.push(fmtDistanceKm(dist));
+        const parts = [meta.street, meta.place].filter(Boolean).map(h);
+        const dist = distById(id);
+        if (dist !== null) parts.push(fmtDistanceKmHtml(dist));
         return parts.join(', ');
     };
     // Day bucket key + header in the displayed timezone/locale so grouping
@@ -7615,11 +7709,11 @@ function renderPredictions() {
                         dayWindows = dayWindows.slice(0, 5); // cap: cheapest 5 per day
                         const best = dayWindows[0];
                         const bestName = nameById(best.s);
-                        const bestAddr = addressById(best.s);
+                        const bestAddr = addressHtmlById(best.s);
                         const runners = dayWindows.slice(1).map((p) => stationRankRow(
                             p.s,
                             nameById(p.s),
-                            nameById(p.s) + distSuffix(p.s),
+                            distById(p.s),
                             fuel,
                             p.price,
                             `<span class="pred-time">${h(windowLabel(p))}</span>`
@@ -7690,7 +7784,7 @@ function stationDialogHtml(stationId) {
         rows.push([t.sdAddress, addressLines.map((line) => h(line)).join('<br>')]);
     }
     if (meta.brand) rows.push([t.brand, h(meta.brand)]);
-    if (dist !== null) rows.push([t.sdDistance, h(fmtDistanceKm(dist))]);
+    if (dist !== null) rows.push([t.sdDistance, fmtDistanceKmHtml(dist)]);
     if (latest) rows.push([t.sdLastUpdate, h(formatDateTime(latest.recorded_at))]);
 
     // Upcoming suggestion windows for this station (same source as the
@@ -7724,7 +7818,7 @@ function stationDialogHtml(stationId) {
             `</h2>` +
             `<div class="sd-tags">` +
                 openTag +
-                (dist !== null ? `<span class="sd-tag">${h(fmtDistanceKm(dist))}</span>` : '') +
+                (dist !== null ? `<span class="sd-tag">${fmtDistanceKmHtml(dist)}</span>` : '') +
                 (meta.brand ? `<span class="sd-tag">${h(meta.brand)}</span>` : '') +
             `</div>` +
         `</div>` +
@@ -7956,14 +8050,14 @@ function priceCell(cls, v) {
 function tableRowHtml(row) {
     const t = translations[currentLang];
     const dist = stationDistancesById[row.station_id];
-    const distSuffix = (dist !== undefined && dist !== null) ? ` (${fmtDistanceKm(dist)})` : '';
+    const distSuffix = (dist !== undefined && dist !== null) ? ` (${fmtDistanceKmHtml(dist)})` : '';
     const openClass = row.is_open ? 'open-yes' : 'open-no';
     const openKey   = row.is_open ? 'openYes' : 'openNo';
     const hasDist   = dist !== undefined && dist !== null;
     return '<tr>' +
         `<td class="td-muted" data-recorded-at="${h(row.recorded_at)}">${h(formatDateTime(row.recorded_at))}</td>` +
         `<td${hasDist ? ` data-name-base="${h(row.station_name)}" data-dist-km="${h(String(dist))}"` : ''}>` +
-            `${h(row.station_name + distSuffix)}</td>` +
+            `${h(row.station_name)}${distSuffix}</td>` +
         `<td class="td-muted">${h(row.brand)}</td>` +
         `<td class="td-muted">${h(row.street)}</td>` +
         `<td class="td-muted">${h(row.place)}</td>` +
