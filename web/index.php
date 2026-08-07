@@ -1864,10 +1864,13 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         const tz  = () => currentLang === 'de' ? 'Europe/Berlin' : 'UTC';
 
         function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
-        function fmtEur(v) { return (v === null || v === undefined) ? '—' : Number(v).toFixed(3); }
-        function fmtCt(v) { return (v === null || v === undefined) ? '—' : (v * 100).toFixed(2) + ' ct'; }
-        function fmtSignedCt(v) { if (v === null || v === undefined) return '—'; const c = v * 100; return (c >= 0 ? '+' : '') + c.toFixed(2) + ' ct'; }
-        function fmtPct(v) { return (v === null || v === undefined) ? '—' : Number(v).toFixed(1) + '%'; }
+        // Euro prices get the pump treatment (raised tenth-of-a-cent digit) and
+        // therefore return HTML; everything else is plain text. Both take the
+        // decimal separator from the shared helpers, so German shows a comma.
+        function fmtEurHtml(v) { return fmtPriceHtml(v); }
+        function fmtCt(v) { const s = (v === null || v === undefined) ? null : fmtDecimal(v * 100, 2); return s === null ? '—' : s + ' ct'; }
+        function fmtSignedCt(v) { if (v === null || v === undefined) return '—'; const c = v * 100; const s = fmtDecimal(c, 2); return s === null ? '—' : (c >= 0 ? '+' : '') + s + ' ct'; }
+        function fmtPct(v) { const s = fmtDecimal(v, 1); return s === null ? '—' : s + '%'; }
         function fmtInt(v) { return Number(v || 0).toLocaleString(loc()); }
         function fmtDateTime(iso) { if (!iso) return '—'; return new Date(iso).toLocaleString(loc(), { timeZone: tz(), year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }); }
         function fmtDate(iso) { return new Date(iso).toLocaleDateString(loc(), { timeZone: tz(), month: 'short', day: '2-digit' }); }
@@ -2058,8 +2061,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 + '<td class="td-muted" data-label="' + esc(t.predColRunAt) + '">' + esc(fmtDateTime(r.run_at)) + '</td>'
                 + '<td class="td-muted" data-label="' + esc(t.predColLead) + '">' + esc(fmtLead(r.lead)) + '</td>'
                 + '<td data-label="' + esc(t.predColConf) + '">' + esc(confLabel(r.conf)) + '</td>'
-                + '<td data-label="' + esc(t.predColPredicted) + '">' + esc(fmtEur(r.p)) + '</td>'
-                + '<td data-label="' + esc(t.predColActual) + '">' + esc(fmtEur(r.a)) + '</td>'
+                + '<td data-label="' + esc(t.predColPredicted) + '">' + fmtEurHtml(r.p) + '</td>'
+                + '<td data-label="' + esc(t.predColActual) + '">' + fmtEurHtml(r.a) + '</td>'
                 + '<td class="' + (good ? 'pred-err-good' : 'pred-err-bad') + '" data-label="' + esc(t.predColError) + '">' + esc(fmtSignedCt(r.err)) + '</td>'
                 + '</tr>';
         }
@@ -2122,13 +2125,17 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             hideTooltip();
         });
 
-        const ttRow = (color, name, value, valueClass) =>
+        // `valueHtml` is inserted as-is; ttRow escapes plain-text values for it.
+        const ttRowHtml = (color, name, valueHtml, valueClass) =>
             '<div class="tt-row">'
             + (color ? '<span class="legend-dot" style="background:' + color + '"></span>' : '')
             + '<span class="tt-name">' + esc(name) + '</span>'
             + '<span class="tt-val' + (valueClass ? ' ' + valueClass : '') + '"'
-            + (color ? ' style="color:' + color + '"' : '') + '>' + esc(value) + '</span>'
+            + (color ? ' style="color:' + color + '"' : '') + '>' + valueHtml + '</span>'
             + '</div>';
+
+        const ttRow = (color, name, value, valueClass) =>
+            ttRowHtml(color, name, esc(value), valueClass);
 
         // Predicted / actual / error / sample-count block shared by both views.
         function ttBody(q, iso) {
@@ -2136,8 +2143,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             const err = q.a - q.p;
             const good = Math.abs(err * 100) <= 1.0;
             return '<div class="tt-meta">' + esc(fmtDateTime(iso)) + '</div>'
-                + ttRow(C_PRED, t.predLegendPredicted, fmtEur(q.p) + ' €')
-                + ttRow(C_ACTUAL, t.predLegendActual, fmtEur(q.a) + ' €')
+                + ttRowHtml(C_PRED, t.predLegendPredicted, fmtEurHtml(q.p) + ' €')
+                + ttRowHtml(C_ACTUAL, t.predLegendActual, fmtEurHtml(q.a) + ' €')
                 + ttRow(null, t.predColError, fmtSignedCt(err), good ? 'pred-err-good' : 'pred-err-bad')
                 + ttRow(null, t.predColCount, fmtInt(q.n));
         }
@@ -2225,7 +2232,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 const val = minY + ((maxY - minY) / 5) * i;
                 const yp = py(val);
                 mk('line', { x1: c.m.left, y1: yp, x2: c.W - c.m.right, y2: yp, stroke: c.grid, 'stroke-width': 1 });
-                mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = val.toFixed(3);
+                fillSvgPrice(mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }), val, 11);
             }
             const tickCount = Math.min(c.W < 560 ? 4 : 7, pts.length);
             for (let i = 0; i < tickCount; i++) {
@@ -2312,8 +2319,8 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 const yp = py(val), xp = px(val);
                 mk('line', { x1: c.m.left, y1: yp, x2: c.W - c.m.right, y2: yp, stroke: c.grid, 'stroke-width': 1 });
                 mk('line', { x1: xp, y1: c.m.top, x2: xp, y2: c.H - c.m.bottom, stroke: c.grid, 'stroke-width': 1 });
-                mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = val.toFixed(2);
-                mk('text', { x: xp, y: c.H - c.m.bottom + 14, 'text-anchor': 'middle', 'font-size': 10, 'font-family': c.font, fill: c.tick }).textContent = val.toFixed(2);
+                mk('text', { x: c.m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': c.font, fill: c.label }).textContent = fmtDecimal(val, 2);
+                mk('text', { x: xp, y: c.H - c.m.bottom + 14, 'text-anchor': 'middle', 'font-size': 10, 'font-family': c.font, fill: c.tick }).textContent = fmtDecimal(val, 2);
             }
             mk('line', { x1: c.m.left, y1: c.H - c.m.bottom, x2: c.W - c.m.right, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
             mk('line', { x1: c.m.left, y1: c.m.top, x2: c.m.left, y2: c.H - c.m.bottom, stroke: c.axis, 'stroke-width': 1 });
@@ -3780,7 +3787,12 @@ function h(?string $value): string
     return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
 }
 
-function stationLabel(array $station): string
+/**
+ * Label for a station in the picker. The distance is optional because the
+ * client re-renders it on a language switch (German writes 3,9 km, English
+ * 3.9 km) and needs the label without it as the stable base.
+ */
+function stationLabel(array $station, bool $withDistance = true): string
 {
     $name = trim($station['name']);
 
@@ -3788,7 +3800,7 @@ function stationLabel(array $station): string
 
     $dist = '';
     $selectedDistKm = $station['selected_dist_km'] ?? null;
-    if ($selectedDistKm !== null) {
+    if ($withDistance && $selectedDistKm !== null) {
         $dist = number_format((float) $selectedDistKm, 1) . ' km';
     }
 
@@ -4348,6 +4360,20 @@ function renderDocumentHead(string $titleSuffix): void
             font-weight: 500;
             color: var(--amber);
             line-height: 1;
+        }
+
+        /* ── Prices ────────────────────────────────────────────── */
+        /* German pump boards print the tenth-of-a-cent digit raised and
+           smaller (2.09⁹). Purely a display treatment: same font, same
+           value, scaled off the surrounding text so it works at every
+           size from the big card price down to a table cell. Positioned
+           rather than vertical-aligned so the raised glyph cannot grow
+           the line box and shift the layout around it. */
+        .price-milli {
+            font-size: 0.62em;
+            line-height: 1;
+            position: relative;
+            top: -0.44em;
         }
 
         /* ── Cheapest card ─────────────────────────────────────── */
@@ -6310,6 +6336,77 @@ function formatTimeOnly(isoString) {
     });
 }
 
+/* ── Number & price formatting ─────────────────────────────────────
+   Display only — nothing here touches stored or submitted values.
+
+   German pump boards show the tenth-of-a-cent digit raised and smaller
+   (2.09⁹), so every three-decimal euro price in the UI is rendered that
+   way. The decimal separator follows the UI language: comma for de, dot
+   for en. Form inputs keep the dot, since that is what the server parses.
+   ──────────────────────────────────────────────────────────────── */
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function decimalSeparator() { return currentLang === 'de' ? ',' : '.'; }
+
+// Fixed-decimal number in the active locale's separator. Returns null for
+// anything that is not a finite number, so callers can pick their own dash.
+function fmtDecimal(v, digits) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    return n.toFixed(digits).replace('.', decimalSeparator());
+}
+
+function fmtDistanceKm(v) {
+    const s = fmtDecimal(v, 1);
+    return s === null ? null : s + ' km';
+}
+
+// Splits a price into the part shown at normal size and the raised
+// tenth-of-a-cent digit. null when there is no number to show.
+function priceParts(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    const s = n.toFixed(3);
+    return { head: s.slice(0, -1).replace('.', decimalSeparator()), milli: s.slice(-1) };
+}
+
+// Plain text — title attributes, aria labels, anything not parsed as HTML.
+function fmtPriceText(v, fallback) {
+    const p = priceParts(v);
+    if (p === null) return fallback === undefined ? '—' : fallback;
+    return p.head + p.milli;
+}
+
+// HTML with the third decimal raised. Digits and separators only, so the
+// result never needs escaping; the fallback is escaped by the caller.
+function fmtPriceHtml(v, fallback) {
+    const p = priceParts(v);
+    if (p === null) return fallback === undefined ? '—' : fallback;
+    return p.head + '<span class="price-milli">' + p.milli + '</span>';
+}
+
+// Same treatment inside an SVG <text>: two tspans, the second shrunk and
+// lifted off the baseline by the same proportions the CSS class uses.
+function fillSvgPrice(textEl, v, fontSize, fallback) {
+    const p = priceParts(v);
+    textEl.textContent = '';
+    if (p === null) {
+        textEl.textContent = fallback === undefined ? '—' : fallback;
+        return textEl;
+    }
+    const head = document.createElementNS(SVG_NS, 'tspan');
+    head.textContent = p.head;
+    textEl.appendChild(head);
+    const milli = document.createElementNS(SVG_NS, 'tspan');
+    milli.setAttribute('font-size', (fontSize * 0.62).toFixed(2));
+    milli.setAttribute('dy', (-fontSize * 0.27).toFixed(2));
+    milli.textContent = p.milli;
+    textEl.appendChild(milli);
+    return textEl;
+}
+
 function applyLang(lang) {
     currentLang = lang;
     localStorage.setItem('lang', lang);
@@ -6345,6 +6442,17 @@ function applyLang(lang) {
     // Re-format date-only stat cells (first/last recorded)
     document.querySelectorAll('[data-date-only]').forEach((el) => {
         el.textContent = formatDateOnly(el.dataset.dateOnly);
+    });
+    // Re-format prices and distances rendered once and paged (snapshot table,
+    // station picker), which the page-specific renderers do not rebuild.
+    document.querySelectorAll('[data-price-value]').forEach((el) => {
+        el.innerHTML = fmtPriceHtml(el.dataset.priceValue, '-');
+    });
+    document.querySelectorAll('[data-dist-km]').forEach((el) => {
+        const base = el.dataset.nameBase || '';
+        const dist = fmtDistanceKm(el.dataset.distKm);
+        if (dist === null) return;
+        el.textContent = base === '' ? dist : `${base} (${dist})`;
     });
     // Page-specific re-rendering (e.g. the dashboard chart) hooks in here.
     if (typeof window.onLangChange === 'function') window.onLangChange();
@@ -6550,8 +6658,18 @@ renderDocumentHead('Price History');
                     <label><span data-i18n="stations">Stations</span> <span style="color:var(--border-hi)" data-i18n="stationsHint">(hold Ctrl to multi-select)</span></label>
                     <select name="station_ids[]" multiple onchange="this.form.submit()">
                         <?php foreach ($stations as $station): ?>
-                            <?php $stationId = (string) $station['id']; ?>
-                            <option value="<?= h($stationId) ?>" <?= in_array($stationId, $selectedStationIds, true) ? 'selected' : '' ?>>
+                            <?php
+                            $stationId = (string) $station['id'];
+                            // The distance is re-formatted client-side per language,
+                            // so hand over the raw value and the label without it.
+                            $stationDistKm = $station['selected_dist_km'] ?? null;
+                            $distAttrs = $stationDistKm === null ? '' : sprintf(
+                                ' data-name-base="%s" data-dist-km="%s"',
+                                h(stationLabel($station, false)),
+                                h(number_format((float) $stationDistKm, 1, '.', ''))
+                            );
+                            ?>
+                            <option value="<?= h($stationId) ?>"<?= $distAttrs ?> <?= in_array($stationId, $selectedStationIds, true) ? 'selected' : '' ?>>
                                 <?= h(stationLabel($station)) ?>
                             </option>
                         <?php endforeach; ?>
@@ -7073,9 +7191,9 @@ if (!chartEl) {
             const yp = py(val);
             mk('line', { x1: margin.left, y1: yp, x2: W - margin.right, y2: yp,
                 stroke: gridStroke, 'stroke-width': 1 });
-            mk('text', { x: margin.left - (compact ? 6 : 10), y: yp + 4, 'text-anchor': 'end',
+            fillSvgPrice(mk('text', { x: margin.left - (compact ? 6 : 10), y: yp + 4, 'text-anchor': 'end',
                 'font-size': 11, 'font-family': "'DM Mono', monospace", fill: '#6b7280' },
-            ).textContent = val.toFixed(3);
+            ), val, 11);
         }
 
         // X ticks — two-line: date + time; fewer on narrow screens so the
@@ -7206,7 +7324,7 @@ if (!chartEl) {
                         `<span class="legend-dot" style="background:${color}"></span>` +
                         `<span class="tt-name">${h(en.name)}</span>` +
                         (showFuel ? `<span class="tt-fuel">${fuelConfig[en.fuel].label}</span>` : '') +
-                        `<span class="tt-val" style="color:${color}">${en.price.toFixed(3)} €</span>` +
+                        `<span class="tt-val" style="color:${color}">${fmtPriceHtml(en.price)} €</span>` +
                     `</div>`;
                 }).join('');
             tooltip.style.display = 'block';
@@ -7286,13 +7404,13 @@ function stationBlock(stationId, stationName, fuel, address) {
 
 // Compact ranked row (runners-up / extra prediction windows), also clickable.
 // `stationName` drives the colour dot, `label` is the (possibly distance-
-// suffixed) text shown to the user.
-function stationRankRow(stationId, stationName, label, fuel, priceText, trailingHtml, titleText) {
+// suffixed) text shown to the user, `price` the raw number to render.
+function stationRankRow(stationId, stationName, label, fuel, price, trailingHtml, titleText) {
     const t = translations[currentLang];
     return `<button type="button" class="rank-row station-rank-btn" data-station-id="${h(stationId)}"` +
         ` title="${h(titleText ? titleText + ' — ' + t.sdHint : t.sdHint)}"` +
-        ` aria-label="${h(t.sdHint + ': ' + label)}">` +
-        `<span class="rank-price" style="color:${FUEL_CSS_COLORS[fuel]}">${h(priceText)}</span>` +
+        ` aria-label="${h(t.sdHint + ': ' + fmtPriceText(price) + ' — ' + label)}">` +
+        `<span class="rank-price" style="color:${FUEL_CSS_COLORS[fuel]}">${fmtPriceHtml(price)}</span>` +
         `<span class="rank-station">${stationDot(stationName, fuel)}${h(label)}</span>` +
         (trailingHtml || '') +
     `</button>`;
@@ -7332,12 +7450,12 @@ function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
                     const addressParts = [street, place].filter(Boolean);
                     const selectedDistKm = stationDistancesById[station_id] ?? null;
                     if (selectedDistKm !== null) {
-                        addressParts.push(`${selectedDistKm.toFixed(1)} km`);
+                        addressParts.push(fmtDistanceKm(selectedDistKm));
                     }
                     const address = addressParts.length ? addressParts.join(', ') : '';
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
-                        `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                        `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(price)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
                         stationBlock(station_id, station, fuel, address) +
                         `<div class="cheapest-time">${h(formatDateTime(recorded_at))}</div>` +
                     `</div>`;
@@ -7385,7 +7503,7 @@ function renderCheapest() {
 
     const distSuffix = (row) => {
         const dist = stationDistancesById[row.station_id] ?? null;
-        return dist !== null ? ` (${dist.toFixed(1)} km)` : '';
+        return dist !== null ? ` (${fmtDistanceKm(dist)})` : '';
     };
 
     const colClass = results.length === 1 ? ' single' : results.length === 2 ? ' two-col' : '';
@@ -7399,19 +7517,19 @@ function renderCheapest() {
                     const best = top[0];
                     const addressParts = [best.street, best.place].filter(Boolean);
                     const bestDist = stationDistancesById[best.station_id] ?? null;
-                    if (bestDist !== null) addressParts.push(`${bestDist.toFixed(1)} km`);
+                    if (bestDist !== null) addressParts.push(fmtDistanceKm(bestDist));
                     const runnersUp = top.slice(1).map((row) => stationRankRow(
                         row.station_id,
                         row.station_name,
                         row.station_name + distSuffix(row),
                         fuel,
-                        row[fuel].toFixed(3),
+                        row[fuel],
                         '',
                         formatDateTime(row.recorded_at)
                     )).join('');
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
-                        `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${best[fuel].toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                        `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(best[fuel])} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
                         stationBlock(best.station_id, best.station_name, fuel, addressParts.join(', ')) +
                         `<div class="cheapest-time">${h(formatDateTime(best.recorded_at))}</div>` +
                         (runnersUp ? `<div class="rank-list">${runnersUp}</div>` : '') +
@@ -7447,7 +7565,7 @@ function renderPredictions() {
     const nameById = (id) => (predictionStationMeta[id] && predictionStationMeta[id].name) || id;
     const distSuffix = (id) => {
         const dist = stationDistancesById[id] ?? null;
-        return dist !== null ? ` (${dist.toFixed(1)} km)` : '';
+        return dist !== null ? ` (${fmtDistanceKm(dist)})` : '';
     };
     // Address line for the top station, mirroring the top-5 card: street, place,
     // then distance. Distance moves out of the name and into this line.
@@ -7455,7 +7573,7 @@ function renderPredictions() {
         const meta = predictionStationMeta[id] || {};
         const parts = [meta.street, meta.place].filter(Boolean);
         const dist = stationDistancesById[id] ?? null;
-        if (dist !== null) parts.push(`${dist.toFixed(1)} km`);
+        if (dist !== null) parts.push(fmtDistanceKm(dist));
         return parts.join(', ');
     };
     // Day bucket key + header in the displayed timezone/locale so grouping
@@ -7503,11 +7621,11 @@ function renderPredictions() {
                             nameById(p.s),
                             nameById(p.s) + distSuffix(p.s),
                             fuel,
-                            p.price.toFixed(3),
+                            p.price,
                             `<span class="pred-time">${h(windowLabel(p))}</span>`
                         )).join('');
                         return `<div class="pred-day">${h(dayLabel(best.start))}</div>` +
-                            `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${best.price.toFixed(3)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                            `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(best.price)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
                             `<div class="cheapest-time">${h(windowLabel(best))}</div>` +
                             stationBlock(best.s, bestName, fuel, bestAddr) +
                             (runners ? `<div class="rank-list">${runners}</div>` : '');
@@ -7562,7 +7680,7 @@ function stationDialogHtml(stationId) {
         return `<div class="sd-price${has ? '' : ' empty'}">` +
             `<div class="sd-price-label"${has ? ` style="color:${FUEL_CSS_COLORS[fuel]}"` : ''}>${fuelConfig[fuel].label}</div>` +
             `<div class="sd-price-value"${has ? ` style="color:${FUEL_CSS_COLORS[fuel]}"` : ''}>` +
-                (has ? `${value.toFixed(3)} <span style="font-size:0.8rem;opacity:0.6">€</span>` : '—') +
+                (has ? `${fmtPriceHtml(value)} <span style="font-size:0.8rem;opacity:0.6">€</span>` : '—') +
             `</div>` +
         `</div>`;
     }).join('');
@@ -7572,7 +7690,7 @@ function stationDialogHtml(stationId) {
         rows.push([t.sdAddress, addressLines.map((line) => h(line)).join('<br>')]);
     }
     if (meta.brand) rows.push([t.brand, h(meta.brand)]);
-    if (dist !== null) rows.push([t.sdDistance, h(dist.toFixed(1) + ' km')]);
+    if (dist !== null) rows.push([t.sdDistance, h(fmtDistanceKm(dist))]);
     if (latest) rows.push([t.sdLastUpdate, h(formatDateTime(latest.recorded_at))]);
 
     // Upcoming suggestion windows for this station (same source as the
@@ -7587,7 +7705,7 @@ function stationDialogHtml(stationId) {
             return `<div class="sd-window">` +
                 `<span class="sd-window-fuel" style="color:${FUEL_CSS_COLORS[p.fuel]}">${fuelConfig[p.fuel].label}</span>` +
                 `<span class="sd-window-time">${h(day + ' · ' + formatTimeOnly(p.start) + '–' + formatTimeOnly(p.end))}</span>` +
-                `<span class="sd-window-price" style="color:${FUEL_CSS_COLORS[p.fuel]}">${h(p.price.toFixed(3))}</span>` +
+                `<span class="sd-window-price" style="color:${FUEL_CSS_COLORS[p.fuel]}">${fmtPriceHtml(p.price)}</span>` +
             `</div>`;
         }).join('');
 
@@ -7606,7 +7724,7 @@ function stationDialogHtml(stationId) {
             `</h2>` +
             `<div class="sd-tags">` +
                 openTag +
-                (dist !== null ? `<span class="sd-tag">${h(dist.toFixed(1) + ' km')}</span>` : '') +
+                (dist !== null ? `<span class="sd-tag">${h(fmtDistanceKm(dist))}</span>` : '') +
                 (meta.brand ? `<span class="sd-tag">${h(meta.brand)}</span>` : '') +
             `</div>` +
         `</div>` +
@@ -7827,24 +7945,32 @@ const TABLE_PAGE    = 1000; // rows rendered per chunk — nobody scrolls 100k <
 
 let tableRendered = 0;
 
-function fmtPrice(v) { return (v === null || v === undefined) ? '-' : Number(v).toFixed(3); }
+// Price cell. The raw value rides along in data-price-value so a language
+// switch can re-format the already-rendered rows without rebuilding the
+// table (which would throw away however far the reader has paged).
+function priceCell(cls, v) {
+    const raw = (v === null || v === undefined) ? '' : String(v);
+    return `<td class="${cls}" data-price-value="${h(raw)}">${fmtPriceHtml(v, '-')}</td>`;
+}
 
 function tableRowHtml(row) {
     const t = translations[currentLang];
     const dist = stationDistancesById[row.station_id];
-    const distSuffix = (dist !== undefined && dist !== null) ? ` (${dist.toFixed(1)} km)` : '';
+    const distSuffix = (dist !== undefined && dist !== null) ? ` (${fmtDistanceKm(dist)})` : '';
     const openClass = row.is_open ? 'open-yes' : 'open-no';
     const openKey   = row.is_open ? 'openYes' : 'openNo';
+    const hasDist   = dist !== undefined && dist !== null;
     return '<tr>' +
         `<td class="td-muted" data-recorded-at="${h(row.recorded_at)}">${h(formatDateTime(row.recorded_at))}</td>` +
-        `<td>${h(row.station_name + distSuffix)}</td>` +
+        `<td${hasDist ? ` data-name-base="${h(row.station_name)}" data-dist-km="${h(String(dist))}"` : ''}>` +
+            `${h(row.station_name + distSuffix)}</td>` +
         `<td class="td-muted">${h(row.brand)}</td>` +
         `<td class="td-muted">${h(row.street)}</td>` +
         `<td class="td-muted">${h(row.place)}</td>` +
         `<td class="${openClass}" data-i18n="${openKey}">${h(t[openKey])}</td>` +
-        `<td class="price-e5">${fmtPrice(row.e5)}</td>` +
-        `<td class="price-e10">${fmtPrice(row.e10)}</td>` +
-        `<td class="price-diesel">${fmtPrice(row.diesel)}</td>` +
+        priceCell('price-e5', row.e5) +
+        priceCell('price-e10', row.e10) +
+        priceCell('price-diesel', row.diesel) +
     '</tr>';
 }
 
