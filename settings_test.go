@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"math"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -24,27 +22,14 @@ func TestInitSchemaCreatesAuthAndSettingsTables(t *testing.T) {
 		}
 	}
 
+	// The notification texts are the whole of the stored configuration.
 	want := map[string]string{
-		settingFuel:            "diesel",
-		settingRangeKM:         "5",
-		settingHistoryDays:     "30",
-		settingPredictDays:     "3",
-		settingLimitPerDay:     "3",
-		settingCheckLimit:      "5",
-		settingSuggestTimes:    "08:00,13:00",
-		settingCheckResetTime:  "00:00",
-		settingNotifyDays:      "mon,tue,wed,thu,fri,sat,sun",
-		settingNotifyWindows:   "07:00-21:00",
 		settingCheckTemplate:   defaultCheckTemplate,
 		settingSuggestTemplate: defaultSuggestTemplate,
 		// Title templates default to empty: notifications fall back to the
 		// user's pushover_app_name until an admin configures a template.
 		settingCheckTitleTemplate:   "",
 		settingSuggestTitleTemplate: "",
-		// Fixed margin mode keeps the historical verdicts; the fraction is
-		// only consulted once an admin switches to relative mode.
-		settingCheckDeltaMode:     checkDeltaModeFixed,
-		settingCheckDeltaFraction: "0.2",
 	}
 	rows, err := db.QueryContext(ctx, `SELECT name, value FROM settings`)
 	if err != nil {
@@ -73,7 +58,7 @@ func TestMigrateSeedDefaultSettingsIsIdempotentAndKeepsEdits(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = 'e5' WHERE name = ?`, settingFuel); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = 'edited' WHERE name = ?`, settingCheckTemplate); err != nil {
 		t.Fatalf("update setting: %v", err)
 	}
 
@@ -85,16 +70,52 @@ func TestMigrateSeedDefaultSettingsIsIdempotentAndKeepsEdits(t *testing.T) {
 		t.Fatalf("second migrate reported seeding again: %v", result.Applied)
 	}
 
-	var fuel string
-	if err := db.QueryRowContext(ctx, `SELECT value FROM settings WHERE name = ?`, settingFuel).Scan(&fuel); err != nil {
+	var template string
+	if err := db.QueryRowContext(ctx, `SELECT value FROM settings WHERE name = ?`, settingCheckTemplate).Scan(&template); err != nil {
 		t.Fatalf("read setting: %v", err)
 	}
-	if fuel != "e5" {
-		t.Fatalf("fuel = %q, want the admin edit e5 to survive", fuel)
+	if template != "edited" {
+		t.Fatalf("check template = %q, want the admin edit to survive", template)
 	}
 }
 
-func TestLoadSettingsOverlaysDefaultsAndRejectsBadNumbers(t *testing.T) {
+func TestMigrateDropsObsoleteSettings(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// An install upgrading from a version that still stored the scope, fuel,
+	// model and margin configuration.
+	for _, name := range obsoleteSettings {
+		if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"),
+			name, "stale", "2026-01-01T00:00:00Z"); err != nil {
+			t.Fatalf("seed obsolete setting %s: %v", name, err)
+		}
+	}
+	result, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("migrateSchema: %v", err)
+	}
+	if !containsString(result.Applied, "settings.drop_obsolete") {
+		t.Fatalf("migrate did not report dropping obsolete settings: %v", result.Applied)
+	}
+	var remaining int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings`).Scan(&remaining); err != nil {
+		t.Fatalf("count settings: %v", err)
+	}
+	if remaining != len(seededSettings()) {
+		t.Fatalf("settings rows = %d, want only the %d seeded templates", remaining, len(seededSettings()))
+	}
+	// Re-running must not report the drop again.
+	second, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("second migrateSchema: %v", err)
+	}
+	if containsString(second.Applied, "settings.drop_obsolete") {
+		t.Fatalf("second migrate reported dropping again: %v", second.Applied)
+	}
+}
+
+func TestLoadSettingsOverlaysDefaultsAndIgnoresUnknownKeys(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
@@ -109,28 +130,22 @@ func TestLoadSettingsOverlaysDefaultsAndRejectsBadNumbers(t *testing.T) {
 		t.Fatalf("empty table settings = %+v, want defaults", s)
 	}
 
-	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"), settingFuel, "e10", "2026-01-01T00:00:00Z"); err != nil {
+	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"), settingCheckTemplate, "custom", "2026-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("insert setting: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"), settingHistoryDays, "30", "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatalf("insert setting: %v", err)
-	}
-	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"), "unknown_key", "ignored", "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatalf("insert setting: %v", err)
+	// Keys an older version wrote must not become errors: an install that has
+	// not migrated yet still has to run.
+	for _, name := range append([]string{"unknown_key"}, obsoleteSettings...) {
+		if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"), name, "ignored", "2026-01-01T00:00:00Z"); err != nil {
+			t.Fatalf("insert setting %s: %v", name, err)
+		}
 	}
 	s, err = loadSettings(ctx, db)
 	if err != nil {
 		t.Fatalf("loadSettings: %v", err)
 	}
-	if s.Fuel != "e10" || s.HistoryDays != 30 || s.PredictDays != 3 {
-		t.Fatalf("settings = %+v, want fuel=e10 history=30 predict=3", s)
-	}
-
-	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"), settingRangeKM, "abc", "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatalf("insert setting: %v", err)
-	}
-	if _, err := loadSettings(ctx, db); err == nil || !strings.Contains(err.Error(), settingRangeKM) {
-		t.Fatalf("loadSettings error = %v, want error naming %s", err, settingRangeKM)
+	if s.CheckTemplate != "custom" || s.SuggestTemplate != defaultSuggestTemplate {
+		t.Fatalf("settings = %+v, want the stored check template and the default suggest template", s)
 	}
 }
 
@@ -161,153 +176,22 @@ func TestLoadSettingsUnescapesTemplates(t *testing.T) {
 	}
 }
 
-func TestAppSettingsFuels(t *testing.T) {
-	cases := []struct {
-		in   string
-		want string
-	}{
-		{"diesel", "diesel"},
-		{"diesel,e5,e10", "diesel,e5,e10"},
-		{"e10,diesel", "diesel,e10"},   // normalized to canonical order
-		{" E5 , diesel ", "diesel,e5"}, // trims and lowercases
-		{"diesel,diesel", "diesel"},    // dedupes
-		{"diesel,bogus", "diesel"},     // drops invalid entries
-		{"", "diesel,e5,e10"},          // empty falls back to all fuels
-		{"bogus", "diesel,e5,e10"},     // fully invalid falls back to all fuels
+func TestSuggestFuelsCoversEveryTrackedFuel(t *testing.T) {
+	// Every fuel is always computed, so this list and the validator that
+	// guards the SQL column name must not drift apart.
+	if want := []string{"diesel", "e5", "e10"}; strings.Join(suggestFuels, ",") != strings.Join(want, ",") {
+		t.Fatalf("suggestFuels = %v, want %v", suggestFuels, want)
 	}
-	for _, tc := range cases {
-		got := strings.Join(appSettings{Fuel: tc.in}.Fuels(), ",")
-		if got != tc.want {
-			t.Errorf("Fuels(%q) = %q, want %q", tc.in, got, tc.want)
+	for _, fuel := range suggestFuels {
+		if !isSuggestFuelType(fuel) {
+			t.Errorf("isSuggestFuelType(%q) = false, want true", fuel)
+		}
+		if _, err := suggestFuelColumn(fuel); err != nil {
+			t.Errorf("suggestFuelColumn(%q): %v", fuel, err)
 		}
 	}
-}
-
-func TestApplySuggestSettingsUsesFirstEnabledFuel(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = 'e5,e10' WHERE name = ?`, settingFuel); err != nil {
-		t.Fatalf("update setting: %v", err)
-	}
-	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
-	fs.String("fuel", "diesel", "")
-	fs.Float64("range-km", 5, "")
-	fs.Int("history-days", 21, "")
-	fs.Int("predict-days", 3, "")
-	fs.Int("limit-per-day", 3, "")
-	if err := fs.Parse(nil); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	opts := suggestOptions{Fuel: "diesel", RangeKM: 5, HistoryDays: 21, PredictDays: 3, LimitPerDay: 3}
-	if err := applySuggestSettings(ctx, db, fs, &opts); err != nil {
-		t.Fatalf("applySuggestSettings: %v", err)
-	}
-	if opts.Fuel != "e5" {
-		t.Fatalf("opts.Fuel = %q, want first enabled fuel e5", opts.Fuel)
-	}
-}
-
-func TestApplySuggestSettingsPrecedence(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-
-	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = 'e5' WHERE name = ?`, settingFuel); err != nil {
-		t.Fatalf("update setting: %v", err)
-	}
-	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = '12' WHERE name = ?`, settingRangeKM); err != nil {
-		t.Fatalf("update setting: %v", err)
-	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, ?, ?)`,
-		"Berlin", 10.0, "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatalf("insert target: %v", err)
-	}
-
-	// No explicit flags: DB settings win over hardcoded defaults.
-	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
-	fs.String("city", "", "")
-	fs.Float64("range-km", 5, "")
-	fs.String("fuel", "diesel", "")
-	fs.Int("history-days", 21, "")
-	fs.Int("predict-days", 3, "")
-	fs.Int("limit-per-day", 3, "")
-	if err := fs.Parse(nil); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	opts := suggestOptions{City: "", RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, LimitPerDay: 3}
-	if err := applySuggestSettings(ctx, db, fs, &opts); err != nil {
-		t.Fatalf("applySuggestSettings: %v", err)
-	}
-	if opts.Fuel != "e5" || opts.RangeKM != 12 {
-		t.Fatalf("opts = %+v, want fuel=e5 range=12", opts)
-	}
-	if opts.City != "" {
-		t.Fatalf("city = %q, want empty: city resolution belongs to resolveCities, not settings", opts.City)
-	}
-
-	// Explicit flags beat the DB.
-	fs = flag.NewFlagSet("suggest", flag.ContinueOnError)
-	fs.String("city", "", "")
-	fs.Float64("range-km", 5, "")
-	fs.String("fuel", "diesel", "")
-	fs.Int("history-days", 21, "")
-	fs.Int("predict-days", 3, "")
-	fs.Int("limit-per-day", 3, "")
-	if err := fs.Parse([]string{"--fuel", "diesel", "--city", "Hamburg"}); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	opts = suggestOptions{City: "Hamburg", RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, LimitPerDay: 3}
-	if err := applySuggestSettings(ctx, db, fs, &opts); err != nil {
-		t.Fatalf("applySuggestSettings: %v", err)
-	}
-	if opts.Fuel != "diesel" || opts.City != "Hamburg" {
-		t.Fatalf("opts = %+v, want explicit fuel=diesel city=Hamburg preserved", opts)
-	}
-	if opts.RangeKM != 12 {
-		t.Fatalf("range = %v, want DB value 12 for unset flag", opts.RangeKM)
-	}
-}
-
-func TestApplyCheckSettingsPrecedence(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-
-	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = '9' WHERE name = ?`, settingCheckLimit); err != nil {
-		t.Fatalf("update setting: %v", err)
-	}
-	fs := flag.NewFlagSet("check", flag.ContinueOnError)
-	fs.String("city", "", "")
-	fs.Float64("range-km", 5, "")
-	fs.String("fuel", "diesel", "")
-	fs.Int("history-days", 21, "")
-	fs.Int("predict-days", 3, "")
-	fs.Int("limit", 5, "")
-	if err := fs.Parse([]string{"--limit", "2"}); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	opts := checkOptions{RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: 2}
-	if err := applyCheckSettings(ctx, db, fs, &opts); err != nil {
-		t.Fatalf("applyCheckSettings: %v", err)
-	}
-	if opts.Limit != 2 {
-		t.Fatalf("limit = %d, want explicit flag 2", opts.Limit)
-	}
-
-	fs = flag.NewFlagSet("check", flag.ContinueOnError)
-	fs.String("city", "", "")
-	fs.Float64("range-km", 5, "")
-	fs.String("fuel", "diesel", "")
-	fs.Int("history-days", 21, "")
-	fs.Int("predict-days", 3, "")
-	fs.Int("limit", 5, "")
-	if err := fs.Parse(nil); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	opts = checkOptions{RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: 5}
-	if err := applyCheckSettings(ctx, db, fs, &opts); err != nil {
-		t.Fatalf("applyCheckSettings: %v", err)
-	}
-	if opts.Limit != 9 {
-		t.Fatalf("limit = %d, want DB value 9", opts.Limit)
+	if isSuggestFuelType("premium") {
+		t.Error("isSuggestFuelType accepted an unknown fuel")
 	}
 }
 
@@ -483,119 +367,6 @@ func TestRunUpdateNoFlagsNoTargetsErrors(t *testing.T) {
 	err := run([]string{"update", "--db", dbPath})
 	if err == nil || !strings.Contains(err.Error(), "--city") {
 		t.Fatalf("err = %v, want update requires --city", err)
-	}
-}
-
-func TestVerdictThresholdsDefaultsPreserveHistoricalMargin(t *testing.T) {
-	// The zero value stands in for every caller that never sets thresholds
-	// (tests, and any path that predates the setting).
-	var zero verdictThresholds
-	if got := zero.forStation(0.10, true); got != defaultCheckDelta {
-		t.Fatalf("zero-value margin = %v, want the historical %v", got, defaultCheckDelta)
-	}
-	// The seeded defaults must resolve to the same flat margin.
-	if got := defaultAppSettings().VerdictThresholds().forStation(0.10, true); got != defaultCheckDelta {
-		t.Fatalf("default settings margin = %v, want the historical %v", got, defaultCheckDelta)
-	}
-}
-
-func TestVerdictThresholdsRelativeMode(t *testing.T) {
-	relative := appSettings{CheckDeltaMode: checkDeltaModeRelative, CheckDeltaFraction: 0.20}.VerdictThresholds()
-
-	// A 10 ct daily swing at a fifth gives the historical 2 ct margin.
-	if got := relative.forStation(0.10, true); math.Abs(got-0.020) > 1e-9 {
-		t.Fatalf("margin for a 10 ct swing = %v, want 0.020", got)
-	}
-	// A calmer station gets a tighter margin, a wilder one a wider margin.
-	if got := relative.forStation(0.04, true); got >= 0.020 {
-		t.Fatalf("margin for a 4 ct swing = %v, want below the flat 0.020", got)
-	}
-	if got := relative.forStation(0.20, true); got <= 0.020 {
-		t.Fatalf("margin for a 20 ct swing = %v, want above the flat 0.020", got)
-	}
-	// Clamps hold at both ends.
-	if got := relative.forStation(0.001, true); got != minRelativeCheckDelta {
-		t.Fatalf("margin for a flat station = %v, want the %v floor", got, minRelativeCheckDelta)
-	}
-	if got := relative.forStation(10.0, true); got != maxRelativeCheckDelta {
-		t.Fatalf("margin for an absurd swing = %v, want the %v ceiling", got, maxRelativeCheckDelta)
-	}
-	// Without a usable amplitude it falls back to the flat margin.
-	if got := relative.forStation(0, false); got != defaultCheckDelta {
-		t.Fatalf("margin without amplitude = %v, want the flat %v", got, defaultCheckDelta)
-	}
-}
-
-func TestLoadSettingsRejectsInvalidDeltaSettings(t *testing.T) {
-	ctx := context.Background()
-	for _, tc := range []struct{ name, value string }{
-		{settingCheckDeltaMode, "sometimes"},
-		{settingCheckDeltaFraction, "abc"},
-		{settingCheckDeltaFraction, "0"},
-		{settingCheckDeltaFraction, "1.5"},
-	} {
-		db := openTestDB(t)
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO settings (name, value, updated_at) VALUES (?, ?, '2026-04-20T00:00:00Z')
-			 ON CONFLICT(name) DO UPDATE SET value = excluded.value`, tc.name, tc.value); err != nil {
-			t.Fatalf("write setting: %v", err)
-		}
-		if _, err := loadSettings(ctx, db); err == nil {
-			t.Fatalf("loadSettings accepted %s=%q, want an error", tc.name, tc.value)
-		}
-	}
-}
-
-func TestApplyCheckSettingsThreadsMarginRule(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-	newFlags := func() *flag.FlagSet {
-		fs := flag.NewFlagSet("check", flag.ContinueOnError)
-		fs.String("fuel", "diesel", "")
-		fs.Float64("range-km", 5, "")
-		fs.Int("history-days", 30, "")
-		fs.Int("predict-days", 3, "")
-		fs.Int("limit", 5, "")
-		if err := fs.Parse(nil); err != nil {
-			t.Fatalf("parse: %v", err)
-		}
-		return fs
-	}
-
-	// Seeded defaults must yield the historical flat margin.
-	var opts checkOptions
-	if err := applyCheckSettings(ctx, db, newFlags(), &opts); err != nil {
-		t.Fatalf("applyCheckSettings: %v", err)
-	}
-	if opts.Thresholds.Relative {
-		t.Fatal("default settings produced a relative margin rule")
-	}
-	if got := opts.Thresholds.forStation(0.04, true); got != defaultCheckDelta {
-		t.Fatalf("default margin = %v, want the historical %v", got, defaultCheckDelta)
-	}
-
-	// Switching the admin setting must reach checkOptions.
-	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE name = ?`,
-		checkDeltaModeRelative, settingCheckDeltaMode); err != nil {
-		t.Fatalf("update setting: %v", err)
-	}
-	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = '0.5' WHERE name = ?`,
-		settingCheckDeltaFraction); err != nil {
-		t.Fatalf("update setting: %v", err)
-	}
-	opts = checkOptions{}
-	if err := applyCheckSettings(ctx, db, newFlags(), &opts); err != nil {
-		t.Fatalf("applyCheckSettings: %v", err)
-	}
-	if !opts.Thresholds.Relative {
-		t.Fatal("relative mode did not reach checkOptions")
-	}
-	if got := opts.Thresholds.forStation(0.04, true); math.Abs(got-0.020) > 1e-9 {
-		t.Fatalf("relative margin for a 4 ct swing at 0.5 = %v, want 0.020", got)
-	}
-	// The same rule now judges a wider station differently, which is the point.
-	if got := opts.Thresholds.forStation(0.10, true); math.Abs(got-0.050) > 1e-9 {
-		t.Fatalf("relative margin for a 10 ct swing at 0.5 = %v, want 0.050", got)
 	}
 }
 

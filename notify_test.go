@@ -159,9 +159,6 @@ func seedNotifyFixture(t *testing.T, db *sql.DB) {
 	insertSuggestSnapshot(t, db, "station-1", "Berlin", notifyFixtureNow.Add(-10*time.Minute), 2.000, true)
 
 	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = '28' WHERE name = ?`, settingHistoryDays); err != nil {
-		t.Fatalf("update history_days: %v", err)
-	}
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, ?, ?)`,
 		"Berlin", 5.0, "2026-04-01T00:00:00Z"); err != nil {
@@ -848,13 +845,9 @@ func TestNotifyOnceBaselineResetCatchesUpAfterDowntime(t *testing.T) {
 		SuggestTimes: "08:00", CheckEnabled: true,
 		LastSuggest: "2026-04-26T08:00",
 	})
-	// Reset time is late in the evening; now (15:30) is before it, so the
-	// target reset boundary is yesterday. A marker from three days ago means
-	// the process was down over yesterday's boundary: it must catch up.
-	if _, err := db.ExecContext(context.Background(),
-		`UPDATE settings SET value = '23:00' WHERE name = ?`, settingCheckResetTime); err != nil {
-		t.Fatalf("update setting: %v", err)
-	}
+	// A marker from three days ago means the process was down over the last
+	// midnight boundary: the reset must catch up rather than keep a stale
+	// baseline.
 	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline_reset_date", "2026-04-23"); err != nil {
 		t.Fatalf("set state: %v", err)
 	}
@@ -871,9 +864,11 @@ func TestNotifyOnceBaselineResetCatchesUpAfterDowntime(t *testing.T) {
 	if len(result.Sent) != 1 || result.Sent[0].Kind != "check" {
 		t.Fatalf("sent = %+v, want one check after catch-up reset", result.Sent)
 	}
+	// The reset is at local midnight, which today's fixture time (15:30) is
+	// already past, so catching up lands on today.
 	value, found, err := getNotificationState(context.Background(), db, "check_baseline_reset_date")
-	if err != nil || !found || value != "2026-04-25" {
-		t.Fatalf("reset marker = %q found=%v err=%v, want yesterday 2026-04-25", value, found, err)
+	if err != nil || !found || value != "2026-04-26" {
+		t.Fatalf("reset marker = %q found=%v err=%v, want today 2026-04-26", value, found, err)
 	}
 }
 
@@ -996,12 +991,7 @@ func TestNotifyOncePerUserFuel(t *testing.T) {
 	withDecimalSeparator(t, ".")
 	db := openTestDB(t)
 	seedNotifyFixture(t, db)
-	// Admin enables two fuels; a user's single choice selects which one they
-	// hear about, and a user who chose a disabled fuel hears nothing.
-	if _, err := db.ExecContext(context.Background(),
-		`UPDATE settings SET value = 'diesel,e5' WHERE name = ?`, settingFuel); err != nil {
-		t.Fatalf("update fuel setting: %v", err)
-	}
+	// Every fuel is computed, so each user's single choice is always served.
 	seedNotifyUser(t, db, notifyUserFixture{
 		Email: "diesel@example.com", UserKey: "user-diesel", Token: "token-d",
 		SuggestTimes: "13:00", CheckEnabled: true, Fuel: "diesel",
@@ -1021,14 +1011,11 @@ func TestNotifyOncePerUserFuel(t *testing.T) {
 		t.Fatalf("failed sends: %+v", result.Failed)
 	}
 
-	// Each enabled-fuel user receives a check and a suggest; the e10 user is
-	// silent because the admin does not compute e10.
-	fuelByUser := map[string]string{"user-diesel": "diesel", "user-e5": "e5"}
+	// Every fuel is computed, so each user hears about exactly the one they
+	// chose — including e10, which no admin setting can switch off any more.
+	fuelByUser := map[string]string{"user-diesel": "diesel", "user-e5": "e5", "user-e10": "e10"}
 	seen := map[string]int{}
 	for _, push := range *pushes {
-		if push.User == "user-e10" {
-			t.Fatalf("user who chose a disabled fuel must not be notified: %+v", push)
-		}
 		wantFuel, ok := fuelByUser[push.User]
 		if !ok {
 			t.Fatalf("unexpected recipient: %+v", push)
@@ -1041,8 +1028,8 @@ func TestNotifyOncePerUserFuel(t *testing.T) {
 		}
 		seen[push.User]++
 	}
-	if seen["user-diesel"] != 2 || seen["user-e5"] != 2 {
-		t.Fatalf("push counts = %v, want 2 each for diesel and e5 users", seen)
+	if seen["user-diesel"] != 2 || seen["user-e5"] != 2 || seen["user-e10"] != 2 {
+		t.Fatalf("push counts = %v, want 2 each for all three fuel users", seen)
 	}
 
 	// Baselines are fuel-scoped, so the two users at the same city do not

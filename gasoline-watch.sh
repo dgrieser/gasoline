@@ -70,11 +70,7 @@ declare -A ONCHANGE_SIG_REF=(
 CHECK_ROW_TEMPLATE='Buy {{fuel}} at {{station_name}} ({{distance}} km): {{current_price}} EUR, confidence {{confidence}}, verdict {{verdict}}'
 SUGGEST_ROW_TEMPLATE='{{date}} {{start_time}}-{{end_time}} {{fuel}} at {{station_name}} ({{distance}} km): predicted {{predicted_price}} EUR, confidence {{confidence}}'
 
-CITY=""
-RADIUS_KM=""
 FUEL=""
-PREDICT_DAYS=""
-HISTORY_DAYS=""
 CHECK_MINUTES=""
 SUGGEST_TIME=""
 RESET_TIME=""
@@ -95,11 +91,15 @@ FILTERED_ROWS=()
 usage() {
   cat <<'EOF'
 Usage:
-  gasoline-watch.sh --city CITY --radius-km KM --fuel diesel|e5|e10 \
-    --predict-days DAYS --history-days DAYS --check-minutes MINUTES \
+  gasoline-watch.sh --fuel diesel|e5|e10 --check-minutes MINUTES \
     --suggest-time HH:MM [--reset-time HH:MM] \
     --check-command COMMAND --suggest-command COMMAND \
     [--once --state-file PATH] [--verbose]
+
+`gasoline check` and `gasoline suggest` cover every station the configured
+update targets feed and compute every fuel, so there is no city, radius or
+model parameter to pass here: --fuel only selects which fuel's rows this
+watcher notifies about.
 
 --reset-time defaults to 00:00. The watcher only emits a check
 notification when a buy recommendation is strictly cheaper than the
@@ -162,29 +162,9 @@ need_value() {
 parse_args() {
   while (($# > 0)); do
     case "$1" in
-      --city)
-        need_value "$1" "${2-}"
-        CITY=$2
-        shift 2
-        ;;
-      --radius-km)
-        need_value "$1" "${2-}"
-        RADIUS_KM=$2
-        shift 2
-        ;;
       --fuel)
         need_value "$1" "${2-}"
         FUEL=$2
-        shift 2
-        ;;
-      --predict-days)
-        need_value "$1" "${2-}"
-        PREDICT_DAYS=$2
-        shift 2
-        ;;
-      --history-days)
-        need_value "$1" "${2-}"
-        HISTORY_DAYS=$2
         shift 2
         ;;
       --check-minutes)
@@ -245,11 +225,7 @@ is_positive_number() {
 }
 
 validate_args() {
-  [[ -n "$CITY" ]] || die "missing --city"
-  [[ -n "$RADIUS_KM" ]] || die "missing --radius-km"
   [[ -n "$FUEL" ]] || die "missing --fuel"
-  [[ -n "$PREDICT_DAYS" ]] || die "missing --predict-days"
-  [[ -n "$HISTORY_DAYS" ]] || die "missing --history-days"
   [[ -n "$SUGGEST_TIME" ]] || die "missing --suggest-time"
   [[ -n "$CHECK_COMMAND" ]] || die "missing --check-command"
   [[ -n "$SUGGEST_COMMAND" ]] || die "missing --suggest-command"
@@ -264,10 +240,7 @@ validate_args() {
     is_positive_int "$CHECK_MINUTES" || die "--check-minutes must be a positive integer"
   fi
 
-  is_positive_number "$RADIUS_KM" || die "--radius-km must be a positive number"
   [[ "$FUEL" =~ ^(diesel|e5|e10)$ ]] || die "--fuel must be one of: diesel, e5, e10"
-  is_positive_int "$PREDICT_DAYS" || die "--predict-days must be a positive integer"
-  is_positive_int "$HISTORY_DAYS" || die "--history-days must be a positive integer"
   [[ "$SUGGEST_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "--suggest-time must be HH:MM"
 
   if [[ -z "$RESET_TIME" ]]; then
@@ -298,11 +271,7 @@ require_tools() {
 }
 
 log_config() {
-  verbose_log "city=$(shell_quote "$CITY")"
-  verbose_log "radius_km=$(shell_quote "$RADIUS_KM")"
   verbose_log "fuel=$(shell_quote "$FUEL")"
-  verbose_log "predict_days=$(shell_quote "$PREDICT_DAYS")"
-  verbose_log "history_days=$(shell_quote "$HISTORY_DAYS")"
   verbose_log "check_minutes=$(shell_quote "$CHECK_MINUTES")"
   verbose_log "suggest_time=$(shell_quote "$SUGGEST_TIME")"
   verbose_log "reset_time=$(shell_quote "$RESET_TIME")"
@@ -865,15 +834,9 @@ send_changed_check_rows() {
 }
 
 run_check_once() {
-  local output
-  verbose_log "running check: $(shell_quote "$GASOLINE_BIN") check --city $(shell_quote "$CITY") --range-km $(shell_quote "$RADIUS_KM") --fuel $(shell_quote "$FUEL") --history-days $(shell_quote "$HISTORY_DAYS") --predict-days $(shell_quote "$PREDICT_DAYS") --output json"
-  if ! output=$("$GASOLINE_BIN" check \
-      --city "$CITY" \
-      --range-km "$RADIUS_KM" \
-      --fuel "$FUEL" \
-      --history-days "$HISTORY_DAYS" \
-      --predict-days "$PREDICT_DAYS" \
-      --output json 2>&1); then
+  local output rows
+  verbose_log "running check: $(shell_quote "$GASOLINE_BIN") check --output json (selecting fuel $(shell_quote "$FUEL"))"
+  if ! output=$("$GASOLINE_BIN" check --output json 2>&1); then
     log "check failed: $output"
     return 0
   fi
@@ -883,20 +846,18 @@ run_check_once() {
     return 0
   fi
 
-  verbose_log "check returned $(printf '%s' "$output" | jq 'length') row(s)"
-  send_changed_check_rows "$output"
+  # check covers every fuel and scopes itself to the stations the configured
+  # update targets feed, so the watcher's job here is to pick its own fuel out
+  # of the result. A fuel that failed carries an error instead of rows.
+  rows=$(printf '%s' "$output" | jq -c --arg fuel "$FUEL" '[.[] | select(.fuel == $fuel) | .checks // []] | add // []')
+  verbose_log "check returned $(printf '%s' "$rows" | jq 'length') $FUEL row(s)"
+  send_changed_check_rows "$rows"
 }
 
 run_suggest_once() {
-  local output
-  verbose_log "running suggest: $(shell_quote "$GASOLINE_BIN") suggest --city $(shell_quote "$CITY") --range-km $(shell_quote "$RADIUS_KM") --fuel $(shell_quote "$FUEL") --history-days $(shell_quote "$HISTORY_DAYS") --predict-days $(shell_quote "$PREDICT_DAYS") --output json"
-  if ! output=$("$GASOLINE_BIN" suggest \
-      --city "$CITY" \
-      --range-km "$RADIUS_KM" \
-      --fuel "$FUEL" \
-      --history-days "$HISTORY_DAYS" \
-      --predict-days "$PREDICT_DAYS" \
-      --output json 2>&1); then
+  local output rows
+  verbose_log "running suggest: $(shell_quote "$GASOLINE_BIN") suggest --output json (selecting fuel $(shell_quote "$FUEL"))"
+  if ! output=$("$GASOLINE_BIN" suggest --output json 2>&1); then
     log "suggest failed: $output"
     return 0
   fi
@@ -906,7 +867,9 @@ run_suggest_once() {
     return 0
   fi
 
-  verbose_log "suggest returned $(printf '%s' "$output" | jq 'length') row(s)"
+  rows=$(printf '%s' "$output" | jq -c --arg fuel "$FUEL" '[.[] | select(.fuel == $fuel) | .suggestions // []] | add // []')
+  output=$rows
+  verbose_log "suggest returned $(printf '%s' "$output" | jq 'length') $FUEL row(s)"
   local cheapest_row
   cheapest_row=$(printf '%s' "$output" | jq -c 'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | min_by(.predicted_price // .predicted_current_price) // empty else empty end')
   send_matching_rows \

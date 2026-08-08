@@ -8,11 +8,7 @@ Type=simple
 # Storage, API key, and MySQL settings live here (see examples/systemd/gasoline.env).
 EnvironmentFile=/etc/gasoline/gasoline.env
 ExecStart=/usr/local/bin/gasoline-watch \
-  --city "Lübbecke" \
-  --radius-km 5 \
   --fuel diesel \
-  --history-days 30 \
-  --predict-days 7 \
   --check-minutes 15 \
   --suggest-time 13:00 \
   --check-command 'pushover gasoline Tankempfehlung {{current_price}} EUR {{fuel}} {{station_name}} {{place}}' \

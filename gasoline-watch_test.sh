@@ -88,52 +88,60 @@ write_check_json() {
   cat >"$CHECK_JSON_FILE" <<'EOF'
 [
   {
-    "station_id": "station-1",
-    "station_name": "Station 1",
-    "distance_km": 1.2,
     "fuel": "diesel",
-    "current_price": 1.7,
-    "predicted_current_price": 1.8,
-    "verdict": "low",
-    "recommendation": "buy",
-    "confidence": "medium",
-    "sample_count": 6,
-    "station": {"address": "Main Street 1", "brand": "TEST"}
+    "checks":
+    [
+      {
+        "station_id": "station-1",
+        "station_name": "Station 1",
+        "distance_km": 1.2,
+        "fuel": "diesel",
+        "current_price": 1.7,
+        "predicted_current_price": 1.8,
+        "verdict": "low",
+        "recommendation": "buy",
+        "confidence": "medium",
+        "sample_count": 6,
+        "station": {"address": "Main Street 1", "brand": "TEST"}
+      },
+      {
+        "station_id": "station-low",
+        "station_name": "Station Low",
+        "distance_km": 1.4,
+        "fuel": "diesel",
+        "current_price": 1.65,
+        "verdict": "low",
+        "recommendation": "buy",
+        "confidence": "low",
+        "station": {"address": "Low Street 1"}
+      },
+      {
+        "station_id": "station-hold",
+        "station_name": "Station Hold",
+        "distance_km": 0.8,
+        "fuel": "diesel",
+        "current_price": 1.9,
+        "verdict": "typical",
+        "recommendation": "hold",
+        "confidence": "high",
+        "station": {"address": "Hold Street 1"}
+      },
+      {
+        "station_id": "station-2",
+        "station_name": "Station 2",
+        "distance_km": 2.3,
+        "fuel": "diesel",
+        "current_price": 1.68,
+        "predicted_current_price": 1.79,
+        "verdict": "low",
+        "recommendation": "buy",
+        "confidence": "high",
+        "station": {"address": "Second Street 2", "brand": "TEST"}
+      }
+    ]
   },
-  {
-    "station_id": "station-low",
-    "station_name": "Station Low",
-    "distance_km": 1.4,
-    "fuel": "diesel",
-    "current_price": 1.65,
-    "verdict": "low",
-    "recommendation": "buy",
-    "confidence": "low",
-    "station": {"address": "Low Street 1"}
-  },
-  {
-    "station_id": "station-hold",
-    "station_name": "Station Hold",
-    "distance_km": 0.8,
-    "fuel": "diesel",
-    "current_price": 1.9,
-    "verdict": "typical",
-    "recommendation": "hold",
-    "confidence": "high",
-    "station": {"address": "Hold Street 1"}
-  },
-  {
-    "station_id": "station-2",
-    "station_name": "Station 2",
-    "distance_km": 2.3,
-    "fuel": "diesel",
-    "current_price": 1.68,
-    "predicted_current_price": 1.79,
-    "verdict": "low",
-    "recommendation": "buy",
-    "confidence": "high",
-    "station": {"address": "Second Street 2", "brand": "TEST"}
-  }
+  { "fuel": "e5", "error": "not enough historical open-price data" },
+  { "fuel": "e10", "error": "not enough historical open-price data" }
 ]
 EOF
 }
@@ -142,54 +150,58 @@ write_suggest_json() {
   cat >"$SUGGEST_JSON_FILE" <<'EOF'
 [
   {
-    "date": "2026-04-27",
-    "weekday": "Monday",
-    "start_time": "18:00",
-    "end_time": "19:00",
-    "station_id": "station-1",
-    "station_name": "Station 1",
-    "distance_km": 1.2,
     "fuel": "diesel",
-    "predicted_price": 1.66,
-    "confidence": "high",
-    "station": {"address": "Main Street 1", "brand": "TEST"}
+    "suggestions":
+    [
+      {
+        "date": "2026-04-27",
+        "weekday": "Monday",
+        "start_time": "18:00",
+        "end_time": "19:00",
+        "station_id": "station-1",
+        "station_name": "Station 1",
+        "distance_km": 1.2,
+        "fuel": "diesel",
+        "predicted_price": 1.66,
+        "confidence": "high",
+        "station": {"address": "Main Street 1", "brand": "TEST"}
+      },
+      {
+        "date": "2026-04-27",
+        "weekday": "Monday",
+        "start_time": "20:00",
+        "end_time": "21:00",
+        "station_id": "station-low",
+        "station_name": "Station Low",
+        "distance_km": 1.4,
+        "fuel": "diesel",
+        "predicted_price": 1.64,
+        "confidence": "low",
+        "station": {"address": "Low Street 1"}
+      },
+      {
+        "date": "2026-04-28",
+        "weekday": "Tuesday",
+        "start_time": "07:00",
+        "end_time": "08:00",
+        "station_id": "station-2",
+        "station_name": "Station 2",
+        "distance_km": 2.3,
+        "fuel": "diesel",
+        "predicted_price": 1.63,
+        "confidence": "medium",
+        "station": {"address": "Second Street 2", "brand": "TEST"}
+      }
+    ]
   },
-  {
-    "date": "2026-04-27",
-    "weekday": "Monday",
-    "start_time": "20:00",
-    "end_time": "21:00",
-    "station_id": "station-low",
-    "station_name": "Station Low",
-    "distance_km": 1.4,
-    "fuel": "diesel",
-    "predicted_price": 1.64,
-    "confidence": "low",
-    "station": {"address": "Low Street 1"}
-  },
-  {
-    "date": "2026-04-28",
-    "weekday": "Tuesday",
-    "start_time": "07:00",
-    "end_time": "08:00",
-    "station_id": "station-2",
-    "station_name": "Station 2",
-    "distance_km": 2.3,
-    "fuel": "diesel",
-    "predicted_price": 1.63,
-    "confidence": "medium",
-    "station": {"address": "Second Street 2", "brand": "TEST"}
-  }
+  { "fuel": "e5", "error": "not enough historical open-price data" },
+  { "fuel": "e10", "error": "not enough historical open-price data" }
 ]
 EOF
 }
 
 configure_defaults() {
-  CITY=Berlin
-  RADIUS_KM=10
   FUEL=diesel
-  PREDICT_DAYS=3
-  HISTORY_DAYS=21
   CHECK_MINUTES=5
   SUGGEST_TIME=07:30
   RESET_TIME=00:00
@@ -215,7 +227,7 @@ test_check_filters_and_batches_results() {
   begin_count=$(grep -c '^BEGIN$' "$NOTIFY_OUT")
 
   [[ "$begin_count" == 1 ]] || fail "expected one check notification, got $begin_count"
-  assert_contains "$args" 'check --city Berlin --range-km 10 --fuel diesel --history-days 21 --predict-days 3 --output json' "check args"
+  assert_contains "$args" 'check --output json' "check args"
   assert_contains "$output" 'ARG1=--message' "check notification"
   assert_contains "$output" 'Buy diesel at Station 1 (1.2 km): 1.700 EUR, confidence medium, verdict low' "check notification"
   assert_contains "$output" 'Buy diesel at Station 2 (2.3 km): 1.680 EUR, confidence high, verdict low' "check notification"
@@ -283,11 +295,11 @@ test_check_sends_only_cheaper_prices() {
 
   local mutated_json
   mutated_json=$TEST_DIR/check.mutated.json
-  jq 'map(
+  jq 'map(if .fuel == "diesel" then .checks |= map(
         if .station_id == "station-1" then .current_price = 1.71
         elif .station_id == "station-2" then .current_price = 1.66
         else . end
-      )' "$CHECK_JSON_FILE" >"$mutated_json"
+      ) else . end)' "$CHECK_JSON_FILE" >"$mutated_json"
   mv "$mutated_json" "$CHECK_JSON_FILE"
 
   run_check_once
@@ -302,10 +314,10 @@ test_check_sends_only_cheaper_prices() {
   [[ "$CHECK_LOWEST_PRICE" == "1.660" ]] || fail "expected baseline 1.660 after cheaper batch, got $CHECK_LOWEST_PRICE"
 
   : >"$NOTIFY_OUT"
-  jq 'map(
+  jq 'map(if .fuel == "diesel" then .checks |= map(
         if .station_id == "station-1" then .current_price = 1.65
         else . end
-      )' "$CHECK_JSON_FILE" >"$mutated_json"
+      ) else . end)' "$CHECK_JSON_FILE" >"$mutated_json"
   mv "$mutated_json" "$CHECK_JSON_FILE"
 
   run_check_once
@@ -360,7 +372,7 @@ test_suggest_filters_and_batches_results() {
   begin_count=$(grep -c '^BEGIN$' "$NOTIFY_OUT")
 
   [[ "$begin_count" == 1 ]] || fail "expected one suggest notification, got $begin_count"
-  assert_contains "$args" 'suggest --city Berlin --range-km 10 --fuel diesel --history-days 21 --predict-days 3 --output json' "suggest args"
+  assert_contains "$args" 'suggest --output json' "suggest args"
   assert_contains "$output" '2026-04-27 18:00-19:00 diesel at Station 1 (1.2 km): predicted 1.660 EUR, confidence high' "suggest notification"
   assert_contains "$output" '2026-04-28 07:00-08:00 diesel at Station 2 (2.3 km): predicted 1.630 EUR, confidence medium' "suggest notification"
   assert_not_contains "$output" 'Station Low' "suggest notification"
@@ -387,18 +399,14 @@ test_verbose_logs_parameters_and_actions() {
   local output
   output=$(<"$TEST_DIR/verbose.err")
 
-  assert_contains "$output" '[gasoline-watch] city=Berlin' "verbose config"
-  assert_contains "$output" '[gasoline-watch] radius_km=10' "verbose config"
   assert_contains "$output" '[gasoline-watch] fuel=diesel' "verbose config"
-  assert_contains "$output" '[gasoline-watch] predict_days=3' "verbose config"
-  assert_contains "$output" '[gasoline-watch] history_days=21' "verbose config"
   assert_contains "$output" '[gasoline-watch] check_minutes=5' "verbose config"
   assert_contains "$output" '[gasoline-watch] suggest_time=07:30' "verbose config"
   assert_contains "$output" '[gasoline-watch] reset_time=00:00' "verbose config"
   assert_contains "$output" '[gasoline-watch] gasoline_bin=' "verbose config"
   assert_contains "$output" 'running check:' "verbose check"
-  assert_contains "$output" 'check --city Berlin --range-km 10 --fuel diesel --history-days 21 --predict-days 3 --output json' "verbose check"
-  assert_contains "$output" 'check returned 4 row(s)' "verbose check"
+  assert_contains "$output" 'check --output json' "verbose check"
+  assert_contains "$output" 'check returned 4 diesel row(s)' "verbose check"
   assert_contains "$output" 'sending 2 cheaper check row(s)' "verbose check"
   assert_contains "$output" 'running check notification:' "verbose notification"
 }
@@ -409,10 +417,10 @@ test_check_formatted_placeholders() {
 
   local mutated_json
   mutated_json=$TEST_DIR/check.formatted.json
-  jq 'map(
+  jq 'map(if .fuel == "diesel" then .checks |= map(
         if .station_id == "station-2" then .current_price = 1.685
         else . end
-      )' "$CHECK_JSON_FILE" >"$mutated_json"
+      ) else . end)' "$CHECK_JSON_FILE" >"$mutated_json"
   mv "$mutated_json" "$CHECK_JSON_FILE"
 
   CHECK_COMMAND="$FAKE_NOTIFY --title cheap_{{cheapest_price_formatted}}_{{cheapest_fuel_formatted}} --message {{current_price_formatted}}|{{price_formatted}}|{{predicted_current_price_formatted}}|{{fuel_formatted}}|{{station_name}}"
@@ -433,10 +441,10 @@ test_suggest_formatted_placeholders() {
 
   local mutated_json
   mutated_json=$TEST_DIR/suggest.formatted.json
-  jq 'map(
+  jq 'map(if .fuel == "diesel" then .suggestions |= map(
         if .station_id == "station-2" then .predicted_price = 1.629
         else . end
-      )' "$SUGGEST_JSON_FILE" >"$mutated_json"
+      ) else . end)' "$SUGGEST_JSON_FILE" >"$mutated_json"
   mv "$mutated_json" "$SUGGEST_JSON_FILE"
 
   SUGGEST_COMMAND="$FAKE_NOTIFY --title cheap_{{cheapest_price_formatted}}_{{cheapest_fuel_formatted}} --message {{predicted_price_formatted}}|{{price_formatted}}|{{fuel_formatted}}|{{station_name}}"
@@ -457,10 +465,10 @@ test_formatted_uses_locale_decimal_separator() {
 
   local mutated_json
   mutated_json=$TEST_DIR/check.locale.json
-  jq 'map(
+  jq 'map(if .fuel == "diesel" then .checks |= map(
         if .station_id == "station-2" then .current_price = 1.685
         else . end
-      )' "$CHECK_JSON_FILE" >"$mutated_json"
+      ) else . end)' "$CHECK_JSON_FILE" >"$mutated_json"
   mv "$mutated_json" "$CHECK_JSON_FILE"
 
   # Stub `locale -k decimal_point` so the test does not depend on a German
@@ -538,7 +546,7 @@ test_weekday_short_and_formatted_placeholders() {
 
   local mutated_json
   mutated_json=$TEST_DIR/check.weekday.json
-  jq 'map(.best_future_weekday = "Tuesday")' "$CHECK_JSON_FILE" >"$mutated_json"
+  jq 'map(if .fuel == "diesel" then .checks |= map(.best_future_weekday = "Tuesday") else . end)' "$CHECK_JSON_FILE" >"$mutated_json"
   mv "$mutated_json" "$CHECK_JSON_FILE"
 
   CHECK_COMMAND="$FAKE_NOTIFY --message {{weekday_short}}|{{weekday_formatted}}|{{weekday_short_formatted}}|{{best_future_weekday}}|{{best_future_weekday_short}}|{{best_future_weekday_formatted}}|{{best_future_weekday_short_formatted}}|{{station_name}}"
@@ -606,7 +614,7 @@ test_suggest_onchange_long_suffix_chain() {
 
   local mutated_json
   mutated_json=$TEST_DIR/suggest.onchange.json
-  jq 'map(.weekday = "Monday")' "$SUGGEST_JSON_FILE" >"$mutated_json"
+  jq 'map(if .fuel == "diesel" then .suggestions |= map(.weekday = "Monday") else . end)' "$SUGGEST_JSON_FILE" >"$mutated_json"
   mv "$mutated_json" "$SUGGEST_JSON_FILE"
 
   SUGGEST_COMMAND="$FAKE_NOTIFY --message {{weekday_short_formatted_onchange}}|{{station_name}}"

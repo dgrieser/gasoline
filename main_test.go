@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -631,25 +630,32 @@ func TestRunCheckSupportsJSONOutput(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() error {
-		return run([]string{"check", "--db", dbPath, "--city", "Berlin", "--fuel", "diesel", "--history-days", "10", "--predict-days", "1", "--output", "json"})
+		return run([]string{"check", "--db", dbPath, "--output", "json"})
 	})
 
-	var checks []priceCheckRow
-	if err := json.Unmarshal([]byte(output), &checks); err != nil {
+	var results []fuelCheckResult
+	if err := json.Unmarshal([]byte(output), &results); err != nil {
 		t.Fatalf("unmarshal check output: %v\noutput=%s", err, output)
 	}
+	if len(results) != len(suggestFuels) || results[0].Fuel != "diesel" {
+		t.Fatalf("results = %+v, want one per fuel starting with diesel", results)
+	}
+	checks := results[0].Checks
 	if len(checks) != 1 {
 		t.Fatalf("len(checks) = %d, want 1", len(checks))
 	}
 	if checks[0].StationID != "station-1" || checks[0].Station.ID != "station-1" {
 		t.Fatalf("station fields = %+v, want station-1", checks[0])
 	}
+	if checks[0].Station.City != "Berlin" {
+		t.Fatalf("station city = %q, want the owning update target Berlin", checks[0].Station.City)
+	}
 	if checks[0].Recommendation != "buy" {
 		t.Fatalf("recommendation = %q, want buy", checks[0].Recommendation)
 	}
 }
 
-func TestRunCheckAllConfiguredCities(t *testing.T) {
+func TestRunCheckCoversEveryFuelAndEveryFedStation(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "check-multi.db")
 	db, err := openDB(dbPath)
@@ -683,29 +689,36 @@ func TestRunCheckAllConfiguredCities(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() error {
-		return run([]string{"check", "--db", dbPath, "--fuel", "diesel", "--history-days", "10", "--predict-days", "1", "--output", "json"})
+		return run([]string{"check", "--db", dbPath, "--output", "json"})
 	})
-	var results []cityCheckResult
+	var results []fuelCheckResult
 	if err := json.Unmarshal([]byte(output), &results); err != nil {
-		t.Fatalf("unmarshal multi-city check output: %v\noutput=%s", err, output)
+		t.Fatalf("unmarshal check output: %v\noutput=%s", err, output)
 	}
-	if len(results) != 2 {
-		t.Fatalf("got %d city results, want 2", len(results))
+	if len(results) != len(suggestFuels) {
+		t.Fatalf("got %d fuel results, want %d", len(results), len(suggestFuels))
 	}
-	for i, want := range []struct{ city, station string }{{"Berlin", "station-b"}, {"Hamburg", "station-h"}} {
-		if results[i].City != want.city {
-			t.Fatalf("results[%d].City = %q, want %q", i, results[i].City, want.city)
+	// One run per fuel, and each covers both cities' stations: there is no
+	// radius and no per-city fan-out any more, so the two stations appear
+	// together with the city each one is attributed to.
+	for i, wantFuel := range suggestFuels {
+		if results[i].Fuel != wantFuel {
+			t.Fatalf("results[%d].Fuel = %q, want %q", i, results[i].Fuel, wantFuel)
 		}
 		if results[i].Error != "" {
 			t.Fatalf("results[%d] unexpected error: %s", i, results[i].Error)
 		}
-		if len(results[i].Checks) != 1 || results[i].Checks[0].StationID != want.station {
-			t.Fatalf("results[%d].Checks = %+v, want one row for %s", i, results[i].Checks, want.station)
+		cities := map[string]string{}
+		for _, row := range results[i].Checks {
+			cities[row.StationID] = row.Station.City
+		}
+		if cities["station-b"] != "Berlin" || cities["station-h"] != "Hamburg" {
+			t.Fatalf("results[%d] station cities = %+v, want station-b in Berlin and station-h in Hamburg", i, cities)
 		}
 	}
 }
 
-func TestRunCheckAllConfiguredCitiesBestEffort(t *testing.T) {
+func TestRunCheckIsBestEffortAcrossFuels(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "check-besteffort.db")
 	db, err := openDB(dbPath)
@@ -726,9 +739,8 @@ func TestRunCheckAllConfiguredCitiesBestEffort(t *testing.T) {
 			insertSuggestSnapshot(t, db, "station-b", "Berlin", at, 2.100, true)
 		}
 	}
-	insertSuggestSnapshot(t, db, "station-b", "Berlin", time.Now().UTC(), 2.000, true)
+	insertSuggestSnapshotDieselOnly(t, db, "station-b", "Berlin", time.Now().UTC(), 2.000, true)
 	insertUpdateTargetRow(t, db, "Berlin", 5)
-	insertUpdateTargetRow(t, db, "Nowhere", 5)
 	if err := db.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
@@ -736,30 +748,34 @@ func TestRunCheckAllConfiguredCitiesBestEffort(t *testing.T) {
 	old := stdout
 	var buf bytes.Buffer
 	stdout = &buf
-	runErr := run([]string{"check", "--db", dbPath, "--fuel", "diesel", "--history-days", "10", "--predict-days", "1", "--output", "json"})
+	runErr := run([]string{"check", "--db", dbPath, "--output", "json"})
 	stdout = old
-	if runErr == nil || !strings.Contains(runErr.Error(), "1 of 2 cities failed") {
-		t.Fatalf("run error = %v, want '1 of 2 cities failed'", runErr)
+	if runErr == nil || !strings.Contains(runErr.Error(), "2 of 3 fuels failed") {
+		t.Fatalf("run error = %v, want '2 of 3 fuels failed'", runErr)
 	}
-	var results []cityCheckResult
+	var results []fuelCheckResult
 	if err := json.Unmarshal(buf.Bytes(), &results); err != nil {
 		t.Fatalf("unmarshal best-effort check output: %v\noutput=%s", err, buf.String())
 	}
-	if len(results) != 2 {
-		t.Fatalf("got %d city results, want 2", len(results))
+	if len(results) != 3 {
+		t.Fatalf("got %d fuel results, want 3", len(results))
 	}
-	if results[0].City != "Berlin" || results[0].Error != "" || len(results[0].Checks) != 1 {
-		t.Fatalf("results[0] = %+v, want one Berlin row without error", results[0])
+	// Only diesel has stored prices: the other two fuels fail without taking
+	// the run down with them.
+	if results[0].Fuel != "diesel" || results[0].Error != "" || len(results[0].Checks) != 1 {
+		t.Fatalf("results[0] = %+v, want one diesel row without error", results[0])
 	}
-	if results[1].City != "Nowhere" || results[1].Error == "" {
-		t.Fatalf("results[1] = %+v, want Nowhere with error", results[1])
-	}
-	if results[1].Checks != nil {
-		t.Fatalf("results[1].Checks = %+v, want null for failed city", results[1].Checks)
+	for _, res := range results[1:] {
+		if res.Error == "" {
+			t.Fatalf("%s unexpectedly succeeded without stored prices", res.Fuel)
+		}
+		if res.Checks != nil {
+			t.Fatalf("%s checks = %+v, want null for a failed fuel", res.Fuel, res.Checks)
+		}
 	}
 }
 
-func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
+func TestSuggestGasCoversEveryFedStationRegardlessOfDistance(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	city := cachedCity{
@@ -771,6 +787,8 @@ func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 	}
 	insertSuggestCity(t, db, city)
 	insertSuggestStation(t, db, "near-station", "Near Station", 52.517389, 13.395131)
+	// Roughly 110 km from the city centre. There is no radius any more: being
+	// fed is what puts a station in scope, so the cheaper far station wins.
 	insertSuggestStation(t, db, "far-station", "Far Station", 53.500000, 13.395131)
 
 	for day := 20; day <= 25; day++ {
@@ -781,8 +799,6 @@ func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 	}
 
 	suggestions, err := suggestGas(ctx, db, suggestOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 10,
 		PredictDays: 2,
@@ -797,14 +813,15 @@ func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 		t.Fatalf("len(suggestions) = %d, want 2: %+v", len(suggestions), suggestions)
 	}
 	for _, suggestion := range suggestions {
-		if suggestion.StationID != "near-station" {
-			t.Fatalf("station id = %q, want near-station", suggestion.StationID)
+		// The far station is the cheapest, and distance no longer excludes it.
+		if suggestion.StationID != "far-station" {
+			t.Fatalf("station id = %q, want the cheapest fed station far-station", suggestion.StationID)
 		}
-		if suggestion.StartTime != "18:00" || suggestion.EndTime != "19:00" {
-			t.Fatalf("time window = %s-%s, want 18:00-19:00", suggestion.StartTime, suggestion.EndTime)
+		if suggestion.DistanceKM < 100 {
+			t.Fatalf("distance = %.1f, want the far station's real distance to the owning city", suggestion.DistanceKM)
 		}
-		if suggestion.DistanceKM > 0.1 {
-			t.Fatalf("distance = %.1f, want near station distance", suggestion.DistanceKM)
+		if suggestion.Station.City != "Berlin" {
+			t.Fatalf("station city = %q, want the owning update target Berlin", suggestion.Station.City)
 		}
 		if suggestion.Station.Address != "Test Street 1, 10115 Berlin" {
 			t.Fatalf("station address = %q, want formatted address", suggestion.Station.Address)
@@ -812,8 +829,8 @@ func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 		if suggestion.Station.Brand != "TEST" || suggestion.Station.Street != "Test Street" || suggestion.Station.HouseNumber != "1" || suggestion.Station.PostCode != 10115 || suggestion.Station.Place != "Berlin" {
 			t.Fatalf("station metadata = %+v, want persisted station details", suggestion.Station)
 		}
-		if suggestion.PredictedPrice >= 2.200 {
-			t.Fatalf("predicted price = %.3f, want lower than 2.200", suggestion.PredictedPrice)
+		if suggestion.PredictedPrice >= 2.000 {
+			t.Fatalf("predicted price = %.3f, want the far station's cheaper level", suggestion.PredictedPrice)
 		}
 	}
 	if suggestions[0].Date != "2026-04-26" || suggestions[0].Weekday != "Sunday" {
@@ -969,8 +986,6 @@ func TestCheckGasRecommendsBuyForLowCurrentPrice(t *testing.T) {
 	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 26, 14, 0, 0, 0, time.UTC), 2.000, true)
 
 	checks, err := checkGas(ctx, db, checkOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 10,
 		PredictDays: 1,
@@ -1017,8 +1032,6 @@ func TestCheckGasRecommendsWaitForLowerFuturePrice(t *testing.T) {
 	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 26, 15, 0, 0, 0, time.UTC), 2.200, true)
 
 	checks, err := checkGas(ctx, db, checkOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 10,
 		PredictDays: 1,
@@ -1046,8 +1059,6 @@ func TestCheckGasRecommendsWaitForLowerFuturePrice(t *testing.T) {
 
 func TestValidateCheckOptions(t *testing.T) {
 	valid := checkOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 21,
 		PredictDays: 3,
@@ -1062,9 +1073,9 @@ func TestValidateCheckOptions(t *testing.T) {
 		opts checkOptions
 		want string
 	}{
-		{name: "city", opts: checkOptions{RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: 5}, want: "requires --city"},
-		{name: "fuel", opts: checkOptions{City: "Berlin", RangeKM: 5, Fuel: "premium", HistoryDays: 21, PredictDays: 3, Limit: 5}, want: "--fuel"},
-		{name: "limit", opts: checkOptions{City: "Berlin", RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: -1}, want: "--limit"},
+		{name: "fuel", opts: checkOptions{Fuel: "premium", HistoryDays: 21, PredictDays: 3, Limit: 5}, want: "fuel must be one of"},
+		{name: "history", opts: checkOptions{Fuel: "diesel", HistoryDays: 0, PredictDays: 3, Limit: 5}, want: "history days"},
+		{name: "limit", opts: checkOptions{Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: -1}, want: "check row limit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1139,6 +1150,21 @@ func insertSuggestSnapshot(t *testing.T, db *sql.DB, stationID, cityName string,
 	`, stationID, cityName, recordedAt.Format(time.RFC3339), 5, boolToInt(isOpen), e5, e10, diesel)
 	if err != nil {
 		t.Fatalf("insert snapshot %q at %s: %v", stationID, recordedAt.Format(time.RFC3339), err)
+	}
+}
+
+// insertSuggestSnapshotDieselOnly stores a snapshot with no e5/e10 price, so a
+// fixture can give one fuel history and leave the others without any.
+func insertSuggestSnapshotDieselOnly(t *testing.T, db *sql.DB, stationID, cityName string, recordedAt time.Time, diesel float64, isOpen bool) {
+	t.Helper()
+
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO price_snapshots (
+			station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
+		) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
+	`, stationID, cityName, recordedAt.Format(time.RFC3339), 5, boolToInt(isOpen), diesel)
+	if err != nil {
+		t.Fatalf("insert diesel-only snapshot %q at %s: %v", stationID, recordedAt.Format(time.RFC3339), err)
 	}
 }
 
@@ -3353,6 +3379,20 @@ func insertSawtoothDay(t *testing.T, db *sql.DB, stationID, cityName string, day
 	}
 }
 
+// insertSawtoothDayDieselOnly is insertSawtoothDay with no e5/e10 prices, for
+// fixtures that need one fuel to have history and the others none.
+func insertSawtoothDayDieselOnly(t *testing.T, db *sql.DB, stationID, cityName string, day time.Time, base float64) {
+	t.Helper()
+	for _, segment := range []struct {
+		hour   int
+		offset float64
+	}{
+		{0, -0.05}, {8, -0.10}, {11, -0.12}, {12, 0.25}, {14, 0.10}, {18, 0.02}, {22, -0.05},
+	} {
+		insertSuggestSnapshotDieselOnly(t, db, stationID, cityName, day.Add(time.Duration(segment.hour)*time.Hour), base+segment.offset, true)
+	}
+}
+
 func TestSuggestGasPrefersPreJumpWindowWithNoonJump(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -3364,8 +3404,6 @@ func TestSuggestGasPrefersPreJumpWindowWithNoonJump(t *testing.T) {
 	}
 
 	suggestions, err := suggestGas(ctx, db, suggestOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 30,
 		PredictDays: 1,
@@ -3407,8 +3445,6 @@ func TestCheckGasStaysRegimeRelativeAfterMarketWideJump(t *testing.T) {
 	insertSuggestSnapshot(t, db, "station-1", "Berlin", today.Add(18*time.Hour), 2.07, true)
 
 	checks, err := checkGas(ctx, db, checkOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 30,
 		PredictDays: 1,
@@ -3456,81 +3492,109 @@ func TestInferJumpAnchorHourIgnoresRisesAcrossGaps(t *testing.T) {
 	}
 }
 
-func TestStationDailyAmplitude(t *testing.T) {
-	// Two weeks of a ~9.2 ct sawtooth puts the station in offset mode, where
-	// the hourly medians are offsets from the daily baseline and their spread
-	// is the intraday swing.
-	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
-	intervals := sawtoothIntervals("s1", firstDay, 14, func(int) float64 { return 2.00 })
-	now := time.Date(2026, 4, 24, 9, 30, 0, 0, time.UTC)
-	model := buildForecastModel(intervals, now, time.UTC)
+func TestLoadSnapshotScanDropsStationsThatStoppedBeingFed(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC)
 
-	if !model.Stations["s1"].OffsetMode {
-		t.Fatal("station not in offset mode; the fixture cannot exercise amplitude")
-	}
-	amplitude, ok := stationDailyAmplitude(model, "s1")
-	if !ok {
-		t.Fatal("stationDailyAmplitude returned !ok for an offset-mode station")
-	}
-	if amplitude <= 0 || amplitude > 0.5 {
-		t.Fatalf("amplitude = %.4f, want a plausible daily swing in euro", amplitude)
-	}
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestStation(t, db, "live", "Live Station", 52.517389, 13.395131)
+	insertSuggestStation(t, db, "dropped", "Dropped Station", 52.517389, 13.395131)
 
-	// An unknown station has no amplitude at all.
-	if _, ok := stationDailyAmplitude(model, "nope"); ok {
-		t.Fatal("stationDailyAmplitude reported an amplitude for an unknown station")
+	// Both stations have history; only one is still receiving updates. A target
+	// that was removed or shrunk leaves its stations looking exactly like this.
+	for day := 20; day <= 25; day++ {
+		insertSuggestSnapshot(t, db, "live", "Berlin", time.Date(2026, 4, day, 18, 0, 0, 0, time.UTC), 2.000, true)
 	}
-}
+	// The dropped station's newest snapshot is six days old, well past the
+	// freshness window even though it is inside the history window.
+	for day := 18; day <= 20; day++ {
+		insertSuggestSnapshot(t, db, "dropped", "Berlin", time.Date(2026, 4, day, 18, 0, 0, 0, time.UTC), 1.500, true)
+	}
+	insertSuggestSnapshot(t, db, "live", "Berlin", now.Add(-30*time.Minute), 1.990, true)
 
-func TestStationDailyAmplitudeSkipsAbsoluteModeStations(t *testing.T) {
-	// Two days is too little history for offset mode. Those samples are
-	// absolute prices, whose spread would mix level drift into the swing.
-	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
-	intervals := sawtoothIntervals("s1", firstDay, 2, func(int) float64 { return 2.00 })
-	now := time.Date(2026, 4, 12, 0, 30, 0, 0, time.UTC)
-	model := buildForecastModel(intervals, now, time.UTC)
-
-	if model.Stations["s1"].OffsetMode {
-		t.Fatal("station unexpectedly in offset mode")
+	scan, err := loadSnapshotScan(ctx, db, now.AddDate(0, 0, -10), now)
+	if err != nil {
+		t.Fatalf("loadSnapshotScan: %v", err)
 	}
-	if _, ok := stationDailyAmplitude(model, "s1"); ok {
-		t.Fatal("amplitude derived for an absolute-mode station: it would include level drift")
+	if _, ok := scan.Stations["live"]; !ok {
+		t.Fatal("a station still being fed must stay in scope")
 	}
-}
-
-// modelWithHourlyOffsets builds an offset-mode model carrying exactly
-// hourCount populated hours, so the minAmplitudeHours gate can be pinned
-// without contriving a snapshot fixture that yields partial day coverage.
-func modelWithHourlyOffsets(hourCount int) forecastModel {
-	model := forecastModel{
-		Stations:    map[string]forecastStation{"s1": {OffsetMode: true}},
-		WeekdayHour: map[stationWeekdayHourKey][]priceSample{},
-		Hour:        map[stationHourKey][]priceSample{},
-		Recent:      map[string][]priceSample{},
+	if _, ok := scan.Stations["dropped"]; ok {
+		t.Fatalf("a station whose last snapshot is older than %v must leave scope", stationFreshness)
 	}
-	for hour := 0; hour < hourCount; hour++ {
-		// A 0.10 spread across the populated hours.
-		offset := -0.05 + 0.10*float64(hour)/float64(max(hourCount-1, 1))
-		model.Hour[stationHourKey{StationID: "s1", Hour: hour}] = []priceSample{
-			{Price: offset, Weight: 60},
+	for _, row := range scan.Rows {
+		if row.StationID != "live" {
+			t.Fatalf("scan carries rows for out-of-scope station %q", row.StationID)
 		}
 	}
-	return model
 }
 
-func TestStationDailyAmplitudeRequiresEnoughHours(t *testing.T) {
-	// One hour below the gate: the observed range is a slice of the sawtooth,
-	// not its height, so no amplitude may be reported.
-	if _, ok := stationDailyAmplitude(modelWithHourlyOffsets(minAmplitudeHours-1), "s1"); ok {
-		t.Fatalf("amplitude reported with only %d hours, want !ok below the %d-hour gate",
-			minAmplitudeHours-1, minAmplitudeHours)
+func TestLoadSnapshotScanAttributesStationsToTheirOwningCity(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC)
+
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Potsdam", Name: "Potsdam", DisplayName: "Potsdam", Lat: 52.4, Lng: 13.06})
+	insertSuggestStation(t, db, "in-berlin", "Berlin Station", 52.517389, 13.395131)
+	insertSuggestStation(t, db, "in-potsdam", "Potsdam Station", 52.4, 13.06)
+	insertSuggestSnapshot(t, db, "in-berlin", "Berlin", now.Add(-time.Hour), 2.000, true)
+	insertSuggestSnapshot(t, db, "in-potsdam", "Potsdam", now.Add(-time.Hour), 1.900, true)
+	// Ownership moved to a nearer centre: the newest snapshot decides, so this
+	// station counts as Potsdam's even though it started out as Berlin's.
+	insertSuggestStation(t, db, "moved", "Moved Station", 52.41, 13.07)
+	insertSuggestSnapshot(t, db, "moved", "Berlin", now.Add(-3*time.Hour), 1.950, true)
+	insertSuggestSnapshot(t, db, "moved", "Potsdam", now.Add(-time.Hour), 1.950, true)
+
+	scan, err := loadSnapshotScan(ctx, db, now.AddDate(0, 0, -10), now)
+	if err != nil {
+		t.Fatalf("loadSnapshotScan: %v", err)
 	}
-	// Exactly at the gate it must be reported.
-	amplitude, ok := stationDailyAmplitude(modelWithHourlyOffsets(minAmplitudeHours), "s1")
-	if !ok {
-		t.Fatalf("no amplitude at exactly %d hours, want ok at the gate", minAmplitudeHours)
+	for id, wantCity := range map[string]string{"in-berlin": "Berlin", "in-potsdam": "Potsdam", "moved": "Potsdam"} {
+		station, ok := scan.Stations[id]
+		if !ok {
+			t.Fatalf("station %q missing from the scan", id)
+		}
+		if station.City != wantCity {
+			t.Errorf("station %q city = %q, want %q", id, station.City, wantCity)
+		}
 	}
-	if math.Abs(amplitude-0.10) > 1e-9 {
-		t.Fatalf("amplitude = %v, want the 0.10 spread the fixture defines", amplitude)
+	// Distance is measured to the owning centre, not to some global origin.
+	if d := scan.Stations["in-potsdam"].DistanceKM; d > 0.1 {
+		t.Errorf("distance for a station at its own city centre = %.2f, want ~0", d)
+	}
+	if d := scan.Stations["moved"].DistanceKM; d < 0.5 || d > 5 {
+		t.Errorf("distance for the moved station = %.2f, want a short hop to the Potsdam centre", d)
+	}
+}
+
+func TestForecastModelForCityFiltersStationsAndSharesSamples(t *testing.T) {
+	model := forecastModel{
+		Stations: map[string]forecastStation{
+			"b1": {Station: suggestionStationRow{ID: "b1", City: "Berlin"}},
+			"b2": {Station: suggestionStationRow{ID: "b2", City: "Berlin"}},
+			"p1": {Station: suggestionStationRow{ID: "p1", City: "Potsdam"}},
+		},
+		Hour:           map[stationHourKey][]priceSample{{StationID: "p1", Hour: 8}: {{Price: 1.5}}},
+		JumpAnchorHour: 12,
+	}
+	berlin := model.forCity("Berlin")
+	if len(berlin.Stations) != 2 {
+		t.Fatalf("Berlin view has %d stations, want 2", len(berlin.Stations))
+	}
+	if _, ok := berlin.Stations["p1"]; ok {
+		t.Error("Berlin view leaked a Potsdam station")
+	}
+	if len(model.Stations) != 3 {
+		t.Error("forCity mutated the model it filtered")
+	}
+	// The sample maps are shared rather than rebuilt, and the rest of the model
+	// carries over untouched.
+	if len(berlin.Hour) != len(model.Hour) || berlin.JumpAnchorHour != 12 {
+		t.Errorf("Berlin view = %d hour keys anchor %d, want the model's own", len(berlin.Hour), berlin.JumpAnchorHour)
+	}
+	if len(model.forCity("Nowhere").Stations) != 0 {
+		t.Error("a city with no stations must yield an empty view")
 	}
 }

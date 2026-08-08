@@ -85,8 +85,6 @@ func buildDecisionFixture(t *testing.T, db *sql.DB, now time.Time) (int64, *sugg
 		insertSawtoothDay(t, db, "station-1", "Berlin", time.Date(2026, 4, day, 0, 0, 0, 0, time.UTC), 2.00)
 	}
 	opts := suggestOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 30,
 		PredictDays: 1,
@@ -278,8 +276,6 @@ func TestPersistPredictionRunStoresGridAndFlagsSuggestions(t *testing.T) {
 	}
 
 	opts := suggestOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 30,
 		PredictDays: 1,
@@ -307,8 +303,9 @@ func TestPersistPredictionRunStoresGridAndFlagsSuggestions(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT jump_anchor_hour, station_count, city_name FROM prediction_runs`).Scan(&anchor, &stationCount, &cityName); err != nil {
 		t.Fatalf("read run: %v", err)
 	}
-	if anchor != 12 || stationCount != 1 || cityName != "Berlin" {
-		t.Fatalf("run = anchor %d, stations %d, city %s; want 12/1/Berlin", anchor, stationCount, cityName)
+	// city_name is a legacy column: a run is no longer scoped to one city.
+	if anchor != 12 || stationCount != 1 || cityName != "" {
+		t.Fatalf("run = anchor %d, stations %d, city %q; want 12/1 and no city", anchor, stationCount, cityName)
 	}
 
 	rows, err := db.QueryContext(ctx, `SELECT target_start, lead_minutes, baseline FROM price_predictions WHERE is_suggestion = 1`)
@@ -785,14 +782,14 @@ func TestRunSuggestPersistEndToEnd(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() error {
-		return run([]string{"suggest", "--db", dbPath, "--persist", "--city", "Berlin", "--fuel", "diesel", "--history-days", "30", "--predict-days", "3", "--limit-per-day", "2", "--output", "json"})
+		return run([]string{"suggest", "--db", dbPath, "--persist", "--output", "json"})
 	})
-	var suggestions []suggestionRow
-	if err := json.Unmarshal([]byte(output), &suggestions); err != nil {
+	var results []fuelSuggestResult
+	if err := json.Unmarshal([]byte(output), &results); err != nil {
 		t.Fatalf("unmarshal suggest output: %v\noutput=%s", err, output)
 	}
-	if len(suggestions) == 0 {
-		t.Fatal("no suggestions returned")
+	if len(results) == 0 || results[0].Fuel != "diesel" || len(results[0].Suggestions) == 0 {
+		t.Fatalf("results = %+v, want diesel suggestions first", results)
 	}
 
 	db, err = openDB(dbPath)
@@ -805,8 +802,9 @@ func TestRunSuggestPersistEndToEnd(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM prediction_runs`).Scan(&runs); err != nil {
 		t.Fatalf("count runs: %v", err)
 	}
-	if runs != 2 {
-		t.Fatalf("prediction_runs = %d, want 2 (seeded + persisted)", runs)
+	// One run per fuel, plus the seeded past run.
+	if want := len(suggestFuels) + 1; runs != want {
+		t.Fatalf("prediction_runs = %d, want %d (seeded + one per fuel)", runs, want)
 	}
 	var futureRows, flagged int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(is_suggestion), 0) FROM price_predictions WHERE evaluated_at IS NULL`).Scan(&futureRows, &flagged); err != nil {
@@ -856,7 +854,7 @@ func TestRunSuggestPersistQuiet(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() error {
-		return run([]string{"suggest", "--db", dbPath, "--persist", "--quiet", "--city", "Berlin", "--fuel", "diesel", "--history-days", "30", "--predict-days", "2", "--limit-per-day", "2"})
+		return run([]string{"suggest", "--db", dbPath, "--persist", "--quiet"})
 	})
 	if output != "" {
 		t.Fatalf("suggest --persist --quiet printed output: %q", output)
@@ -886,7 +884,7 @@ func insertUpdateTargetRow(t *testing.T, db *sql.DB, city string, radiusKM float
 	}
 }
 
-func TestRunSuggestAllConfiguredCities(t *testing.T) {
+func TestRunSuggestPersistsOneRunPerFuelOverEveryFedStation(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "multi.db")
 	db, err := openDB(dbPath)
@@ -914,18 +912,18 @@ func TestRunSuggestAllConfiguredCities(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() error {
-		return run([]string{"suggest", "--db", dbPath, "--persist", "--fuel", "diesel", "--history-days", "30", "--predict-days", "2", "--limit-per-day", "2", "--output", "json"})
+		return run([]string{"suggest", "--db", dbPath, "--persist", "--output", "json"})
 	})
-	var results []citySuggestResult
+	var results []fuelSuggestResult
 	if err := json.Unmarshal([]byte(output), &results); err != nil {
-		t.Fatalf("unmarshal multi-city output: %v\noutput=%s", err, output)
+		t.Fatalf("unmarshal suggest output: %v\noutput=%s", err, output)
 	}
-	if len(results) != 2 {
-		t.Fatalf("got %d city results, want 2", len(results))
+	if len(results) != len(suggestFuels) {
+		t.Fatalf("got %d fuel results, want %d", len(results), len(suggestFuels))
 	}
-	for i, want := range []string{"Berlin", "Hamburg"} {
-		if results[i].City != want {
-			t.Fatalf("results[%d].City = %q, want %q", i, results[i].City, want)
+	for i, want := range suggestFuels {
+		if results[i].Fuel != want {
+			t.Fatalf("results[%d].Fuel = %q, want %q", i, results[i].Fuel, want)
 		}
 		if results[i].Error != "" {
 			t.Fatalf("results[%d] unexpected error: %s", i, results[i].Error)
@@ -940,16 +938,22 @@ func TestRunSuggestAllConfiguredCities(t *testing.T) {
 		t.Fatalf("reopen db: %v", err)
 	}
 	defer db.Close()
-	var runs, cities int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COUNT(DISTINCT city_name) FROM prediction_runs`).Scan(&runs, &cities); err != nil {
+	// One run per fuel, each covering both cities' stations, so the station
+	// count is the whole fed set rather than one city's slice.
+	var runs, fuels, stations int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COUNT(DISTINCT fuel), MAX(station_count) FROM prediction_runs`).Scan(&runs, &fuels, &stations); err != nil {
 		t.Fatalf("count runs: %v", err)
 	}
-	if runs != 2 || cities != 2 {
-		t.Fatalf("prediction_runs = %d over %d cities, want 2 over 2", runs, cities)
+	if runs != len(suggestFuels) || fuels != len(suggestFuels) {
+		t.Fatalf("prediction_runs = %d over %d fuels, want %d over %d", runs, fuels, len(suggestFuels), len(suggestFuels))
+	}
+	if stations != 2 {
+		t.Fatalf("station_count = %d, want both fed stations in one run", stations)
 	}
 }
 
-func TestRunSuggestAllConfiguredCitiesBestEffort(t *testing.T) {
+func TestRunSuggestIsBestEffortAcrossFuels(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "besteffort.db")
 	db, err := openDB(dbPath)
@@ -965,10 +969,11 @@ func TestRunSuggestAllConfiguredCitiesBestEffort(t *testing.T) {
 	nowLocal := time.Now().In(time.Local)
 	for daysAgo := 15; daysAgo >= 1; daysAgo-- {
 		day := localDayStart(nowLocal).AddDate(0, 0, -daysAgo)
-		insertSawtoothDay(t, db, "station-b", "Berlin", day.In(time.UTC), 2.00)
+		insertSawtoothDayDieselOnly(t, db, "station-b", "Berlin", day.In(time.UTC), 2.00)
 	}
+	// Only diesel has stored prices, so e5 and e10 must fail on their own.
+	insertSuggestSnapshotDieselOnly(t, db, "station-b", "Berlin", time.Now().UTC(), 2.000, true)
 	insertUpdateTargetRow(t, db, "Berlin", 5)
-	insertUpdateTargetRow(t, db, "Nowhere", 5)
 	if err := db.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
@@ -976,17 +981,19 @@ func TestRunSuggestAllConfiguredCitiesBestEffort(t *testing.T) {
 	old := stdout
 	var buf bytes.Buffer
 	stdout = &buf
-	runErr := run([]string{"suggest", "--db", dbPath, "--persist", "--fuel", "diesel", "--history-days", "30", "--predict-days", "2", "--limit-per-day", "2"})
+	runErr := run([]string{"suggest", "--db", dbPath, "--persist"})
 	stdout = old
-	if runErr == nil || !strings.Contains(runErr.Error(), "1 of 2 cities failed") {
-		t.Fatalf("run error = %v, want '1 of 2 cities failed'", runErr)
+	if runErr == nil || !strings.Contains(runErr.Error(), "2 of 3 fuels failed") {
+		t.Fatalf("run error = %v, want '2 of 3 fuels failed'", runErr)
 	}
 	output := buf.String()
-	if !strings.Contains(output, "city: Berlin") || !strings.Contains(output, "city: Nowhere") {
-		t.Fatalf("output missing city sections:\n%s", output)
+	for _, fuel := range suggestFuels {
+		if !strings.Contains(output, "fuel: "+fuel) {
+			t.Fatalf("output missing section for %s:\n%s", fuel, output)
+		}
 	}
 	if !strings.Contains(output, "error:") {
-		t.Fatalf("output missing error line for failed city:\n%s", output)
+		t.Fatalf("output missing error line for the failed fuels:\n%s", output)
 	}
 
 	db, err = openDB(dbPath)
@@ -995,11 +1002,11 @@ func TestRunSuggestAllConfiguredCitiesBestEffort(t *testing.T) {
 	}
 	defer db.Close()
 	var runs int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM prediction_runs WHERE city_name = 'Berlin'`).Scan(&runs); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM prediction_runs WHERE fuel = 'diesel'`).Scan(&runs); err != nil {
 		t.Fatalf("count runs: %v", err)
 	}
 	if runs != 1 {
-		t.Fatalf("prediction_runs for Berlin = %d, want 1 (good city persisted despite failure)", runs)
+		t.Fatalf("prediction_runs for diesel = %d, want 1 (the good fuel persisted despite the failures)", runs)
 	}
 }
 
