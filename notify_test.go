@@ -47,14 +47,21 @@ func TestParseWindowsAndDaysAndTimes(t *testing.T) {
 
 func TestCitySelected(t *testing.T) {
 	set := map[string]bool{"Berlin": true}
-	if !citySelected(set, "Berlin") {
+	if !citySelected(set, []string{"Berlin"}) {
 		t.Fatal("selected city must match")
 	}
-	if citySelected(set, "Hamburg") {
+	if citySelected(set, []string{"Hamburg"}) {
 		t.Fatal("unselected city must not match")
 	}
-	if !citySelected(nil, "anything") {
+	if !citySelected(nil, []string{"anything"}) {
 		t.Fatal("nil set (empty selection) must match every city")
+	}
+	// One city, two target names: selecting either one selects the city.
+	if !citySelected(set, []string{"Berlin, Germany", "Berlin"}) {
+		t.Fatal("a city named by several targets must match on any of them")
+	}
+	if citySelected(set, []string{"Hamburg", "Bremen"}) {
+		t.Fatal("a city none of whose names is selected must not match")
 	}
 }
 
@@ -1141,5 +1148,120 @@ func TestNotifyOnceSkipsTargetsWithoutACachedCity(t *testing.T) {
 	// The uncached target is skipped with a warning; the good one is unaffected.
 	if len(result.Sent) != 2 {
 		t.Fatalf("sent = %+v, want the cached target still delivered", result.Sent)
+	}
+}
+
+func TestResolveTargetCitiesGroupsTargetsNamingTheSamePlace(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.5, Lng: 13.4})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin, Germany", Name: "Berlin", DisplayName: "Berlin, Deutschland", Lat: 52.5, Lng: 13.4})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Hamburg", Name: "Hamburg", DisplayName: "Hamburg", Lat: 53.55, Lng: 9.99})
+
+	cities := resolveTargetCities(ctx, db, []updateTarget{
+		{City: "Berlin", RadiusKM: 5},
+		{City: "Hamburg", RadiusKM: 5},
+		{City: "Berlin, Germany", RadiusKM: 10},
+		{City: "Nowhere", RadiusKM: 5},
+	})
+
+	// Three targets resolve, two of them to the same place, and the uncached one
+	// is skipped.
+	if len(cities) != 2 {
+		t.Fatalf("resolved = %+v, want two cities", cities)
+	}
+	if cities[0].Normalized != "Berlin" || len(cities[0].Targets) != 2 {
+		t.Fatalf("cities[0] = %+v, want Berlin naming both targets", cities[0])
+	}
+	// Configured order is preserved, so the key is stable across runs.
+	if cities[0].Key() != "Berlin" {
+		t.Errorf("key = %q, want the first configured target name", cities[0].Key())
+	}
+	if cities[1].Normalized != "Hamburg" || len(cities[1].Targets) != 1 {
+		t.Fatalf("cities[1] = %+v, want Hamburg alone", cities[1])
+	}
+}
+
+// seedNotifyDuplicateCityTarget adds a second update target that names the city
+// seedNotifyFixture already configured, the way an admin can by typing a longer
+// query for the same place.
+func seedNotifyDuplicateCityTarget(t *testing.T, db *sql.DB) {
+	t.Helper()
+	insertSuggestCity(t, db, cachedCity{
+		QueryName:   "Berlin, Germany",
+		Name:        "Berlin",
+		DisplayName: "Berlin, Deutschland",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	})
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, ?, ?)`,
+		"Berlin, Germany", 5.0, "2026-04-02T00:00:00Z"); err != nil {
+		t.Fatalf("insert duplicate target: %v", err)
+	}
+}
+
+func TestNotifyOnceDoesNotDeliverTwiceForOneCityConfiguredUnderTwoNames(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyDuplicateCityTarget(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "all@example.com", UserKey: "user-all", Token: "token-all",
+		SuggestTimes: "13:00", CheckEnabled: true,
+	})
+
+	pushes := stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+
+	// One station, so one check row — not two because two targets happen to name
+	// the same place.
+	if result.CheckRows != 1 {
+		t.Fatalf("check rows = %d, want 1", result.CheckRows)
+	}
+	// A suggestion message legitimately carries the same station once per
+	// forecast day, so the invariant is that no row repeats verbatim.
+	for _, push := range *pushes {
+		seen := map[string]bool{}
+		for _, line := range strings.Split(push.Message, "\n") {
+			if seen[line] {
+				t.Fatalf("message repeats a row %q:\n%s", line, push.Message)
+			}
+			seen[line] = true
+		}
+	}
+
+	// And one baseline, keyed by the first configured target name.
+	if _, found, err := getNotificationState(context.Background(), db,
+		"check_baseline:1:diesel:Berlin"); err != nil || !found {
+		t.Fatalf("baseline for the first target found=%v err=%v, want it set", found, err)
+	}
+	if _, found, _ := getNotificationState(context.Background(), db,
+		"check_baseline:1:diesel:Berlin, Germany"); found {
+		t.Fatal("a second baseline for the same city must not be written")
+	}
+}
+
+func TestNotifyOnceHonoursEitherNameOfACityConfiguredTwice(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyDuplicateCityTarget(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "picked@example.com", UserKey: "user-picked", Token: "token-picked",
+		SuggestTimes: "13:00", CheckEnabled: true,
+	})
+	// The user selected the city under its second name. Folding the two targets
+	// together must not lose that selection.
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (?, ?, ?)`,
+		1, "Berlin, Germany", "2026-04-02T00:00:00Z"); err != nil {
+		t.Fatalf("insert city selection: %v", err)
+	}
+
+	stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+	if len(result.Sent) != 2 || result.CheckRows != 1 {
+		t.Fatalf("result = %+v, want one check row and both notifications delivered", result)
 	}
 }

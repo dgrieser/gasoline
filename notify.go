@@ -280,10 +280,21 @@ func loadUserCitySelections(ctx context.Context, db *sql.DB) (map[int64]map[stri
 	return selections, rows.Err()
 }
 
-// citySelected reports whether a user's selection covers the city. A nil set
-// (no rows for that user) selects every city, including targets added later.
-func citySelected(set map[string]bool, city string) bool {
-	return set == nil || set[city]
+// citySelected reports whether a user's selection covers a city. A nil set (no
+// rows for that user) selects every city, including targets added later.
+//
+// A city can be named by more than one update target, and users select target
+// names; picking any of them selects the city.
+func citySelected(set map[string]bool, targets []string) bool {
+	if set == nil {
+		return true
+	}
+	for _, target := range targets {
+		if set[target] {
+			return true
+		}
+	}
+	return false
 }
 
 var weekdayNames = map[string]time.Weekday{
@@ -597,43 +608,61 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 	return result, nil
 }
 
-// targetCity is one update target paired with the cached city that owns its
-// stations.
+// targetCity is one cached city paired with every update target that names it.
 //
-// The two strings differ more often than not. Target is what an admin typed and
-// what users select, stored verbatim in update_targets.city and referenced by
-// user_notify_cities and the per-city baseline keys. Normalized is the
-// geocoder's name for the same place, which is what price_snapshots.city_name
-// records — a target added as "Berlin, Germany" owns snapshots filed under
-// "Berlin". Matching stations against the raw target string would silently
-// deliver nothing for every target whose two names disagree.
+// Normalized is the geocoder's name for the place, which is what
+// price_snapshots.city_name records. Targets are the strings admins typed, stored
+// verbatim in update_targets.city and referenced by user_notify_cities — a target
+// added as "Berlin, Germany" owns snapshots filed under "Berlin", so matching
+// stations against the raw target string would silently deliver nothing.
+//
+// Targets is a list because update_targets.city is unique per string, not per
+// place: an admin can configure "Berlin" and "Berlin, Germany" as two targets of
+// the same city. They own exactly the same stations, so they are one city with
+// two names — see resolveTargetCities.
 type targetCity struct {
-	Target     string
 	Normalized string
+	Targets    []string
 }
 
-// resolveTargetCities pairs each update target with its cached city. A target
-// whose city is not cached cannot own a snapshot yet, so it is reported and
-// skipped rather than quietly matching nothing.
+// Key is the city's stable identity for per-city state: the first configured
+// target that names it. Check baselines track one price series per city, so the
+// key must not depend on which of several spellings a given user selected.
+func (c targetCity) Key() string { return c.Targets[0] }
+
+// resolveTargetCities pairs each update target with its cached city, grouping
+// targets that resolve to the same place.
+//
+// A target whose city is not cached cannot own a snapshot yet, so it is reported
+// and skipped rather than quietly matching nothing.
 func resolveTargetCities(ctx context.Context, db *sql.DB, targets []updateTarget) []targetCity {
 	resolved := make([]targetCity, 0, len(targets))
+	index := map[string]int{}
 	for _, target := range targets {
 		normalized, err := lookupCityNormalizedName(ctx, db, target.City)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: skipping update target %s: %v\n", target.City, err)
 			continue
 		}
-		resolved = append(resolved, targetCity{Target: target.City, Normalized: normalized})
+		if at, ok := index[normalized]; ok {
+			// Two targets name the same place. Keeping them apart would put the
+			// same stations in two buckets, so every user who selected both — or
+			// selected nothing, which means all cities — would receive each row
+			// twice, against two separate baselines.
+			resolved[at].Targets = append(resolved[at].Targets, target.City)
+			continue
+		}
+		index[normalized] = len(resolved)
+		resolved = append(resolved, targetCity{Normalized: normalized, Targets: []string{target.City}})
 	}
 	return resolved
 }
 
-// cityCheckRows is the pre-filtered price check of the stations one update
-// target owns: buy recommendations with medium/high confidence, sorted cheapest
-// first. It is computed once per run and shared by all users. city is the raw
-// target name, so it lines up with the user's city selection and baseline keys.
+// cityCheckRows is the pre-filtered price check of the stations one city owns:
+// buy recommendations with medium/high confidence, sorted cheapest first. It is
+// computed once per run and shared by all users.
 type cityCheckRows struct {
-	city string
+	city targetCity
 	rows []priceCheckRow
 }
 
@@ -641,9 +670,10 @@ type cityCheckRows struct {
 // fed, then groups the deliverable rows by the update target that owns each
 // station so each user's city selection can be applied afterwards.
 //
-// The computation itself is city-independent, which is what stops two
-// overlapping targets from delivering the same station twice: a station belongs
-// to exactly one owner. A fuel whose model has too little data is skipped with a
+// The computation itself is city-independent, and every station has exactly one
+// owner, so no station can land in two buckets — not for targets whose radii
+// overlap, and not for two targets naming the same city (resolveTargetCities
+// folds those together). A fuel whose model has too little data is skipped with a
 // warning rather than failing the whole run.
 func collectChecks(ctx context.Context, db *sql.DB, scan snapshotScan, cities []targetCity, opts notifyOptions) map[string][]cityCheckRows {
 	byFuel := map[string][]cityCheckRows{}
@@ -682,7 +712,7 @@ func collectChecks(ctx context.Context, db *sql.DB, scan snapshotScan, cities []
 			if len(matching) > checkRowLimit {
 				matching = matching[:checkRowLimit]
 			}
-			byCity = append(byCity, cityCheckRows{city: city.Target, rows: matching})
+			byCity = append(byCity, cityCheckRows{city: city, rows: matching})
 		}
 		byFuel[fuel] = byCity
 	}
@@ -698,10 +728,10 @@ func userCheckRows(ctx context.Context, db *sql.DB, fuel string, cityChecks []ci
 	var rows []notifyRow
 	baselines := map[string]string{}
 	for _, tc := range cityChecks {
-		if !citySelected(cities, tc.city) {
+		if !citySelected(cities, tc.city.Targets) {
 			continue
 		}
-		baselineKey := fmt.Sprintf("check_baseline:%d:%s:%s", userID, fuel, tc.city)
+		baselineKey := fmt.Sprintf("check_baseline:%d:%s:%s", userID, fuel, tc.city.Key())
 		baselineValue, hasBaseline, err := getNotificationState(ctx, db, baselineKey)
 		if err != nil {
 			return nil, nil, err
@@ -733,11 +763,11 @@ func userCheckRows(ctx context.Context, db *sql.DB, fuel string, cityChecks []ci
 	return rows, baselines, nil
 }
 
-// citySuggestRows is the pre-filtered suggestion run for the stations one
-// update target owns: forecast rows with medium/high confidence. It is computed
-// once per run and shared by all users.
+// citySuggestRows is the pre-filtered suggestion run for the stations one city
+// owns: forecast rows with medium/high confidence. It is computed once per run
+// and shared by all users.
 type citySuggestRows struct {
-	city string
+	city targetCity
 	rows []notifyRow
 }
 
@@ -782,7 +812,7 @@ func collectSuggestions(ctx context.Context, db *sql.DB, scan snapshotScan, citi
 			if len(rows) == 0 {
 				continue
 			}
-			byCity = append(byCity, citySuggestRows{city: city.Target, rows: rows})
+			byCity = append(byCity, citySuggestRows{city: city, rows: rows})
 		}
 		byFuel[fuel] = byCity
 	}
@@ -795,7 +825,7 @@ func collectSuggestions(ctx context.Context, db *sql.DB, scan snapshotScan, citi
 func userSuggestRows(citySuggests []citySuggestRows, cities map[string]bool) []notifyRow {
 	var rows []notifyRow
 	for _, ts := range citySuggests {
-		if !citySelected(cities, ts.city) {
+		if !citySelected(cities, ts.city.Targets) {
 			continue
 		}
 		rows = append(rows, ts.rows...)
