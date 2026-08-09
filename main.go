@@ -2099,6 +2099,26 @@ func computeSuggestions(ctx context.Context, db *sql.DB, opts suggestOptions) (*
 	return computeSuggestionsFromScan(ctx, db, scan, opts)
 }
 
+// buildFuelForecast builds one fuel's forecast model from an already loaded
+// history. This is the part of a suggestion run that does not depend on which
+// windows end up printed, so a caller that only needs the model — notify picks
+// each city's windows from its own stations — does not pay for a candidate pass
+// it would discard.
+func buildFuelForecast(ctx context.Context, db *sql.DB, scan snapshotScan, opts suggestOptions) (forecastModel, []suggestSnapshot, error) {
+	opts = opts.normalized()
+	historyStart := opts.Now.AddDate(0, 0, -opts.HistoryDays)
+	snapshots := scan.forFuel(opts.Fuel)
+	intervals := reconstructPriceIntervals(snapshots, historyStart, opts.Now)
+	if len(intervals) == 0 {
+		return forecastModel{}, nil, errors.New("not enough historical open-price data for suggestions")
+	}
+	model := buildForecastModel(intervals, opts.Now, opts.Location)
+	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, opts.Now, opts.Location); err != nil {
+		return forecastModel{}, nil, err
+	}
+	return model, snapshots, nil
+}
+
 // computeSuggestionsFromScan builds one fuel's forecast from an already loaded
 // history, so a run covering every fuel reads the snapshots once instead of
 // once per fuel.
@@ -2107,15 +2127,8 @@ func computeSuggestionsFromScan(ctx context.Context, db *sql.DB, scan snapshotSc
 	if err := validateSuggestOptions(opts); err != nil {
 		return nil, err
 	}
-	historyStart := opts.Now.AddDate(0, 0, -opts.HistoryDays)
-	snapshots := scan.forFuel(opts.Fuel)
-	intervals := reconstructPriceIntervals(snapshots, historyStart, opts.Now)
-	if len(intervals) == 0 {
-		return nil, errors.New("not enough historical open-price data for suggestions")
-	}
-
-	model := buildForecastModel(intervals, opts.Now, opts.Location)
-	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, opts.Now, opts.Location); err != nil {
+	model, snapshots, err := buildFuelForecast(ctx, db, scan, opts)
+	if err != nil {
 		return nil, err
 	}
 	suggestions := mergeSuggestions(generateSuggestions(model, opts.Fuel, opts.Now, opts.Location, opts.PredictDays, opts.LimitPerDay))

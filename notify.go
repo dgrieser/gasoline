@@ -753,7 +753,7 @@ type citySuggestRows struct {
 func collectSuggestions(ctx context.Context, db *sql.DB, scan snapshotScan, cities []targetCity, opts notifyOptions) map[string][]citySuggestRows {
 	byFuel := map[string][]citySuggestRows{}
 	for _, fuel := range suggestFuels {
-		computation, err := computeSuggestionsFromScan(ctx, db, scan, suggestOptions{
+		model, _, err := buildFuelForecast(ctx, db, scan, suggestOptions{
 			Fuel:        fuel,
 			HistoryDays: modelHistoryDays,
 			PredictDays: forecastPredictDays,
@@ -767,12 +767,12 @@ func collectSuggestions(ctx context.Context, db *sql.DB, scan snapshotScan, citi
 		}
 		var byCity []citySuggestRows
 		for _, city := range cities {
-			cityModel := computation.Model.forCity(city.Normalized)
+			cityModel := model.forCity(city.Normalized)
 			if len(cityModel.Stations) == 0 {
 				continue
 			}
 			suggestions := mergeSuggestions(generateSuggestions(cityModel, fuel,
-				computation.Now, computation.Location, forecastPredictDays, suggestLimitPerDay))
+				opts.Now, opts.Location, forecastPredictDays, suggestLimitPerDay))
 			var rows []notifyRow
 			for i := range suggestions {
 				if suggestions[i].Confidence == "medium" || suggestions[i].Confidence == "high" {
