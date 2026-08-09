@@ -1041,3 +1041,105 @@ func TestNotifyOncePerUserFuel(t *testing.T) {
 		t.Fatal("e5 user's e5 baseline must advance")
 	}
 }
+
+// seedNotifyFixtureWithVerboseTarget is seedNotifyFixture for an install whose
+// update target was added the way the web UI lets an admin type it — the full
+// geocoder query — while the snapshots are filed under the shorter normalized
+// name the geocoder returned. Matching those two strings verbatim would deliver
+// nothing at all.
+func seedNotifyFixtureWithVerboseTarget(t *testing.T, db *sql.DB) {
+	t.Helper()
+	insertSuggestCity(t, db, cachedCity{
+		QueryName:   "Berlin, Germany",
+		Name:        "Berlin",
+		DisplayName: "Berlin, Deutschland",
+		Lat:         52.517389,
+		Lng:         13.395131,
+	})
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+	for daysAgo := 28; daysAgo >= 1; daysAgo-- {
+		dayStart := notifyFixtureNow.Truncate(24*time.Hour).AddDate(0, 0, -daysAgo)
+		for hour := 0; hour < 24; hour++ {
+			insertSuggestSnapshot(t, db, "station-1", "Berlin", dayStart.Add(time.Duration(hour)*time.Hour), 2.100, true)
+		}
+	}
+	insertSuggestSnapshot(t, db, "station-1", "Berlin", notifyFixtureNow.Add(-10*time.Minute), 2.000, true)
+
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, ?, ?)`,
+		"Berlin, Germany", 5.0, "2026-04-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert target: %v", err)
+	}
+}
+
+func TestNotifyOnceMatchesTargetsWhoseNameDiffersFromTheCachedCity(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixtureWithVerboseTarget(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "both@example.com", UserKey: "user-both", Token: "token-both",
+		SuggestTimes: "13:00", CheckEnabled: true,
+	})
+
+	pushes := stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+
+	if len(result.Sent) != 2 || result.CheckRows == 0 || result.SuggestRows == 0 {
+		t.Fatalf("result = %+v, want a check and a suggest delivered for the target", result)
+	}
+	if len(*pushes) != 2 {
+		t.Fatalf("pushes = %+v, want two", *pushes)
+	}
+
+	// The baseline key stays on the raw target name, which is what
+	// user_notify_cities references.
+	if _, found, err := getNotificationState(context.Background(), db,
+		"check_baseline:1:diesel:Berlin, Germany"); err != nil || !found {
+		t.Fatalf("baseline for the raw target name found=%v err=%v, want it keyed by the target", found, err)
+	}
+}
+
+func TestNotifyOnceHonoursCitySelectionForVerboseTargetNames(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixtureWithVerboseTarget(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "picked@example.com", UserKey: "user-picked", Token: "token-picked",
+		SuggestTimes: "13:00", CheckEnabled: true,
+	})
+	// A user who selected the target by the name the UI shows them must still
+	// receive it: the selection is stored against update_targets.city.
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (?, ?, ?)`,
+		1, "Berlin, Germany", "2026-04-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert city selection: %v", err)
+	}
+
+	stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+	if len(result.Sent) != 2 {
+		t.Fatalf("sent = %+v, want the selected target delivered", result.Sent)
+	}
+}
+
+func TestNotifyOnceSkipsTargetsWithoutACachedCity(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "one@example.com", UserKey: "user-one", Token: "token-one",
+		SuggestTimes: "13:00", CheckEnabled: true,
+	})
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, ?, ?)`,
+		"Nowhere", 5.0, "2026-04-02T00:00:00Z"); err != nil {
+		t.Fatalf("insert target: %v", err)
+	}
+
+	stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+	// The uncached target is skipped with a warning; the good one is unaffected.
+	if len(result.Sent) != 2 {
+		t.Fatalf("sent = %+v, want the cached target still delivered", result.Sent)
+	}
+}

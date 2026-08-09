@@ -3598,3 +3598,82 @@ func TestForecastModelForCityFiltersStationsAndSharesSamples(t *testing.T) {
 		t.Error("a city with no stations must yield an empty view")
 	}
 }
+
+func TestLoadSnapshotScanDoesNotDuplicateHistoryForCitiesSharingANormalizedName(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC)
+
+	// cities.normalized_name has no unique constraint: the same place is cached
+	// once per query string an admin ever used. Both of these normalize to
+	// "Berlin", which is what the snapshots are filed under.
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin, Germany", Name: "Berlin", DisplayName: "Berlin, Deutschland", Lat: 52.4, Lng: 13.0})
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+
+	const snapshots = 4
+	for i := 0; i < snapshots; i++ {
+		insertSuggestSnapshot(t, db, "station-1", "Berlin", now.Add(-time.Duration(i+1)*time.Hour), 2.000, true)
+	}
+
+	scan, err := loadSnapshotScan(ctx, db, now.AddDate(0, 0, -10), now)
+	if err != nil {
+		t.Fatalf("loadSnapshotScan: %v", err)
+	}
+	if len(scan.Rows) != snapshots {
+		t.Fatalf("scan rows = %d, want %d: a second cached spelling must not duplicate the history", len(scan.Rows), snapshots)
+	}
+	// The centre is picked deterministically — the row whose query name already
+	// is the normalized name — so the station sits at its own city centre.
+	if d := scan.Stations["station-1"].DistanceKM; d > 0.1 {
+		t.Errorf("distance = %.2f, want ~0 from the preferred cached city row", d)
+	}
+}
+
+func TestLoadCityCentresPrefersTheCanonicalRow(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Inserted worst-first so a naive "last row wins" would pick the wrong one.
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin, Germany", Name: "Berlin", DisplayName: "Berlin, Deutschland", Lat: 52.4, Lng: 13.0})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Hamburg", Name: "Hamburg", DisplayName: "Hamburg", Lat: 53.550556, Lng: 9.993333})
+
+	centres, err := loadCityCentres(ctx, db, []string{"Berlin", "Hamburg", "Nowhere"})
+	if err != nil {
+		t.Fatalf("loadCityCentres: %v", err)
+	}
+	if len(centres) != 2 {
+		t.Fatalf("centres = %+v, want only the two cached cities", centres)
+	}
+	if centres["Berlin"].Lat != 52.517389 || centres["Berlin"].Lng != 13.395131 {
+		t.Errorf("Berlin centre = %+v, want the canonical row's coordinates", centres["Berlin"])
+	}
+	if _, err := loadCityCentres(ctx, db, nil); err != nil {
+		t.Errorf("loadCityCentres with no names: %v", err)
+	}
+}
+
+func TestLookupCityNormalizedName(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestCity(t, db, cachedCity{
+		QueryName: "Berlin, Germany", Name: "Berlin", DisplayName: "Berlin, Deutschland",
+		Lat: 52.517389, Lng: 13.395131,
+	})
+
+	// The query string, the normalized name and the display name all resolve to
+	// the name the snapshots are filed under.
+	for _, in := range []string{"Berlin, Germany", "Berlin", "Berlin, Deutschland", "  Berlin  "} {
+		got, err := lookupCityNormalizedName(ctx, db, in)
+		if err != nil {
+			t.Fatalf("lookupCityNormalizedName(%q): %v", in, err)
+		}
+		if got != "Berlin" {
+			t.Errorf("lookupCityNormalizedName(%q) = %q, want Berlin", in, got)
+		}
+	}
+	if _, err := lookupCityNormalizedName(ctx, db, "Nowhere"); err == nil {
+		t.Error("an uncached city must report an error")
+	}
+}

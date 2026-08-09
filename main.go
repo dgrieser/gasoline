@@ -2250,14 +2250,11 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 			ps.recorded_at,
 			ps.is_open,
 			ps.city_name,
-			c.lat,
-			c.lng,
 			ps.diesel,
 			ps.e5,
 			ps.e10
 		FROM stations s
 		JOIN price_snapshots ps ON ps.station_id = s.id
-		LEFT JOIN cities c ON c.normalized_name = ps.city_name
 		WHERE (
 				ps.recorded_at >= ?
 				OR ps.recorded_at = (
@@ -2287,7 +2284,6 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 			postCode                                                  int
 			lat, lng                                                  float64
 			isOpen                                                    bool
-			cityLat, cityLng                                          sql.NullFloat64
 			diesel, e5, e10                                           sql.NullFloat64
 		)
 		if err := rows.Scan(
@@ -2305,8 +2301,6 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 			&recordedAtText,
 			&isOpen,
 			&cityName,
-			&cityLat,
-			&cityLng,
 			&diesel,
 			&e5,
 			&e10,
@@ -2321,13 +2315,7 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 			continue
 		}
 		// A station's owner can move to a nearer centre; the scan is ordered
-		// oldest first, so the last row seen carries the current owner. A city
-		// missing from `cities` leaves the distance unknown rather than
-		// discarding the station's prices.
-		distanceKM := 0.0
-		if cityLat.Valid && cityLng.Valid {
-			distanceKM = haversineKM(cityLat.Float64, cityLng.Float64, lat, lng)
-		}
+		// oldest first, so the last row seen carries the current owner.
 		scan.Stations[stationID] = suggestionStationRow{
 			ID:          stationID,
 			Name:        stationName,
@@ -2342,7 +2330,6 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 			LastSeenAt:  lastSeenAt,
 			Address:     formatStationAddress(street, houseNumber, postCode, place),
 			City:        cityName,
-			DistanceKM:  distanceKM,
 		}
 		scan.Rows = append(scan.Rows, snapshotScanRow{
 			StationID:  stationID,
@@ -2353,7 +2340,122 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 			E10:        e10,
 		})
 	}
-	return scan, rows.Err()
+	if err := rows.Err(); err != nil {
+		return snapshotScan{}, err
+	}
+	if err := scan.fillDistances(ctx, db); err != nil {
+		return snapshotScan{}, err
+	}
+	return scan, nil
+}
+
+// fillDistances measures each station's distance to the centre of the city that
+// owns it.
+//
+// The centres are resolved after the scan, from the handful of owners it
+// actually saw, rather than joined onto every snapshot row: cities.normalized_name
+// is not unique — the same place can be cached under several query strings, e.g.
+// "Berlin" and "Berlin, Germany" — so a join would multiply the entire history by
+// the number of cached spellings and leave the distance depending on whichever
+// row the database happened to return last.
+func (s snapshotScan) fillDistances(ctx context.Context, db *sql.DB) error {
+	owners := make([]string, 0, len(s.Stations))
+	seen := map[string]bool{}
+	for _, station := range s.Stations {
+		if station.City != "" && !seen[station.City] {
+			seen[station.City] = true
+			owners = append(owners, station.City)
+		}
+	}
+	sort.Strings(owners)
+	centres, err := loadCityCentres(ctx, db, owners)
+	if err != nil {
+		return err
+	}
+	for stationID, station := range s.Stations {
+		centre, ok := centres[station.City]
+		if !ok {
+			// The owning city is no longer cached (target deleted, cache
+			// cleared). The station's prices still count; only the reported
+			// distance is unknown.
+			continue
+		}
+		station.DistanceKM = haversineKM(centre.Lat, centre.Lng, station.Lat, station.Lng)
+		s.Stations[stationID] = station
+	}
+	return nil
+}
+
+// cityCoords is one cached city's centre.
+type cityCoords struct {
+	Lat float64
+	Lng float64
+}
+
+// loadCityCentres resolves normalized city names to one centre each. Where
+// several cached query strings share a normalized name, the row is picked by the
+// same preference rule the other city lookups use: the one whose query name
+// already is the normalized name, then the oldest.
+func loadCityCentres(ctx context.Context, db *sql.DB, names []string) (map[string]cityCoords, error) {
+	centres := map[string]cityCoords{}
+	if len(names) == 0 {
+		return centres, nil
+	}
+	args := make([]any, 0, len(names))
+	for _, name := range names {
+		args = append(args, name)
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT normalized_name, lat, lng
+		FROM cities
+		WHERE normalized_name IN (?`+strings.Repeat(", ?", len(names)-1)+`)
+		ORDER BY normalized_name ASC,
+			CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC,
+			created_at ASC,
+			name ASC
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var centre cityCoords
+		if err := rows.Scan(&name, &centre.Lat, &centre.Lng); err != nil {
+			return nil, err
+		}
+		// Ordered so the preferred row comes first; later spellings are dropped.
+		if _, taken := centres[name]; !taken {
+			centres[name] = centre
+		}
+	}
+	return centres, rows.Err()
+}
+
+// lookupCityNormalizedName resolves a city as an admin wrote it — the query
+// string, the normalized name, or the display name — to the normalized name that
+// price_snapshots.city_name records for it. Those differ whenever the geocoder
+// returns a shorter name than the query: a target added as "Berlin, Germany" owns
+// the snapshots recorded under "Berlin".
+func lookupCityNormalizedName(ctx context.Context, db *sql.DB, city string) (string, error) {
+	city = strings.TrimSpace(city)
+	var normalized string
+	err := db.QueryRowContext(ctx, `
+		SELECT normalized_name
+		FROM cities
+		WHERE name = ?
+			OR normalized_name = ?
+			OR display_name = ?
+		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
+		LIMIT 1
+	`, city, city, city).Scan(&normalized)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("city %q is not cached; run gasoline update --city %q first", city, city)
+	}
+	if err != nil {
+		return "", err
+	}
+	return normalized, nil
 }
 
 func reconstructPriceIntervals(snapshots []suggestSnapshot, historyStart, now time.Time) []priceInterval {
@@ -2784,15 +2886,17 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 	return suggestions
 }
 
-// forCity returns a view of the model restricted to the stations the given
-// update target owns. The per-station sample maps are shared rather than
-// copied: only the station set that the suggestion pass iterates over changes,
-// so this is a filter over an already built model, not a rebuild.
-func (m forecastModel) forCity(city string) forecastModel {
+// forCity returns a view of the model restricted to the stations owned by one
+// city, named as price_snapshots.city_name records it — the geocoder's
+// normalized name, not the string an admin typed into an update target (see
+// targetCity). The per-station sample maps are shared rather than copied: only
+// the station set that the suggestion pass iterates over changes, so this is a
+// filter over an already built model, not a rebuild.
+func (m forecastModel) forCity(normalizedCity string) forecastModel {
 	filtered := m
 	filtered.Stations = make(map[string]forecastStation, len(m.Stations))
 	for stationID, station := range m.Stations {
-		if station.Station.City == city {
+		if station.Station.City == normalizedCity {
 			filtered.Stations[stationID] = station
 		}
 	}

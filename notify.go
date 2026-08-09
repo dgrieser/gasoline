@@ -493,15 +493,16 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 		suggestsByFuel map[string][]citySuggestRows
 	)
 	if len(checkUsers) > 0 || len(suggestUsers) > 0 {
+		cities := resolveTargetCities(ctx, db, targets)
 		scan, err := loadSnapshotScan(ctx, db, opts.Now.AddDate(0, 0, -modelHistoryDays), opts.Now)
 		if err != nil {
 			return result, err
 		}
 		if len(checkUsers) > 0 {
-			checksByFuel = collectChecks(ctx, db, scan, targets, opts)
+			checksByFuel = collectChecks(ctx, db, scan, cities, opts)
 		}
 		if len(suggestUsers) > 0 {
-			suggestsByFuel = collectSuggestions(ctx, db, scan, targets, opts)
+			suggestsByFuel = collectSuggestions(ctx, db, scan, cities, opts)
 		}
 	}
 
@@ -596,9 +597,41 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 	return result, nil
 }
 
+// targetCity is one update target paired with the cached city that owns its
+// stations.
+//
+// The two strings differ more often than not. Target is what an admin typed and
+// what users select, stored verbatim in update_targets.city and referenced by
+// user_notify_cities and the per-city baseline keys. Normalized is the
+// geocoder's name for the same place, which is what price_snapshots.city_name
+// records — a target added as "Berlin, Germany" owns snapshots filed under
+// "Berlin". Matching stations against the raw target string would silently
+// deliver nothing for every target whose two names disagree.
+type targetCity struct {
+	Target     string
+	Normalized string
+}
+
+// resolveTargetCities pairs each update target with its cached city. A target
+// whose city is not cached cannot own a snapshot yet, so it is reported and
+// skipped rather than quietly matching nothing.
+func resolveTargetCities(ctx context.Context, db *sql.DB, targets []updateTarget) []targetCity {
+	resolved := make([]targetCity, 0, len(targets))
+	for _, target := range targets {
+		normalized, err := lookupCityNormalizedName(ctx, db, target.City)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping update target %s: %v\n", target.City, err)
+			continue
+		}
+		resolved = append(resolved, targetCity{Target: target.City, Normalized: normalized})
+	}
+	return resolved
+}
+
 // cityCheckRows is the pre-filtered price check of the stations one update
 // target owns: buy recommendations with medium/high confidence, sorted cheapest
-// first. It is computed once per run and shared by all users.
+// first. It is computed once per run and shared by all users. city is the raw
+// target name, so it lines up with the user's city selection and baseline keys.
 type cityCheckRows struct {
 	city string
 	rows []priceCheckRow
@@ -612,7 +645,7 @@ type cityCheckRows struct {
 // overlapping targets from delivering the same station twice: a station belongs
 // to exactly one owner. A fuel whose model has too little data is skipped with a
 // warning rather than failing the whole run.
-func collectChecks(ctx context.Context, db *sql.DB, scan snapshotScan, targets []updateTarget, opts notifyOptions) map[string][]cityCheckRows {
+func collectChecks(ctx context.Context, db *sql.DB, scan snapshotScan, cities []targetCity, opts notifyOptions) map[string][]cityCheckRows {
 	byFuel := map[string][]cityCheckRows{}
 	for _, fuel := range suggestFuels {
 		// Limit 0: the per-city row limit is applied after grouping, so one
@@ -630,10 +663,10 @@ func collectChecks(ctx context.Context, db *sql.DB, scan snapshotScan, targets [
 			continue
 		}
 		var byCity []cityCheckRows
-		for _, target := range targets {
+		for _, city := range cities {
 			var matching []priceCheckRow
 			for _, row := range checks {
-				if row.Station.City != target.City {
+				if row.Station.City != city.Normalized {
 					continue
 				}
 				if row.Recommendation == "buy" && (row.Confidence == "medium" || row.Confidence == "high") {
@@ -649,7 +682,7 @@ func collectChecks(ctx context.Context, db *sql.DB, scan snapshotScan, targets [
 			if len(matching) > checkRowLimit {
 				matching = matching[:checkRowLimit]
 			}
-			byCity = append(byCity, cityCheckRows{city: target.City, rows: matching})
+			byCity = append(byCity, cityCheckRows{city: city.Target, rows: matching})
 		}
 		byFuel[fuel] = byCity
 	}
@@ -717,7 +750,7 @@ type citySuggestRows struct {
 // another city a user also selected. The model is built once and only filtered
 // per city (see forecastModel.forCity), so this costs candidate scoring, not a
 // second pass over the history.
-func collectSuggestions(ctx context.Context, db *sql.DB, scan snapshotScan, targets []updateTarget, opts notifyOptions) map[string][]citySuggestRows {
+func collectSuggestions(ctx context.Context, db *sql.DB, scan snapshotScan, cities []targetCity, opts notifyOptions) map[string][]citySuggestRows {
 	byFuel := map[string][]citySuggestRows{}
 	for _, fuel := range suggestFuels {
 		computation, err := computeSuggestionsFromScan(ctx, db, scan, suggestOptions{
@@ -733,8 +766,8 @@ func collectSuggestions(ctx context.Context, db *sql.DB, scan snapshotScan, targ
 			continue
 		}
 		var byCity []citySuggestRows
-		for _, target := range targets {
-			cityModel := computation.Model.forCity(target.City)
+		for _, city := range cities {
+			cityModel := computation.Model.forCity(city.Normalized)
 			if len(cityModel.Stations) == 0 {
 				continue
 			}
@@ -749,7 +782,7 @@ func collectSuggestions(ctx context.Context, db *sql.DB, scan snapshotScan, targ
 			if len(rows) == 0 {
 				continue
 			}
-			byCity = append(byCity, citySuggestRows{city: target.City, rows: rows})
+			byCity = append(byCity, citySuggestRows{city: city.Target, rows: rows})
 		}
 		byFuel[fuel] = byCity
 	}

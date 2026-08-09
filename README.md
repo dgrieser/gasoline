@@ -178,7 +178,7 @@ Suggest cheap fueling windows for the coming days:
 gasoline suggest
 ```
 
-`suggest` takes no scope flags: it covers **every station currently being fed** — whatever the configured update targets collect — and computes all three fuels in one run. A station leaves scope once it stops receiving price updates for 48 hours, which is what happens when an update target is removed or its radius shrinks. Each station is attributed to the target that owns it (the nearest fed city centre, recorded at collection time), and the reported distance is measured to that centre.
+`suggest` takes no scope flags: it covers **every station currently being fed** — whatever the configured update targets collect — and computes all three fuels in one run. A station leaves scope once it stops receiving price updates for 48 hours, which is what happens when an update target is removed or its radius shrinks. Each station is attributed to the city that owns it (the nearest fed centre, recorded at collection time as the geocoder's normalized name), and the reported distance is measured to that centre. `notify` resolves each update target to the same normalized name before it filters, so a target added as `Berlin, Germany` still matches the snapshots recorded under `Berlin`.
 
 The suggestion algorithm uses open historical prices, reconstructs compacted price intervals, and decomposes each station's history into a per-day price level plus an intraday pattern:
 
