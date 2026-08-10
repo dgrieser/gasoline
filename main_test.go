@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1600,17 +1601,50 @@ func TestResolveSnapshotOwner(t *testing.T) {
 	berlin := cachedCity{Name: "Berlin", Lat: 52.5, Lng: 13.4}
 	potsdam := cachedCity{Name: "Potsdam", Lat: 52.4, Lng: 13.06}
 
+	// Both cities cover the station: Potsdam at 3.5 km, Berlin at 22 km. These
+	// cases model a configured install, where an absent city means a removed
+	// target rather than a city this run did not name.
+	configured := func(radii map[string]float64) cityCoverage {
+		return cityCoverage{radiusByCity: radii, configured: true}
+	}
+	covered := configured(map[string]float64{"Potsdam": 5, "Berlin": 25})
+
 	tests := []struct {
 		name         string
 		currentOwner string
 		candidate    cachedCity
+		coverage     cityCoverage
 		want         string
 	}{
-		{"unowned station goes to the fetching city", "", berlin, "Berlin"},
-		{"owner re-fetching itself keeps it", "Berlin", berlin, "Berlin"},
-		{"nearer owner survives a farther city's run", "Potsdam", berlin, "Potsdam"},
-		{"farther owner loses to a nearer city", "Berlin", potsdam, "Potsdam"},
-		{"unknown owner cannot hold the station", "Atlantis", berlin, "Berlin"},
+		{"unowned station goes to the fetching city", "", berlin, covered, "Berlin"},
+		{"owner re-fetching itself keeps it", "Berlin", berlin, covered, "Berlin"},
+		{"nearer owner survives a farther city's run", "Potsdam", berlin, covered, "Potsdam"},
+		{"farther owner loses to a nearer city", "Berlin", potsdam, covered, "Potsdam"},
+		{"unknown owner cannot hold the station", "Atlantis", berlin, covered, "Berlin"},
+		// The owner's target was removed. Its cities row survives, and the
+		// remaining target keeps the station fresh forever, so without the
+		// coverage check the station would never move.
+		{
+			name: "removed owner hands the station over", currentOwner: "Potsdam", candidate: berlin,
+			coverage: configured(map[string]float64{"Berlin": 25}), want: "Berlin",
+		},
+		// The owner's radius was shrunk past the station.
+		{
+			name: "shrunk owner hands the station over", currentOwner: "Potsdam", candidate: berlin,
+			coverage: configured(map[string]float64{"Potsdam": 2, "Berlin": 25}), want: "Berlin",
+		},
+		// Shrunk, but still reaching: ownership is stable.
+		{
+			name: "owner still in reach after a shrink keeps it", currentOwner: "Potsdam", candidate: berlin,
+			coverage: configured(map[string]float64{"Potsdam": 4, "Berlin": 25}), want: "Potsdam",
+		},
+		// A flag-driven install has no configuration to compare against, so an
+		// owner this run did not name — a solo run, or a failed fetch — keeps the
+		// station on distance alone.
+		{
+			name: "unnamed owner keeps the station without configured targets", currentOwner: "Potsdam", candidate: berlin,
+			coverage: cityCoverage{radiusByCity: map[string]float64{"Berlin": 25}}, want: "Potsdam",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1619,7 +1653,7 @@ func TestResolveSnapshotOwner(t *testing.T) {
 				t.Fatalf("begin: %v", err)
 			}
 			defer tx.Rollback()
-			got, err := resolveSnapshotOwner(ctx, tx, newCityCentres(), tc.currentOwner, tc.candidate, station)
+			got, err := resolveSnapshotOwner(ctx, tx, newCityCentres(tc.coverage), tc.currentOwner, tc.candidate, station)
 			if err != nil {
 				t.Fatalf("resolveSnapshotOwner: %v", err)
 			}
@@ -1627,6 +1661,73 @@ func TestResolveSnapshotOwner(t *testing.T) {
 				t.Fatalf("owner = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadCityCoverageMergesTargetsAndSweep(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin, Germany", Name: "Berlin", DisplayName: "Berlin, Deutschland", Lat: 52.5, Lng: 13.4})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Potsdam", Name: "Potsdam", DisplayName: "Potsdam", Lat: 52.4, Lng: 13.06})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Hamburg", Name: "Hamburg", DisplayName: "Hamburg", Lat: 53.55, Lng: 9.99})
+	// A target written the long way still has to be keyed by the normalized name
+	// that ownership uses.
+	insertUpdateTargetRow(t, db, "Berlin, Germany", 5)
+	insertUpdateTargetRow(t, db, "Potsdam", 10)
+	insertUpdateTargetRow(t, db, "Ghosttown", 20) // never geocoded
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	loaded, err := loadCityCoverage(ctx, tx, []cityFetch{
+		// An ad-hoc sweep reaching further than the configured target, plus a
+		// city that is not a target at all.
+		{Query: cityQuery{name: "Berlin", radius: 25}, City: cachedCity{Name: "Berlin"}},
+		{Query: cityQuery{name: "Hamburg", radius: 15}, City: cachedCity{Name: "Hamburg"}},
+	})
+	if err != nil {
+		t.Fatalf("loadCityCoverage: %v", err)
+	}
+	if !loaded.configured {
+		t.Error("coverage must be authoritative when update targets exist")
+	}
+	coverage := loaded.radiusByCity
+	// The wider of target and sweep wins, so an ad-hoc wide run cannot hand away
+	// ownership the scheduled target would keep.
+	if coverage["Berlin"] != 25 {
+		t.Errorf("Berlin coverage = %v, want the wider sweep radius 25", coverage["Berlin"])
+	}
+	// A configured target that this sweep did not fetch still covers its own.
+	if coverage["Potsdam"] != 10 {
+		t.Errorf("Potsdam coverage = %v, want the configured 10", coverage["Potsdam"])
+	}
+	// A swept city that is not a target counts too — it is what fetched them.
+	if coverage["Hamburg"] != 15 {
+		t.Errorf("Hamburg coverage = %v, want the swept 15", coverage["Hamburg"])
+	}
+	// A target whose city was never geocoded cannot own anything.
+	if _, ok := coverage["Ghosttown"]; ok {
+		t.Error("an ungeocoded target must not appear in the coverage")
+	}
+
+	// With no update targets at all a sweep is flag-driven, and absence from the
+	// coverage cannot be read as a removal.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM update_targets`); err != nil {
+		t.Fatalf("clear targets: %v", err)
+	}
+	flagDriven, err := loadCityCoverage(ctx, tx, []cityFetch{
+		{Query: cityQuery{name: "Berlin", radius: 25}, City: cachedCity{Name: "Berlin"}},
+	})
+	if err != nil {
+		t.Fatalf("loadCityCoverage without targets: %v", err)
+	}
+	if flagDriven.configured {
+		t.Error("coverage must not be authoritative without configured targets")
+	}
+	if reaches, authoritative := flagDriven.stillReaches("Potsdam", 3.5); reaches || authoritative {
+		t.Errorf("stillReaches for an unnamed city = (%v, %v), want (false, false)", reaches, authoritative)
 	}
 }
 
@@ -1751,6 +1852,18 @@ func overlapStub(t *testing.T, diesel func(city string) string, failCity string)
 			}
 			if city == failCity {
 				return jsonResponse(http.StatusInternalServerError, `{"ok":false,"message":"upstream down"}`), nil
+			}
+			// Honour the requested radius the way the real API does, so a
+			// shrunk target genuinely stops seeing the station.
+			radius, err := strconv.ParseFloat(u.Query().Get("rad"), 64)
+			if err != nil {
+				return nil, fmt.Errorf("unexpected rad: %s", u.Query().Get("rad"))
+			}
+			centre := centres[city]
+			lat, _ := strconv.ParseFloat(centre[0], 64)
+			lng, _ := strconv.ParseFloat(centre[1], 64)
+			if haversineKM(lat, lng, 52.42, 13.10) > radius {
+				return jsonResponse(http.StatusOK, `{"ok":true,"stations":[]}`), nil
 			}
 			return jsonResponse(http.StatusOK, fmt.Sprintf(
 				`{"ok":true,"stations":[{"id":"shared-1","name":"S","brand":"B","street":"St","place":"Teltow","lat":52.42,"lng":13.10,"dist":1,"diesel":%s,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`,
@@ -3690,5 +3803,105 @@ func TestLookupCityNormalizedName(t *testing.T) {
 	}
 	if _, err := lookupCityNormalizedName(ctx, db, "Nowhere"); err == nil {
 		t.Error("an uncached city must report an error")
+	}
+}
+
+// The regression this guards: deleting an update target leaves its cities row
+// behind, and the remaining target keeps the station fresh forever, so ownership
+// used to stay on the removed city indefinitely.
+func TestRunUpdateTransfersOwnershipWhenATargetIsRemoved(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "removed-target.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	restore := overlapStub(t, func(string) string { return "1.500" }, "")
+	defer restore()
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := initSchema(context.Background(), db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	insertUpdateTargetRow(t, db, "Berlin", 25)
+	insertUpdateTargetRow(t, db, "Potsdam", 25)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	// Both targets reach the station; the nearer one owns it.
+	_ = captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath})
+	})
+	if owner, _ := sharedStationOwner(t, dbPath); owner != "Potsdam" {
+		t.Fatalf("after the configured sweep: owner = %q, want Potsdam", owner)
+	}
+
+	// The admin removes the owning target. Berlin keeps the station fed, so
+	// freshness alone will never let it go.
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `DELETE FROM update_targets WHERE city = 'Potsdam'`); err != nil {
+		t.Fatalf("delete target: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	_ = captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath})
+	})
+	if owner, rows := sharedStationOwner(t, dbPath); owner != "Berlin" || rows != 1 {
+		t.Fatalf("after removing Potsdam: owner = %q in %d rows, want Berlin in 1", owner, rows)
+	}
+}
+
+// The same for a radius shrink: the target stays, but no longer reaches.
+func TestRunUpdateTransfersOwnershipWhenATargetShrinks(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "shrunk-target.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	restore := overlapStub(t, func(string) string { return "1.500" }, "")
+	defer restore()
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := initSchema(context.Background(), db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	insertUpdateTargetRow(t, db, "Berlin", 25)
+	insertUpdateTargetRow(t, db, "Potsdam", 25)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	_ = captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath})
+	})
+	if owner, _ := sharedStationOwner(t, dbPath); owner != "Potsdam" {
+		t.Fatalf("after the configured sweep: owner = %q, want Potsdam", owner)
+	}
+
+	// The station sits ~3.5 km out, so a 2 km radius no longer contains it.
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `UPDATE update_targets SET radius_km = 2 WHERE city = 'Potsdam'`); err != nil {
+		t.Fatalf("shrink target: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	_ = captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath})
+	})
+	if owner, rows := sharedStationOwner(t, dbPath); owner != "Berlin" || rows != 1 {
+		t.Fatalf("after shrinking Potsdam: owner = %q in %d rows, want Berlin in 1", owner, rows)
 	}
 }

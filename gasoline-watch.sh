@@ -833,42 +833,52 @@ send_changed_check_rows() {
   run_notification check "$CHECK_COMMAND" "$message" "" "${FILTERED_ROWS[@]}"
 }
 
-run_check_once() {
-  local output rows
-  verbose_log "running check: $(shell_quote "$GASOLINE_BIN") check --output json (selecting fuel $(shell_quote "$FUEL"))"
-  if ! output=$("$GASOLINE_BIN" check --output json 2>&1); then
-    log "check failed: $output"
-    return 0
-  fi
+# run_gasoline_fuel_rows runs `gasoline <subcommand> --output json` and prints
+# this watcher's fuel rows on stdout.
+#
+# Both commands cover every fuel and exit non-zero when any of them lacks
+# usable history, so a non-zero exit is not by itself a reason to skip: a
+# watcher configured for diesel must still notify when only e5 and e10 failed.
+# Only this watcher's own fuel decides. stderr is left attached to the
+# watcher's own so real failures still reach the service log, and the per-fuel
+# diagnostics needed here are in the JSON itself.
+#
+# Returns 1 without printing when there is nothing usable for $FUEL.
+run_gasoline_fuel_rows() {
+  local subcommand=$1 rows_key=$2
+  local output status=0 entry fuel_error
+
+  output=$("$GASOLINE_BIN" "$subcommand" --output json) || status=$?
 
   if ! printf '%s' "$output" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    log "check returned invalid JSON: $output"
-    return 0
+    log "$subcommand returned invalid JSON (exit $status): $output"
+    return 1
   fi
+  entry=$(printf '%s' "$output" | jq -c --arg fuel "$FUEL" 'map(select(.fuel == $fuel)) | first // empty')
+  if [[ -z "$entry" ]]; then
+    log "$subcommand returned no result for fuel $FUEL (exit $status)"
+    return 1
+  fi
+  fuel_error=$(printf '%s' "$entry" | jq -r '.error // ""')
+  if [[ -n "$fuel_error" ]]; then
+    log "$subcommand failed for $FUEL: $fuel_error"
+    return 1
+  fi
+  printf '%s' "$entry" | jq -c --arg key "$rows_key" '.[$key] // []'
+}
 
-  # check covers every fuel and scopes itself to the stations the configured
-  # update targets feed, so the watcher's job here is to pick its own fuel out
-  # of the result. A fuel that failed carries an error instead of rows.
-  rows=$(printf '%s' "$output" | jq -c --arg fuel "$FUEL" '[.[] | select(.fuel == $fuel) | .checks // []] | add // []')
+run_check_once() {
+  local rows
+  verbose_log "running check: $(shell_quote "$GASOLINE_BIN") check --output json (selecting fuel $(shell_quote "$FUEL"))"
+  rows=$(run_gasoline_fuel_rows check checks) || return 0
   verbose_log "check returned $(printf '%s' "$rows" | jq 'length') $FUEL row(s)"
   send_changed_check_rows "$rows"
 }
 
 run_suggest_once() {
-  local output rows
+  local output
   verbose_log "running suggest: $(shell_quote "$GASOLINE_BIN") suggest --output json (selecting fuel $(shell_quote "$FUEL"))"
-  if ! output=$("$GASOLINE_BIN" suggest --output json 2>&1); then
-    log "suggest failed: $output"
-    return 0
-  fi
-
-  if ! printf '%s' "$output" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    log "suggest returned invalid JSON: $output"
-    return 0
-  fi
-
-  rows=$(printf '%s' "$output" | jq -c --arg fuel "$FUEL" '[.[] | select(.fuel == $fuel) | .suggestions // []] | add // []')
-  output=$rows
+  output=$(run_gasoline_fuel_rows suggest suggestions) || return 0
   verbose_log "suggest returned $(printf '%s' "$output" | jq 'length') $FUEL row(s)"
   local cheapest_row
   cheapest_row=$(printf '%s' "$output" | jq -c 'if type == "array" then map(select(.confidence == "medium" or .confidence == "high")) | min_by(.predicted_price // .predicted_current_price) // empty else empty end')

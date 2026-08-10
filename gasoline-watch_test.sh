@@ -64,6 +64,11 @@ case "$1" in
     exit 42
     ;;
 esac
+# The real command exits non-zero when any fuel lacks history, even though the
+# other fuels succeeded. GASOLINE_EXIT_FILE lets a test reproduce that.
+if [[ -n "${GASOLINE_EXIT_FILE:-}" && -f "$GASOLINE_EXIT_FILE" ]]; then
+  exit "$(<"$GASOLINE_EXIT_FILE")"
+fi
 EOF
 
   cat >"$fake_notify" <<'EOF'
@@ -201,6 +206,9 @@ EOF
 }
 
 configure_defaults() {
+  GASOLINE_EXIT_FILE=$TEST_DIR/gasoline.exit
+  export GASOLINE_EXIT_FILE
+  rm -f "$GASOLINE_EXIT_FILE"
   FUEL=diesel
   CHECK_MINUTES=5
   SUGGEST_TIME=07:30
@@ -376,6 +384,55 @@ test_suggest_filters_and_batches_results() {
   assert_contains "$output" '2026-04-27 18:00-19:00 diesel at Station 1 (1.2 km): predicted 1.660 EUR, confidence high' "suggest notification"
   assert_contains "$output" '2026-04-28 07:00-08:00 diesel at Station 2 (2.3 km): predicted 1.630 EUR, confidence medium' "suggest notification"
   assert_not_contains "$output" 'Station Low' "suggest notification"
+}
+
+# The fixtures already carry e5/e10 error entries, which is what the real
+# command emits when only diesel has enough history — and it exits non-zero for
+# them. The selected fuel succeeded, so the watcher must still notify.
+test_partial_fuel_failure_still_notifies_selected_fuel() {
+  configure_defaults
+  write_check_json
+  write_suggest_json
+  printf '1\n' >"$GASOLINE_EXIT_FILE"
+
+  run_check_once
+  local begin_count
+  begin_count=$(grep -c '^BEGIN$' "$NOTIFY_OUT" || true)
+  [[ "$begin_count" == 1 ]] || fail "expected a check notification despite the partial failure, got $begin_count"
+  assert_contains "$(<"$NOTIFY_OUT")" 'Buy diesel at Station 2 (2.3 km): 1.680 EUR' "partial-failure check notification"
+
+  : >"$NOTIFY_OUT"
+  run_suggest_once
+  begin_count=$(grep -c '^BEGIN$' "$NOTIFY_OUT" || true)
+  [[ "$begin_count" == 1 ]] || fail "expected a suggest notification despite the partial failure, got $begin_count"
+}
+
+# When the selected fuel is the one that failed there is nothing to send, and the
+# reason has to be logged rather than swallowed.
+test_selected_fuel_failure_logs_and_sends_nothing() {
+  configure_defaults
+  write_check_json
+  printf '1\n' >"$GASOLINE_EXIT_FILE"
+  FUEL=e5
+
+  run_check_once 2>"$TEST_DIR/fuel-error.err"
+
+  [[ ! -s "$NOTIFY_OUT" ]] || fail "expected no notification when the selected fuel failed"
+  assert_contains "$(<"$TEST_DIR/fuel-error.err")" 'check failed for e5' "selected-fuel error log"
+}
+
+# A fuel the command does not report at all is not a silent no-op either.
+test_missing_fuel_entry_logs_and_sends_nothing() {
+  configure_defaults
+  write_check_json
+  FUEL=e10
+  jq 'map(select(.fuel != "e10"))' "$CHECK_JSON_FILE" >"$TEST_DIR/check.nofuel.json"
+  mv "$TEST_DIR/check.nofuel.json" "$CHECK_JSON_FILE"
+
+  run_check_once 2>"$TEST_DIR/missing-fuel.err"
+
+  [[ ! -s "$NOTIFY_OUT" ]] || fail "expected no notification when the fuel is absent"
+  assert_contains "$(<"$TEST_DIR/missing-fuel.err")" 'no result for fuel e10' "missing-fuel log"
 }
 
 test_invalid_json_does_not_notify() {
@@ -782,6 +839,9 @@ test_check_sends_only_cheaper_prices
 test_check_reset_releases_baseline
 test_suggest_filters_and_batches_results
 test_invalid_json_does_not_notify
+test_partial_fuel_failure_still_notifies_selected_fuel
+test_selected_fuel_failure_logs_and_sends_nothing
+test_missing_fuel_entry_logs_and_sends_nothing
 test_verbose_logs_parameters_and_actions
 test_check_formatted_placeholders
 test_suggest_formatted_placeholders

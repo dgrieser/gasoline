@@ -1061,7 +1061,11 @@ func persistSweep(ctx context.Context, db *sql.DB, d dialect, fetches []cityFetc
 		return err
 	}
 
-	centres := newCityCentres()
+	coverage, err := loadCityCoverage(ctx, tx, fetches)
+	if err != nil {
+		return err
+	}
+	centres := newCityCentres(coverage)
 	written := make(map[string]bool)
 	for _, obs := range observations {
 		recordedAt := obs.RecordedAt.Format(time.RFC3339)
@@ -3829,7 +3833,7 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 		if !ok {
 			city = targetOrder[0]
 		}
-		lat, lng, found, err := cachedCityCentreTx(ctx, tx, city)
+		_, lat, lng, found, err := cachedCityTx(ctx, tx, city)
 		if err != nil {
 			return err
 		}
@@ -3878,26 +3882,28 @@ func migrateDropUserNotifyCities(ctx context.Context, tx *sql.Tx, d dialect, res
 	return nil
 }
 
-// cachedCityCentreTx resolves a city as written — query string, normalized name
-// or display name — to its cached coordinates, preferring the canonical row.
-func cachedCityCentreTx(ctx context.Context, tx *sql.Tx, city string) (float64, float64, bool, error) {
+// cachedCityTx resolves a city as written — query string, normalized name or
+// display name — to its normalized name and cached coordinates, preferring the
+// canonical row.
+func cachedCityTx(ctx context.Context, tx *sql.Tx, city string) (string, float64, float64, bool, error) {
+	var normalized string
 	var lat, lng float64
 	err := tx.QueryRowContext(ctx, `
-		SELECT lat, lng
+		SELECT normalized_name, lat, lng
 		FROM cities
 		WHERE name = ?
 			OR normalized_name = ?
 			OR display_name = ?
 		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
 		LIMIT 1
-	`, city, city, city).Scan(&lat, &lng)
+	`, city, city, city).Scan(&normalized, &lat, &lng)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, false, nil
+		return "", 0, 0, false, nil
 	}
 	if err != nil {
-		return 0, 0, false, err
+		return "", 0, 0, false, err
 	}
-	return lat, lng, true, nil
+	return normalized, lat, lng, true, nil
 }
 
 // migrateUsersNotifySuggestEnabled adds the per-user notify_suggest_enabled
@@ -4801,11 +4807,40 @@ func latestPriceSnapshots(ctx context.Context, tx *sql.Tx, stationID string) (*p
 // table that `import cities` can fill with thousands of rows, so each owner is
 // looked up at most once per sweep.
 type cityCentres struct {
-	byName map[string]*cachedCity
+	byName   map[string]*cachedCity
+	coverage cityCoverage
 }
 
-func newCityCentres() *cityCentres {
-	return &cityCentres{byName: map[string]*cachedCity{}}
+func newCityCentres(coverage cityCoverage) *cityCentres {
+	return &cityCentres{byName: map[string]*cachedCity{}, coverage: coverage}
+}
+
+// cityCoverage is which cities currently reach their stations, and whether that
+// is configuration or merely what one flag-driven sweep happened to name.
+type cityCoverage struct {
+	// radiusByCity maps a normalized city name to the radius currently reaching
+	// its stations.
+	radiusByCity map[string]float64
+	// configured is true when update_targets has rows. Without any, a sweep is
+	// driven entirely by --city flags, so a city missing from the coverage says
+	// nothing about whether it still exists — only that this invocation did not
+	// name it.
+	configured bool
+}
+
+// stillReaches reports whether a city that currently owns a station keeps a
+// claim on it, and whether the coverage is authoritative enough to say.
+//
+// An owner absent from a configured install's coverage had its target removed
+// and loses the station. The same absence in a flag-driven install means only
+// that this run did not name the city — a solo run or a failed fetch — which
+// must not move ownership.
+func (c cityCoverage) stillReaches(city string, distanceKM float64) (reaches bool, authoritative bool) {
+	radius, covered := c.radiusByCity[city]
+	if covered {
+		return distanceKM <= radius, true
+	}
+	return false, c.configured
 }
 
 // lookup returns the centre cached for a normalized city name, or nil when no
@@ -4839,8 +4874,14 @@ func (c *cityCentres) lookup(ctx context.Context, tx *sql.Tx, name string) (*cac
 // only ranks the targets a sweep actually fetched, so a single-city run — or a
 // sweep whose nearer target failed — must not take a station away from the
 // nearer city that already owns it. Ownership therefore moves only to a
-// strictly nearer centre, which keeps ownership independent of invocation
-// order and transient fetch failures.
+// strictly nearer centre, which keeps ownership independent of invocation order
+// and transient fetch failures.
+//
+// That preference is conditional on the owner still reaching the station.
+// Deleting an update target leaves its cities row behind, and shrinking a
+// target's radius leaves the row untouched, so without the coverage check a
+// removed or shrunk city would keep owning stations that another target now
+// feeds — for as long as that other target kept them fresh, which is forever.
 func resolveSnapshotOwner(ctx context.Context, tx *sql.Tx, centres *cityCentres, currentOwner string, candidate cachedCity, station tankerStation) (string, error) {
 	if currentOwner == "" || currentOwner == candidate.Name {
 		return candidate.Name, nil
@@ -4850,15 +4891,64 @@ func resolveSnapshotOwner(ctx context.Context, tx *sql.Tx, centres *cityCentres,
 		return "", err
 	}
 	if owner == nil {
-		// The owning city is no longer cached (target deleted, cache cleared),
-		// so it can no longer claim the station.
+		// The owning city is no longer cached (cache cleared), so it can no
+		// longer claim the station.
 		return candidate.Name, nil
 	}
-	if haversineKM(owner.Lat, owner.Lng, station.Lat, station.Lng) <=
-		haversineKM(candidate.Lat, candidate.Lng, station.Lat, station.Lng) {
+	ownerDistance := haversineKM(owner.Lat, owner.Lng, station.Lat, station.Lng)
+	if reaches, authoritative := centres.coverage.stillReaches(currentOwner, ownerDistance); authoritative && !reaches {
+		// The previous owner demonstrably does not reach this station any more,
+		// so the city that actually fetched it takes over.
+		return candidate.Name, nil
+	}
+	if ownerDistance <= haversineKM(candidate.Lat, candidate.Lng, station.Lat, station.Lng) {
 		return currentOwner, nil
 	}
 	return candidate.Name, nil
+}
+
+// loadCityCoverage collects the radius currently reaching each city's stations:
+// the configured update target's radius, or the radius this sweep fetched with,
+// whichever is larger. Taking the larger keeps an ad-hoc
+// `update --city X --radius 25` from handing away ownership that a scheduled
+// 5 km target would keep.
+func loadCityCoverage(ctx context.Context, tx *sql.Tx, fetches []cityFetch) (cityCoverage, error) {
+	coverage := cityCoverage{radiusByCity: map[string]float64{}}
+	record := func(name string, radius float64) {
+		if name == "" || radius <= 0 {
+			return
+		}
+		if current, ok := coverage.radiusByCity[name]; !ok || radius > current {
+			coverage.radiusByCity[name] = radius
+		}
+	}
+	for _, fetch := range fetches {
+		record(fetch.City.Name, fetch.Query.radius)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT city, radius_km FROM update_targets`)
+	if err != nil {
+		return cityCoverage{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var city string
+		var radius float64
+		if err := rows.Scan(&city, &radius); err != nil {
+			return cityCoverage{}, err
+		}
+		coverage.configured = true
+		// update_targets stores the string an admin typed; ownership is keyed by
+		// the geocoder's normalized name for the same place.
+		normalized, _, _, found, err := cachedCityTx(ctx, tx, city)
+		if err != nil {
+			return cityCoverage{}, err
+		}
+		if !found {
+			continue
+		}
+		record(normalized, radius)
+	}
+	return coverage, rows.Err()
 }
 
 func insertPriceSnapshot(ctx context.Context, tx *sql.Tx, cityName string, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
