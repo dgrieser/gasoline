@@ -1686,6 +1686,9 @@ func runSuggest(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
+		return err
+	}
 
 	// Best-effort across fuels like `update` is across cities: compute and
 	// persist each fuel independently, report failures at the end.
@@ -1808,6 +1811,9 @@ func runCheck(args []string) error {
 	// One pass over the history serves every fuel.
 	scan, err := loadSnapshotScan(ctx, db, opts.Now.AddDate(0, 0, -opts.HistoryDays), opts.Now)
 	if err != nil {
+		return err
+	}
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
 		return err
 	}
 
@@ -2096,6 +2102,9 @@ func computeSuggestions(ctx context.Context, db *sql.DB, opts suggestOptions) (*
 	if err != nil {
 		return nil, err
 	}
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
+		return nil, err
+	}
 	return computeSuggestionsFromScan(ctx, db, scan, opts)
 }
 
@@ -2151,6 +2160,9 @@ func checkGas(ctx context.Context, db *sql.DB, opts checkOptions) ([]priceCheckR
 	}
 	scan, err := loadSnapshotScan(ctx, db, opts.Now.AddDate(0, 0, -opts.HistoryDays), opts.Now)
 	if err != nil {
+		return nil, err
+	}
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
 		return nil, err
 	}
 	return checkGasFromScan(ctx, db, scan, opts)
@@ -2356,14 +2368,15 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 	if err := rows.Err(); err != nil {
 		return snapshotScan{}, err
 	}
-	if err := scan.fillDistances(ctx, db); err != nil {
-		return snapshotScan{}, err
-	}
 	return scan, nil
 }
 
-// fillDistances measures each station's distance to the centre of the city that
-// owns it.
+// fillOwningCityDistances measures each station's distance to the centre of the
+// city that owns it, for output that has no better reference point to offer.
+//
+// This is the CLI's notion of distance. Notifications do not use it: a
+// subscriber's distance is measured from their own location, so notify never
+// calls this and therefore never reads the cities cache.
 //
 // The centres are resolved after the scan, from the handful of owners it
 // actually saw, rather than joined onto every snapshot row: cities.normalized_name
@@ -2371,7 +2384,7 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 // "Berlin" and "Berlin, Germany" — so a join would multiply the entire history by
 // the number of cached spellings and leave the distance depending on whichever
 // row the database happened to return last.
-func (s snapshotScan) fillDistances(ctx context.Context, db *sql.DB) error {
+func (s snapshotScan) fillOwningCityDistances(ctx context.Context, db *sql.DB) error {
 	owners := make([]string, 0, len(s.Stations))
 	seen := map[string]bool{}
 	for _, station := range s.Stations {
@@ -2899,19 +2912,24 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 	return suggestions
 }
 
-// forCity returns a view of the model restricted to the stations owned by one
-// city, named as price_snapshots.city_name records it — the geocoder's
-// normalized name, not the string an admin typed into an update target (see
-// targetCity). The per-station sample maps are shared rather than copied: only
-// the station set that the suggestion pass iterates over changes, so this is a
-// filter over an already built model, not a rebuild.
-func (m forecastModel) forCity(normalizedCity string) forecastModel {
+// withinRadius returns a view of the model restricted to the stations inside
+// radiusKM of a point, with each station's distance restated as the distance
+// from that point — so a suggestion reports how far the station is from whoever
+// asked, not from some administrative centre.
+//
+// The per-station sample maps are shared rather than copied: only the station
+// set that the suggestion pass iterates over changes, so this is a filter over
+// an already built model, not a rebuild.
+func (m forecastModel) withinRadius(lat, lng, radiusKM float64) forecastModel {
 	filtered := m
 	filtered.Stations = make(map[string]forecastStation, len(m.Stations))
 	for stationID, station := range m.Stations {
-		if station.Station.City == normalizedCity {
-			filtered.Stations[stationID] = station
+		distance := haversineKM(lat, lng, station.Station.Lat, station.Station.Lng)
+		if distance > radiusKM {
+			continue
 		}
+		station.Station.DistanceKM = distance
+		filtered.Stations[stationID] = station
 	}
 	return filtered
 }
@@ -3520,6 +3538,12 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migrateUsersNotifySuggestEnabled(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateUsersNotifyLocation(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
+	if err := migrateDropUserNotifyCities(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migratePredictionsAccuracyIndex(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -3660,6 +3684,220 @@ func migrateUsersNotifyFuel(ctx context.Context, tx *sql.Tx, d dialect, result *
 	}
 	result.Applied = append(result.Applied, "users.notify_fuel")
 	return nil
+}
+
+// migrateUsersNotifyLocation adds the per-user notification location: the city
+// an admin-independent subscription is centred on, its coordinates, and its
+// radius. Pre-existing installs subscribed users to a set of admin update
+// targets instead (user_notify_cities), so the columns are backfilled from that
+// selection before migrateDropUserNotifyCities removes it.
+func migrateUsersNotifyLocation(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	textType, floatType := "TEXT", "REAL"
+	if d == dialectMySQL {
+		textType, floatType = "VARCHAR(255)", "DOUBLE"
+	}
+	added := false
+	for _, col := range []struct{ name, spec string }{
+		{"notify_city", textType + " NOT NULL DEFAULT ''"},
+		{"notify_lat", floatType + " NOT NULL DEFAULT 0"},
+		{"notify_lng", floatType + " NOT NULL DEFAULT 0"},
+		{"notify_radius_km", floatType + " NOT NULL DEFAULT 0"},
+	} {
+		hasColumn, err := tableHasColumn(ctx, tx, d, "users", col.name)
+		if err != nil {
+			return err
+		}
+		if hasColumn {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+			`ALTER TABLE users ADD COLUMN %s %s`, col.name, col.spec,
+		)); err != nil {
+			return err
+		}
+		added = true
+	}
+	if added {
+		result.Applied = append(result.Applied, "users.notify_location")
+	}
+	// Driven by the presence of the legacy table rather than by whether the
+	// columns were just added: a database can reach this point with the columns
+	// already created by initSchema and the old selection still in place.
+	return backfillNotifyLocations(ctx, tx, d, result)
+}
+
+// backfillNotifyLocations turns each user's old city selection into a location.
+//
+// The new subscription is a single point plus a radius, so a user who had
+// selected several cities keeps the first one in configured order — the others
+// cannot be expressed and are reported. A user who had selected nothing was
+// subscribed to every configured city; that collapses to the first update
+// target, which is exact for a single-target install and narrower for the rest.
+func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasSelections, err := tableExists(ctx, tx, d, "user_notify_cities")
+	if err != nil {
+		return err
+	}
+	if !hasSelections {
+		// Either a fresh install or one that already migrated.
+		return nil
+	}
+	// city -> radius, in configured order, so "no selection" has a fallback.
+	targetRows, err := tx.QueryContext(ctx, `SELECT city, radius_km FROM update_targets ORDER BY id ASC`)
+	if err != nil {
+		return err
+	}
+	var targetOrder []string
+	targetRadius := map[string]float64{}
+	for targetRows.Next() {
+		var city string
+		var radius float64
+		if err := targetRows.Scan(&city, &radius); err != nil {
+			targetRows.Close()
+			return err
+		}
+		targetOrder = append(targetOrder, city)
+		targetRadius[city] = radius
+	}
+	targetRows.Close()
+	if err := targetRows.Err(); err != nil {
+		return err
+	}
+	if len(targetOrder) == 0 {
+		// Nothing was ever collected, so there is no location to infer.
+		return nil
+	}
+	targetRank := map[string]int{}
+	for i, city := range targetOrder {
+		targetRank[city] = i
+	}
+
+	// The city each user keeps: their selected target with the lowest configured
+	// rank, or the first target when they had selected none.
+	chosen := map[int64]string{}
+	extras := 0
+	rows, err := tx.QueryContext(ctx, `SELECT user_id, city FROM user_notify_cities`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var userID int64
+		var city string
+		if err := rows.Scan(&userID, &city); err != nil {
+			rows.Close()
+			return err
+		}
+		rank, known := targetRank[city]
+		if !known {
+			continue
+		}
+		if current, ok := chosen[userID]; ok {
+			extras++
+			if targetRank[current] <= rank {
+				continue
+			}
+		}
+		chosen[userID] = city
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Never overwrite a location a user has already chosen.
+	userRows, err := tx.QueryContext(ctx, `SELECT id FROM users WHERE notify_radius_km <= 0 ORDER BY id ASC`)
+	if err != nil {
+		return err
+	}
+	var userIDs []int64
+	for userRows.Next() {
+		var id int64
+		if err := userRows.Scan(&id); err != nil {
+			userRows.Close()
+			return err
+		}
+		userIDs = append(userIDs, id)
+	}
+	userRows.Close()
+	if err := userRows.Err(); err != nil {
+		return err
+	}
+
+	migrated := 0
+	for _, id := range userIDs {
+		city, ok := chosen[id]
+		if !ok {
+			city = targetOrder[0]
+		}
+		lat, lng, found, err := cachedCityCentreTx(ctx, tx, city)
+		if err != nil {
+			return err
+		}
+		if !found {
+			// The city was never geocoded, so there are no coordinates to carry
+			// over. The user has to pick a location in the web UI.
+			continue
+		}
+		radius := targetRadius[city]
+		if radius <= 0 {
+			radius = 5
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE users SET notify_city = ?, notify_lat = ?, notify_lng = ?, notify_radius_km = ? WHERE id = ?`,
+			city, lat, lng, radius, id); err != nil {
+			return err
+		}
+		migrated++
+	}
+	if migrated > 0 {
+		result.Applied = append(result.Applied,
+			fmt.Sprintf("users.notify_location.backfilled=%d", migrated))
+	}
+	if extras > 0 {
+		result.Applied = append(result.Applied,
+			fmt.Sprintf("users.notify_location.dropped_extra_cities=%d", extras))
+	}
+	return nil
+}
+
+// migrateDropUserNotifyCities removes the table that subscribed users to admin
+// update targets. Notifications are now a per-user point and radius, so the
+// selection has no meaning; migrateUsersNotifyLocation carries it over first.
+func migrateDropUserNotifyCities(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	exists, err := tableExists(ctx, tx, d, "user_notify_cities")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE user_notify_cities`); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "users.drop_notify_cities")
+	return nil
+}
+
+// cachedCityCentreTx resolves a city as written — query string, normalized name
+// or display name — to its cached coordinates, preferring the canonical row.
+func cachedCityCentreTx(ctx context.Context, tx *sql.Tx, city string) (float64, float64, bool, error) {
+	var lat, lng float64
+	err := tx.QueryRowContext(ctx, `
+		SELECT lat, lng
+		FROM cities
+		WHERE name = ?
+			OR normalized_name = ?
+			OR display_name = ?
+		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
+		LIMIT 1
+	`, city, city, city).Scan(&lat, &lng)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return lat, lng, true, nil
 }
 
 // migrateUsersNotifySuggestEnabled adds the per-user notify_suggest_enabled

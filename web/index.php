@@ -123,7 +123,8 @@ function flashText(string $key): string
         'wrongPassword' => 'The current password is incorrect.',
         'passwordChanged' => 'Password changed.',
         'notifySaved' => 'Notification settings saved.',
-        'invalidNotifySettings' => 'Invalid notification settings. Check days, time windows, times, and cities.',
+        'invalidNotifySettings' => 'Invalid notification settings. Check days, time windows, and times.',
+    'invalidNotifyLocation' => 'Pick a city from the suggestions and a radius between 1 and 50 km.',
         'lastAdminGuard' => 'You are the last administrator and cannot delete this account.',
         'accountDeleted' => 'Your account has been deleted.',
         'confirmRequired' => 'Please confirm the deletion.',
@@ -501,6 +502,13 @@ function validHHMM(string $value): bool
 
 const GASOLINE_WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 
+/**
+ * Largest notification radius a user may pick, in km. Generous compared with an
+ * update target's collection radius: a user can sit between two targets and
+ * legitimately care about stations from both.
+ */
+const GASOLINE_MAX_NOTIFY_RADIUS_KM = 50;
+
 /** The suggest/check fuel types, in canonical display order. */
 const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
 
@@ -573,71 +581,9 @@ function normalizeTimeList(array $times): ?string
     return implode(',', $list);
 }
 
-/**
- * Normalizes submitted notification-city checkboxes against the configured
- * update targets. Returns the canonical city names in target order; an empty
- * selection returns [] (meaning: all cities, including ones added later).
- * Null when a submitted city is not a configured target (tampered form or
- * stale page).
- */
-function normalizeCityList(array $cities, array $targets): ?array
-{
-    $canonical = [];
-    foreach ($targets as $target) {
-        $target = trim((string) $target);
-        if ($target !== '') {
-            $canonical[strtolower($target)] = $target;
-        }
-    }
-    $selected = [];
-    foreach ($cities as $city) {
-        $key = strtolower(trim((string) $city));
-        if ($key === '' || !isset($canonical[$key])) {
-            return null;
-        }
-        $selected[$key] = true;
-    }
-    $ordered = [];
-    foreach ($canonical as $key => $name) {
-        if (isset($selected[$key])) {
-            $ordered[] = $name;
-        }
-    }
-    return $ordered;
-}
 
-/** The configured update-target cities, in admin-defined order. */
-function updateTargetCities(PDO $pdo): array
-{
-    return $pdo->query('SELECT city FROM update_targets ORDER BY id ASC')->fetchAll(PDO::FETCH_COLUMN);
-}
 
-/** One user's notification city selection; [] means all cities. */
-function userNotifyCities(PDO $pdo, int $userId): array
-{
-    $stmt = $pdo->prepare('SELECT city FROM user_notify_cities WHERE user_id = :id');
-    $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
-    $stmt->execute();
-    return $stmt->fetchAll(PDO::FETCH_COLUMN);
-}
 
-/** Replaces one user's notification city selection. */
-function saveUserNotifyCities(PDO $pdo, int $userId, array $cities): void
-{
-    $stmt = $pdo->prepare('DELETE FROM user_notify_cities WHERE user_id = :id');
-    $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
-    $stmt->execute();
-    if ($cities === []) {
-        return;
-    }
-    $stmt = $pdo->prepare('INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (:id, :city, :now)');
-    foreach ($cities as $city) {
-        $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
-        $stmt->bindValue(':city', (string) $city);
-        $stmt->bindValue(':now', nowUTC());
-        $stmt->execute();
-    }
-}
 
 
 
@@ -786,12 +732,28 @@ function handlePost(PDO $pdo, string $driver): void
                 (array) ($_POST['notify_windows_to'] ?? [])
             );
             $times = normalizeTimeList((array) ($_POST['notify_suggest_times'] ?? []));
-            $cities = normalizeCityList((array) ($_POST['notify_cities'] ?? []), updateTargetCities($pdo));
             $fuel = strtolower(trim((string) ($_POST['notify_fuel'] ?? '')));
-            if ($method !== 'pushover' || $days === null || $windows === null || $times === null || $cities === null
+            if ($method !== 'pushover' || $days === null || $windows === null || $times === null
                 || !in_array($fuel, GASOLINE_FUELS, true)) {
                 setFlash('error', 'invalidNotifySettings');
                 redirectTo('?page=account');
+            }
+            // The notification area: a city and a radius around it, resolved to
+            // coordinates here so nothing downstream has to consult the geocode
+            // cache. A location is only required once a notification kind is
+            // switched on; leaving both off pauses everything.
+            $wantsNotifications = isset($_POST['notify_suggest_enabled']) || isset($_POST['notify_check_enabled']);
+            $cityKey = trim((string) ($_POST['notify_city'] ?? ''));
+            $radiusRaw = trim((string) ($_POST['notify_radius_km'] ?? ''));
+            $cityRow = resolveCity($pdo, $cityKey);
+            $radius = 0.0;
+            if ($cityKey !== '' || $radiusRaw !== '' || $wantsNotifications) {
+                if ($cityRow === null || !ctype_digit($radiusRaw)
+                    || (int) $radiusRaw < 1 || (int) $radiusRaw > GASOLINE_MAX_NOTIFY_RADIUS_KM) {
+                    setFlash('error', 'invalidNotifyLocation');
+                    redirectTo('?page=account');
+                }
+                $radius = (float) $radiusRaw;
             }
             $pdo->beginTransaction();
             $stmt = $pdo->prepare(
@@ -800,7 +762,9 @@ function handlePost(PDO $pdo, string $driver): void
                     notify_days = :days, notify_windows = :windows,
                     notify_suggest_times = :times, notify_check_enabled = :check_enabled,
                     notify_suggest_enabled = :suggest_enabled,
-                    notify_fuel = :fuel
+                    notify_fuel = :fuel,
+                    notify_city = :city, notify_lat = :lat, notify_lng = :lng,
+                    notify_radius_km = :radius
                  WHERE id = :id'
             );
             $stmt->bindValue(':method', 'pushover');
@@ -813,9 +777,12 @@ function handlePost(PDO $pdo, string $driver): void
             $stmt->bindValue(':check_enabled', isset($_POST['notify_check_enabled']) ? 1 : 0, PDO::PARAM_INT);
             $stmt->bindValue(':suggest_enabled', isset($_POST['notify_suggest_enabled']) ? 1 : 0, PDO::PARAM_INT);
             $stmt->bindValue(':fuel', $fuel);
+            $stmt->bindValue(':city', $cityRow === null ? '' : (string) $cityRow['city_key']);
+            $stmt->bindValue(':lat', $cityRow === null ? 0.0 : (float) $cityRow['lat']);
+            $stmt->bindValue(':lng', $cityRow === null ? 0.0 : (float) $cityRow['lng']);
+            $stmt->bindValue(':radius', $radius);
             $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
             $stmt->execute();
-            saveUserNotifyCities($pdo, (int) $user['id'], $cities);
             $pdo->commit();
             setFlash('success', 'notifySaved');
             redirectTo('?page=account');
@@ -1228,20 +1195,39 @@ function renderAccountPage(PDO $pdo, array $user): never
                     <p class="field-hint" data-i18n="notifyFuelHint">You are notified about this fuel only. All three are tracked, so any choice is served.</p>
                 </div>
                 <?php
-                $targetCities = updateTargetCities($pdo);
-                if ($targetCities !== []) {
-                    $selectedCities = array_flip(userNotifyCities($pdo, (int) $user['id']));
+                // The subscription area. Coordinates are stored on the account,
+                // so the city is only a way of picking them: the notification
+                // itself is "every station within N km of here".
+                $notifyCityKey = trim((string) ($user['notify_city'] ?? ''));
+                $notifyCityRow = resolveCity($pdo, $notifyCityKey);
+                $notifyRadius = (float) ($user['notify_radius_km'] ?? 0);
                 ?>
                 <div class="field">
-                    <label data-i18n="notifyCities">Cities</label>
-                    <div class="day-toggles">
-                        <?php foreach ($targetCities as $city) { ?>
-                        <label class="day-toggle"><input type="checkbox" name="notify_cities[]" value="<?= h($city) ?>" <?= isset($selectedCities[$city]) ? 'checked' : '' ?>><span><?= h($city) ?></span></label>
-                        <?php } ?>
+                    <label for="nf-city" data-i18n="notifyLocation">Notify me around</label>
+                    <div class="city-ac" id="nf-city-ac">
+                        <input
+                            type="text"
+                            id="nf-city"
+                            class="city-ac-input"
+                            data-i18n-placeholder="enterCity"
+                            placeholder="Enter city..."
+                            autocomplete="off"
+                            spellcheck="false"
+                            value="<?= h($notifyCityRow ? (string) $notifyCityRow['display_name'] : '') ?>"
+                            aria-autocomplete="list"
+                            aria-controls="nf-city-list"
+                            aria-expanded="false"
+                        >
+                        <input type="hidden" name="notify_city" id="nf-city-value" value="<?= h($notifyCityKey) ?>">
+                        <ul class="city-ac-list" id="nf-city-list" role="listbox" hidden></ul>
                     </div>
-                    <p class="field-hint" data-i18n="notifyCitiesHint">Notifications cover only the selected cities. Selecting none means every city, including ones added later.</p>
                 </div>
-                <?php } ?>
+                <div class="field">
+                    <label for="nf-radius" data-i18n="notifyRadius">Radius (km)</label>
+                    <input type="number" id="nf-radius" name="notify_radius_km" min="1" max="<?= GASOLINE_MAX_NOTIFY_RADIUS_KM ?>"
+                        value="<?= $notifyRadius > 0 ? h((string) round($notifyRadius)) : '' ?>">
+                    <p class="field-hint" data-i18n="notifyLocationHint">Notifications cover every tracked station within this distance of the city you pick, and distances are measured from there. Stations only appear once your administrator's update targets actually collect them.</p>
+                </div>
                 <div class="field">
                     <label class="check-toggle"><input type="checkbox" name="notify_suggest_enabled" <?= (int) $user['notify_suggest_enabled'] === 1 ? 'checked' : '' ?>><span data-i18n="notifySuggestEnabled">Send daily price suggestions</span></label>
                     <label class="check-toggle"><input type="checkbox" name="notify_check_enabled" <?= (int) $user['notify_check_enabled'] === 1 ? 'checked' : '' ?>><span data-i18n="notifyCheckEnabled">Send buy-now alerts when prices drop</span></label>
@@ -1250,6 +1236,69 @@ function renderAccountPage(PDO $pdo, array $user): never
                 <button type="submit" class="btn-primary" data-i18n="save">Save</button>
             </form>
         </div>
+
+        <script>
+        /* City autocomplete for the notification area. Unlike the dashboard's
+           filter this must not submit on selection: the radius is picked
+           afterwards and the form is saved explicitly. */
+        (function () {
+            const wrap   = document.getElementById('nf-city-ac');
+            const input  = document.getElementById('nf-city');
+            const hidden = document.getElementById('nf-city-value');
+            const list   = document.getElementById('nf-city-list');
+            if (!wrap || !input || !hidden || !list) return;
+
+            let controller = null;
+            let debounceTimer = null;
+
+            const hide = () => { list.hidden = true; input.setAttribute('aria-expanded', 'false'); };
+            const show = () => { list.hidden = false; input.setAttribute('aria-expanded', 'true'); };
+
+            async function fetchMatches(q) {
+                if (controller) controller.abort();
+                controller = new AbortController();
+                try {
+                    const url = new URL(location.href);
+                    url.search = '';
+                    url.searchParams.set('action', 'city_search');
+                    url.searchParams.set('q', q);
+                    const res = await fetch(url.toString(), { signal: controller.signal });
+                    return await res.json();
+                } catch { return null; }
+            }
+
+            input.addEventListener('input', () => {
+                const q = input.value.trim();
+                // Clearing the key makes a stale selection impossible to save.
+                hidden.value = '';
+                clearTimeout(debounceTimer);
+                if (q.length < 3) { hide(); return; }
+                debounceTimer = setTimeout(async () => {
+                    const results = await fetchMatches(q);
+                    if (results === null) return;
+                    list.innerHTML = '';
+                    results.forEach(({ city_key, display_name }) => {
+                        const li = document.createElement('li');
+                        li.className = 'city-ac-item';
+                        li.role = 'option';
+                        li.setAttribute('aria-selected', 'false');
+                        li.textContent = display_name || city_key;
+                        li.addEventListener('mousedown', (e) => {
+                            e.preventDefault();
+                            input.value = display_name || city_key;
+                            hidden.value = city_key;
+                            hide();
+                        });
+                        list.appendChild(li);
+                    });
+                    if (results.length) show(); else hide();
+                }, 200);
+            });
+
+            input.addEventListener('blur', () => setTimeout(hide, 150));
+            document.addEventListener('click', (e) => { if (!wrap.contains(e.target)) hide(); });
+        })();
+        </script>
 
         <div class="settings-card danger">
             <h2 data-i18n="dangerZone">Danger zone</h2>
@@ -5678,10 +5727,12 @@ const translations = {
         notifyKindsHint: 'Choose which notifications you receive. Suggestions forecast good times to fill up; buy-now alerts fire when a current price drops. Leave both off to pause all notifications.',
         notifyFuel: 'Fuel to be notified about',
         notifyFuelHint: 'You are notified about this fuel only. The list shows the fuels your administrator currently tracks.',
-        notifyCities: 'Cities',
-        notifyCitiesHint: 'Notifications cover only the selected cities. Selecting none means every city, including ones added later.',
+        notifyLocation: 'Notify me around',
+        notifyRadius: 'Radius (km)',
+        notifyLocationHint: "Notifications cover every tracked station within this distance of the city you pick, and distances are measured from there. Stations only appear once your administrator's update targets actually collect them.",
         notifySaved: 'Notification settings saved.',
-        invalidNotifySettings: 'Invalid notification settings. Check days, time windows, times, and cities.',
+        invalidNotifySettings: 'Invalid notification settings. Check days, time windows, and times.',
+        invalidNotifyLocation: 'Pick a city from the suggestions and a radius between 1 and 50 km.',
         addWindow: 'Add window',
         addTime: 'Add time',
         removeRow: 'Remove',
@@ -5944,10 +5995,12 @@ const translations = {
         notifyKindsHint: 'Wähle, welche Benachrichtigungen du erhältst. Vorschläge sagen günstige Tankzeiten voraus; Kaufalarme werden ausgelöst, wenn ein aktueller Preis fällt. Lass beide aus, um alle Benachrichtigungen zu pausieren.',
         notifyFuel: 'Kraftstoff für Benachrichtigungen',
         notifyFuelHint: 'Sie werden nur über diesen Kraftstoff benachrichtigt. Alle drei werden erfasst, jede Auswahl wird also bedient.',
-        notifyCities: 'Städte',
-        notifyCitiesHint: 'Benachrichtigungen gelten nur für die ausgewählten Städte. Keine Auswahl bedeutet alle Städte, auch später hinzugefügte.',
+        notifyLocation: 'Benachrichtigen rund um',
+        notifyRadius: 'Radius (km)',
+        notifyLocationHint: 'Benachrichtigungen umfassen alle erfassten Tankstellen innerhalb dieser Entfernung zur gewählten Stadt, und Entfernungen werden von dort gemessen. Tankstellen erscheinen erst, wenn die Aktualisierungsziele Ihres Administrators sie tatsächlich erfassen.',
         notifySaved: 'Benachrichtigungseinstellungen gespeichert.',
-        invalidNotifySettings: 'Ungültige Benachrichtigungseinstellungen. Bitte Tage, Zeitfenster, Zeiten und Städte prüfen.',
+        invalidNotifySettings: 'Ungültige Benachrichtigungseinstellungen. Bitte Tage, Zeitfenster und Zeiten prüfen.',
+        invalidNotifyLocation: 'Bitte eine Stadt aus den Vorschlägen und einen Radius zwischen 1 und 50 km wählen.',
         addWindow: 'Zeitfenster hinzufügen',
         addTime: 'Zeit hinzufügen',
         removeRow: 'Entfernen',

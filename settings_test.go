@@ -388,3 +388,98 @@ func TestPriceCheckVerdictHonoursMargin(t *testing.T) {
 		t.Fatalf("verdict above the reference with a 5 ct margin = %q, want typical", got)
 	}
 }
+
+func TestMigrateBackfillsNotifyLocationFromCitySelection(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// An install from before notifications had their own location: users were
+	// subscribed to a set of admin update targets.
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE user_notify_cities (
+			user_id INTEGER NOT NULL,
+			city TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (user_id, city)
+		)`); err != nil {
+		t.Fatalf("recreate legacy table: %v", err)
+	}
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Hamburg", Name: "Hamburg", DisplayName: "Hamburg", Lat: 53.550556, Lng: 9.993333})
+	insertUpdateTargetRow(t, db, "Berlin", 7)
+	insertUpdateTargetRow(t, db, "Hamburg", 12)
+	for i, email := range []string{"picked@example.com", "multi@example.com", "none@example.com"} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO users (email, password_hash, status, created_at) VALUES (?, 'x', 'approved', '2026-04-01T00:00:00Z')`,
+			email); err != nil {
+			t.Fatalf("insert user %d: %v", i, err)
+		}
+	}
+	// User 1 picked Hamburg; user 2 picked both; user 3 picked nothing, which
+	// used to mean every city.
+	for _, sel := range []struct {
+		userID int
+		city   string
+	}{{1, "Hamburg"}, {2, "Hamburg"}, {2, "Berlin"}} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (?, ?, '2026-04-01T00:00:00Z')`,
+			sel.userID, sel.city); err != nil {
+			t.Fatalf("insert selection: %v", err)
+		}
+	}
+
+	result, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("migrateSchema: %v", err)
+	}
+	if !containsString(result.Applied, "users.drop_notify_cities") {
+		t.Fatalf("migrate did not drop the legacy table: %v", result.Applied)
+	}
+	// The dropped extra city is reported rather than silently lost.
+	if !containsString(result.Applied, "users.notify_location.dropped_extra_cities=1") {
+		t.Fatalf("migrate did not report the unrepresentable extra city: %v", result.Applied)
+	}
+
+	type loc struct {
+		city     string
+		lat, lng float64
+		radius   float64
+	}
+	got := map[int64]loc{}
+	rows, err := db.QueryContext(ctx, `SELECT id, notify_city, notify_lat, notify_lng, notify_radius_km FROM users ORDER BY id`)
+	if err != nil {
+		t.Fatalf("read locations: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var l loc
+		if err := rows.Scan(&id, &l.city, &l.lat, &l.lng, &l.radius); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[id] = l
+	}
+	// The single selection is carried over with that target's own radius.
+	if got[1] != (loc{"Hamburg", 53.550556, 9.993333, 12}) {
+		t.Errorf("user 1 = %+v, want Hamburg at radius 12", got[1])
+	}
+	// Several selections collapse to the first in configured order.
+	if got[2] != (loc{"Berlin", 52.517389, 13.395131, 7}) {
+		t.Errorf("user 2 = %+v, want the first configured target Berlin", got[2])
+	}
+	// No selection meant every city; that collapses to the first target.
+	if got[3] != (loc{"Berlin", 52.517389, 13.395131, 7}) {
+		t.Errorf("user 3 = %+v, want the first configured target Berlin", got[3])
+	}
+
+	// Re-running is a no-op.
+	second, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("second migrateSchema: %v", err)
+	}
+	for _, step := range []string{"users.notify_location", "users.drop_notify_cities", "users.notify_location.backfilled=3"} {
+		if containsString(second.Applied, step) {
+			t.Errorf("second migrate reported %s again: %v", step, second.Applied)
+		}
+	}
+}

@@ -3551,6 +3551,11 @@ func TestLoadSnapshotScanAttributesStationsToTheirOwningCity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSnapshotScan: %v", err)
 	}
+	// Owning-city distance is opt-in: notifications measure from the subscriber
+	// instead, so the scan does not pay for the cities lookup unless asked.
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
+		t.Fatalf("fillOwningCityDistances: %v", err)
+	}
 	for id, wantCity := range map[string]string{"in-berlin": "Berlin", "in-potsdam": "Potsdam", "moved": "Potsdam"} {
 		station, ok := scan.Stations[id]
 		if !ok {
@@ -3569,33 +3574,40 @@ func TestLoadSnapshotScanAttributesStationsToTheirOwningCity(t *testing.T) {
 	}
 }
 
-func TestForecastModelForCityFiltersStationsAndSharesSamples(t *testing.T) {
+func TestForecastModelWithinRadiusFiltersAndRestatesDistance(t *testing.T) {
+	// Berlin centre, a station ~8 km west of it, and Hamburg.
 	model := forecastModel{
 		Stations: map[string]forecastStation{
-			"b1": {Station: suggestionStationRow{ID: "b1", City: "Berlin"}},
-			"b2": {Station: suggestionStationRow{ID: "b2", City: "Berlin"}},
-			"p1": {Station: suggestionStationRow{ID: "p1", City: "Potsdam"}},
+			"here": {Station: suggestionStationRow{ID: "here", Lat: 52.517389, Lng: 13.395131}},
+			"near": {Station: suggestionStationRow{ID: "near", Lat: 52.517389, Lng: 13.277}},
+			"far":  {Station: suggestionStationRow{ID: "far", Lat: 53.550556, Lng: 9.993333}},
 		},
-		Hour:           map[stationHourKey][]priceSample{{StationID: "p1", Hour: 8}: {{Price: 1.5}}},
+		Hour:           map[stationHourKey][]priceSample{{StationID: "far", Hour: 8}: {{Price: 1.5}}},
 		JumpAnchorHour: 12,
 	}
-	berlin := model.forCity("Berlin")
-	if len(berlin.Stations) != 2 {
-		t.Fatalf("Berlin view has %d stations, want 2", len(berlin.Stations))
+	view := model.withinRadius(52.517389, 13.395131, 25)
+	if len(view.Stations) != 2 {
+		t.Fatalf("view has %d stations, want the two inside 25 km", len(view.Stations))
 	}
-	if _, ok := berlin.Stations["p1"]; ok {
-		t.Error("Berlin view leaked a Potsdam station")
+	if _, ok := view.Stations["far"]; ok {
+		t.Error("a station outside the radius must be filtered out")
+	}
+	// Distances are restated from the point that was asked about.
+	if d := view.Stations["here"].Station.DistanceKM; d > 0.1 {
+		t.Errorf("distance at the point itself = %.2f, want ~0", d)
+	}
+	if d := view.Stations["near"].Station.DistanceKM; d < 7 || d > 9 {
+		t.Errorf("distance for the nearby station = %.2f, want ~8", d)
 	}
 	if len(model.Stations) != 3 {
-		t.Error("forCity mutated the model it filtered")
+		t.Error("withinRadius mutated the model it filtered")
 	}
-	// The sample maps are shared rather than rebuilt, and the rest of the model
-	// carries over untouched.
-	if len(berlin.Hour) != len(model.Hour) || berlin.JumpAnchorHour != 12 {
-		t.Errorf("Berlin view = %d hour keys anchor %d, want the model's own", len(berlin.Hour), berlin.JumpAnchorHour)
+	// The sample maps are shared rather than rebuilt, and the rest carries over.
+	if len(view.Hour) != len(model.Hour) || view.JumpAnchorHour != 12 {
+		t.Errorf("view = %d hour keys anchor %d, want the model's own", len(view.Hour), view.JumpAnchorHour)
 	}
-	if len(model.forCity("Nowhere").Stations) != 0 {
-		t.Error("a city with no stations must yield an empty view")
+	if len(model.withinRadius(0, 0, 1).Stations) != 0 {
+		t.Error("an area with no stations must yield an empty view")
 	}
 }
 
@@ -3619,6 +3631,9 @@ func TestLoadSnapshotScanDoesNotDuplicateHistoryForCitiesSharingANormalizedName(
 	scan, err := loadSnapshotScan(ctx, db, now.AddDate(0, 0, -10), now)
 	if err != nil {
 		t.Fatalf("loadSnapshotScan: %v", err)
+	}
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
+		t.Fatalf("fillOwningCityDistances: %v", err)
 	}
 	if len(scan.Rows) != snapshots {
 		t.Fatalf("scan rows = %d, want %d: a second cached spelling must not duplicate the history", len(scan.Rows), snapshots)
