@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math"
 	"os"
 	"path/filepath"
@@ -491,4 +494,127 @@ func TestCopyTableBatching(t *testing.T) {
 	if int(count.Int64) != copyBatchSize+7 {
 		t.Fatalf("target count = %d, want %d", count.Int64, copyBatchSize+7)
 	}
+}
+
+// knownNestedCommandSites are functions that issue a command while one of their
+// own result sets is still open. See TestNoCommandsWhileAResultSetIsOpen for why
+// that is a bug; these predate the check (migrateCitiesDeduplicate came in with
+// MySQL support) and are recorded rather than silently tolerated.
+var knownNestedCommandSites = map[string]bool{
+	"migrateCitiesDeduplicate": true,
+}
+
+// TestNoCommandsWhileAResultSetIsOpen fails when a function starts another
+// command on a transaction whose previous result set is still being read.
+//
+// A transaction is pinned to one connection, and go-sql-driver/mysql talks to it
+// synchronously through a single buffer, so it cannot begin a command while rows
+// are outstanding — it returns "commands out of sync" instead. SQLite tolerates
+// it, and CI has no MySQL service, so nothing else in this suite would notice.
+// Read the rows into a slice, close them, then issue the next command.
+//
+// Calls to package functions that themselves query are flagged too, because that
+// is the shape the bug actually took: a helper taking the same transaction, one
+// call away from the loop.
+func TestNoCommandsWhileAResultSetIsOpen(t *testing.T) {
+	paths, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	fset := token.NewFileSet()
+	files := map[string]*ast.File{}
+	for _, path := range paths {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		files[path] = file
+	}
+
+	// Package functions whose body issues a command, so a call to one inside a
+	// rows loop is as unsafe as the command itself.
+	queries := map[string]bool{}
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if sel, ok := callSelector(n); ok && isCommand(sel) {
+					queries[fn.Name.Name] = true
+				}
+				return true
+			})
+		}
+	}
+
+	for path, file := range files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || knownNestedCommandSites[fn.Name.Name] {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				loop, ok := n.(*ast.ForStmt)
+				if !ok || loop.Cond == nil {
+					return true
+				}
+				cond, ok := loop.Cond.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := cond.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "Next" {
+					return true
+				}
+				ast.Inspect(loop.Body, func(inner ast.Node) bool {
+					call, ok := inner.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					switch fun := call.Fun.(type) {
+					case *ast.SelectorExpr:
+						if isCommand(fun.Sel.Name) {
+							t.Errorf("%s: %s calls %s while its rows are still open; buffer the rows "+
+								"and close them first (MySQL: commands out of sync)",
+								fset.Position(call.Pos()), fn.Name.Name, fun.Sel.Name)
+						}
+					case *ast.Ident:
+						if queries[fun.Name] && fun.Name != fn.Name.Name {
+							t.Errorf("%s: %s calls %s() — which queries — while its rows are still open; "+
+								"buffer the rows and close them first (MySQL: commands out of sync)",
+								fset.Position(call.Pos()), fn.Name.Name, fun.Name)
+						}
+					}
+					return true
+				})
+				return true
+			})
+		}
+		_ = path
+	}
+}
+
+func callSelector(n ast.Node) (string, bool) {
+	call, ok := n.(*ast.CallExpr)
+	if !ok {
+		return "", false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	return sel.Sel.Name, true
+}
+
+func isCommand(name string) bool {
+	switch name {
+	case "QueryContext", "QueryRowContext", "ExecContext":
+		return true
+	}
+	return false
 }

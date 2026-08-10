@@ -408,15 +408,31 @@ func TestMigrateBackfillsNotifyLocationFromCitySelection(t *testing.T) {
 	insertSuggestCity(t, db, cachedCity{QueryName: "Hamburg", Name: "Hamburg", DisplayName: "Hamburg", Lat: 53.550556, Lng: 9.993333})
 	insertUpdateTargetRow(t, db, "Berlin", 7)
 	insertUpdateTargetRow(t, db, "Hamburg", 12)
-	for i, email := range []string{"picked@example.com", "multi@example.com", "none@example.com"} {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO users (email, password_hash, status, created_at) VALUES (?, 'x', 'approved', '2026-04-01T00:00:00Z')`,
-			email); err != nil {
-			t.Fatalf("insert user %d: %v", i, err)
+
+	// The first three would receive notifications; the fourth never configured
+	// Pushover, so nothing changes for them either way.
+	for _, u := range []struct {
+		email    string
+		pushover bool
+	}{
+		{"picked@example.com", true},
+		{"multi@example.com", true},
+		{"none@example.com", true},
+		{"dormant@example.com", false},
+	} {
+		key, token := "", ""
+		if u.pushover {
+			key, token = "k", "t"
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO users (email, password_hash, status, created_at, pushover_user_key, pushover_token, notify_check_enabled)
+			VALUES (?, 'x', 'approved', '2026-04-01T00:00:00Z', ?, ?, 1)`,
+			u.email, key, token); err != nil {
+			t.Fatalf("insert user %s: %v", u.email, err)
 		}
 	}
-	// User 1 picked Hamburg; user 2 picked both; user 3 picked nothing, which
-	// used to mean every city.
+	// User 1 picked Hamburg; user 2 picked both; users 3 and 4 picked nothing,
+	// which used to mean every city.
 	for _, sel := range []struct {
 		userID int
 		city   string
@@ -428,16 +444,33 @@ func TestMigrateBackfillsNotifyLocationFromCitySelection(t *testing.T) {
 		}
 	}
 
-	result, err := migrateSchema(ctx, db, dialectSQLite)
-	if err != nil {
-		t.Fatalf("migrateSchema: %v", err)
-	}
+	var result migrateResult
+	stderr := captureStderr(t, func() {
+		var err error
+		result, err = migrateSchema(ctx, db, dialectSQLite)
+		if err != nil {
+			t.Fatalf("migrateSchema: %v", err)
+		}
+	})
 	if !containsString(result.Applied, "users.drop_notify_cities") {
 		t.Fatalf("migrate did not drop the legacy table: %v", result.Applied)
 	}
-	// The dropped extra city is reported rather than silently lost.
-	if !containsString(result.Applied, "users.notify_location.dropped_extra_cities=1") {
-		t.Fatalf("migrate did not report the unrepresentable extra city: %v", result.Applied)
+	// Exactly one selection is expressible as an area.
+	if !containsString(result.Applied, "users.notify_location.backfilled=1") {
+		t.Fatalf("migrate did not backfill the single-city user: %v", result.Applied)
+	}
+	// The other two are reported, by address, because their old selection cannot
+	// become one area and the selection is about to be gone.
+	if !containsString(result.Applied, "users.notify_location.needs_area=2") {
+		t.Fatalf("migrate did not report the users needing an area: %v", result.Applied)
+	}
+	for _, email := range []string{"multi@example.com", "none@example.com"} {
+		if !strings.Contains(stderr, email) {
+			t.Errorf("migrate did not name %s as needing an area: %q", email, stderr)
+		}
+	}
+	if strings.Contains(stderr, "dormant@example.com") {
+		t.Errorf("a user who receives nothing anyway was reported: %q", stderr)
 	}
 
 	type loc struct {
@@ -463,13 +496,12 @@ func TestMigrateBackfillsNotifyLocationFromCitySelection(t *testing.T) {
 	if got[1] != (loc{"Hamburg", 53.550556, 9.993333, 12}) {
 		t.Errorf("user 1 = %+v, want Hamburg at radius 12", got[1])
 	}
-	// Several selections collapse to the first in configured order.
-	if got[2] != (loc{"Berlin", 52.517389, 13.395131, 7}) {
-		t.Errorf("user 2 = %+v, want the first configured target Berlin", got[2])
-	}
-	// No selection meant every city; that collapses to the first target.
-	if got[3] != (loc{"Berlin", 52.517389, 13.395131, 7}) {
-		t.Errorf("user 3 = %+v, want the first configured target Berlin", got[3])
+	// Everyone else is left without an area rather than being narrowed to one
+	// city they never asked for.
+	for _, id := range []int64{2, 3, 4} {
+		if got[id] != (loc{}) {
+			t.Errorf("user %d = %+v, want no invented area", id, got[id])
+		}
 	}
 
 	// Re-running is a no-op.
@@ -477,7 +509,7 @@ func TestMigrateBackfillsNotifyLocationFromCitySelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second migrateSchema: %v", err)
 	}
-	for _, step := range []string{"users.notify_location", "users.drop_notify_cities", "users.notify_location.backfilled=3"} {
+	for _, step := range []string{"users.notify_location", "users.drop_notify_cities", "users.notify_location.backfilled=1"} {
 		if containsString(second.Applied, step) {
 			t.Errorf("second migrate reported %s again: %v", step, second.Applied)
 		}

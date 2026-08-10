@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -155,6 +156,13 @@ const (
 	notifyFixtureLat = 52.517389
 	notifyFixtureLng = 13.395131
 )
+
+// notifyFixtureBaseline is the baseline key for a user on the default fixture
+// area. Built through the production helper because these assertions are about
+// whether a baseline advanced, not about how the key is spelled.
+func notifyFixtureBaseline(userID int64, fuel string) string {
+	return subscription{Lat: notifyFixtureLat, Lng: notifyFixtureLng, RadiusKM: 5}.baselineKey(userID, fuel)
+}
 
 // seedNotifyFixture builds a database where checkGas returns a buy
 // recommendation and suggestGas returns forecast rows with medium/high
@@ -529,6 +537,71 @@ func TestNotifyOnceFiltersByUserSubscriptionArea(t *testing.T) {
 	wideSuggest := kinds["user-all"]["suggest"]
 	if !strings.Contains(wideSuggest, "Station 1") {
 		t.Fatalf("wide-radius suggestion %q should prefer the nearby station", wideSuggest)
+	}
+}
+
+func TestNotifyOnceStartsANewBaselineWhenTheAreaChanges(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "mover@example.com", UserKey: "user-mover", Token: "token-m",
+		CheckEnabled: true, SuggestDisabled: true,
+	})
+	ctx := context.Background()
+
+	stubPushover(t, nil)
+	if result := runNotifyOnce(t, db, false); len(result.Sent) != 1 {
+		t.Fatalf("first run sent = %+v, want one check", result.Sent)
+	}
+	// The same price cannot alert again in the same area today.
+	if result := runNotifyOnce(t, db, false); len(result.Sent) != 0 {
+		t.Fatalf("repeat run sent = %+v, want nothing at an unchanged price", result.Sent)
+	}
+
+	// The user widens their area. That is a different question — "cheapest
+	// around here" now covers different ground — so the old area's minimum must
+	// not go on suppressing alerts until midnight.
+	if _, err := db.ExecContext(ctx, `UPDATE users SET notify_radius_km = 25 WHERE email = 'mover@example.com'`); err != nil {
+		t.Fatalf("widen area: %v", err)
+	}
+	result := runNotifyOnce(t, db, false)
+	if result.BaselineReset {
+		t.Fatal("the day's reset must not be what let this through")
+	}
+	if len(result.Sent) != 1 || result.Sent[0].Kind != "check" {
+		t.Fatalf("after the area change sent = %+v, want a check for the new area", result.Sent)
+	}
+}
+
+func TestNotifyOnceDoesNotWarnAboutPausedUsersWithoutAnArea(t *testing.T) {
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	// Both kinds off is how a user pauses notifications. They have no area and
+	// do not need one, so every run must not nag about it.
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "paused@example.com", UserKey: "user-paused", Token: "token-p",
+		SuggestDisabled: true, NoLocation: true,
+	})
+
+	stubPushover(t, nil)
+	stderr := captureStderr(t, func() {
+		runNotifyOnce(t, db, false)
+	})
+	if strings.Contains(stderr, "paused@example.com") {
+		t.Fatalf("a paused user was warned about: %q", stderr)
+	}
+
+	// A user who does want notifications is still told.
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "wants@example.com", UserKey: "user-wants", Token: "token-w",
+		CheckEnabled: true, SuggestDisabled: true, NoLocation: true,
+	})
+	stderr = captureStderr(t, func() {
+		runNotifyOnce(t, db, false)
+	})
+	if !strings.Contains(stderr, "wants@example.com") {
+		t.Fatalf("a user expecting notifications was not warned: %q", stderr)
 	}
 }
 
@@ -907,7 +980,7 @@ func TestNotifyOnceBaselineResetCatchesUpAfterDowntime(t *testing.T) {
 	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline_reset_date", "2026-04-23"); err != nil {
 		t.Fatalf("set state: %v", err)
 	}
-	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline:1:diesel", "1.000"); err != nil {
+	if err := setNotificationState(context.Background(), db, dialectSQLite, notifyFixtureBaseline(1, "diesel"), "1.000"); err != nil {
 		t.Fatalf("set stale baseline: %v", err)
 	}
 
@@ -944,7 +1017,7 @@ func TestNotifyOnceCheckBaselineNotAdvancedWhenAllSendsFail(t *testing.T) {
 	if len(first.Failed) != 1 || len(first.Sent) != 0 {
 		t.Fatalf("first run = sent %+v failed %+v, want one failure", first.Sent, first.Failed)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel"); found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(1, "diesel")); found {
 		t.Fatal("baseline must not advance when every send failed")
 	}
 
@@ -959,7 +1032,7 @@ func TestNotifyOnceCheckBaselineNotAdvancedWhenAllSendsFail(t *testing.T) {
 	if len(second.Sent) != 1 || second.Sent[0].Kind != "check" {
 		t.Fatalf("second run sent = %+v, want retried check", second.Sent)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(1, "diesel")); !found {
 		t.Fatal("baseline must advance after a successful delivery")
 	}
 }
@@ -1018,10 +1091,10 @@ func TestNotifyOnceCheckBaselinesArePerUser(t *testing.T) {
 	if len(first.Failed) != 1 || first.Failed[0].Email != "b@example.com" {
 		t.Fatalf("first run failed = %+v, want b@example.com", first.Failed)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(1, "diesel")); !found {
 		t.Fatal("user A's baseline must advance after their delivery")
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:diesel"); found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(2, "diesel")); found {
 		t.Fatal("user B's baseline must not advance while their sends fail")
 	}
 
@@ -1038,7 +1111,7 @@ func TestNotifyOnceCheckBaselinesArePerUser(t *testing.T) {
 	if len(second.Failed) != 0 {
 		t.Fatalf("second run failed = %+v, want none", second.Failed)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:diesel"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(2, "diesel")); !found {
 		t.Fatal("user B's baseline must advance after their successful retry")
 	}
 }
@@ -1090,10 +1163,10 @@ func TestNotifyOncePerUserFuel(t *testing.T) {
 
 	// Baselines are fuel-scoped, so the two users at the same city do not
 	// collide.
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(1, "diesel")); !found {
 		t.Fatal("diesel user's diesel baseline must advance")
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:e5"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(2, "e5")); !found {
 		t.Fatal("e5 user's e5 baseline must advance")
 	}
 }
@@ -1118,4 +1191,32 @@ func TestNotifyOnceSkipsTargetsWithoutACachedCity(t *testing.T) {
 	if len(result.Sent) != 2 {
 		t.Fatalf("sent = %+v, want the cached target still delivered", result.Sent)
 	}
+}
+
+// captureStderr collects what a function writes to the process's stderr, which
+// is where notify reports users it had to skip.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	original := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+	fn()
+	os.Stderr = original
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	out := <-done
+	if err := r.Close(); err != nil {
+		t.Fatalf("close reader: %v", err)
+	}
+	return out
 }

@@ -2363,7 +2363,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
 
         <div class="settings-card">
             <h2 data-i18n="updateTargets">Automatic updates</h2>
-            <p class="auth-note" data-i18n="updateTargetsHint">These cities are updated automatically by `gasoline update` (and used by suggest/check/notify) when the CLI is invoked without --city/--radius flags.</p>
+            <p class="auth-note" data-i18n="updateTargetsHint">These cities are collected automatically by `gasoline update` when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately.</p>
             <div class="table-scroll">
             <table class="stack-table">
                 <thead>
@@ -2394,7 +2394,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
 
         <div class="settings-card">
             <h2 data-i18n="notificationTexts">Notification texts</h2>
-            <p class="auth-note" data-i18n="notificationTextsHint">Suggestions and checks are computed for every fuel, covering every station the update targets above currently feed. These templates are the only part that is configured here; each user picks their fuel, cities and schedule in My Account.</p>
+            <p class="auth-note" data-i18n="notificationTextsHint">Suggestions and checks are computed for every fuel, covering every station the update targets above currently feed. These templates are the only part that is configured here; each user picks their own fuel, area and schedule in My Account.</p>
             <form method="post" action="">
                 <?= csrfField() ?>
                 <input type="hidden" name="action" value="save_settings">
@@ -5726,7 +5726,7 @@ const translations = {
         notifyCheckEnabled: 'Send buy-now alerts when prices drop',
         notifyKindsHint: 'Choose which notifications you receive. Suggestions forecast good times to fill up; buy-now alerts fire when a current price drops. Leave both off to pause all notifications.',
         notifyFuel: 'Fuel to be notified about',
-        notifyFuelHint: 'You are notified about this fuel only. The list shows the fuels your administrator currently tracks.',
+        notifyFuelHint: 'You are notified about this fuel only. All three are tracked, so any choice is served.',
         notifyLocation: 'Notify me around',
         notifyRadius: 'Radius (km)',
         notifyLocationHint: "Notifications cover every tracked station within this distance of the city you pick, and distances are measured from there. Stations only appear once your administrator's update targets actually collect them.",
@@ -5774,7 +5774,7 @@ const translations = {
         cannotActOnSelf: 'You cannot perform this action on your own account.',
         notFound: 'The requested item was not found.',
         updateTargets: 'Automatic updates',
-        updateTargetsHint: 'These cities are updated automatically by gasoline update (and used by suggest/check/notify) when the CLI is invoked without --city/--radius flags.',
+        updateTargetsHint: 'These cities are collected automatically by gasoline update when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately.',
         targetCity: 'City',
         targetRadius: 'Radius (km)',
         addTarget: 'Add',
@@ -5800,7 +5800,7 @@ const translations = {
         templateCheck: 'Buy-alert notification template',
         templateSuggest: 'Suggestion notification template',
         notificationTexts: 'Notification texts',
-        notificationTextsHint: 'Suggestions and checks are computed for every fuel, covering every station the update targets above currently feed. These templates are the only part that is configured here; each user picks their fuel, cities and schedule in My Account.',
+        notificationTextsHint: 'Suggestions and checks are computed for every fuel, covering every station the update targets above currently feed. These templates are the only part that is configured here; each user picks their own fuel, area and schedule in My Account.',
         templateCheckTitle: 'Buy-alert notification title',
         templateSuggestTitle: 'Suggestion notification title',
         titleTemplatePlaceholder: 'e.g. Fill up for {{cheapest_current_price_formatted}} EUR',
@@ -6042,7 +6042,7 @@ const translations = {
         cannotActOnSelf: 'Diese Aktion ist auf dem eigenen Konto nicht möglich.',
         notFound: 'Der angeforderte Eintrag wurde nicht gefunden.',
         updateTargets: 'Automatische Updates',
-        updateTargetsHint: 'Diese Städte werden von gasoline update automatisch aktualisiert (und von suggest/check/notify genutzt), wenn die CLI ohne --city/--radius aufgerufen wird.',
+        updateTargetsHint: 'Diese Städte werden von gasoline update automatisch erfasst, wenn die CLI ohne --city/--radius aufgerufen wird. Sie bestimmen, welche Tankstellen es gibt; das Gebiet für Benachrichtigungen wählt jeder Nutzer separat.',
         targetCity: 'Stadt',
         targetRadius: 'Radius (km)',
         addTarget: 'Hinzufügen',
@@ -6068,7 +6068,7 @@ const translations = {
         templateCheck: 'Vorlage für Kaufalarme',
         templateSuggest: 'Vorlage für Vorschläge',
         notificationTexts: 'Benachrichtigungstexte',
-        notificationTextsHint: 'Vorschläge und Prüfungen werden für jeden Kraftstoff berechnet und umfassen alle Tankstellen, die von den Aktualisierungszielen oben derzeit erfasst werden. Nur diese Vorlagen werden hier konfiguriert; Kraftstoff, Städte und Zeitplan wählt jeder Nutzer im eigenen Konto.',
+        notificationTextsHint: 'Vorschläge und Prüfungen werden für jeden Kraftstoff berechnet und umfassen alle Tankstellen, die von den Aktualisierungszielen oben derzeit erfasst werden. Nur diese Vorlagen werden hier konfiguriert; Kraftstoff, Gebiet und Zeitplan wählt jeder Nutzer im eigenen Konto.',
         templateCheckTitle: 'Titel für Kaufalarme',
         templateSuggestTitle: 'Titel für Vorschläge',
         titleTemplatePlaceholder: 'z. B. Tanken für {{cheapest_current_price_formatted}} EUR',

@@ -3730,13 +3730,16 @@ func migrateUsersNotifyLocation(ctx context.Context, tx *sql.Tx, d dialect, resu
 	return backfillNotifyLocations(ctx, tx, d, result)
 }
 
-// backfillNotifyLocations turns each user's old city selection into a location.
+// backfillNotifyLocations turns each user's old city selection into a location,
+// but only where the old selection says exactly what the new model can express.
 //
-// The new subscription is a single point plus a radius, so a user who had
-// selected several cities keeps the first one in configured order — the others
-// cannot be expressed and are reported. A user who had selected nothing was
-// subscribed to every configured city; that collapses to the first update
-// target, which is exact for a single-target install and narrower for the rest.
+// A user who had selected one city gets that city's centre and its target's
+// radius, which is the same coverage they had. Anything else is left unset and
+// reported by address: a selection of several cities cannot become one area, and
+// an empty selection meant *every* configured city, so picking one of them would
+// quietly shrink what that user receives. Those users receive nothing until they
+// choose an area — which `notify` tells them about on every run — and that is the
+// point: a visible gap beats silently narrowed coverage.
 func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
 	hasSelections, err := tableExists(ctx, tx, d, "user_notify_cities")
 	if err != nil {
@@ -3778,8 +3781,10 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 
 	// The city each user keeps: their selected target with the lowest configured
 	// rank, or the first target when they had selected none.
+	// The city each user keeps, and the users whose selection cannot be
+	// expressed as one area.
 	chosen := map[int64]string{}
-	extras := 0
+	ambiguous := map[int64]bool{}
 	rows, err := tx.QueryContext(ctx, `SELECT user_id, city FROM user_notify_cities`)
 	if err != nil {
 		return err
@@ -3791,15 +3796,14 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 			rows.Close()
 			return err
 		}
-		rank, known := targetRank[city]
-		if !known {
+		if _, known := targetRank[city]; !known {
 			continue
 		}
-		if current, ok := chosen[userID]; ok {
-			extras++
-			if targetRank[current] <= rank {
-				continue
-			}
+		if _, seen := chosen[userID]; seen {
+			// More than one city: no single area covers exactly those and
+			// nothing else.
+			ambiguous[userID] = true
+			continue
 		}
 		chosen[userID] = city
 	}
@@ -3808,19 +3812,35 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 		return err
 	}
 
-	// Never overwrite a location a user has already chosen.
-	userRows, err := tx.QueryContext(ctx, `SELECT id FROM users WHERE notify_radius_km <= 0 ORDER BY id ASC`)
+	// Never overwrite a location a user has already chosen. A representable
+	// selection is carried over for everyone; only a user who would actually
+	// have received something is worth reporting as needing attention.
+	type pending struct {
+		id           int64
+		email        string
+		wouldReceive bool
+	}
+	userRows, err := tx.QueryContext(ctx, `
+		SELECT id, email,
+			CASE WHEN status = 'approved' AND pushover_user_key <> '' AND pushover_token <> ''
+				AND (notify_check_enabled <> 0 OR notify_suggest_enabled <> 0)
+			THEN 1 ELSE 0 END
+		FROM users
+		WHERE notify_radius_km <= 0
+		ORDER BY id ASC`)
 	if err != nil {
 		return err
 	}
-	var userIDs []int64
+	var users []pending
 	for userRows.Next() {
-		var id int64
-		if err := userRows.Scan(&id); err != nil {
+		var u pending
+		var wouldReceive int
+		if err := userRows.Scan(&u.id, &u.email, &wouldReceive); err != nil {
 			userRows.Close()
 			return err
 		}
-		userIDs = append(userIDs, id)
+		u.wouldReceive = wouldReceive != 0
+		users = append(users, u)
 	}
 	userRows.Close()
 	if err := userRows.Err(); err != nil {
@@ -3828,10 +3848,17 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 	}
 
 	migrated := 0
-	for _, id := range userIDs {
-		city, ok := chosen[id]
-		if !ok {
-			city = targetOrder[0]
+	var needReview []string
+	for _, u := range users {
+		city, unambiguous := chosen[u.id]
+		if !unambiguous || ambiguous[u.id] {
+			// Either an empty selection, which meant every configured city, or
+			// several cities. Inventing one of them would narrow their coverage
+			// without telling anyone.
+			if u.wouldReceive {
+				needReview = append(needReview, u.email)
+			}
+			continue
 		}
 		_, lat, lng, found, err := cachedCityTx(ctx, tx, city)
 		if err != nil {
@@ -3839,7 +3866,10 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 		}
 		if !found {
 			// The city was never geocoded, so there are no coordinates to carry
-			// over. The user has to pick a location in the web UI.
+			// over.
+			if u.wouldReceive {
+				needReview = append(needReview, u.email)
+			}
 			continue
 		}
 		radius := targetRadius[city]
@@ -3848,7 +3878,7 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE users SET notify_city = ?, notify_lat = ?, notify_lng = ?, notify_radius_km = ? WHERE id = ?`,
-			city, lat, lng, radius, id); err != nil {
+			city, lat, lng, radius, u.id); err != nil {
 			return err
 		}
 		migrated++
@@ -3857,9 +3887,16 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 		result.Applied = append(result.Applied,
 			fmt.Sprintf("users.notify_location.backfilled=%d", migrated))
 	}
-	if extras > 0 {
+	if len(needReview) > 0 {
 		result.Applied = append(result.Applied,
-			fmt.Sprintf("users.notify_location.dropped_extra_cities=%d", extras))
+			fmt.Sprintf("users.notify_location.needs_area=%d", len(needReview)))
+		// Named, not just counted: the admin has to tell these people to pick an
+		// area, and after this migration the old selection is gone.
+		fmt.Fprintf(os.Stderr,
+			"warning: %d notification user(s) had a city selection that no single area can express "+
+				"(all cities, or several of them). They receive nothing until they pick a city and radius "+
+				"in My Account -> Notifications: %s\n",
+			len(needReview), strings.Join(needReview, ", "))
 	}
 	return nil
 }
@@ -4925,30 +4962,46 @@ func loadCityCoverage(ctx context.Context, tx *sql.Tx, fetches []cityFetch) (cit
 	for _, fetch := range fetches {
 		record(fetch.City.Name, fetch.Query.radius)
 	}
+	// Read the targets out in full before resolving any of them. A transaction is
+	// pinned to one connection and the MySQL driver speaks to it synchronously,
+	// so issuing cachedCityTx while this result set is still open would fail the
+	// whole sweep with "commands out of sync".
+	type target struct {
+		city   string
+		radius float64
+	}
+	var targets []target
 	rows, err := tx.QueryContext(ctx, `SELECT city, radius_km FROM update_targets`)
 	if err != nil {
 		return cityCoverage{}, err
 	}
-	defer rows.Close()
 	for rows.Next() {
-		var city string
-		var radius float64
-		if err := rows.Scan(&city, &radius); err != nil {
+		var t target
+		if err := rows.Scan(&t.city, &t.radius); err != nil {
+			rows.Close()
 			return cityCoverage{}, err
 		}
-		coverage.configured = true
+		targets = append(targets, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return cityCoverage{}, err
+	}
+	coverage.configured = len(targets) > 0
+
+	for _, t := range targets {
 		// update_targets stores the string an admin typed; ownership is keyed by
 		// the geocoder's normalized name for the same place.
-		normalized, _, _, found, err := cachedCityTx(ctx, tx, city)
+		normalized, _, _, found, err := cachedCityTx(ctx, tx, t.city)
 		if err != nil {
 			return cityCoverage{}, err
 		}
 		if !found {
 			continue
 		}
-		record(normalized, radius)
+		record(normalized, t.radius)
 	}
-	return coverage, rows.Err()
+	return coverage, nil
 }
 
 func insertPriceSnapshot(ctx context.Context, tx *sql.Tx, cityName string, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {

@@ -66,6 +66,17 @@ type subscription struct {
 // area is the whole of what they asked for.
 func (s subscription) valid() bool { return s.RadiusKM > 0 }
 
+// baselineKey names the running cheapest price for one user, fuel and area.
+//
+// The area is part of the key because the baseline answers "what is the cheapest
+// I have seen here today": moving to a different place asks a different question,
+// and inheriting the old area's minimum would suppress alerts in the new one
+// until the next reset. Keys for areas nobody uses any more are removed by the
+// daily reset, which deletes the whole check_baseline prefix.
+func (s subscription) baselineKey(userID int64, fuel string) string {
+	return fmt.Sprintf("check_baseline:%d:%s:%.4f,%.4f,%.1f", userID, fuel, s.Lat, s.Lng, s.RadiusKM)
+}
+
 type notifyOptions struct {
 	Now      time.Time
 	Location *time.Location
@@ -442,11 +453,16 @@ func notifyOnce(ctx context.Context, db *sql.DB, d dialect, opts notifyOptions) 
 	var checkUsers, suggestUsers []notifyUser
 	var suggestSlots = map[int64]string{}
 	for _, u := range users {
+		if !u.CheckEnabled && !u.SuggestEnabled {
+			// Both kinds off is how a user pauses everything; nothing to do and
+			// nothing to warn about.
+			continue
+		}
 		if !u.subscription().valid() {
 			// A subscription is an area, and there is no "everywhere" default:
 			// without one there is nothing to send. Reported rather than
-			// silently dropped, because the user configured Pushover and would
-			// otherwise wonder why nothing arrives.
+			// silently dropped, because this user does want notifications and
+			// would otherwise wonder why none arrive.
 			fmt.Fprintf(os.Stderr,
 				"warning: skipping %s: no notification location set (My Account -> Notifications)\n", u.Email)
 			continue
@@ -645,12 +661,13 @@ func collectChecks(ctx context.Context, db *sql.DB, scan snapshotScan, opts noti
 }
 
 // userCheckRows narrows one fuel's check rows to a user's subscription area and
-// then to the prices strictly cheaper than that user's running minimum
-// (check_baseline:<user_id>:<fuel>), sorted cheapest-first. Returns the rows to
-// send plus the baseline update to persist after a successful delivery.
+// then to the prices strictly cheaper than that user's running minimum, sorted
+// cheapest-first. Returns the rows to send plus the baseline update to persist
+// after a successful delivery.
 //
-// The baseline is per user and fuel, not per city: a subscription is one area,
-// so it tracks one price series.
+// The baseline is per user, fuel and area (see subscription.baselineKey): a
+// subscription is one area, so it tracks one price series, and moving the area
+// starts a new one.
 func userCheckRows(ctx context.Context, db *sql.DB, fuel string, checks fuelChecks, u notifyUser) ([]notifyRow, map[string]string, error) {
 	sub := u.subscription()
 	if !sub.valid() {
@@ -664,7 +681,7 @@ func userCheckRows(ctx context.Context, db *sql.DB, fuel string, checks fuelChec
 		return inRange[i].CurrentPrice < inRange[j].CurrentPrice
 	})
 
-	baselineKey := fmt.Sprintf("check_baseline:%d:%s", u.ID, fuel)
+	baselineKey := sub.baselineKey(u.ID, fuel)
 	baselineValue, hasBaseline, err := getNotificationState(ctx, db, baselineKey)
 	if err != nil {
 		return nil, nil, err
