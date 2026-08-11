@@ -652,10 +652,14 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 	}
 	defer tx.Rollback()
 
+	// city_name and range_km are legacy columns: a run is no longer scoped to
+	// one city within a radius, it covers every station currently being fed.
+	// They are written empty rather than dropped, because rebuilding this table
+	// costs more than the two dead columns do.
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO prediction_runs (run_at, city_name, fuel, range_km, history_days, predict_days, jump_anchor_hour, station_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, computation.Now.UTC().Format(time.RFC3339), computation.CityName, opts.Fuel, opts.RangeKM,
+	`, computation.Now.UTC().Format(time.RFC3339), "", opts.Fuel, 0,
 		opts.HistoryDays, opts.PredictDays, computation.Model.JumpAnchorHour, len(stationIDs))
 	if err != nil {
 		return 0, 0, err
@@ -748,10 +752,10 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 // deferred evaluation pass is needed. The outcome columns are the exception —
 // they need the pricing day to finish and are filled by evaluateCheckOutcomes.
 func persistCheckDecisions(ctx context.Context, db *sql.DB, computation *suggestComputation, opts suggestOptions, runID int64) (int, error) {
-	// limit 0 keeps every station: the admin CheckLimit truncation is a
-	// delivery concern, and measurement wants the full picture.
+	// limit 0 keeps every station: the checkRowLimit truncation is a delivery
+	// concern, and measurement wants the full picture.
 	checks := generatePriceChecks(computation.Model, computation.Snapshots, opts.Fuel,
-		computation.Now, computation.Location, opts.PredictDays, 0, opts.Thresholds)
+		computation.Now, computation.Location, opts.PredictDays, 0)
 	if len(checks) == 0 {
 		// Every station closed or without a usable price. Nothing to record;
 		// unlike checkGas this is not an error.

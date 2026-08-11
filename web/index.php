@@ -123,7 +123,8 @@ function flashText(string $key): string
         'wrongPassword' => 'The current password is incorrect.',
         'passwordChanged' => 'Password changed.',
         'notifySaved' => 'Notification settings saved.',
-        'invalidNotifySettings' => 'Invalid notification settings. Check days, time windows, times, and cities.',
+        'invalidNotifySettings' => 'Invalid notification settings. Check days, time windows, and times.',
+    'invalidNotifyLocation' => 'Pick a city from the suggestions and a radius between 1 and 100 km.',
         'lastAdminGuard' => 'You are the last administrator and cannot delete this account.',
         'accountDeleted' => 'Your account has been deleted.',
         'confirmRequired' => 'Please confirm the deletion.',
@@ -501,48 +502,31 @@ function validHHMM(string $value): bool
 
 const GASOLINE_WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 
+/**
+ * Renders a notification radius for the form: the stored value unchanged, minus a
+ * trailing ".0" so a whole number does not read as a decimal. Rounding here would
+ * silently resize a migrated fractional area the next time the form is saved.
+ * Always a period decimal separator, which is what a number input requires.
+ */
+function formatRadiusKm(float $radiusKm): string
+{
+    $text = rtrim(rtrim(number_format($radiusKm, 3, '.', ''), '0'), '.');
+    return $text === '' ? '0' : $text;
+}
+
+/**
+ * Largest notification radius a user may pick, in km. Generous compared with an
+ * update target's collection radius, because a user can sit between two targets
+ * and legitimately care about stations from both — and it matches the ceiling the
+ * old admin-wide range_km allowed, so any radius the migration carried over from
+ * it can still be saved from this form.
+ */
+const GASOLINE_MAX_NOTIFY_RADIUS_KM = 100;
+
 /** The suggest/check fuel types, in canonical display order. */
 const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
 
-/**
- * Normalizes submitted fuel checkboxes into a canonical, deduplicated CSV
- * (subset of GASOLINE_FUELS in canonical order). Null when a value is invalid
- * or the selection is empty (at least one fuel must stay enabled).
- */
-function normalizeFuelList(array $fuels): ?string
-{
-    $selected = [];
-    foreach ($fuels as $fuel) {
-        $fuel = strtolower(trim((string) $fuel));
-        if (!in_array($fuel, GASOLINE_FUELS, true)) {
-            return null;
-        }
-        $selected[$fuel] = true;
-    }
-    if ($selected === []) {
-        return null;
-    }
-    $ordered = array_values(array_filter(GASOLINE_FUELS, static fn (string $f): bool => isset($selected[$f])));
-    return implode(',', $ordered);
-}
 
-/**
- * Parses the stored comma-separated admin fuel setting into a canonical list.
- * Empty or fully invalid input falls back to all fuels, mirroring the Go
- * appSettings.Fuels() behavior so the UI and notifier agree.
- */
-function enabledFuels(string $stored): array
-{
-    $selected = [];
-    foreach (explode(',', $stored) as $fuel) {
-        $fuel = strtolower(trim($fuel));
-        if (in_array($fuel, GASOLINE_FUELS, true)) {
-            $selected[$fuel] = true;
-        }
-    }
-    $ordered = array_values(array_filter(GASOLINE_FUELS, static fn (string $f): bool => isset($selected[$f])));
-    return $ordered === [] ? GASOLINE_FUELS : $ordered;
-}
 
 /** Normalizes a submitted weekday list to canonical order; null when invalid/empty. */
 function normalizeDayList(array $days): ?string
@@ -611,98 +595,11 @@ function normalizeTimeList(array $times): ?string
     return implode(',', $list);
 }
 
-/**
- * Normalizes submitted notification-city checkboxes against the configured
- * update targets. Returns the canonical city names in target order; an empty
- * selection returns [] (meaning: all cities, including ones added later).
- * Null when a submitted city is not a configured target (tampered form or
- * stale page).
- */
-function normalizeCityList(array $cities, array $targets): ?array
-{
-    $canonical = [];
-    foreach ($targets as $target) {
-        $target = trim((string) $target);
-        if ($target !== '') {
-            $canonical[strtolower($target)] = $target;
-        }
-    }
-    $selected = [];
-    foreach ($cities as $city) {
-        $key = strtolower(trim((string) $city));
-        if ($key === '' || !isset($canonical[$key])) {
-            return null;
-        }
-        $selected[$key] = true;
-    }
-    $ordered = [];
-    foreach ($canonical as $key => $name) {
-        if (isset($selected[$key])) {
-            $ordered[] = $name;
-        }
-    }
-    return $ordered;
-}
 
-/** The configured update-target cities, in admin-defined order. */
-function updateTargetCities(PDO $pdo): array
-{
-    return $pdo->query('SELECT city FROM update_targets ORDER BY id ASC')->fetchAll(PDO::FETCH_COLUMN);
-}
 
-/** One user's notification city selection; [] means all cities. */
-function userNotifyCities(PDO $pdo, int $userId): array
-{
-    $stmt = $pdo->prepare('SELECT city FROM user_notify_cities WHERE user_id = :id');
-    $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
-    $stmt->execute();
-    return $stmt->fetchAll(PDO::FETCH_COLUMN);
-}
 
-/** Replaces one user's notification city selection. */
-function saveUserNotifyCities(PDO $pdo, int $userId, array $cities): void
-{
-    $stmt = $pdo->prepare('DELETE FROM user_notify_cities WHERE user_id = :id');
-    $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
-    $stmt->execute();
-    if ($cities === []) {
-        return;
-    }
-    $stmt = $pdo->prepare('INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (:id, :city, :now)');
-    foreach ($cities as $city) {
-        $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
-        $stmt->bindValue(':city', (string) $city);
-        $stmt->bindValue(':now', nowUTC());
-        $stmt->execute();
-    }
-}
 
-/** Validates an already comma-separated windows string (admin text input). */
-function validWindowListString(string $value): bool
-{
-    foreach (explode(',', $value) as $part) {
-        $part = trim($part);
-        if ($part === '') {
-            return false;
-        }
-        $pair = explode('-', $part);
-        if (count($pair) !== 2 || !validHHMM(trim($pair[0])) || !validHHMM(trim($pair[1]))) {
-            return false;
-        }
-    }
-    return true;
-}
 
-/** Validates an already comma-separated HH:MM list string (admin text input). */
-function validTimeListString(string $value): bool
-{
-    foreach (explode(',', $value) as $part) {
-        if (!validHHMM(trim($part))) {
-            return false;
-        }
-    }
-    return true;
-}
 
 // ── POST router ───────────────────────────────────────────────────────────────
 
@@ -849,13 +746,31 @@ function handlePost(PDO $pdo, string $driver): void
                 (array) ($_POST['notify_windows_to'] ?? [])
             );
             $times = normalizeTimeList((array) ($_POST['notify_suggest_times'] ?? []));
-            $cities = normalizeCityList((array) ($_POST['notify_cities'] ?? []), updateTargetCities($pdo));
-            $allowedFuels = enabledFuels((string) (settingsAll($pdo)['fuel'] ?? ''));
             $fuel = strtolower(trim((string) ($_POST['notify_fuel'] ?? '')));
-            if ($method !== 'pushover' || $days === null || $windows === null || $times === null || $cities === null
-                || !in_array($fuel, $allowedFuels, true)) {
+            if ($method !== 'pushover' || $days === null || $windows === null || $times === null
+                || !in_array($fuel, GASOLINE_FUELS, true)) {
                 setFlash('error', 'invalidNotifySettings');
                 redirectTo('?page=account');
+            }
+            // The notification area: a city and a radius around it, resolved to
+            // coordinates here so nothing downstream has to consult the geocode
+            // cache. A location is only required once a notification kind is
+            // switched on; leaving both off pauses everything.
+            $wantsNotifications = isset($_POST['notify_suggest_enabled']) || isset($_POST['notify_check_enabled']);
+            $cityKey = trim((string) ($_POST['notify_city'] ?? ''));
+            $radiusRaw = trim((string) ($_POST['notify_radius_km'] ?? ''));
+            $cityRow = resolveCity($pdo, $cityKey);
+            $radius = 0.0;
+            if ($cityKey !== '' || $radiusRaw !== '' || $wantsNotifications) {
+                // Numeric rather than integer: the legacy range_km this migrates
+                // from stepped in halves, so 7.5 km subscriptions exist and must
+                // survive an unrelated save.
+                if ($cityRow === null || !is_numeric($radiusRaw)
+                    || (float) $radiusRaw < 1 || (float) $radiusRaw > GASOLINE_MAX_NOTIFY_RADIUS_KM) {
+                    setFlash('error', 'invalidNotifyLocation');
+                    redirectTo('?page=account');
+                }
+                $radius = (float) $radiusRaw;
             }
             $pdo->beginTransaction();
             $stmt = $pdo->prepare(
@@ -864,7 +779,9 @@ function handlePost(PDO $pdo, string $driver): void
                     notify_days = :days, notify_windows = :windows,
                     notify_suggest_times = :times, notify_check_enabled = :check_enabled,
                     notify_suggest_enabled = :suggest_enabled,
-                    notify_fuel = :fuel
+                    notify_fuel = :fuel,
+                    notify_city = :city, notify_lat = :lat, notify_lng = :lng,
+                    notify_radius_km = :radius
                  WHERE id = :id'
             );
             $stmt->bindValue(':method', 'pushover');
@@ -877,9 +794,12 @@ function handlePost(PDO $pdo, string $driver): void
             $stmt->bindValue(':check_enabled', isset($_POST['notify_check_enabled']) ? 1 : 0, PDO::PARAM_INT);
             $stmt->bindValue(':suggest_enabled', isset($_POST['notify_suggest_enabled']) ? 1 : 0, PDO::PARAM_INT);
             $stmt->bindValue(':fuel', $fuel);
+            $stmt->bindValue(':city', $cityRow === null ? '' : (string) $cityRow['city_key']);
+            $stmt->bindValue(':lat', $cityRow === null ? 0.0 : (float) $cityRow['lat']);
+            $stmt->bindValue(':lng', $cityRow === null ? 0.0 : (float) $cityRow['lng']);
+            $stmt->bindValue(':radius', $radius);
             $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
             $stmt->execute();
-            saveUserNotifyCities($pdo, (int) $user['id'], $cities);
             $pdo->commit();
             setFlash('success', 'notifySaved');
             redirectTo('?page=account');
@@ -966,55 +886,22 @@ function handlePost(PDO $pdo, string $driver): void
             // no break
 
         case 'save_settings':
+            // Templates are the whole of the stored configuration. Title
+            // templates may be empty: notifications then fall back to each
+            // user's configured notification title.
             $fields = [
-                'fuel' => null, // submitted as checkbox array below
-                'range_km' => static fn (string $v): bool => is_numeric($v) && (float) $v > 0 && (float) $v <= 100,
-                'history_days' => static fn (string $v): bool => ctype_digit($v) && (int) $v > 0 && (int) $v <= 365,
-                'predict_days' => static fn (string $v): bool => ctype_digit($v) && (int) $v > 0 && (int) $v <= 14,
-                'limit_per_day' => static fn (string $v): bool => ctype_digit($v) && (int) $v >= 0 && (int) $v <= 50,
-                'check_limit' => static fn (string $v): bool => ctype_digit($v) && (int) $v >= 0 && (int) $v <= 50,
-                'suggest_times' => static fn (string $v): bool => validTimeListString($v),
-                'check_reset_time' => static fn (string $v): bool => validHHMM($v),
-                'notify_days' => null, // submitted as checkbox array below
-                'notify_windows' => static fn (string $v): bool => validWindowListString($v),
                 'check_template' => static fn (string $v): bool => $v !== '',
                 'suggest_template' => static fn (string $v): bool => $v !== '',
-                // Title templates may be empty: notifications then fall back
-                // to each user's configured notification title.
                 'check_title_template' => static fn (string $v): bool => true,
                 'suggest_title_template' => static fn (string $v): bool => true,
-                // Verdict margin rule. "fixed" keeps the historical flat 2 ct
-                // margin; "relative" scales it by each station's daily swing.
-                'check_delta_mode' => static fn (string $v): bool => in_array($v, ['fixed', 'relative'], true),
-                'check_delta_fraction' => static fn (string $v): bool => is_numeric($v) && (float) $v > 0 && (float) $v <= 1,
             ];
             $kv = [];
             foreach ($fields as $name => $validate) {
-                if ($name === 'notify_days') {
-                    if (isset($_POST['notify_days'])) {
-                        $days = normalizeDayList((array) $_POST['notify_days']);
-                        if ($days === null) {
-                            setFlash('error', 'invalidSettings');
-                            redirectTo('?page=admin_settings');
-                        }
-                        $kv[$name] = $days;
-                    }
-                    continue;
-                }
-                if ($name === 'fuel') {
-                    $fuel = normalizeFuelList((array) ($_POST['fuel'] ?? []));
-                    if ($fuel === null) {
-                        setFlash('error', 'invalidSettings');
-                        redirectTo('?page=admin_settings');
-                    }
-                    $kv[$name] = $fuel;
-                    continue;
-                }
                 if (!isset($_POST[$name])) {
                     continue;
                 }
                 $value = trim((string) $_POST[$name]);
-                if ($validate !== null && !$validate($value)) {
+                if (!$validate($value)) {
                     setFlash('error', 'invalidSettings');
                     redirectTo('?page=admin_settings');
                 }
@@ -1308,10 +1195,9 @@ function renderAccountPage(PDO $pdo, array $user): never
                 </div>
                 <?php renderScheduleEditor((string) $user['notify_days'], (string) $user['notify_windows'], (string) $user['notify_suggest_times']); ?>
                 <?php
-                $accountFuels = enabledFuels((string) (settingsAll($pdo)['fuel'] ?? ''));
                 $currentFuel = strtolower(trim((string) ($user['notify_fuel'] ?? '')));
-                if (!in_array($currentFuel, $accountFuels, true)) {
-                    $currentFuel = $accountFuels[0];
+                if (!in_array($currentFuel, GASOLINE_FUELS, true)) {
+                    $currentFuel = GASOLINE_FUELS[0];
                 }
                 $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10'];
                 $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10'];
@@ -1319,27 +1205,46 @@ function renderAccountPage(PDO $pdo, array $user): never
                 <div class="field">
                     <label for="nf-fuel" data-i18n="notifyFuel">Fuel to be notified about</label>
                     <select id="nf-fuel" name="notify_fuel">
-                        <?php foreach ($accountFuels as $f) { ?>
+                        <?php foreach (GASOLINE_FUELS as $f) { ?>
                         <option value="<?= h($f) ?>" data-i18n="<?= h($fuelI18n[$f]) ?>" <?= $currentFuel === $f ? 'selected' : '' ?>><?= h($fuelLabels[$f]) ?></option>
                         <?php } ?>
                     </select>
-                    <p class="field-hint" data-i18n="notifyFuelHint">You are notified about this fuel only. The list shows the fuels your administrator currently tracks.</p>
+                    <p class="field-hint" data-i18n="notifyFuelHint">You are notified about this fuel only. All three are tracked, so any choice is served.</p>
                 </div>
                 <?php
-                $targetCities = updateTargetCities($pdo);
-                if ($targetCities !== []) {
-                    $selectedCities = array_flip(userNotifyCities($pdo, (int) $user['id']));
+                // The subscription area. Coordinates are stored on the account,
+                // so the city is only a way of picking them: the notification
+                // itself is "every station within N km of here".
+                $notifyCityKey = trim((string) ($user['notify_city'] ?? ''));
+                $notifyCityRow = resolveCity($pdo, $notifyCityKey);
+                $notifyRadius = (float) ($user['notify_radius_km'] ?? 0);
                 ?>
                 <div class="field">
-                    <label data-i18n="notifyCities">Cities</label>
-                    <div class="day-toggles">
-                        <?php foreach ($targetCities as $city) { ?>
-                        <label class="day-toggle"><input type="checkbox" name="notify_cities[]" value="<?= h($city) ?>" <?= isset($selectedCities[$city]) ? 'checked' : '' ?>><span><?= h($city) ?></span></label>
-                        <?php } ?>
+                    <label for="nf-city" data-i18n="notifyLocation">Notify me around</label>
+                    <div class="city-ac" id="nf-city-ac">
+                        <input
+                            type="text"
+                            id="nf-city"
+                            class="city-ac-input"
+                            data-i18n-placeholder="enterCity"
+                            placeholder="Enter city..."
+                            autocomplete="off"
+                            spellcheck="false"
+                            value="<?= h($notifyCityRow ? (string) $notifyCityRow['display_name'] : '') ?>"
+                            aria-autocomplete="list"
+                            aria-controls="nf-city-list"
+                            aria-expanded="false"
+                        >
+                        <input type="hidden" name="notify_city" id="nf-city-value" value="<?= h($notifyCityKey) ?>">
+                        <ul class="city-ac-list" id="nf-city-list" role="listbox" hidden></ul>
                     </div>
-                    <p class="field-hint" data-i18n="notifyCitiesHint">Notifications cover only the selected cities. Selecting none means every city, including ones added later.</p>
                 </div>
-                <?php } ?>
+                <div class="field">
+                    <label for="nf-radius" data-i18n="notifyRadius">Radius (km)</label>
+                    <input type="number" id="nf-radius" name="notify_radius_km" min="1" max="<?= GASOLINE_MAX_NOTIFY_RADIUS_KM ?>" step="any"
+                        value="<?= $notifyRadius > 0 ? h(formatRadiusKm($notifyRadius)) : '' ?>">
+                    <p class="field-hint" data-i18n="notifyLocationHint">Notifications cover every tracked station within this distance of the city you pick, and distances are measured from there. Stations only appear once your administrator's update targets actually collect them.</p>
+                </div>
                 <div class="field">
                     <label class="check-toggle"><input type="checkbox" name="notify_suggest_enabled" <?= (int) $user['notify_suggest_enabled'] === 1 ? 'checked' : '' ?>><span data-i18n="notifySuggestEnabled">Send daily price suggestions</span></label>
                     <label class="check-toggle"><input type="checkbox" name="notify_check_enabled" <?= (int) $user['notify_check_enabled'] === 1 ? 'checked' : '' ?>><span data-i18n="notifyCheckEnabled">Send buy-now alerts when prices drop</span></label>
@@ -1348,6 +1253,69 @@ function renderAccountPage(PDO $pdo, array $user): never
                 <button type="submit" class="btn-primary" data-i18n="save">Save</button>
             </form>
         </div>
+
+        <script>
+        /* City autocomplete for the notification area. Unlike the dashboard's
+           filter this must not submit on selection: the radius is picked
+           afterwards and the form is saved explicitly. */
+        (function () {
+            const wrap   = document.getElementById('nf-city-ac');
+            const input  = document.getElementById('nf-city');
+            const hidden = document.getElementById('nf-city-value');
+            const list   = document.getElementById('nf-city-list');
+            if (!wrap || !input || !hidden || !list) return;
+
+            let controller = null;
+            let debounceTimer = null;
+
+            const hide = () => { list.hidden = true; input.setAttribute('aria-expanded', 'false'); };
+            const show = () => { list.hidden = false; input.setAttribute('aria-expanded', 'true'); };
+
+            async function fetchMatches(q) {
+                if (controller) controller.abort();
+                controller = new AbortController();
+                try {
+                    const url = new URL(location.href);
+                    url.search = '';
+                    url.searchParams.set('action', 'city_search');
+                    url.searchParams.set('q', q);
+                    const res = await fetch(url.toString(), { signal: controller.signal });
+                    return await res.json();
+                } catch { return null; }
+            }
+
+            input.addEventListener('input', () => {
+                const q = input.value.trim();
+                // Clearing the key makes a stale selection impossible to save.
+                hidden.value = '';
+                clearTimeout(debounceTimer);
+                if (q.length < 3) { hide(); return; }
+                debounceTimer = setTimeout(async () => {
+                    const results = await fetchMatches(q);
+                    if (results === null) return;
+                    list.innerHTML = '';
+                    results.forEach(({ city_key, display_name }) => {
+                        const li = document.createElement('li');
+                        li.className = 'city-ac-item';
+                        li.role = 'option';
+                        li.setAttribute('aria-selected', 'false');
+                        li.textContent = display_name || city_key;
+                        li.addEventListener('mousedown', (e) => {
+                            e.preventDefault();
+                            input.value = display_name || city_key;
+                            hidden.value = city_key;
+                            hide();
+                        });
+                        list.appendChild(li);
+                    });
+                    if (results.length) show(); else hide();
+                }, 200);
+            });
+
+            input.addEventListener('blur', () => setTimeout(hide, 150));
+            document.addEventListener('click', (e) => { if (!wrap.contains(e.target)) hide(); });
+        })();
+        </script>
 
         <div class="settings-card danger">
             <h2 data-i18n="dangerZone">Danger zone</h2>
@@ -1634,18 +1602,6 @@ function renderAdminStationsPage(PDO $pdo, array $user): never
 
 function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): never
 {
-    // Cities that have prediction runs, for the optional city filter.
-    $cities = [];
-    try {
-        foreach ($pdo->query('SELECT DISTINCT city_name FROM prediction_runs ORDER BY city_name ASC')->fetchAll() as $row) {
-            $city = trim((string) $row['city_name']);
-            if ($city !== '') {
-                $cities[] = $city;
-            }
-        }
-    } catch (Throwable $e) {
-        // prediction_runs may be empty / freshly migrated — fall back to no cities.
-    }
 
     // Default the fuel picker to whichever fuel has the most evaluated predictions,
     // so the page lands on data instead of an empty set.
@@ -1693,15 +1649,6 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                     <select id="pred-fuel">
                         <?php foreach ($fuelLabels as $fuelValue => $fuelLabel) { ?>
                         <option value="<?= h($fuelValue) ?>" data-i18n="<?= h($fuelI18n[$fuelValue]) ?>" <?= $defaultFuel === $fuelValue ? 'selected' : '' ?>><?= h($fuelLabel) ?></option>
-                        <?php } ?>
-                    </select>
-                </div>
-                <div class="field">
-                    <label for="pred-city" data-i18n="predCity">City</label>
-                    <select id="pred-city">
-                        <option value="" data-i18n="predAllCities">All cities</option>
-                        <?php foreach ($cities as $city) { ?>
-                        <option value="<?= h($city) ?>"><?= h($city) ?></option>
                         <?php } ?>
                     </select>
                 </div>
@@ -1831,7 +1778,6 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
     (function () {
         const cfg = {
             fuel:  document.getElementById('pred-fuel'),
-            city:  document.getElementById('pred-city'),
             range: document.getElementById('pred-range'),
             conf:  document.getElementById('pred-conf'),
         };
@@ -1887,7 +1833,6 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             const u = new URL(location.origin + location.pathname);
             u.searchParams.set('action', 'prediction_accuracy');
             u.searchParams.set('fuel', cfg.fuel.value);
-            u.searchParams.set('city', cfg.city.value);
             u.searchParams.set('range', cfg.range.value);
             u.searchParams.set('confidence', cfg.conf.value);
             return u.toString();
@@ -2404,7 +2349,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             }
         }
 
-        [cfg.fuel, cfg.city, cfg.range, cfg.conf].forEach((el) => { if (el) el.addEventListener('change', load); });
+        [cfg.fuel, cfg.range, cfg.conf].forEach((el) => { if (el) el.addEventListener('change', load); });
         if (moreBtn) moreBtn.addEventListener('click', renderMore);
         if (viewTogl) viewTogl.querySelectorAll('[data-view]').forEach((btn) => btn.addEventListener('click', () => {
             view = btn.dataset.view;
@@ -2428,7 +2373,6 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
     $settings = settingsAll($pdo);
     $targets = $pdo->query('SELECT id, city, radius_km FROM update_targets ORDER BY id ASC')->fetchAll();
     $get = static fn (string $name, string $fallback = ''): string => trim((string) ($settings[$name] ?? $fallback));
-    $fuel = $get('fuel', 'diesel');
     renderPageStart('Settings', $user, 'admin_settings');
     ?>
     <div class="settings-layout wide">
@@ -2436,7 +2380,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
 
         <div class="settings-card">
             <h2 data-i18n="updateTargets">Automatic updates</h2>
-            <p class="auth-note" data-i18n="updateTargetsHint">These cities are updated automatically by `gasoline update` (and used by suggest/check/notify) when the CLI is invoked without --city/--radius flags.</p>
+            <p class="auth-note" data-i18n="updateTargetsHint">These cities are collected automatically by `gasoline update` when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately.</p>
             <div class="table-scroll">
             <table class="stack-table">
                 <thead>
@@ -2466,78 +2410,11 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
         </div>
 
         <div class="settings-card">
-            <h2 data-i18n="suggestionSettings">Suggestions &amp; checks</h2>
+            <h2 data-i18n="notificationTexts">Notification texts</h2>
+            <p class="auth-note" data-i18n="notificationTextsHint">Suggestions and checks are computed for every fuel, covering every station the update targets above currently feed. These templates are the only part that is configured here; each user picks their own fuel, area and schedule in My Account.</p>
             <form method="post" action="">
                 <?= csrfField() ?>
                 <input type="hidden" name="action" value="save_settings">
-                <div class="field">
-                    <label data-i18n="settingFuel">Fuel</label>
-                    <div class="day-toggles">
-                        <?php $enabledFuelSet = array_flip(enabledFuels($fuel)); ?>
-                        <?php $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10']; ?>
-                        <?php $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10']; ?>
-                        <?php foreach (GASOLINE_FUELS as $f) { ?>
-                        <label class="day-toggle"><input type="checkbox" name="fuel[]" value="<?= h($f) ?>" <?= isset($enabledFuelSet[$f]) ? 'checked' : '' ?>><span data-i18n="<?= h($fuelI18n[$f]) ?>"><?= h($fuelLabels[$f]) ?></span></label>
-                        <?php } ?>
-                    </div>
-                    <p class="field-hint" data-i18n="settingFuelHint">Suggestions and checks are computed for every enabled fuel. Each user picks one of these to be notified about.</p>
-                </div>
-                <div class="field-grid">
-                    <div class="field">
-                        <label for="st-range" data-i18n="settingRangeKm">Range (km)</label>
-                        <input type="number" id="st-range" name="range_km" min="1" max="100" step="0.5" value="<?= h($get('range_km', '5')) ?>">
-                    </div>
-                    <div class="field">
-                        <label for="st-history" data-i18n="settingHistoryDays">History days</label>
-                        <input type="number" id="st-history" name="history_days" min="1" max="365" value="<?= h($get('history_days', '21')) ?>">
-                    </div>
-                    <div class="field">
-                        <label for="st-predict" data-i18n="settingPredictDays">Prediction days</label>
-                        <input type="number" id="st-predict" name="predict_days" min="1" max="14" value="<?= h($get('predict_days', '3')) ?>">
-                    </div>
-                    <div class="field">
-                        <label for="st-limit-day" data-i18n="settingLimitPerDay">Suggestions per day</label>
-                        <input type="number" id="st-limit-day" name="limit_per_day" min="0" max="50" value="<?= h($get('limit_per_day', '3')) ?>">
-                    </div>
-                    <div class="field">
-                        <label for="st-check-limit" data-i18n="settingCheckLimit">Check row limit</label>
-                        <input type="number" id="st-check-limit" name="check_limit" min="0" max="50" value="<?= h($get('check_limit', '5')) ?>">
-                    </div>
-                    <div class="field">
-                        <label for="st-suggest-times" data-i18n="settingSuggestTimes">Default suggestion times</label>
-                        <input type="text" id="st-suggest-times" name="suggest_times" pattern="\s*([01][0-9]|2[0-3]):[0-5][0-9](\s*,\s*([01][0-9]|2[0-3]):[0-5][0-9])*\s*" placeholder="08:00,13:00" value="<?= h($get('suggest_times', '08:00,13:00')) ?>">
-                    </div>
-                    <div class="field">
-                        <label for="st-reset" data-i18n="settingCheckResetTime">Check baseline reset</label>
-                        <input type="text" id="st-reset" name="check_reset_time" value="<?= h($get('check_reset_time', '00:00')) ?>" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" title="HH:MM">
-                    </div>
-                    <div class="field">
-                        <label for="st-delta-mode" data-i18n="settingCheckDeltaMode">Price margin</label>
-                        <select id="st-delta-mode" name="check_delta_mode">
-                            <?php $deltaMode = $get('check_delta_mode', 'fixed'); ?>
-                            <option value="fixed"<?= $deltaMode === 'relative' ? '' : ' selected' ?> data-i18n="settingCheckDeltaFixed">Fixed (2 ct)</option>
-                            <option value="relative"<?= $deltaMode === 'relative' ? ' selected' : '' ?> data-i18n="settingCheckDeltaRelative">Relative to station swing</option>
-                        </select>
-                    </div>
-                    <div class="field">
-                        <label for="st-delta-fraction" data-i18n="settingCheckDeltaFraction">Margin fraction</label>
-                        <input type="number" id="st-delta-fraction" name="check_delta_fraction" min="0.01" max="1" step="0.01" value="<?= h($get('check_delta_fraction', '0.2')) ?>">
-                    </div>
-                </div>
-                <p class="auth-note" data-i18n="settingCheckDeltaHint">The price margin decides when a price counts as low and when a cheaper upcoming window suppresses a buy. Fixed keeps the historical flat 2 ct for every station. Relative uses the margin fraction of each station's own daily price swing instead, so calm and volatile stations are judged on their own terms; stations without a reliable swing estimate keep the fixed margin.</p>
-                <div class="field">
-                    <label for="st-windows" data-i18n="settingNotifyWindows">Default notification windows</label>
-                    <input type="text" id="st-windows" name="notify_windows" placeholder="07:00-21:00" value="<?= h($get('notify_windows', '07:00-21:00')) ?>">
-                </div>
-                <div class="field">
-                    <label data-i18n="settingNotifyDays">Default notification days</label>
-                    <div class="day-toggles">
-                        <?php $defaultDays = array_flip(array_filter(array_map('trim', explode(',', $get('notify_days', 'mon,tue,wed,thu,fri,sat,sun'))))); ?>
-                        <?php foreach (GASOLINE_WEEKDAYS as $day) { ?>
-                        <label class="day-toggle"><input type="checkbox" name="notify_days[]" value="<?= h($day) ?>" <?= isset($defaultDays[$day]) ? 'checked' : '' ?>><span data-i18n="day_<?= h($day) ?>"><?= h(ucfirst($day)) ?></span></label>
-                        <?php } ?>
-                    </div>
-                </div>
                 <div class="field">
                     <label for="st-check-title" data-i18n="templateCheckTitle">Buy-alert notification title</label>
                     <input type="text" id="st-check-title" name="check_title_template" data-i18n-placeholder="titleTemplatePlaceholder" placeholder="e.g. Fill up for {{cheapest_current_price_formatted}} EUR" value="<?= h($get('check_title_template')) ?>">
@@ -2881,7 +2758,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
     if (!in_array($paFuel, ['diesel', 'e5', 'e10'], true)) {
         $paFuel = 'diesel';
     }
-    $paCity = trim((string) ($_GET['city'] ?? ''));
     $paConfidence = trim((string) ($_GET['confidence'] ?? 'all')); // 'all' | 'medium_high'
 
     // Date range on the target hour. Default: last 14 days. target_start is an
@@ -2913,7 +2789,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         'series' => [],
         'rows' => [],
         'stations' => [],
-        'filters' => ['fuel' => $paFuel, 'city' => $paCity, 'confidence' => $paConfidence, 'from' => $fromTs, 'to' => $toTs],
+        'filters' => ['fuel' => $paFuel, 'confidence' => $paConfidence, 'from' => $fromTs, 'to' => $toTs],
         'truncated' => false,
         'errors' => [],
     ];
@@ -2932,13 +2808,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         $ppHint = gasolineAccuracyIndexHint($pdo, $driver);
         $ppTable = 'price_predictions pp ';
         $ppHinted = $ppHint === '' ? $ppTable : $ppTable . $ppHint . ' ';
-        $joinRuns = $paCity !== '' ? 'JOIN prediction_runs pr ON pr.id = pp.run_id ' : '';
+        $joinRuns = '';
         $where = 'pp.actual_price IS NOT NULL AND pp.fuel = :fuel AND pp.target_start >= :from AND pp.target_start <= :to';
         $params = [':fuel' => $paFuel, ':from' => $fromTs, ':to' => $toTs];
-        if ($paCity !== '') {
-            $where .= ' AND pr.city_name = :city';
-            $params[':city'] = $paCity;
-        }
         if ($paConfidence === 'medium_high') {
             $where .= " AND pp.confidence IN ('medium', 'high')";
         }
@@ -3117,11 +2989,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
                 . ' AND d.fuel = :fuel AND d.target_start >= :from AND d.target_start <= :to';
             $decParams = [':fuel' => $paFuel, ':from' => $fromTs, ':to' => $toTs];
             $decJoin = '';
-            if ($paCity !== '') {
-                $decJoin = 'JOIN prediction_runs pr ON pr.id = d.run_id ';
-                $decWhere .= ' AND pr.city_name = :city';
-                $decParams[':city'] = $paCity;
-            }
             if ($paConfidence === 'medium_high') {
                 $decWhere .= " AND d.confidence IN ('medium', 'high')";
             }
@@ -5876,11 +5743,13 @@ const translations = {
         notifyCheckEnabled: 'Send buy-now alerts when prices drop',
         notifyKindsHint: 'Choose which notifications you receive. Suggestions forecast good times to fill up; buy-now alerts fire when a current price drops. Leave both off to pause all notifications.',
         notifyFuel: 'Fuel to be notified about',
-        notifyFuelHint: 'You are notified about this fuel only. The list shows the fuels your administrator currently tracks.',
-        notifyCities: 'Cities',
-        notifyCitiesHint: 'Notifications cover only the selected cities. Selecting none means every city, including ones added later.',
+        notifyFuelHint: 'You are notified about this fuel only. All three are tracked, so any choice is served.',
+        notifyLocation: 'Notify me around',
+        notifyRadius: 'Radius (km)',
+        notifyLocationHint: "Notifications cover every tracked station within this distance of the city you pick, and distances are measured from there. Stations only appear once your administrator's update targets actually collect them.",
         notifySaved: 'Notification settings saved.',
-        invalidNotifySettings: 'Invalid notification settings. Check days, time windows, times, and cities.',
+        invalidNotifySettings: 'Invalid notification settings. Check days, time windows, and times.',
+        invalidNotifyLocation: 'Pick a city from the suggestions and a radius between 1 and 100 km.',
         addWindow: 'Add window',
         addTime: 'Add time',
         removeRow: 'Remove',
@@ -5922,7 +5791,7 @@ const translations = {
         cannotActOnSelf: 'You cannot perform this action on your own account.',
         notFound: 'The requested item was not found.',
         updateTargets: 'Automatic updates',
-        updateTargetsHint: 'These cities are updated automatically by gasoline update (and used by suggest/check/notify) when the CLI is invoked without --city/--radius flags.',
+        updateTargetsHint: 'These cities are collected automatically by gasoline update when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately.',
         targetCity: 'City',
         targetRadius: 'Radius (km)',
         addTarget: 'Add',
@@ -5945,25 +5814,10 @@ const translations = {
         stationRenamed: 'Station renamed.',
         renameCleared: 'Rename removed. The original name is used again.',
         invalidRename: 'Select a station and enter a non-empty new name.',
-        suggestionSettings: 'Suggestions & checks',
-        settingFuel: 'Fuel',
-        settingFuelHint: 'Suggestions and checks are computed for every enabled fuel. Each user picks one of these to be notified about.',
-        settingRangeKm: 'Range (km)',
-        settingHistoryDays: 'History days',
-        settingPredictDays: 'Prediction days',
-        settingLimitPerDay: 'Suggestions per day',
-        settingCheckLimit: 'Check row limit',
-        settingSuggestTimes: 'Default suggestion times',
-        settingCheckResetTime: 'Check baseline reset',
-        settingCheckDeltaMode: 'Price margin',
-        settingCheckDeltaFixed: 'Fixed (2 ct)',
-        settingCheckDeltaRelative: 'Relative to station swing',
-        settingCheckDeltaFraction: 'Margin fraction',
-        settingCheckDeltaHint: "The price margin decides when a price counts as low and when a cheaper upcoming window suppresses a buy. Fixed keeps the historical flat 2 ct for every station. Relative uses the margin fraction of each station's own daily price swing instead, so calm and volatile stations are judged on their own terms; stations without a reliable swing estimate keep the fixed margin.",
-        settingNotifyWindows: 'Default notification windows',
-        settingNotifyDays: 'Default notification days',
         templateCheck: 'Buy-alert notification template',
         templateSuggest: 'Suggestion notification template',
+        notificationTexts: 'Notification texts',
+        notificationTextsHint: 'Suggestions and checks are computed for every fuel, covering every station the update targets above currently feed. These templates are the only part that is configured here; each user picks their own fuel, area and schedule in My Account.',
         templateCheckTitle: 'Buy-alert notification title',
         templateSuggestTitle: 'Suggestion notification title',
         titleTemplatePlaceholder: 'e.g. Fill up for {{cheapest_current_price_formatted}} EUR',
@@ -5977,8 +5831,6 @@ const translations = {
         menuPredictions: 'Prediction accuracy',
         predAccuracyTitle: 'Prediction accuracy',
         predAccuracyHint: 'Compares each past prediction with the actual price recorded for that target window. Only evaluated predictions — whose target hour has passed and had a recorded price — are included. Errors are shown in cents (ct); bias is the mean signed error (actual − predicted), so a positive bias means predictions ran low.',
-        predCity: 'City',
-        predAllCities: 'All cities',
         predRange: 'Target range',
         predConfidence: 'Confidence',
         predConfAll: 'All',
@@ -6159,11 +6011,13 @@ const translations = {
         notifyCheckEnabled: 'Kaufalarme bei Preistiefs senden',
         notifyKindsHint: 'Wähle, welche Benachrichtigungen du erhältst. Vorschläge sagen günstige Tankzeiten voraus; Kaufalarme werden ausgelöst, wenn ein aktueller Preis fällt. Lass beide aus, um alle Benachrichtigungen zu pausieren.',
         notifyFuel: 'Kraftstoff für Benachrichtigungen',
-        notifyFuelHint: 'Sie werden nur über diesen Kraftstoff benachrichtigt. Die Liste zeigt die Kraftstoffe, die Ihr Administrator derzeit erfasst.',
-        notifyCities: 'Städte',
-        notifyCitiesHint: 'Benachrichtigungen gelten nur für die ausgewählten Städte. Keine Auswahl bedeutet alle Städte, auch später hinzugefügte.',
+        notifyFuelHint: 'Sie werden nur über diesen Kraftstoff benachrichtigt. Alle drei werden erfasst, jede Auswahl wird also bedient.',
+        notifyLocation: 'Benachrichtigen rund um',
+        notifyRadius: 'Radius (km)',
+        notifyLocationHint: 'Benachrichtigungen umfassen alle erfassten Tankstellen innerhalb dieser Entfernung zur gewählten Stadt, und Entfernungen werden von dort gemessen. Tankstellen erscheinen erst, wenn die Aktualisierungsziele Ihres Administrators sie tatsächlich erfassen.',
         notifySaved: 'Benachrichtigungseinstellungen gespeichert.',
-        invalidNotifySettings: 'Ungültige Benachrichtigungseinstellungen. Bitte Tage, Zeitfenster, Zeiten und Städte prüfen.',
+        invalidNotifySettings: 'Ungültige Benachrichtigungseinstellungen. Bitte Tage, Zeitfenster und Zeiten prüfen.',
+        invalidNotifyLocation: 'Bitte eine Stadt aus den Vorschlägen und einen Radius zwischen 1 und 100 km wählen.',
         addWindow: 'Zeitfenster hinzufügen',
         addTime: 'Zeit hinzufügen',
         removeRow: 'Entfernen',
@@ -6205,7 +6059,7 @@ const translations = {
         cannotActOnSelf: 'Diese Aktion ist auf dem eigenen Konto nicht möglich.',
         notFound: 'Der angeforderte Eintrag wurde nicht gefunden.',
         updateTargets: 'Automatische Updates',
-        updateTargetsHint: 'Diese Städte werden von gasoline update automatisch aktualisiert (und von suggest/check/notify genutzt), wenn die CLI ohne --city/--radius aufgerufen wird.',
+        updateTargetsHint: 'Diese Städte werden von gasoline update automatisch erfasst, wenn die CLI ohne --city/--radius aufgerufen wird. Sie bestimmen, welche Tankstellen es gibt; das Gebiet für Benachrichtigungen wählt jeder Nutzer separat.',
         targetCity: 'Stadt',
         targetRadius: 'Radius (km)',
         addTarget: 'Hinzufügen',
@@ -6228,25 +6082,10 @@ const translations = {
         stationRenamed: 'Tankstelle umbenannt.',
         renameCleared: 'Umbenennung entfernt. Der Originalname wird wieder verwendet.',
         invalidRename: 'Bitte eine Tankstelle auswählen und einen neuen Namen eingeben.',
-        suggestionSettings: 'Vorschläge & Preisprüfungen',
-        settingFuel: 'Kraftstoff',
-        settingFuelHint: 'Vorschläge und Prüfungen werden für jeden aktivierten Kraftstoff berechnet. Jeder Nutzer wählt einen davon für Benachrichtigungen aus.',
-        settingRangeKm: 'Umkreis (km)',
-        settingHistoryDays: 'Historie (Tage)',
-        settingPredictDays: 'Vorhersage (Tage)',
-        settingLimitPerDay: 'Vorschläge pro Tag',
-        settingCheckLimit: 'Zeilenlimit der Preisprüfung',
-        settingSuggestTimes: 'Standard-Vorschlagszeiten',
-        settingCheckResetTime: 'Preis-Baseline zurücksetzen um',
-        settingCheckDeltaMode: 'Preisabstand',
-        settingCheckDeltaFixed: 'Fest (2 ct)',
-        settingCheckDeltaRelative: 'Relativ zur Tagesspanne',
-        settingCheckDeltaFraction: 'Anteil der Tagesspanne',
-        settingCheckDeltaHint: 'Der Preisabstand bestimmt, ab wann ein Preis als niedrig gilt und wann ein günstigeres kommendes Zeitfenster eine Kaufempfehlung unterdrückt. „Fest“ behält die bisherigen 2 ct für jede Tankstelle bei. „Relativ“ verwendet stattdessen den eingestellten Anteil der tankstelleneigenen Tagesspanne, sodass ruhige und schwankungsreiche Tankstellen jeweils an ihrem eigenen Verhalten gemessen werden; Tankstellen ohne verlässliche Schätzung der Tagesspanne behalten den festen Abstand.',
-        settingNotifyWindows: 'Standard-Zeitfenster',
-        settingNotifyDays: 'Standard-Wochentage',
         templateCheck: 'Vorlage für Kaufalarme',
         templateSuggest: 'Vorlage für Vorschläge',
+        notificationTexts: 'Benachrichtigungstexte',
+        notificationTextsHint: 'Vorschläge und Prüfungen werden für jeden Kraftstoff berechnet und umfassen alle Tankstellen, die von den Aktualisierungszielen oben derzeit erfasst werden. Nur diese Vorlagen werden hier konfiguriert; Kraftstoff, Gebiet und Zeitplan wählt jeder Nutzer im eigenen Konto.',
         templateCheckTitle: 'Titel für Kaufalarme',
         templateSuggestTitle: 'Titel für Vorschläge',
         titleTemplatePlaceholder: 'z. B. Tanken für {{cheapest_current_price_formatted}} EUR',
@@ -6260,8 +6099,6 @@ const translations = {
         menuPredictions: 'Vorhersagegenauigkeit',
         predAccuracyTitle: 'Vorhersagegenauigkeit',
         predAccuracyHint: 'Vergleicht jede vergangene Vorhersage mit dem tatsächlich aufgezeichneten Preis im jeweiligen Zielfenster. Nur ausgewertete Vorhersagen — deren Zielstunde vorbei ist und für die ein Preis vorlag — werden berücksichtigt. Fehler werden in Cent (ct) angezeigt; der Bias ist der mittlere vorzeichenbehaftete Fehler (Ist − Vorhersage), ein positiver Bias bedeutet also zu niedrige Vorhersagen.',
-        predCity: 'Stadt',
-        predAllCities: 'Alle Städte',
         predRange: 'Zeitraum (Ziel)',
         predConfidence: 'Konfidenz',
         predConfAll: 'Alle',

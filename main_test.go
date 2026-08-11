@@ -9,11 +9,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -631,25 +631,32 @@ func TestRunCheckSupportsJSONOutput(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() error {
-		return run([]string{"check", "--db", dbPath, "--city", "Berlin", "--fuel", "diesel", "--history-days", "10", "--predict-days", "1", "--output", "json"})
+		return run([]string{"check", "--db", dbPath, "--output", "json"})
 	})
 
-	var checks []priceCheckRow
-	if err := json.Unmarshal([]byte(output), &checks); err != nil {
+	var results []fuelCheckResult
+	if err := json.Unmarshal([]byte(output), &results); err != nil {
 		t.Fatalf("unmarshal check output: %v\noutput=%s", err, output)
 	}
+	if len(results) != len(suggestFuels) || results[0].Fuel != "diesel" {
+		t.Fatalf("results = %+v, want one per fuel starting with diesel", results)
+	}
+	checks := results[0].Checks
 	if len(checks) != 1 {
 		t.Fatalf("len(checks) = %d, want 1", len(checks))
 	}
 	if checks[0].StationID != "station-1" || checks[0].Station.ID != "station-1" {
 		t.Fatalf("station fields = %+v, want station-1", checks[0])
 	}
+	if checks[0].Station.City != "Berlin" {
+		t.Fatalf("station city = %q, want the owning update target Berlin", checks[0].Station.City)
+	}
 	if checks[0].Recommendation != "buy" {
 		t.Fatalf("recommendation = %q, want buy", checks[0].Recommendation)
 	}
 }
 
-func TestRunCheckAllConfiguredCities(t *testing.T) {
+func TestRunCheckCoversEveryFuelAndEveryFedStation(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "check-multi.db")
 	db, err := openDB(dbPath)
@@ -683,29 +690,36 @@ func TestRunCheckAllConfiguredCities(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() error {
-		return run([]string{"check", "--db", dbPath, "--fuel", "diesel", "--history-days", "10", "--predict-days", "1", "--output", "json"})
+		return run([]string{"check", "--db", dbPath, "--output", "json"})
 	})
-	var results []cityCheckResult
+	var results []fuelCheckResult
 	if err := json.Unmarshal([]byte(output), &results); err != nil {
-		t.Fatalf("unmarshal multi-city check output: %v\noutput=%s", err, output)
+		t.Fatalf("unmarshal check output: %v\noutput=%s", err, output)
 	}
-	if len(results) != 2 {
-		t.Fatalf("got %d city results, want 2", len(results))
+	if len(results) != len(suggestFuels) {
+		t.Fatalf("got %d fuel results, want %d", len(results), len(suggestFuels))
 	}
-	for i, want := range []struct{ city, station string }{{"Berlin", "station-b"}, {"Hamburg", "station-h"}} {
-		if results[i].City != want.city {
-			t.Fatalf("results[%d].City = %q, want %q", i, results[i].City, want.city)
+	// One run per fuel, and each covers both cities' stations: there is no
+	// radius and no per-city fan-out any more, so the two stations appear
+	// together with the city each one is attributed to.
+	for i, wantFuel := range suggestFuels {
+		if results[i].Fuel != wantFuel {
+			t.Fatalf("results[%d].Fuel = %q, want %q", i, results[i].Fuel, wantFuel)
 		}
 		if results[i].Error != "" {
 			t.Fatalf("results[%d] unexpected error: %s", i, results[i].Error)
 		}
-		if len(results[i].Checks) != 1 || results[i].Checks[0].StationID != want.station {
-			t.Fatalf("results[%d].Checks = %+v, want one row for %s", i, results[i].Checks, want.station)
+		cities := map[string]string{}
+		for _, row := range results[i].Checks {
+			cities[row.StationID] = row.Station.City
+		}
+		if cities["station-b"] != "Berlin" || cities["station-h"] != "Hamburg" {
+			t.Fatalf("results[%d] station cities = %+v, want station-b in Berlin and station-h in Hamburg", i, cities)
 		}
 	}
 }
 
-func TestRunCheckAllConfiguredCitiesBestEffort(t *testing.T) {
+func TestRunCheckIsBestEffortAcrossFuels(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "check-besteffort.db")
 	db, err := openDB(dbPath)
@@ -726,9 +740,8 @@ func TestRunCheckAllConfiguredCitiesBestEffort(t *testing.T) {
 			insertSuggestSnapshot(t, db, "station-b", "Berlin", at, 2.100, true)
 		}
 	}
-	insertSuggestSnapshot(t, db, "station-b", "Berlin", time.Now().UTC(), 2.000, true)
+	insertSuggestSnapshotDieselOnly(t, db, "station-b", "Berlin", time.Now().UTC(), 2.000, true)
 	insertUpdateTargetRow(t, db, "Berlin", 5)
-	insertUpdateTargetRow(t, db, "Nowhere", 5)
 	if err := db.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
@@ -736,30 +749,34 @@ func TestRunCheckAllConfiguredCitiesBestEffort(t *testing.T) {
 	old := stdout
 	var buf bytes.Buffer
 	stdout = &buf
-	runErr := run([]string{"check", "--db", dbPath, "--fuel", "diesel", "--history-days", "10", "--predict-days", "1", "--output", "json"})
+	runErr := run([]string{"check", "--db", dbPath, "--output", "json"})
 	stdout = old
-	if runErr == nil || !strings.Contains(runErr.Error(), "1 of 2 cities failed") {
-		t.Fatalf("run error = %v, want '1 of 2 cities failed'", runErr)
+	if runErr == nil || !strings.Contains(runErr.Error(), "2 of 3 fuels failed") {
+		t.Fatalf("run error = %v, want '2 of 3 fuels failed'", runErr)
 	}
-	var results []cityCheckResult
+	var results []fuelCheckResult
 	if err := json.Unmarshal(buf.Bytes(), &results); err != nil {
 		t.Fatalf("unmarshal best-effort check output: %v\noutput=%s", err, buf.String())
 	}
-	if len(results) != 2 {
-		t.Fatalf("got %d city results, want 2", len(results))
+	if len(results) != 3 {
+		t.Fatalf("got %d fuel results, want 3", len(results))
 	}
-	if results[0].City != "Berlin" || results[0].Error != "" || len(results[0].Checks) != 1 {
-		t.Fatalf("results[0] = %+v, want one Berlin row without error", results[0])
+	// Only diesel has stored prices: the other two fuels fail without taking
+	// the run down with them.
+	if results[0].Fuel != "diesel" || results[0].Error != "" || len(results[0].Checks) != 1 {
+		t.Fatalf("results[0] = %+v, want one diesel row without error", results[0])
 	}
-	if results[1].City != "Nowhere" || results[1].Error == "" {
-		t.Fatalf("results[1] = %+v, want Nowhere with error", results[1])
-	}
-	if results[1].Checks != nil {
-		t.Fatalf("results[1].Checks = %+v, want null for failed city", results[1].Checks)
+	for _, res := range results[1:] {
+		if res.Error == "" {
+			t.Fatalf("%s unexpectedly succeeded without stored prices", res.Fuel)
+		}
+		if res.Checks != nil {
+			t.Fatalf("%s checks = %+v, want null for a failed fuel", res.Fuel, res.Checks)
+		}
 	}
 }
 
-func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
+func TestSuggestGasCoversEveryFedStationRegardlessOfDistance(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	city := cachedCity{
@@ -771,6 +788,8 @@ func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 	}
 	insertSuggestCity(t, db, city)
 	insertSuggestStation(t, db, "near-station", "Near Station", 52.517389, 13.395131)
+	// Roughly 110 km from the city centre. There is no radius any more: being
+	// fed is what puts a station in scope, so the cheaper far station wins.
 	insertSuggestStation(t, db, "far-station", "Far Station", 53.500000, 13.395131)
 
 	for day := 20; day <= 25; day++ {
@@ -781,8 +800,6 @@ func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 	}
 
 	suggestions, err := suggestGas(ctx, db, suggestOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 10,
 		PredictDays: 2,
@@ -797,14 +814,15 @@ func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 		t.Fatalf("len(suggestions) = %d, want 2: %+v", len(suggestions), suggestions)
 	}
 	for _, suggestion := range suggestions {
-		if suggestion.StationID != "near-station" {
-			t.Fatalf("station id = %q, want near-station", suggestion.StationID)
+		// The far station is the cheapest, and distance no longer excludes it.
+		if suggestion.StationID != "far-station" {
+			t.Fatalf("station id = %q, want the cheapest fed station far-station", suggestion.StationID)
 		}
-		if suggestion.StartTime != "18:00" || suggestion.EndTime != "19:00" {
-			t.Fatalf("time window = %s-%s, want 18:00-19:00", suggestion.StartTime, suggestion.EndTime)
+		if suggestion.DistanceKM < 100 {
+			t.Fatalf("distance = %.1f, want the far station's real distance to the owning city", suggestion.DistanceKM)
 		}
-		if suggestion.DistanceKM > 0.1 {
-			t.Fatalf("distance = %.1f, want near station distance", suggestion.DistanceKM)
+		if suggestion.Station.City != "Berlin" {
+			t.Fatalf("station city = %q, want the owning update target Berlin", suggestion.Station.City)
 		}
 		if suggestion.Station.Address != "Test Street 1, 10115 Berlin" {
 			t.Fatalf("station address = %q, want formatted address", suggestion.Station.Address)
@@ -812,8 +830,8 @@ func TestSuggestGasReturnsDayAndTimeSuggestionsWithinRange(t *testing.T) {
 		if suggestion.Station.Brand != "TEST" || suggestion.Station.Street != "Test Street" || suggestion.Station.HouseNumber != "1" || suggestion.Station.PostCode != 10115 || suggestion.Station.Place != "Berlin" {
 			t.Fatalf("station metadata = %+v, want persisted station details", suggestion.Station)
 		}
-		if suggestion.PredictedPrice >= 2.200 {
-			t.Fatalf("predicted price = %.3f, want lower than 2.200", suggestion.PredictedPrice)
+		if suggestion.PredictedPrice >= 2.000 {
+			t.Fatalf("predicted price = %.3f, want the far station's cheaper level", suggestion.PredictedPrice)
 		}
 	}
 	if suggestions[0].Date != "2026-04-26" || suggestions[0].Weekday != "Sunday" {
@@ -969,8 +987,6 @@ func TestCheckGasRecommendsBuyForLowCurrentPrice(t *testing.T) {
 	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 26, 14, 0, 0, 0, time.UTC), 2.000, true)
 
 	checks, err := checkGas(ctx, db, checkOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 10,
 		PredictDays: 1,
@@ -1017,8 +1033,6 @@ func TestCheckGasRecommendsWaitForLowerFuturePrice(t *testing.T) {
 	insertSuggestSnapshot(t, db, "station-1", "Berlin", time.Date(2026, 4, 26, 15, 0, 0, 0, time.UTC), 2.200, true)
 
 	checks, err := checkGas(ctx, db, checkOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 10,
 		PredictDays: 1,
@@ -1046,8 +1060,6 @@ func TestCheckGasRecommendsWaitForLowerFuturePrice(t *testing.T) {
 
 func TestValidateCheckOptions(t *testing.T) {
 	valid := checkOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 21,
 		PredictDays: 3,
@@ -1062,9 +1074,9 @@ func TestValidateCheckOptions(t *testing.T) {
 		opts checkOptions
 		want string
 	}{
-		{name: "city", opts: checkOptions{RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: 5}, want: "requires --city"},
-		{name: "fuel", opts: checkOptions{City: "Berlin", RangeKM: 5, Fuel: "premium", HistoryDays: 21, PredictDays: 3, Limit: 5}, want: "--fuel"},
-		{name: "limit", opts: checkOptions{City: "Berlin", RangeKM: 5, Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: -1}, want: "--limit"},
+		{name: "fuel", opts: checkOptions{Fuel: "premium", HistoryDays: 21, PredictDays: 3, Limit: 5}, want: "fuel must be one of"},
+		{name: "history", opts: checkOptions{Fuel: "diesel", HistoryDays: 0, PredictDays: 3, Limit: 5}, want: "history days"},
+		{name: "limit", opts: checkOptions{Fuel: "diesel", HistoryDays: 21, PredictDays: 3, Limit: -1}, want: "check row limit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1139,6 +1151,21 @@ func insertSuggestSnapshot(t *testing.T, db *sql.DB, stationID, cityName string,
 	`, stationID, cityName, recordedAt.Format(time.RFC3339), 5, boolToInt(isOpen), e5, e10, diesel)
 	if err != nil {
 		t.Fatalf("insert snapshot %q at %s: %v", stationID, recordedAt.Format(time.RFC3339), err)
+	}
+}
+
+// insertSuggestSnapshotDieselOnly stores a snapshot with no e5/e10 price, so a
+// fixture can give one fuel history and leave the others without any.
+func insertSuggestSnapshotDieselOnly(t *testing.T, db *sql.DB, stationID, cityName string, recordedAt time.Time, diesel float64, isOpen bool) {
+	t.Helper()
+
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO price_snapshots (
+			station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel
+		) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
+	`, stationID, cityName, recordedAt.Format(time.RFC3339), 5, boolToInt(isOpen), diesel)
+	if err != nil {
+		t.Fatalf("insert diesel-only snapshot %q at %s: %v", stationID, recordedAt.Format(time.RFC3339), err)
 	}
 }
 
@@ -1574,17 +1601,50 @@ func TestResolveSnapshotOwner(t *testing.T) {
 	berlin := cachedCity{Name: "Berlin", Lat: 52.5, Lng: 13.4}
 	potsdam := cachedCity{Name: "Potsdam", Lat: 52.4, Lng: 13.06}
 
+	// Both cities cover the station: Potsdam at 3.5 km, Berlin at 22 km. These
+	// cases model a configured install, where an absent city means a removed
+	// target rather than a city this run did not name.
+	configured := func(radii map[string]float64) cityCoverage {
+		return cityCoverage{radiusByCity: radii, configured: true}
+	}
+	covered := configured(map[string]float64{"Potsdam": 5, "Berlin": 25})
+
 	tests := []struct {
 		name         string
 		currentOwner string
 		candidate    cachedCity
+		coverage     cityCoverage
 		want         string
 	}{
-		{"unowned station goes to the fetching city", "", berlin, "Berlin"},
-		{"owner re-fetching itself keeps it", "Berlin", berlin, "Berlin"},
-		{"nearer owner survives a farther city's run", "Potsdam", berlin, "Potsdam"},
-		{"farther owner loses to a nearer city", "Berlin", potsdam, "Potsdam"},
-		{"unknown owner cannot hold the station", "Atlantis", berlin, "Berlin"},
+		{"unowned station goes to the fetching city", "", berlin, covered, "Berlin"},
+		{"owner re-fetching itself keeps it", "Berlin", berlin, covered, "Berlin"},
+		{"nearer owner survives a farther city's run", "Potsdam", berlin, covered, "Potsdam"},
+		{"farther owner loses to a nearer city", "Berlin", potsdam, covered, "Potsdam"},
+		{"unknown owner cannot hold the station", "Atlantis", berlin, covered, "Berlin"},
+		// The owner's target was removed. Its cities row survives, and the
+		// remaining target keeps the station fresh forever, so without the
+		// coverage check the station would never move.
+		{
+			name: "removed owner hands the station over", currentOwner: "Potsdam", candidate: berlin,
+			coverage: configured(map[string]float64{"Berlin": 25}), want: "Berlin",
+		},
+		// The owner's radius was shrunk past the station.
+		{
+			name: "shrunk owner hands the station over", currentOwner: "Potsdam", candidate: berlin,
+			coverage: configured(map[string]float64{"Potsdam": 2, "Berlin": 25}), want: "Berlin",
+		},
+		// Shrunk, but still reaching: ownership is stable.
+		{
+			name: "owner still in reach after a shrink keeps it", currentOwner: "Potsdam", candidate: berlin,
+			coverage: configured(map[string]float64{"Potsdam": 4, "Berlin": 25}), want: "Potsdam",
+		},
+		// A flag-driven install has no configuration to compare against, so an
+		// owner this run did not name — a solo run, or a failed fetch — keeps the
+		// station on distance alone.
+		{
+			name: "unnamed owner keeps the station without configured targets", currentOwner: "Potsdam", candidate: berlin,
+			coverage: cityCoverage{radiusByCity: map[string]float64{"Berlin": 25}}, want: "Potsdam",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1593,7 +1653,7 @@ func TestResolveSnapshotOwner(t *testing.T) {
 				t.Fatalf("begin: %v", err)
 			}
 			defer tx.Rollback()
-			got, err := resolveSnapshotOwner(ctx, tx, newCityCentres(), tc.currentOwner, tc.candidate, station)
+			got, err := resolveSnapshotOwner(ctx, tx, newCityCentres(tc.coverage), tc.currentOwner, tc.candidate, station)
 			if err != nil {
 				t.Fatalf("resolveSnapshotOwner: %v", err)
 			}
@@ -1601,6 +1661,73 @@ func TestResolveSnapshotOwner(t *testing.T) {
 				t.Fatalf("owner = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadCityCoverageMergesTargetsAndSweep(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin, Germany", Name: "Berlin", DisplayName: "Berlin, Deutschland", Lat: 52.5, Lng: 13.4})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Potsdam", Name: "Potsdam", DisplayName: "Potsdam", Lat: 52.4, Lng: 13.06})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Hamburg", Name: "Hamburg", DisplayName: "Hamburg", Lat: 53.55, Lng: 9.99})
+	// A target written the long way still has to be keyed by the normalized name
+	// that ownership uses.
+	insertUpdateTargetRow(t, db, "Berlin, Germany", 5)
+	insertUpdateTargetRow(t, db, "Potsdam", 10)
+	insertUpdateTargetRow(t, db, "Ghosttown", 20) // never geocoded
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	loaded, err := loadCityCoverage(ctx, tx, []cityFetch{
+		// An ad-hoc sweep reaching further than the configured target, plus a
+		// city that is not a target at all.
+		{Query: cityQuery{name: "Berlin", radius: 25}, City: cachedCity{Name: "Berlin"}},
+		{Query: cityQuery{name: "Hamburg", radius: 15}, City: cachedCity{Name: "Hamburg"}},
+	})
+	if err != nil {
+		t.Fatalf("loadCityCoverage: %v", err)
+	}
+	if !loaded.configured {
+		t.Error("coverage must be authoritative when update targets exist")
+	}
+	coverage := loaded.radiusByCity
+	// The wider of target and sweep wins, so an ad-hoc wide run cannot hand away
+	// ownership the scheduled target would keep.
+	if coverage["Berlin"] != 25 {
+		t.Errorf("Berlin coverage = %v, want the wider sweep radius 25", coverage["Berlin"])
+	}
+	// A configured target that this sweep did not fetch still covers its own.
+	if coverage["Potsdam"] != 10 {
+		t.Errorf("Potsdam coverage = %v, want the configured 10", coverage["Potsdam"])
+	}
+	// A swept city that is not a target counts too — it is what fetched them.
+	if coverage["Hamburg"] != 15 {
+		t.Errorf("Hamburg coverage = %v, want the swept 15", coverage["Hamburg"])
+	}
+	// A target whose city was never geocoded cannot own anything.
+	if _, ok := coverage["Ghosttown"]; ok {
+		t.Error("an ungeocoded target must not appear in the coverage")
+	}
+
+	// With no update targets at all a sweep is flag-driven, and absence from the
+	// coverage cannot be read as a removal.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM update_targets`); err != nil {
+		t.Fatalf("clear targets: %v", err)
+	}
+	flagDriven, err := loadCityCoverage(ctx, tx, []cityFetch{
+		{Query: cityQuery{name: "Berlin", radius: 25}, City: cachedCity{Name: "Berlin"}},
+	})
+	if err != nil {
+		t.Fatalf("loadCityCoverage without targets: %v", err)
+	}
+	if flagDriven.configured {
+		t.Error("coverage must not be authoritative without configured targets")
+	}
+	if reaches, authoritative := flagDriven.stillReaches("Potsdam", 3.5); reaches || authoritative {
+		t.Errorf("stillReaches for an unnamed city = (%v, %v), want (false, false)", reaches, authoritative)
 	}
 }
 
@@ -1725,6 +1852,18 @@ func overlapStub(t *testing.T, diesel func(city string) string, failCity string)
 			}
 			if city == failCity {
 				return jsonResponse(http.StatusInternalServerError, `{"ok":false,"message":"upstream down"}`), nil
+			}
+			// Honour the requested radius the way the real API does, so a
+			// shrunk target genuinely stops seeing the station.
+			radius, err := strconv.ParseFloat(u.Query().Get("rad"), 64)
+			if err != nil {
+				return nil, fmt.Errorf("unexpected rad: %s", u.Query().Get("rad"))
+			}
+			centre := centres[city]
+			lat, _ := strconv.ParseFloat(centre[0], 64)
+			lng, _ := strconv.ParseFloat(centre[1], 64)
+			if haversineKM(lat, lng, 52.42, 13.10) > radius {
+				return jsonResponse(http.StatusOK, `{"ok":true,"stations":[]}`), nil
 			}
 			return jsonResponse(http.StatusOK, fmt.Sprintf(
 				`{"ok":true,"stations":[{"id":"shared-1","name":"S","brand":"B","street":"St","place":"Teltow","lat":52.42,"lng":13.10,"dist":1,"diesel":%s,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`,
@@ -3353,6 +3492,20 @@ func insertSawtoothDay(t *testing.T, db *sql.DB, stationID, cityName string, day
 	}
 }
 
+// insertSawtoothDayDieselOnly is insertSawtoothDay with no e5/e10 prices, for
+// fixtures that need one fuel to have history and the others none.
+func insertSawtoothDayDieselOnly(t *testing.T, db *sql.DB, stationID, cityName string, day time.Time, base float64) {
+	t.Helper()
+	for _, segment := range []struct {
+		hour   int
+		offset float64
+	}{
+		{0, -0.05}, {8, -0.10}, {11, -0.12}, {12, 0.25}, {14, 0.10}, {18, 0.02}, {22, -0.05},
+	} {
+		insertSuggestSnapshotDieselOnly(t, db, stationID, cityName, day.Add(time.Duration(segment.hour)*time.Hour), base+segment.offset, true)
+	}
+}
+
 func TestSuggestGasPrefersPreJumpWindowWithNoonJump(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -3364,8 +3517,6 @@ func TestSuggestGasPrefersPreJumpWindowWithNoonJump(t *testing.T) {
 	}
 
 	suggestions, err := suggestGas(ctx, db, suggestOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 30,
 		PredictDays: 1,
@@ -3407,8 +3558,6 @@ func TestCheckGasStaysRegimeRelativeAfterMarketWideJump(t *testing.T) {
 	insertSuggestSnapshot(t, db, "station-1", "Berlin", today.Add(18*time.Hour), 2.07, true)
 
 	checks, err := checkGas(ctx, db, checkOptions{
-		City:        "Berlin",
-		RangeKM:     5,
 		Fuel:        "diesel",
 		HistoryDays: 30,
 		PredictDays: 1,
@@ -3456,81 +3605,303 @@ func TestInferJumpAnchorHourIgnoresRisesAcrossGaps(t *testing.T) {
 	}
 }
 
-func TestStationDailyAmplitude(t *testing.T) {
-	// Two weeks of a ~9.2 ct sawtooth puts the station in offset mode, where
-	// the hourly medians are offsets from the daily baseline and their spread
-	// is the intraday swing.
-	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
-	intervals := sawtoothIntervals("s1", firstDay, 14, func(int) float64 { return 2.00 })
-	now := time.Date(2026, 4, 24, 9, 30, 0, 0, time.UTC)
-	model := buildForecastModel(intervals, now, time.UTC)
+func TestLoadSnapshotScanDropsStationsThatStoppedBeingFed(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC)
 
-	if !model.Stations["s1"].OffsetMode {
-		t.Fatal("station not in offset mode; the fixture cannot exercise amplitude")
-	}
-	amplitude, ok := stationDailyAmplitude(model, "s1")
-	if !ok {
-		t.Fatal("stationDailyAmplitude returned !ok for an offset-mode station")
-	}
-	if amplitude <= 0 || amplitude > 0.5 {
-		t.Fatalf("amplitude = %.4f, want a plausible daily swing in euro", amplitude)
-	}
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestStation(t, db, "live", "Live Station", 52.517389, 13.395131)
+	insertSuggestStation(t, db, "dropped", "Dropped Station", 52.517389, 13.395131)
 
-	// An unknown station has no amplitude at all.
-	if _, ok := stationDailyAmplitude(model, "nope"); ok {
-		t.Fatal("stationDailyAmplitude reported an amplitude for an unknown station")
+	// Both stations have history; only one is still receiving updates. A target
+	// that was removed or shrunk leaves its stations looking exactly like this.
+	for day := 20; day <= 25; day++ {
+		insertSuggestSnapshot(t, db, "live", "Berlin", time.Date(2026, 4, day, 18, 0, 0, 0, time.UTC), 2.000, true)
 	}
-}
+	// The dropped station's newest snapshot is six days old, well past the
+	// freshness window even though it is inside the history window.
+	for day := 18; day <= 20; day++ {
+		insertSuggestSnapshot(t, db, "dropped", "Berlin", time.Date(2026, 4, day, 18, 0, 0, 0, time.UTC), 1.500, true)
+	}
+	insertSuggestSnapshot(t, db, "live", "Berlin", now.Add(-30*time.Minute), 1.990, true)
 
-func TestStationDailyAmplitudeSkipsAbsoluteModeStations(t *testing.T) {
-	// Two days is too little history for offset mode. Those samples are
-	// absolute prices, whose spread would mix level drift into the swing.
-	firstDay := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
-	intervals := sawtoothIntervals("s1", firstDay, 2, func(int) float64 { return 2.00 })
-	now := time.Date(2026, 4, 12, 0, 30, 0, 0, time.UTC)
-	model := buildForecastModel(intervals, now, time.UTC)
-
-	if model.Stations["s1"].OffsetMode {
-		t.Fatal("station unexpectedly in offset mode")
+	scan, err := loadSnapshotScan(ctx, db, now.AddDate(0, 0, -10), now)
+	if err != nil {
+		t.Fatalf("loadSnapshotScan: %v", err)
 	}
-	if _, ok := stationDailyAmplitude(model, "s1"); ok {
-		t.Fatal("amplitude derived for an absolute-mode station: it would include level drift")
+	if _, ok := scan.Stations["live"]; !ok {
+		t.Fatal("a station still being fed must stay in scope")
 	}
-}
-
-// modelWithHourlyOffsets builds an offset-mode model carrying exactly
-// hourCount populated hours, so the minAmplitudeHours gate can be pinned
-// without contriving a snapshot fixture that yields partial day coverage.
-func modelWithHourlyOffsets(hourCount int) forecastModel {
-	model := forecastModel{
-		Stations:    map[string]forecastStation{"s1": {OffsetMode: true}},
-		WeekdayHour: map[stationWeekdayHourKey][]priceSample{},
-		Hour:        map[stationHourKey][]priceSample{},
-		Recent:      map[string][]priceSample{},
+	if _, ok := scan.Stations["dropped"]; ok {
+		t.Fatalf("a station whose last snapshot is older than %v must leave scope", stationFreshness)
 	}
-	for hour := 0; hour < hourCount; hour++ {
-		// A 0.10 spread across the populated hours.
-		offset := -0.05 + 0.10*float64(hour)/float64(max(hourCount-1, 1))
-		model.Hour[stationHourKey{StationID: "s1", Hour: hour}] = []priceSample{
-			{Price: offset, Weight: 60},
+	for _, row := range scan.Rows {
+		if row.StationID != "live" {
+			t.Fatalf("scan carries rows for out-of-scope station %q", row.StationID)
 		}
 	}
-	return model
 }
 
-func TestStationDailyAmplitudeRequiresEnoughHours(t *testing.T) {
-	// One hour below the gate: the observed range is a slice of the sawtooth,
-	// not its height, so no amplitude may be reported.
-	if _, ok := stationDailyAmplitude(modelWithHourlyOffsets(minAmplitudeHours-1), "s1"); ok {
-		t.Fatalf("amplitude reported with only %d hours, want !ok below the %d-hour gate",
-			minAmplitudeHours-1, minAmplitudeHours)
+func TestLoadSnapshotScanAttributesStationsToTheirOwningCity(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC)
+
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Potsdam", Name: "Potsdam", DisplayName: "Potsdam", Lat: 52.4, Lng: 13.06})
+	insertSuggestStation(t, db, "in-berlin", "Berlin Station", 52.517389, 13.395131)
+	insertSuggestStation(t, db, "in-potsdam", "Potsdam Station", 52.4, 13.06)
+	insertSuggestSnapshot(t, db, "in-berlin", "Berlin", now.Add(-time.Hour), 2.000, true)
+	insertSuggestSnapshot(t, db, "in-potsdam", "Potsdam", now.Add(-time.Hour), 1.900, true)
+	// Ownership moved to a nearer centre: the newest snapshot decides, so this
+	// station counts as Potsdam's even though it started out as Berlin's.
+	insertSuggestStation(t, db, "moved", "Moved Station", 52.41, 13.07)
+	insertSuggestSnapshot(t, db, "moved", "Berlin", now.Add(-3*time.Hour), 1.950, true)
+	insertSuggestSnapshot(t, db, "moved", "Potsdam", now.Add(-time.Hour), 1.950, true)
+
+	scan, err := loadSnapshotScan(ctx, db, now.AddDate(0, 0, -10), now)
+	if err != nil {
+		t.Fatalf("loadSnapshotScan: %v", err)
 	}
-	// Exactly at the gate it must be reported.
-	amplitude, ok := stationDailyAmplitude(modelWithHourlyOffsets(minAmplitudeHours), "s1")
-	if !ok {
-		t.Fatalf("no amplitude at exactly %d hours, want ok at the gate", minAmplitudeHours)
+	// Owning-city distance is opt-in: notifications measure from the subscriber
+	// instead, so the scan does not pay for the cities lookup unless asked.
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
+		t.Fatalf("fillOwningCityDistances: %v", err)
 	}
-	if math.Abs(amplitude-0.10) > 1e-9 {
-		t.Fatalf("amplitude = %v, want the 0.10 spread the fixture defines", amplitude)
+	for id, wantCity := range map[string]string{"in-berlin": "Berlin", "in-potsdam": "Potsdam", "moved": "Potsdam"} {
+		station, ok := scan.Stations[id]
+		if !ok {
+			t.Fatalf("station %q missing from the scan", id)
+		}
+		if station.City != wantCity {
+			t.Errorf("station %q city = %q, want %q", id, station.City, wantCity)
+		}
+	}
+	// Distance is measured to the owning centre, not to some global origin.
+	if d := scan.Stations["in-potsdam"].DistanceKM; d > 0.1 {
+		t.Errorf("distance for a station at its own city centre = %.2f, want ~0", d)
+	}
+	if d := scan.Stations["moved"].DistanceKM; d < 0.5 || d > 5 {
+		t.Errorf("distance for the moved station = %.2f, want a short hop to the Potsdam centre", d)
+	}
+}
+
+func TestForecastModelWithinRadiusFiltersAndRestatesDistance(t *testing.T) {
+	// Berlin centre, a station ~8 km west of it, and Hamburg.
+	model := forecastModel{
+		Stations: map[string]forecastStation{
+			"here": {Station: suggestionStationRow{ID: "here", Lat: 52.517389, Lng: 13.395131}},
+			"near": {Station: suggestionStationRow{ID: "near", Lat: 52.517389, Lng: 13.277}},
+			"far":  {Station: suggestionStationRow{ID: "far", Lat: 53.550556, Lng: 9.993333}},
+		},
+		Hour:           map[stationHourKey][]priceSample{{StationID: "far", Hour: 8}: {{Price: 1.5}}},
+		JumpAnchorHour: 12,
+	}
+	view := model.withinRadius(52.517389, 13.395131, 25)
+	if len(view.Stations) != 2 {
+		t.Fatalf("view has %d stations, want the two inside 25 km", len(view.Stations))
+	}
+	if _, ok := view.Stations["far"]; ok {
+		t.Error("a station outside the radius must be filtered out")
+	}
+	// Distances are restated from the point that was asked about.
+	if d := view.Stations["here"].Station.DistanceKM; d > 0.1 {
+		t.Errorf("distance at the point itself = %.2f, want ~0", d)
+	}
+	if d := view.Stations["near"].Station.DistanceKM; d < 7 || d > 9 {
+		t.Errorf("distance for the nearby station = %.2f, want ~8", d)
+	}
+	if len(model.Stations) != 3 {
+		t.Error("withinRadius mutated the model it filtered")
+	}
+	// The sample maps are shared rather than rebuilt, and the rest carries over.
+	if len(view.Hour) != len(model.Hour) || view.JumpAnchorHour != 12 {
+		t.Errorf("view = %d hour keys anchor %d, want the model's own", len(view.Hour), view.JumpAnchorHour)
+	}
+	if len(model.withinRadius(0, 0, 1).Stations) != 0 {
+		t.Error("an area with no stations must yield an empty view")
+	}
+}
+
+func TestLoadSnapshotScanDoesNotDuplicateHistoryForCitiesSharingANormalizedName(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC)
+
+	// cities.normalized_name has no unique constraint: the same place is cached
+	// once per query string an admin ever used. Both of these normalize to
+	// "Berlin", which is what the snapshots are filed under.
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin, Germany", Name: "Berlin", DisplayName: "Berlin, Deutschland", Lat: 52.4, Lng: 13.0})
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+
+	const snapshots = 4
+	for i := 0; i < snapshots; i++ {
+		insertSuggestSnapshot(t, db, "station-1", "Berlin", now.Add(-time.Duration(i+1)*time.Hour), 2.000, true)
+	}
+
+	scan, err := loadSnapshotScan(ctx, db, now.AddDate(0, 0, -10), now)
+	if err != nil {
+		t.Fatalf("loadSnapshotScan: %v", err)
+	}
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
+		t.Fatalf("fillOwningCityDistances: %v", err)
+	}
+	if len(scan.Rows) != snapshots {
+		t.Fatalf("scan rows = %d, want %d: a second cached spelling must not duplicate the history", len(scan.Rows), snapshots)
+	}
+	// The centre is picked deterministically — the row whose query name already
+	// is the normalized name — so the station sits at its own city centre.
+	if d := scan.Stations["station-1"].DistanceKM; d > 0.1 {
+		t.Errorf("distance = %.2f, want ~0 from the preferred cached city row", d)
+	}
+}
+
+func TestLoadCityCentresPrefersTheCanonicalRow(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Inserted worst-first so a naive "last row wins" would pick the wrong one.
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin, Germany", Name: "Berlin", DisplayName: "Berlin, Deutschland", Lat: 52.4, Lng: 13.0})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestCity(t, db, cachedCity{QueryName: "Hamburg", Name: "Hamburg", DisplayName: "Hamburg", Lat: 53.550556, Lng: 9.993333})
+
+	centres, err := loadCityCentres(ctx, db, []string{"Berlin", "Hamburg", "Nowhere"})
+	if err != nil {
+		t.Fatalf("loadCityCentres: %v", err)
+	}
+	if len(centres) != 2 {
+		t.Fatalf("centres = %+v, want only the two cached cities", centres)
+	}
+	if centres["Berlin"].Lat != 52.517389 || centres["Berlin"].Lng != 13.395131 {
+		t.Errorf("Berlin centre = %+v, want the canonical row's coordinates", centres["Berlin"])
+	}
+	if _, err := loadCityCentres(ctx, db, nil); err != nil {
+		t.Errorf("loadCityCentres with no names: %v", err)
+	}
+}
+
+func TestLookupCityNormalizedName(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestCity(t, db, cachedCity{
+		QueryName: "Berlin, Germany", Name: "Berlin", DisplayName: "Berlin, Deutschland",
+		Lat: 52.517389, Lng: 13.395131,
+	})
+
+	// The query string, the normalized name and the display name all resolve to
+	// the name the snapshots are filed under.
+	for _, in := range []string{"Berlin, Germany", "Berlin", "Berlin, Deutschland", "  Berlin  "} {
+		got, err := lookupCityNormalizedName(ctx, db, in)
+		if err != nil {
+			t.Fatalf("lookupCityNormalizedName(%q): %v", in, err)
+		}
+		if got != "Berlin" {
+			t.Errorf("lookupCityNormalizedName(%q) = %q, want Berlin", in, got)
+		}
+	}
+	if _, err := lookupCityNormalizedName(ctx, db, "Nowhere"); err == nil {
+		t.Error("an uncached city must report an error")
+	}
+}
+
+// The regression this guards: deleting an update target leaves its cities row
+// behind, and the remaining target keeps the station fresh forever, so ownership
+// used to stay on the removed city indefinitely.
+func TestRunUpdateTransfersOwnershipWhenATargetIsRemoved(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "removed-target.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	restore := overlapStub(t, func(string) string { return "1.500" }, "")
+	defer restore()
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := initSchema(context.Background(), db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	insertUpdateTargetRow(t, db, "Berlin", 25)
+	insertUpdateTargetRow(t, db, "Potsdam", 25)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	// Both targets reach the station; the nearer one owns it.
+	_ = captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath})
+	})
+	if owner, _ := sharedStationOwner(t, dbPath); owner != "Potsdam" {
+		t.Fatalf("after the configured sweep: owner = %q, want Potsdam", owner)
+	}
+
+	// The admin removes the owning target. Berlin keeps the station fed, so
+	// freshness alone will never let it go.
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `DELETE FROM update_targets WHERE city = 'Potsdam'`); err != nil {
+		t.Fatalf("delete target: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	_ = captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath})
+	})
+	if owner, rows := sharedStationOwner(t, dbPath); owner != "Berlin" || rows != 1 {
+		t.Fatalf("after removing Potsdam: owner = %q in %d rows, want Berlin in 1", owner, rows)
+	}
+}
+
+// The same for a radius shrink: the target stays, but no longer reaches.
+func TestRunUpdateTransfersOwnershipWhenATargetShrinks(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "shrunk-target.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	restore := overlapStub(t, func(string) string { return "1.500" }, "")
+	defer restore()
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := initSchema(context.Background(), db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	insertUpdateTargetRow(t, db, "Berlin", 25)
+	insertUpdateTargetRow(t, db, "Potsdam", 25)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	_ = captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath})
+	})
+	if owner, _ := sharedStationOwner(t, dbPath); owner != "Potsdam" {
+		t.Fatalf("after the configured sweep: owner = %q, want Potsdam", owner)
+	}
+
+	// The station sits ~3.5 km out, so a 2 km radius no longer contains it.
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `UPDATE update_targets SET radius_km = 2 WHERE city = 'Potsdam'`); err != nil {
+		t.Fatalf("shrink target: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	_ = captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath})
+	})
+	if owner, rows := sharedStationOwner(t, dbPath); owner != "Berlin" || rows != 1 {
+		t.Fatalf("after shrinking Potsdam: owner = %q in %d rows, want Berlin in 1", owner, rows)
 	}
 }

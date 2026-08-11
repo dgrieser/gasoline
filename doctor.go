@@ -123,7 +123,6 @@ type doctorIndex struct {
 
 type doctorFilters struct {
 	Fuel       string `json:"fuel"`
-	City       string `json:"city"`
 	Confidence string `json:"confidence"`
 	From       string `json:"from"`
 	To         string `json:"to"`
@@ -239,11 +238,6 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 	joinRuns := ""
 	where := "pp.actual_price IS NOT NULL AND pp.fuel = ? AND pp.target_start >= ? AND pp.target_start <= ?"
 	args := []any{f.Fuel, f.From, f.To}
-	if f.City != "" {
-		joinRuns = "JOIN prediction_runs pr ON pr.id = pp.run_id "
-		where += " AND pr.city_name = ?"
-		args = append(args, f.City)
-	}
 	if f.Confidence == "medium_high" {
 		where += " AND pp.confidence IN ('medium', 'high')"
 	}
@@ -366,11 +360,6 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			" AND d.fuel = ? AND d.target_start >= ? AND d.target_start <= ?"
 		decArgs := []any{f.Fuel, f.From, f.To}
 		decJoin := ""
-		if f.City != "" {
-			decJoin = "JOIN prediction_runs pr ON pr.id = d.run_id "
-			decWhere += " AND pr.city_name = ?"
-			decArgs = append(decArgs, f.City)
-		}
 		if f.Confidence == "medium_high" {
 			decWhere += " AND d.confidence IN ('medium', 'high')"
 		}
@@ -1094,7 +1083,6 @@ func runDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	dbf := addDBFlags(fs)
 	fuel := fs.String("fuel", "diesel", "Fuel the accuracy-page queries filter on: diesel, e5 or e10")
-	city := fs.String("city", "", "Restrict the accuracy-page queries to one city (default: all cities)")
 	confidence := fs.String("confidence", "all", "Confidence filter: all or medium_high")
 	rangeName := fs.String("range", "", "Target-date range: 7d, 14d (default) or 30d")
 	from := fs.String("from", "", "Range start as YYYY-MM-DD (needs --to)")
@@ -1157,7 +1145,6 @@ func runDoctor(args []string) error {
 	opts := doctorOptions{
 		Filters: doctorFilters{
 			Fuel:       *fuel,
-			City:       strings.TrimSpace(*city),
 			Confidence: *confidence,
 			From:       fromTS,
 			To:         toTS,
@@ -1225,12 +1212,8 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 		fmt.Fprintf(stdout, "    %s %-46s %8s  (%s)\n", marker, idx.Name, size, strings.Join(idx.Columns, ", "))
 	}
 
-	cityLabel := r.Filters.City
-	if cityLabel == "" {
-		cityLabel = "all cities"
-	}
-	fmt.Fprintf(stdout, "\naccuracy page queries: fuel=%s, %s, confidence=%s, %s .. %s\n",
-		r.Filters.Fuel, cityLabel, r.Filters.Confidence, r.Filters.From, r.Filters.To)
+	fmt.Fprintf(stdout, "\naccuracy page queries: fuel=%s, confidence=%s, %s .. %s\n",
+		r.Filters.Fuel, r.Filters.Confidence, r.Filters.From, r.Filters.To)
 	for _, q := range r.Queries {
 		if q.Skipped {
 			fmt.Fprintf(stdout, "  %-16s %s\n", q.Name, q.Purpose)

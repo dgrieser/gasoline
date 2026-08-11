@@ -175,10 +175,12 @@ gasoline list history --station-id 474e5046-deaf-4f9b-9a32-9797b778f047 --fuel d
 Suggest cheap fueling windows for the coming days:
 
 ```bash
-gasoline suggest --city "Berlin" --range-km 10 --fuel diesel --history-days 30 --predict-days 3 --limit-per-day 3
+gasoline suggest
 ```
 
-The suggestion algorithm uses open historical prices within the range, reconstructs compacted price intervals, and decomposes each station's history into a per-day price level plus an intraday pattern:
+`suggest` takes no scope flags: it covers **every station currently being fed** — whatever the configured update targets collect — and computes all three fuels in one run. A station leaves scope once it stops receiving price updates for 48 hours, which is what happens when an update target is removed or its radius shrinks. Each station is attributed to the city that owns it (the nearest fed centre, recorded at collection time as the geocoder's normalized name), and the reported distance is measured to that centre. `notify` resolves each update target to the same normalized name before it filters, so a target added as `Berlin, Germany` still matches the snapshots recorded under `Berlin`.
+
+The suggestion algorithm uses open historical prices, reconstructs compacted price intervals, and decomposes each station's history into a per-day price level plus an intraday pattern:
 
 - It first infers the **daily jump hour** — the local hour where upward price moves concentrate across all stations (with the current German once-per-day-raise regulation that is typically 12:00). Nothing is hardcoded: if the regulation changes or disappears, the inferred anchor and the learned pattern follow the data.
 - Each 24h window between jumps ("pricing day") gets a duration-weighted median **baseline**; the samples bucketed by local weekday and hour are stored as **offsets** from that baseline, so the once-per-day sawtooth is learned independently of the absolute price level.
@@ -187,23 +189,20 @@ The suggestion algorithm uses open historical prices within the range, reconstru
 
 Useful `suggest` flags:
 
-- `--range-km` maximum station distance from the cached city coordinates
-- `--fuel diesel|e5|e10`
-- `--history-days` amount of historic data to use
-- `--predict-days` amount of calendar days to suggest, including today when future hours remain
-- `--limit-per-day` maximum suggestions per day
 - `--persist` store the full prediction grid, evaluate past predictions, and learn from the errors (see below)
 - `--quiet` or `-q` suppress the suggestion output — store only; requires `--persist`
 - `--output json` or `-o json`
 
 Suggestion output includes the day, time window, predicted price, confidence, distance, and full persisted station metadata. JSON output keeps the existing top-level station fields and also includes a nested `station` object with address, brand, street, house number, post code, place, coordinates, and first/last seen timestamps.
 
-Without `--city`, `suggest` and `check` run against every configured update target (see [Server-stored configuration](#server-stored-configuration-admin-settings)). The single-city output shape is unchanged; with multiple targets the text output gains per-city `city: <name>` sections and the JSON output becomes an array of `{city, suggestions}` (`{city, checks}` for check) objects, where `city` is the configured target name and failed cities carry an `error` string instead of results.
+Both commands fan out over the three fuels: the text output has one `fuel: <name>` section each, and the JSON output is an array of `{fuel, suggestions}` (`{fuel, checks}` for check) objects. A fuel without enough stored history carries an `error` string instead of results and does not stop the others; the exit code reports how many failed.
+
+The model parameters and row limits are not configurable: 30 days of history, a 3-day forecast horizon, 3 suggestions per day and 5 check rows. `update_targets.radius_km` is the only radius in the system — it decides what gets collected, and everything downstream covers what was collected.
 
 Check whether the latest stored prices are low right now:
 
 ```bash
-gasoline check --city "Berlin" --range-km 10 --fuel diesel --history-days 30 --predict-days 3 --limit 5
+gasoline check
 ```
 
 The check command uses the same historical model as `suggest`, compares each open station's latest stored price with recent station history, and scans the coming forecast window for a lower expected price. It prints the station, current price, low/typical/high verdict, buy/wait/hold recommendation, confidence, and best lower future window when one is expected. Run `gasoline update` first when you need fresh current prices.
@@ -212,7 +211,7 @@ The reported `history_percentile` is regime-relative for stations with enough hi
 
 Public holidays are kept out of the weekday model: a holiday does not price like its calendar weekday, so holiday days are excluded from the per-weekday buckets and a holiday target is scored from the station's hour-of-day and recent history instead. Only the nine nationwide German holidays are recognized — state-specific ones such as Fronleichnam or Reformationstag would require mapping each station to its Bundesland, which the station data does not provide.
 
-The margin that decides "low", and that suppresses a buy when a cheaper window is coming, defaults to a flat 2 ct for every station. Admins can switch it to **relative** mode (hamburger menu → Settings), where the margin is a configurable fraction of each station's own daily price swing, so a station that moves 12 ct a day is not judged by the same margin as one that moves 4 ct. The swing is only estimated for stations with enough history to be scored in regime-relative mode; the rest keep the flat margin. The default preserves the previous behavior exactly.
+The margin that decides "low", and that suppresses a buy when a cheaper window is coming, is a flat 2 ct for every station.
 
 ### Persistent predictions and learning (`suggest --persist`)
 
@@ -230,19 +229,23 @@ The margin that decides "low", and that suppresses a buy when a cheaper window i
 5. **Records** the check decisions taken against that same model: per open station the observed price, the model's reference price for the current hour, the history percentile, and the resulting verdict and recommendation.
 6. **Prunes** predictions and decisions older than 30 days.
 
-The recorded decisions exist because the notification path itself keeps no record: `notify` computes each verdict and discards it, so without this there is no way to tell whether the numbers that trigger low-price alerts are any good. They are a faithful **proxy**, not a delivery log — the same model, bias and admin settings as `notify` uses, but computed on the suggestion timer's schedule and before `notify` applies its row limit, per-user city selection, notification windows and repeat-suppression baseline. Read them as "what the model decided", not "what users received".
+The recorded decisions exist because the notification path itself keeps no record: `notify` computes each verdict and discards it, so without this there is no way to tell whether the numbers that trigger low-price alerts are any good. They are a faithful **proxy**, not a delivery log — the same model and bias as `notify` uses, for every fuel `notify` delivers, but computed on the suggestion timer's schedule and before `notify` applies its row limit, per-user city selection, notification windows and repeat-suppression baseline. Read them as "what the model decided", not "what users received".
 
-The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. A timer run without `--city` covers every configured update target in one invocation, so stations in all cities accrue evaluation data for the bias learning; per-city failures are reported on stderr and via the exit code. The accrued evaluation data also feeds the bias learning and is surfaced in the web UI on the admin **Prediction accuracy** page (hamburger menu → Prediction accuracy), which compares each past predicted price with the actual price recorded for that window — raw rows, accuracy statistics (MAE, bias, RMSE, share within ±1/±2 ct, per-confidence breakdown), breakdowns by lead time and by hour of day, the alert outcomes described above, and a predicted-vs-actual graph.
+The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. One invocation persists a run per fuel over every fed station, so all of them accrue evaluation data for the bias learning; per-fuel failures are reported on stderr and via the exit code. The accrued evaluation data also feeds the bias learning and is surfaced in the web UI on the admin **Prediction accuracy** page (hamburger menu → Prediction accuracy), which compares each past predicted price with the actual price recorded for that window — raw rows, accuracy statistics (MAE, bias, RMSE, share within ±1/±2 ct, per-confidence breakdown), breakdowns by lead time and by hour of day, the alert outcomes described above, and a predicted-vs-actual graph.
 
 ### Server-stored configuration (admin settings)
 
-Administrators can store the operational configuration in the database via the web UI (hamburger menu → Settings): a list of update targets (city + radius pairs) plus the suggestion/check parameters (fuel, range, history/prediction days, limits, notification templates, schedule defaults). The **fuel** setting is a multi-select: enable any subset of `diesel`, `e5`, and `e10` (stored comma-separated). `notify` computes suggestions and checks for every enabled fuel, and each user picks one of them to be notified about (see below). The CLI uses those values as its defaults:
+Administrators configure two things in the web UI (hamburger menu → Settings): the **update targets** (city + radius pairs) that decide which stations are collected, and the **notification texts**.
 
-- `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius, as a single de-duplicated sweep: targets whose radii overlap share stations, and each shared station is stored once under its nearest target. Passing explicit flags ignores the targets entirely.
-- `gasoline suggest` and `gasoline check` take `--fuel`, `--range-km`, `--history-days`, `--predict-days`, and `--limit-per-day`/`--limit` from the settings table when the corresponding flag is not set. These commands stay single-fuel: when the settings enable more than one fuel, they default to the first enabled one, still overridable with `--fuel`. Without `--city`, both run against **every** configured update target (best-effort: one failing city does not stop the others; the exit code reports failures).
-- Explicit CLI flags always override the stored settings; with an empty settings table everything behaves exactly as before.
+That is deliberately all of it. The station scope, the fuels, the model parameters and the delivery limits used to be settings and are now fixed, because none of them had a per-install answer:
 
-Run `gasoline migrate` once to create the tables and seed the settings with the built-in defaults. Seeding never overwrites existing rows, so an install that already stores `history_days = 21` keeps it until an admin changes it (the built-in default is now 30 days).
+- `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius, as a single de-duplicated sweep: targets whose radii overlap share stations, and each shared station is stored once under its nearest target. Passing explicit flags ignores the targets entirely. `radius_km` is the only radius in the system.
+- `gasoline suggest`, `gasoline check` and `notify` take no scope or fuel arguments. They cover every station still being fed and compute all three fuels, so nothing that gets delivered goes unmeasured. Each user picks the one fuel they are notified about (see below).
+- The fixed parameters are 30 days of history, a 3-day forecast horizon, 3 suggestions per day, 5 check rows, a flat 2 ct price margin, a 48-hour station freshness window, and a baseline reset at local midnight. The per-user notification schedule defaults (every day, 07:00–21:00, suggestions at 08:00 and 13:00) apply only until a user sets their own.
+
+Upgrading to per-user notification areas: `migrate` carries a user's old city selection over whenever it says exactly what one area can express, using the legacy `range_km` setting as the radius — that is what the old notification path measured with, whereas a target's radius only ever decided what got collected. A single selected city becomes that city's centre at that range, and so does the old default of selecting nothing whenever there is exactly one update target, since "all cities" and "that city" are then the same area. Only genuinely ambiguous cases — several selected cities, or none with several targets — are left without an area and named on stderr as `needs_area`; those users receive nothing until they pick a city and radius, which is better than silently changing what they receive.
+
+Run `gasoline migrate` once to create the tables and seed the notification templates. Seeding never overwrites existing rows, so admin edits survive re-runs. `migrate` also deletes the settings rows that older versions stored for the parameters listed above, so the table stops advertising configuration that no longer does anything.
 
 `migrate` also backfills the covering index the admin **Prediction accuracy** page aggregates over (`idx_price_predictions_accuracy`); `gasoline doctor` reports whether it is present, see [Diagnosing a slow database](#diagnosing-a-slow-database-gasoline-doctor). On an install that has already accrued a large `price_predictions` table this is the one migration step that takes a noticeable while — tens of seconds per few million rows — and it grows the database by roughly the size of the table's own data. MySQL builds the index in place without blocking reads or writes, so a `suggest --persist` run may overlap it.
 
@@ -253,14 +256,14 @@ gasoline notify            # from cron or a systemd timer, e.g. every 5 minutes
 gasoline notify --dry-run  # render and report what would be sent, write nothing
 ```
 
-`notify` reads the admin settings and update targets, runs the check/suggest models, and delivers Pushover messages to every approved user who has configured a Pushover user key and API token in the web UI (My Account → Notifications). It needs no Tankerkönig API key — it only reads the database, so run `gasoline update` on a timer next to it. Per user it honors:
+`notify` reads the notification templates, runs the check/suggest models once per fuel over every fed station, and delivers Pushover messages to every approved user who has configured a Pushover user key and API token in the web UI (My Account → Notifications). It needs no Tankerkönig API key — it only reads the database, so run `gasoline update` on a timer next to it. Per user it honors:
 
 - the **notification schedule**: enabled weekdays and one or more time windows (default: every day, 07:00–21:00). Outside the schedule nothing is delivered.
-- the **city selection**: notifications cover only the update-target cities the user selected (multi-select in My Account → Notifications, stored in `user_notify_cities`). An empty selection means all configured cities, including ones added later. Deleting an update target also removes it from every user's selection.
-- the **fuel selection**: each user picks the single fuel they want to be notified about (My Account → Notifications, stored in `users.notify_fuel`). The dropdown lists only the fuels the admin currently enables, so a user always hears about one of the tracked fuels.
+- the **notification area**: a city and a radius around it (My Account → Notifications, stored as `users.notify_city` plus `notify_lat`/`notify_lng`/`notify_radius_km`). Notifications cover every tracked station within that distance, computed geometrically at run time, and the reported distance is measured from there — so `{{distance}}` means "how far from me". The area is the user's own: it has nothing to do with which cities the administrator collects, beyond the obvious fact that a station has to be collected before it can be notified about. Picking a city only resolves its coordinates; nothing consults the geocode cache afterwards. A user with no area set receives nothing, and `notify` says so on stderr rather than staying silent — unless they have both notification kinds off, which is how you pause everything. The buy-alert baseline is per user, fuel **and** area, so moving or resizing your area starts a fresh one instead of inheriting the old area's minimum for the rest of the day.
+- the **fuel selection**: each user picks the single fuel they want to be notified about (My Account → Notifications, stored in `users.notify_fuel`). All three are always computed, so every choice is served.
 - the **notification kinds**: two independent opt-ins (My Account → Notifications) select which of the two notification types the user receives — suggestions, buy-now alerts, both, or none. Suggestions are on by default (`users.notify_suggest_enabled`); buy-now alerts are opt-in (`users.notify_check_enabled`).
 - the **daily suggestion times** (default 08:00 and 13:00): when suggestions are enabled, each slot fires one suggestion notification per day; missed slots collapse into one on the next run instead of bursting.
-- the **buy-now alerts** opt-in: when enabled, check notifications fire only for buy recommendations with medium/high confidence that are strictly cheaper than the day's running baseline (reset daily at the admin-configured reset time), mirroring `gasoline-watch.sh`.
+- the **buy-now alerts** opt-in: when enabled, check notifications fire only for buy recommendations with medium/high confidence that are strictly cheaper than the day's running baseline (reset daily at local midnight), mirroring `gasoline-watch.sh`.
 
 The notification texts come from the admin-configured templates and support the full `gasoline-watch.sh` placeholder language — per-row placeholders such as `{{station_name}}`, `{{price}}`, `{{date}}`, `{{start_time}}`, all `*_formatted` variants (locale-aware decimal separator and weekday names), all `*_onchange` variants with window-aware time reprinting and line skipping, plus `{{count}}`, `{{cheapest_<field>}}`, and `{{message}}`. The only difference: the template renders directly into the Pushover message text instead of a shell command, so no quoting is involved. A literal `\n` (and `\t`) in a template is unescaped into a real line break (tab), so multi-line rows can be configured in the single-line settings fields; write `\\n` for a literal backslash-n. Message titles come from the admin-configured title templates (`check_title_template` / `suggest_title_template`), which support the same placeholder language rendered against the cheapest row; when no title template is set, the title falls back to each user's configured notification title.
 
@@ -288,11 +291,7 @@ Run continuous buy/suggestion notifications:
 
 ```bash
 ./gasoline-watch.sh \
-  --city "Berlin" \
-  --radius-km 10 \
   --fuel diesel \
-  --history-days 30 \
-  --predict-days 3 \
   --check-minutes 15 \
   --suggest-time 07:30 \
   --reset-time 00:00 \
@@ -300,7 +299,7 @@ Run continuous buy/suggestion notifications:
   --suggest-command 'notify --message {{message}}'
 ```
 
-The watcher runs `gasoline check` every `--check-minutes` and `gasoline suggest` once per local day after `--suggest-time`. It sends only medium/high-confidence rows: check notifications require `recommendation=buy`; suggestion notifications include all medium/high-confidence suggestions. Rows are sorted ascending by price (current price for check, predicted price for suggest) so the first row is the cheapest. Command templates can use `{{message}}` for the full multiline message, row placeholders such as `{{price}}`, `{{fuel}}`, `{{station_name}}`, `{{distance}}`, `{{confidence}}`, `{{date}}`, `{{start_time}}`, `{{end_time}}`, scalar placeholders `{{cheapest_<field>}}` (sourced from the cheapest row, e.g. `{{cheapest_price}}`, `{{cheapest_station_name}}`), or `{{count}}` for the number of rows. Scalar placeholders substitute once, which makes them useful for non-repeating notification titles.
+The watcher runs `gasoline check` every `--check-minutes` and `gasoline suggest` once per local day after `--suggest-time`. Both cover every station the update targets feed, so the watcher takes no city, radius or model parameters — `--fuel` only selects which fuel's rows it notifies about. Since those commands cover every fuel and exit non-zero when any of them lacks history, a non-zero exit does not stop the watcher: it notifies whenever its own fuel produced rows, and logs the reason only when that fuel is the one that failed. It sends only medium/high-confidence rows: check notifications require `recommendation=buy`; suggestion notifications include all medium/high-confidence suggestions. Rows are sorted ascending by price (current price for check, predicted price for suggest) so the first row is the cheapest. Command templates can use `{{message}}` for the full multiline message, row placeholders such as `{{price}}`, `{{fuel}}`, `{{station_name}}`, `{{distance}}`, `{{confidence}}`, `{{date}}`, `{{start_time}}`, `{{end_time}}`, scalar placeholders `{{cheapest_<field>}}` (sourced from the cheapest row, e.g. `{{cheapest_price}}`, `{{cheapest_station_name}}`), or `{{count}}` for the number of rows. Scalar placeholders substitute once, which makes them useful for non-repeating notification titles.
 
 Each price placeholder has a `*_formatted` variant (`current_price_formatted`, `predicted_price_formatted`, `predicted_current_price_formatted`, `best_future_price_formatted`, `price_formatted`) that truncates after the second decimal without rounding (e.g. `1.685` → `1.68`, `1.7` → `1.70`). The decimal separator follows the active locale (`LC_ALL` / `LC_NUMERIC` / `LANG`), so e.g. `LANG=de_DE.UTF-8` renders `1,68` instead of `1.68`. The `fuel_formatted` variant capitalizes the first letter (`diesel` → `Diesel`, `e5` → `E5`).
 
@@ -332,7 +331,7 @@ mkdir -p /var/lib/gasoline                    # writable state dir for the cron 
 crontab -e                                    # paste the line from examples/cron/gasoline-watch.cron
 ```
 
-Edit the city/radius/fuel and the `--check-command` / `--suggest-command` templates to taste, and confirm the paths to `gasoline`, `gasoline-watch`, and `/etc/gasoline/gasoline.env` match your install.
+Edit the fuel and the `--check-command` / `--suggest-command` templates to taste, and confirm the paths to `gasoline`, `gasoline-watch`, and `/etc/gasoline/gasoline.env` match your install.
 
 ### Continuous updates with a timer
 
@@ -365,12 +364,12 @@ The grouped commands above are the canonical interface shown by `gasoline help`.
 gasoline doctor                                     # default 14-day window, fuel diesel
 gasoline doctor --db-driver mysql --explain         # print the full plan per query
 gasoline doctor --analyze                           # real per-step timings (MySQL 8.0.18+)
-gasoline doctor --range 30d --city Berlin           # reproduce a specific page filter
+gasoline doctor --range 30d --fuel e5               # reproduce a specific page filter
 gasoline doctor --skip-queries                      # schema, sizes and indexes only
 gasoline doctor -o json | jq '.findings'            # machine-readable
 ```
 
-Its filter flags (`--fuel`, `--city`, `--confidence`, `--range`, or `--from`/`--to`) mirror the page's own controls, so you can reproduce exactly the filter that felt slow in the browser. Each query line ends in a verdict: `covering <index>` means the query was answered from an index alone, a bare index name means it used that index but still fetched table rows, and `TABLE SCAN` means it read the whole table. The `findings` section collects the actionable parts — a missing index, a query over `--slow-ms` (default 1000), a table scan.
+Its filter flags (`--fuel`, `--confidence`, `--range`, or `--from`/`--to`) mirror the page's own controls, so you can reproduce exactly the filter that felt slow in the browser. Each query line ends in a verdict: `covering <index>` means the query was answered from an index alone, a bare index name means it used that index but still fetched table rows, and `TABLE SCAN` means it read the whole table. The `findings` section collects the actionable parts — a missing index, a query over `--slow-ms` (default 1000), a table scan.
 
 When a query is slow but the index it needs exists, the usual cause is the optimizer passing that index over. `doctor` reports the index MySQL actually committed to (its `key`), not the ones it merely weighed, and warns when it chose a non-covering index while the covering one was among the candidates.
 
@@ -458,6 +457,7 @@ Pushing a tag that matches `v*` triggers the GitHub Actions release workflow. It
 
 - City geocoding is cached in the database, so Nominatim is only queried once per place unless the cached row is cleared or refreshed.
 - `update` stores only changed snapshots plus the adjacent unchanged snapshots needed to preserve price graphs.
-- A station inside two update targets' radii belongs to the nearest one, and `price_snapshots.city_name` records that owner. It is provenance only: `suggest`, `check`, `notify`, and the web viewer decide city membership geometrically (distance from the city centre), not from this column. `gasoline stations --city` is the one command that filters on it, so a shared station appears there only under its nearest city — stably, regardless of which cities a given `update` invocation covered.
+- A station inside two update targets' radii belongs to the nearest one, and `price_snapshots.city_name` records that owner. It is provenance: `gasoline stations --city` filters on it, and `suggest`/`check` use it to report a distance when nothing better is available. Notifications do not — a subscriber's distance is measured from their own location.
+- The `cities` table is a **geocode cache**, nothing more. `update` needs a city's coordinates for the Tankerkönig call and caches them there; the web UI reads it as an autocomplete source when a user or visitor picks a city, resolving the coordinates once at that moment. Neither the notification path nor the forecast reads it at run time. `gasoline import cities <CC>` fills it in bulk so the autocomplete covers a whole country.
 - Distance-only changes do not create a new snapshot, but open/closed changes do.
 - `import cities` downloads populated-place data from GeoNames and keeps only matching entries for the requested 2-letter country code.

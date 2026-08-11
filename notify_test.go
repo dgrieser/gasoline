@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -45,16 +46,30 @@ func TestParseWindowsAndDaysAndTimes(t *testing.T) {
 	}
 }
 
-func TestCitySelected(t *testing.T) {
-	set := map[string]bool{"Berlin": true}
-	if !citySelected(set, "Berlin") {
-		t.Fatal("selected city must match")
+func TestSubscriptionValidity(t *testing.T) {
+	located := notifyUser{NotifyLat: 52.5, NotifyLng: 13.4, NotifyRadiusKM: 10}
+	if !located.subscription().valid() {
+		t.Fatal("a user with a radius has a subscription")
 	}
-	if citySelected(set, "Hamburg") {
-		t.Fatal("unselected city must not match")
+	if (notifyUser{NotifyLat: 52.5, NotifyLng: 13.4}).subscription().valid() {
+		t.Fatal("a zero radius is not a subscription")
 	}
-	if !citySelected(nil, "anything") {
-		t.Fatal("nil set (empty selection) must match every city")
+	if (notifyUser{NotifyRadiusKM: -1}).subscription().valid() {
+		t.Fatal("a negative radius is not a subscription")
+	}
+}
+
+func TestDistinctSubscriptionsDeduplicatesAreas(t *testing.T) {
+	users := []notifyUser{
+		{NotifyLat: 52.5, NotifyLng: 13.4, NotifyRadiusKM: 10},
+		{NotifyLat: 52.5, NotifyLng: 13.4, NotifyRadiusKM: 10}, // same area
+		{NotifyLat: 52.5, NotifyLng: 13.4, NotifyRadiusKM: 25}, // same point, wider
+		{NotifyLat: 53.5, NotifyLng: 9.9, NotifyRadiusKM: 10},
+		{NotifyLat: 53.5, NotifyLng: 9.9}, // no radius: skipped
+	}
+	subs := distinctSubscriptions(users)
+	if len(subs) != 3 {
+		t.Fatalf("distinct subscriptions = %+v, want 3", subs)
 	}
 }
 
@@ -135,6 +150,20 @@ func mustParseHHMM(t *testing.T, s string) int {
 // weekday is Sunday (2026-04-26).
 var notifyFixtureNow = time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC)
 
+// notifyFixtureLat/Lng is where seedNotifyFixture puts both the city and its
+// station, so a default subscription around it covers that station exactly.
+const (
+	notifyFixtureLat = 52.517389
+	notifyFixtureLng = 13.395131
+)
+
+// notifyFixtureBaseline is the baseline key for a user on the default fixture
+// area. Built through the production helper because these assertions are about
+// whether a baseline advanced, not about how the key is spelled.
+func notifyFixtureBaseline(userID int64, fuel string) string {
+	return subscription{Lat: notifyFixtureLat, Lng: notifyFixtureLng, RadiusKM: 5}.baselineKey(userID, fuel)
+}
+
 // seedNotifyFixture builds a database where checkGas returns a buy
 // recommendation and suggestGas returns forecast rows with medium/high
 // confidence: four weeks of hourly history plus a fresh low snapshot. The
@@ -159,9 +188,6 @@ func seedNotifyFixture(t *testing.T, db *sql.DB) {
 	insertSuggestSnapshot(t, db, "station-1", "Berlin", notifyFixtureNow.Add(-10*time.Minute), 2.000, true)
 
 	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, `UPDATE settings SET value = '28' WHERE name = ?`, settingHistoryDays); err != nil {
-		t.Fatalf("update history_days: %v", err)
-	}
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, ?, ?)`,
 		"Berlin", 5.0, "2026-04-01T00:00:00Z"); err != nil {
@@ -212,8 +238,15 @@ type notifyUserFixture struct {
 	LastSuggest     string
 	Status          string
 	Method          string
-	Fuel            string   // notify_fuel; empty defaults to diesel
-	Cities          []string // notification city selection; empty = all cities
+	Fuel            string // notify_fuel; empty defaults to diesel
+	// The subscription area. The zero value is the Berlin fixture point with a
+	// 5 km radius, which covers seedNotifyFixture's station, so existing
+	// fixtures need no changes. NoLocation leaves it unset instead.
+	City       string
+	Lat        float64
+	Lng        float64
+	RadiusKM   float64
+	NoLocation bool
 }
 
 func seedNotifyUser(t *testing.T, db *sql.DB, u notifyUserFixture) {
@@ -227,31 +260,25 @@ func seedNotifyUser(t *testing.T, db *sql.DB, u notifyUserFixture) {
 	if u.Fuel == "" {
 		u.Fuel = "diesel"
 	}
+	if !u.NoLocation && u.RadiusKM == 0 {
+		u.City, u.Lat, u.Lng, u.RadiusKM = "Berlin", notifyFixtureLat, notifyFixtureLng, 5
+	}
 	ctx := context.Background()
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO users (
 			email, password_hash, is_admin, status, created_at, approved_at,
 			notify_method, pushover_app_name, pushover_user_key, pushover_token,
 			notify_days, notify_windows, notify_suggest_times, notify_check_enabled,
-			notify_suggest_enabled, notify_last_suggest, notify_fuel
-		) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			notify_suggest_enabled, notify_last_suggest, notify_fuel,
+			notify_city, notify_lat, notify_lng, notify_radius_km
+		) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.Email, "x", u.Status, "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z",
 		u.Method, "gasoline", u.UserKey, u.Token,
 		u.Days, u.Windows, u.SuggestTimes, boolToInt(u.CheckEnabled),
-		boolToInt(!u.SuggestDisabled), u.LastSuggest, u.Fuel)
+		boolToInt(!u.SuggestDisabled), u.LastSuggest, u.Fuel,
+		u.City, u.Lat, u.Lng, u.RadiusKM)
 	if err != nil {
 		t.Fatalf("insert user %s: %v", u.Email, err)
-	}
-	var userID int64
-	if err := db.QueryRowContext(ctx, `SELECT id FROM users WHERE email = ?`, u.Email).Scan(&userID); err != nil {
-		t.Fatalf("read user id %s: %v", u.Email, err)
-	}
-	for _, city := range u.Cities {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (?, ?, ?)`,
-			userID, city, "2026-04-01T00:00:00Z"); err != nil {
-			t.Fatalf("insert city selection %s/%s: %v", u.Email, city, err)
-		}
 	}
 }
 
@@ -436,22 +463,27 @@ func TestNotifyOnceRespectsPerKindToggles(t *testing.T) {
 	}
 }
 
-func TestNotifyOnceFiltersByUserCitySelection(t *testing.T) {
+func TestNotifyOnceFiltersByUserSubscriptionArea(t *testing.T) {
 	withDecimalSeparator(t, ".")
 	db := openTestDB(t)
 	seedNotifyFixture(t, db)
 	seedNotifySecondCity(t, db)
+	// Berlin and Hamburg are ~255 km apart, so a tight radius around either one
+	// sees only its own station, and a wide one sees both.
 	seedNotifyUser(t, db, notifyUserFixture{
 		Email: "berlin@example.com", UserKey: "user-berlin", Token: "token-b",
-		SuggestTimes: "08:00,13:00", CheckEnabled: true, Cities: []string{"Berlin"},
+		SuggestTimes: "08:00,13:00", CheckEnabled: true,
+		City: "Berlin", Lat: notifyFixtureLat, Lng: notifyFixtureLng, RadiusKM: 10,
 	})
 	seedNotifyUser(t, db, notifyUserFixture{
 		Email: "hamburg@example.com", UserKey: "user-hamburg", Token: "token-h",
-		SuggestTimes: "08:00,13:00", CheckEnabled: true, Cities: []string{"Hamburg"},
+		SuggestTimes: "08:00,13:00", CheckEnabled: true,
+		City: "Hamburg", Lat: 53.550556, Lng: 9.993333, RadiusKM: 10,
 	})
 	seedNotifyUser(t, db, notifyUserFixture{
 		Email: "all@example.com", UserKey: "user-all", Token: "token-a",
-		SuggestTimes: "08:00,13:00", CheckEnabled: true, // no selection rows = all cities
+		SuggestTimes: "08:00,13:00", CheckEnabled: true,
+		City: "Berlin", Lat: notifyFixtureLat, Lng: notifyFixtureLng, RadiusKM: 400,
 	})
 
 	pushes := stubPushover(t, nil)
@@ -460,76 +492,170 @@ func TestNotifyOnceFiltersByUserCitySelection(t *testing.T) {
 		t.Fatalf("failed sends: %+v", result.Failed)
 	}
 
-	messages := map[string][]string{}
+	// Check and suggest messages are told apart by the default templates: a
+	// check row starts with "Buy", a suggestion with its date.
+	kinds := map[string]map[string]string{}
 	for _, push := range *pushes {
-		messages[push.User] = append(messages[push.User], push.Message)
+		kind := "suggest"
+		if strings.HasPrefix(push.Message, "Buy ") {
+			kind = "check"
+		}
+		if kinds[push.User] == nil {
+			kinds[push.User] = map[string]string{}
+		}
+		kinds[push.User][kind] = push.Message
 	}
-	assertOnlyCity := func(user, wantStation, filteredStation string) {
+	assertOnlyStation := func(user, wantStation, filteredStation string) {
 		t.Helper()
-		if len(messages[user]) != 2 {
-			t.Fatalf("%s got %d messages, want check+suggest: %v", user, len(messages[user]), messages[user])
+		if len(kinds[user]) != 2 {
+			t.Fatalf("%s got %v, want a check and a suggest", user, kinds[user])
 		}
-		for _, msg := range messages[user] {
+		for kind, msg := range kinds[user] {
 			if !strings.Contains(msg, wantStation) {
-				t.Fatalf("%s message %q misses %s", user, msg, wantStation)
+				t.Fatalf("%s %s message %q misses %s", user, kind, msg, wantStation)
 			}
-			if filteredStation != "" && strings.Contains(msg, filteredStation) {
-				t.Fatalf("%s message %q contains filtered-out %s", user, msg, filteredStation)
+			if strings.Contains(msg, filteredStation) {
+				t.Fatalf("%s %s message %q contains out-of-range %s", user, kind, msg, filteredStation)
 			}
 		}
 	}
-	assertOnlyCity("user-berlin", "Station 1", "Station 2")
-	assertOnlyCity("user-hamburg", "Station 2", "Station 1")
-	assertOnlyCity("user-all", "Station 1", "")
-	for _, msg := range messages["user-all"] {
-		if !strings.Contains(msg, "Station 2") {
-			t.Fatalf("all-cities message %q misses Station 2", msg)
+	// A tight radius sees only its own city's station.
+	assertOnlyStation("user-berlin", "Station 1", "Station 2")
+	assertOnlyStation("user-hamburg", "Station 2", "Station 1")
+
+	// The wide radius reaches both, and the check lists them cheapest-first —
+	// Hamburg's 1.900 beats Berlin's 2.000 even though it is 255 km away.
+	wideCheck := kinds["user-all"]["check"]
+	if !strings.Contains(wideCheck, "Station 1") || !strings.Contains(wideCheck, "Station 2") {
+		t.Fatalf("wide-radius check %q must cover both stations", wideCheck)
+	}
+	if strings.Index(wideCheck, "Station 2") > strings.Index(wideCheck, "Station 1") {
+		t.Fatalf("wide-radius check %q must list the cheaper station first", wideCheck)
+	}
+	// Its suggestion picks the nearer station: both forecast the same price, so
+	// distance from the subscriber breaks the tie.
+	wideSuggest := kinds["user-all"]["suggest"]
+	if !strings.Contains(wideSuggest, "Station 1") {
+		t.Fatalf("wide-radius suggestion %q should prefer the nearby station", wideSuggest)
+	}
+}
+
+func TestNotifyOnceStartsANewBaselineWhenTheAreaChanges(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "mover@example.com", UserKey: "user-mover", Token: "token-m",
+		CheckEnabled: true, SuggestDisabled: true,
+	})
+	ctx := context.Background()
+
+	stubPushover(t, nil)
+	if result := runNotifyOnce(t, db, false); len(result.Sent) != 1 {
+		t.Fatalf("first run sent = %+v, want one check", result.Sent)
+	}
+	// The same price cannot alert again in the same area today.
+	if result := runNotifyOnce(t, db, false); len(result.Sent) != 0 {
+		t.Fatalf("repeat run sent = %+v, want nothing at an unchanged price", result.Sent)
+	}
+
+	// The user widens their area. That is a different question — "cheapest
+	// around here" now covers different ground — so the old area's minimum must
+	// not go on suppressing alerts until midnight.
+	if _, err := db.ExecContext(ctx, `UPDATE users SET notify_radius_km = 25 WHERE email = 'mover@example.com'`); err != nil {
+		t.Fatalf("widen area: %v", err)
+	}
+	result := runNotifyOnce(t, db, false)
+	if result.BaselineReset {
+		t.Fatal("the day's reset must not be what let this through")
+	}
+	if len(result.Sent) != 1 || result.Sent[0].Kind != "check" {
+		t.Fatalf("after the area change sent = %+v, want a check for the new area", result.Sent)
+	}
+}
+
+func TestNotifyOnceDoesNotWarnAboutPausedUsersWithoutAnArea(t *testing.T) {
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	// Both kinds off is how a user pauses notifications. They have no area and
+	// do not need one, so every run must not nag about it.
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "paused@example.com", UserKey: "user-paused", Token: "token-p",
+		SuggestDisabled: true, NoLocation: true,
+	})
+
+	stubPushover(t, nil)
+	stderr := captureStderr(t, func() {
+		runNotifyOnce(t, db, false)
+	})
+	if strings.Contains(stderr, "paused@example.com") {
+		t.Fatalf("a paused user was warned about: %q", stderr)
+	}
+
+	// A user who does want notifications is still told.
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "wants@example.com", UserKey: "user-wants", Token: "token-w",
+		CheckEnabled: true, SuggestDisabled: true, NoLocation: true,
+	})
+	stderr = captureStderr(t, func() {
+		runNotifyOnce(t, db, false)
+	})
+	if !strings.Contains(stderr, "wants@example.com") {
+		t.Fatalf("a user expecting notifications was not warned: %q", stderr)
+	}
+}
+
+func TestNotifyOnceSkipsUsersWithoutASubscription(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "located@example.com", UserKey: "user-located", Token: "token-l",
+		SuggestTimes: "13:00", CheckEnabled: true,
+	})
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "nowhere@example.com", UserKey: "user-nowhere", Token: "token-n",
+		SuggestTimes: "13:00", CheckEnabled: true, NoLocation: true,
+	})
+
+	pushes := stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+
+	// A subscription is an area; without one there is nothing to send, and the
+	// user with one is unaffected.
+	if len(result.Sent) != 2 {
+		t.Fatalf("sent = %+v, want the located user's check and suggest", result.Sent)
+	}
+	for _, push := range *pushes {
+		if push.User == "user-nowhere" {
+			t.Fatalf("user without a location was notified: %+v", push)
 		}
 	}
 }
 
-func TestUserNotifyCitiesForeignKeys(t *testing.T) {
+func TestNotifyOnceMeasuresDistanceFromTheSubscriber(t *testing.T) {
+	withDecimalSeparator(t, ".")
 	db := openTestDB(t)
 	seedNotifyFixture(t, db)
-	seedNotifySecondCity(t, db)
+	// About 8 km west of the station, well inside the radius.
 	seedNotifyUser(t, db, notifyUserFixture{
-		Email: "a@example.com", UserKey: "user-a", Token: "token-a",
-		Cities: []string{"Berlin", "Hamburg"},
+		Email: "west@example.com", UserKey: "user-west", Token: "token-w",
+		CheckEnabled: true, SuggestDisabled: true,
+		City: "Berlin", Lat: notifyFixtureLat, Lng: notifyFixtureLng - 0.118, RadiusKM: 25,
 	})
-	ctx := context.Background()
 
-	// A city that is not a configured update target is rejected.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO user_notify_cities (user_id, city, created_at) VALUES (1, 'Ghosttown', '2026-04-01T00:00:00Z')`); err == nil {
-		t.Fatal("selection for an unknown city must violate the foreign key")
+	pushes := stubPushover(t, nil)
+	if result := runNotifyOnce(t, db, false); len(result.Sent) != 1 {
+		t.Fatalf("sent = %+v, want one check", result.Sent)
 	}
-
-	countSelections := func() int {
-		t.Helper()
-		var n int
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_notify_cities`).Scan(&n); err != nil {
-			t.Fatalf("count selections: %v", err)
-		}
-		return n
+	// The default template renders {{distance}}; it has to be the distance from
+	// the subscriber, not from any city centre.
+	msg := (*pushes)[0].Message
+	if strings.Contains(msg, "(0.0 km)") {
+		t.Fatalf("distance is not measured from the subscriber: %q", msg)
 	}
-	if countSelections() != 2 {
-		t.Fatalf("selections = %d, want 2", countSelections())
-	}
-
-	// Deleting an update target cascades away the matching selections.
-	if _, err := db.ExecContext(ctx, `DELETE FROM update_targets WHERE city = 'Hamburg'`); err != nil {
-		t.Fatalf("delete target: %v", err)
-	}
-	if countSelections() != 1 {
-		t.Fatalf("selections after target delete = %d, want 1", countSelections())
-	}
-
-	// Deleting the user cascades away the rest.
-	if _, err := db.ExecContext(ctx, `DELETE FROM users WHERE email = 'a@example.com'`); err != nil {
-		t.Fatalf("delete user: %v", err)
-	}
-	if countSelections() != 0 {
-		t.Fatalf("selections after user delete = %d, want 0", countSelections())
+	if !strings.Contains(msg, "(8.0 km)") {
+		t.Fatalf("message = %q, want the ~8 km distance from the subscriber", msg)
 	}
 }
 
@@ -820,7 +946,7 @@ func TestNotifyOnceDryRunSendsNothingAndWritesNoState(t *testing.T) {
 func TestNotifyOnceNoTargetsOrUsersIsNoop(t *testing.T) {
 	db := openTestDB(t)
 	result := runNotifyOnce(t, db, false)
-	if result.Targets != 0 || result.Users != 0 || len(result.Sent) != 0 {
+	if result.Stations != 0 || result.Users != 0 || len(result.Sent) != 0 {
 		t.Fatalf("result = %+v, want noop", result)
 	}
 }
@@ -848,17 +974,13 @@ func TestNotifyOnceBaselineResetCatchesUpAfterDowntime(t *testing.T) {
 		SuggestTimes: "08:00", CheckEnabled: true,
 		LastSuggest: "2026-04-26T08:00",
 	})
-	// Reset time is late in the evening; now (15:30) is before it, so the
-	// target reset boundary is yesterday. A marker from three days ago means
-	// the process was down over yesterday's boundary: it must catch up.
-	if _, err := db.ExecContext(context.Background(),
-		`UPDATE settings SET value = '23:00' WHERE name = ?`, settingCheckResetTime); err != nil {
-		t.Fatalf("update setting: %v", err)
-	}
+	// A marker from three days ago means the process was down over the last
+	// midnight boundary: the reset must catch up rather than keep a stale
+	// baseline.
 	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline_reset_date", "2026-04-23"); err != nil {
 		t.Fatalf("set state: %v", err)
 	}
-	if err := setNotificationState(context.Background(), db, dialectSQLite, "check_baseline:1:diesel:Berlin", "1.000"); err != nil {
+	if err := setNotificationState(context.Background(), db, dialectSQLite, notifyFixtureBaseline(1, "diesel"), "1.000"); err != nil {
 		t.Fatalf("set stale baseline: %v", err)
 	}
 
@@ -871,9 +993,11 @@ func TestNotifyOnceBaselineResetCatchesUpAfterDowntime(t *testing.T) {
 	if len(result.Sent) != 1 || result.Sent[0].Kind != "check" {
 		t.Fatalf("sent = %+v, want one check after catch-up reset", result.Sent)
 	}
+	// The reset is at local midnight, which today's fixture time (15:30) is
+	// already past, so catching up lands on today.
 	value, found, err := getNotificationState(context.Background(), db, "check_baseline_reset_date")
-	if err != nil || !found || value != "2026-04-25" {
-		t.Fatalf("reset marker = %q found=%v err=%v, want yesterday 2026-04-25", value, found, err)
+	if err != nil || !found || value != "2026-04-26" {
+		t.Fatalf("reset marker = %q found=%v err=%v, want today 2026-04-26", value, found, err)
 	}
 }
 
@@ -893,7 +1017,7 @@ func TestNotifyOnceCheckBaselineNotAdvancedWhenAllSendsFail(t *testing.T) {
 	if len(first.Failed) != 1 || len(first.Sent) != 0 {
 		t.Fatalf("first run = sent %+v failed %+v, want one failure", first.Sent, first.Failed)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel:Berlin"); found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(1, "diesel")); found {
 		t.Fatal("baseline must not advance when every send failed")
 	}
 
@@ -908,7 +1032,7 @@ func TestNotifyOnceCheckBaselineNotAdvancedWhenAllSendsFail(t *testing.T) {
 	if len(second.Sent) != 1 || second.Sent[0].Kind != "check" {
 		t.Fatalf("second run sent = %+v, want retried check", second.Sent)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel:Berlin"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(1, "diesel")); !found {
 		t.Fatal("baseline must advance after a successful delivery")
 	}
 }
@@ -967,10 +1091,10 @@ func TestNotifyOnceCheckBaselinesArePerUser(t *testing.T) {
 	if len(first.Failed) != 1 || first.Failed[0].Email != "b@example.com" {
 		t.Fatalf("first run failed = %+v, want b@example.com", first.Failed)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel:Berlin"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(1, "diesel")); !found {
 		t.Fatal("user A's baseline must advance after their delivery")
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:diesel:Berlin"); found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(2, "diesel")); found {
 		t.Fatal("user B's baseline must not advance while their sends fail")
 	}
 
@@ -987,7 +1111,7 @@ func TestNotifyOnceCheckBaselinesArePerUser(t *testing.T) {
 	if len(second.Failed) != 0 {
 		t.Fatalf("second run failed = %+v, want none", second.Failed)
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:diesel:Berlin"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(2, "diesel")); !found {
 		t.Fatal("user B's baseline must advance after their successful retry")
 	}
 }
@@ -996,12 +1120,7 @@ func TestNotifyOncePerUserFuel(t *testing.T) {
 	withDecimalSeparator(t, ".")
 	db := openTestDB(t)
 	seedNotifyFixture(t, db)
-	// Admin enables two fuels; a user's single choice selects which one they
-	// hear about, and a user who chose a disabled fuel hears nothing.
-	if _, err := db.ExecContext(context.Background(),
-		`UPDATE settings SET value = 'diesel,e5' WHERE name = ?`, settingFuel); err != nil {
-		t.Fatalf("update fuel setting: %v", err)
-	}
+	// Every fuel is computed, so each user's single choice is always served.
 	seedNotifyUser(t, db, notifyUserFixture{
 		Email: "diesel@example.com", UserKey: "user-diesel", Token: "token-d",
 		SuggestTimes: "13:00", CheckEnabled: true, Fuel: "diesel",
@@ -1021,14 +1140,11 @@ func TestNotifyOncePerUserFuel(t *testing.T) {
 		t.Fatalf("failed sends: %+v", result.Failed)
 	}
 
-	// Each enabled-fuel user receives a check and a suggest; the e10 user is
-	// silent because the admin does not compute e10.
-	fuelByUser := map[string]string{"user-diesel": "diesel", "user-e5": "e5"}
+	// Every fuel is computed, so each user hears about exactly the one they
+	// chose — including e10, which no admin setting can switch off any more.
+	fuelByUser := map[string]string{"user-diesel": "diesel", "user-e5": "e5", "user-e10": "e10"}
 	seen := map[string]int{}
 	for _, push := range *pushes {
-		if push.User == "user-e10" {
-			t.Fatalf("user who chose a disabled fuel must not be notified: %+v", push)
-		}
 		wantFuel, ok := fuelByUser[push.User]
 		if !ok {
 			t.Fatalf("unexpected recipient: %+v", push)
@@ -1041,16 +1157,66 @@ func TestNotifyOncePerUserFuel(t *testing.T) {
 		}
 		seen[push.User]++
 	}
-	if seen["user-diesel"] != 2 || seen["user-e5"] != 2 {
-		t.Fatalf("push counts = %v, want 2 each for diesel and e5 users", seen)
+	if seen["user-diesel"] != 2 || seen["user-e5"] != 2 || seen["user-e10"] != 2 {
+		t.Fatalf("push counts = %v, want 2 each for all three fuel users", seen)
 	}
 
 	// Baselines are fuel-scoped, so the two users at the same city do not
 	// collide.
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:1:diesel:Berlin"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(1, "diesel")); !found {
 		t.Fatal("diesel user's diesel baseline must advance")
 	}
-	if _, found, _ := getNotificationState(context.Background(), db, "check_baseline:2:e5:Berlin"); !found {
+	if _, found, _ := getNotificationState(context.Background(), db, notifyFixtureBaseline(2, "e5")); !found {
 		t.Fatal("e5 user's e5 baseline must advance")
 	}
+}
+
+func TestNotifyOnceSkipsTargetsWithoutACachedCity(t *testing.T) {
+	withDecimalSeparator(t, ".")
+	db := openTestDB(t)
+	seedNotifyFixture(t, db)
+	seedNotifyUser(t, db, notifyUserFixture{
+		Email: "one@example.com", UserKey: "user-one", Token: "token-one",
+		SuggestTimes: "13:00", CheckEnabled: true,
+	})
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, ?, ?)`,
+		"Nowhere", 5.0, "2026-04-02T00:00:00Z"); err != nil {
+		t.Fatalf("insert target: %v", err)
+	}
+
+	stubPushover(t, nil)
+	result := runNotifyOnce(t, db, false)
+	// The uncached target is skipped with a warning; the good one is unaffected.
+	if len(result.Sent) != 2 {
+		t.Fatalf("sent = %+v, want the cached target still delivered", result.Sent)
+	}
+}
+
+// captureStderr collects what a function writes to the process's stderr, which
+// is where notify reports users it had to skip.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	original := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+	fn()
+	os.Stderr = original
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	out := <-done
+	if err := r.Close(); err != nil {
+		t.Fatalf("close reader: %v", err)
+	}
+	return out
 }

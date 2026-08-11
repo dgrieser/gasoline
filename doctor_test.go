@@ -639,15 +639,13 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 	if !strings.Contains(mediumHigh[0].sql, "pp.confidence IN ('medium', 'high')") {
 		t.Error("doctor ignores --confidence medium_high")
 	}
-	withCity := pageSpecs(doctorFilters{Fuel: "diesel", Confidence: "all", City: "Berlin"}, false)
-	if !strings.Contains(withCity[0].sql, "JOIN prediction_runs pr ON pr.id = pp.run_id") ||
-		!strings.Contains(withCity[0].sql, "pr.city_name = ?") {
-		t.Errorf("doctor ignores --city:\n%s", withCity[0].sql)
+	// A run covers every station currently being fed, so there is no city
+	// filter left to apply on either side.
+	if strings.Contains(php, "pr.city_name") {
+		t.Error("web/index.php still filters the accuracy page by city")
 	}
-	// The city filter adds a bound parameter; a mismatch here would make every
-	// query fail at execution time.
-	if len(withCity[0].args) != 4 {
-		t.Fatalf("city-filtered query has %d args, want 4", len(withCity[0].args))
+	if strings.Contains(mediumHigh[0].sql, "pr.city_name") {
+		t.Errorf("doctor still filters by city:\n%s", mediumHigh[0].sql)
 	}
 }
 
@@ -677,11 +675,6 @@ func legacyAccuracySQL(f doctorFilters) map[string]accuracyQuerySpec {
 	joinRuns := ""
 	where := "pp.actual_price IS NOT NULL AND pp.fuel = ? AND pp.target_start >= ? AND pp.target_start <= ?"
 	args := []any{f.Fuel, f.From, f.To}
-	if f.City != "" {
-		joinRuns = "JOIN prediction_runs pr ON pr.id = pp.run_id "
-		where += " AND pr.city_name = ?"
-		args = append(args, f.City)
-	}
 	if f.Confidence == "medium_high" {
 		where += " AND pp.confidence IN ('medium', 'high')"
 	}
@@ -843,8 +836,8 @@ func TestAccuracyQueryRewritesPreserveResults(t *testing.T) {
 		{Fuel: "diesel", Confidence: "all", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
 		{Fuel: "e5", Confidence: "all", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
 		{Fuel: "diesel", Confidence: "medium_high", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
-		{Fuel: "diesel", Confidence: "all", City: "Berlin", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
-		{Fuel: "diesel", Confidence: "medium_high", City: "Hamburg", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		{Fuel: "diesel", Confidence: "all", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		{Fuel: "diesel", Confidence: "medium_high", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
 		// A window that selects a subset, so the range bound is exercised too.
 		{Fuel: "diesel", Confidence: "all", From: "2026-07-10T00:00:00Z", To: "2026-07-10T08:59:59Z"},
 		// A window that selects nothing at all.
@@ -852,7 +845,7 @@ func TestAccuracyQueryRewritesPreserveResults(t *testing.T) {
 	}
 
 	for _, filters := range filterCases {
-		label := filters.Fuel + "/" + filters.Confidence + "/" + filters.City + "/" + filters.From
+		label := filters.Fuel + "/" + filters.Confidence + "/" + filters.From
 		t.Run(label, func(t *testing.T) {
 			legacy := legacyAccuracySQL(filters)
 			current := map[string]accuracyQuerySpec{}
@@ -1042,11 +1035,11 @@ func TestHintedQueriesReturnIdenticalResults(t *testing.T) {
 
 	filterCases := []doctorFilters{
 		{Fuel: "diesel", Confidence: "all", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
-		{Fuel: "diesel", Confidence: "medium_high", City: "Berlin", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
+		{Fuel: "diesel", Confidence: "medium_high", From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"},
 		{Fuel: "e5", Confidence: "all", From: "2026-07-10T00:00:00Z", To: "2026-07-10T08:59:59Z"},
 	}
 	for _, filters := range filterCases {
-		t.Run(filters.Fuel+"/"+filters.Confidence+"/"+filters.City, func(t *testing.T) {
+		t.Run(filters.Fuel+"/"+filters.Confidence, func(t *testing.T) {
 			plain := map[string]accuracyQuerySpec{}
 			for _, spec := range unhintedSpecs(filters, true) {
 				plain[spec.name] = spec

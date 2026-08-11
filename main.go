@@ -221,35 +221,51 @@ type suggestionStationRow struct {
 	FirstSeenAt string  `json:"first_seen_at"`
 	LastSeenAt  string  `json:"last_seen_at"`
 	Address     string  `json:"address"`
-	DistanceKM  float64 `json:"distance_km"`
+	// City is the update target that owns this station: the nearest fed city
+	// centre, resolved at collection time. DistanceKM is measured to that
+	// centre.
+	City       string  `json:"city"`
+	DistanceKM float64 `json:"distance_km"`
 }
 
 type suggestOptions struct {
-	City        string
-	RangeKM     float64
 	Fuel        string
 	HistoryDays int
 	PredictDays int
 	LimitPerDay int
 	Now         time.Time
 	Location    *time.Location
-	// Thresholds is carried for the check decisions logged alongside a
-	// persisted run, so they use the same margin rule the check path would.
-	Thresholds verdictThresholds
+}
+
+// normalized fills in the zero clock fields so every entry point into a
+// computation shares one notion of "now".
+func (o suggestOptions) normalized() suggestOptions {
+	if o.Now.IsZero() {
+		o.Now = time.Now().UTC()
+	}
+	if o.Location == nil {
+		o.Location = time.Local
+	}
+	return o
 }
 
 type checkOptions struct {
-	City        string
-	RangeKM     float64
 	Fuel        string
 	HistoryDays int
 	PredictDays int
 	Limit       int
 	Now         time.Time
 	Location    *time.Location
-	// Thresholds selects the price margin rule. The zero value is the
-	// historical flat margin, so callers that do not set it are unaffected.
-	Thresholds verdictThresholds
+}
+
+func (o checkOptions) normalized() checkOptions {
+	if o.Now.IsZero() {
+		o.Now = time.Now().UTC()
+	}
+	if o.Location == nil {
+		o.Location = time.Local
+	}
+	return o
 }
 
 type suggestSnapshot struct {
@@ -567,8 +583,8 @@ Commands:
   list cities   list cached city geocodes
   list stations list known stations with latest stored snapshot
   list history  show historical prices
-  suggest       predict cheap fueling windows by day and time
-  check         check if latest stored prices are currently low
+  suggest       predict cheap fueling windows by day and time, for every fuel
+  check         check if latest stored prices are currently low, for every fuel
   notify        send Pushover notifications to configured web users
   rename        set a persistent display-name override for a station
   merge-stations merge duplicate station identities into one canonical station
@@ -597,8 +613,9 @@ Examples:
   gasoline list cities
   gasoline list stations --city "Berlin, Germany"
   gasoline list history --fuel diesel
-  gasoline suggest --city "Berlin" --range-km 10 --fuel diesel
-  gasoline check --city "Berlin" --range-km 10 --fuel diesel
+  gasoline suggest
+  gasoline suggest --persist --quiet
+  gasoline check
   gasoline notify --dry-run
   gasoline rename <station-id> "Custom Name"
   gasoline rename --clear <station-id>
@@ -1044,7 +1061,11 @@ func persistSweep(ctx context.Context, db *sql.DB, d dialect, fetches []cityFetc
 		return err
 	}
 
-	centres := newCityCentres()
+	coverage, err := loadCityCoverage(ctx, tx, fetches)
+	if err != nil {
+		return err
+	}
+	centres := newCityCentres(coverage)
 	written := make(map[string]bool)
 	for _, obs := range observations {
 		recordedAt := obs.RecordedAt.Format(time.RFC3339)
@@ -1625,12 +1646,6 @@ func runHistory(args []string) error {
 func runSuggest(args []string) error {
 	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
 	dbf := addDBFlags(fs)
-	city := fs.String("city", "", "Cached city to use as the range center")
-	rangeKM := fs.Float64("range-km", 5, "Maximum station distance from the city center in km")
-	fuel := fs.String("fuel", "diesel", "Fuel type: diesel, e5, e10")
-	historyDays := fs.Int("history-days", 30, "Historical days to use for prediction")
-	predictDays := fs.Int("predict-days", 3, "Calendar days to suggest, including today when future hours remain")
-	limitPerDay := fs.Int("limit-per-day", 3, "Maximum suggestions per day")
 	persist := fs.Bool("persist", false, "Store the full prediction grid in the database, evaluate past predictions against actual prices, and learn from the errors")
 	var quiet bool
 	fs.BoolVar(&quiet, "quiet", false, "Suppress the suggestion output; requires --persist (store only)")
@@ -1652,12 +1667,9 @@ func runSuggest(args []string) error {
 	}
 
 	opts := suggestOptions{
-		City:        strings.TrimSpace(*city),
-		RangeKM:     *rangeKM,
-		Fuel:        strings.TrimSpace(*fuel),
-		HistoryDays: *historyDays,
-		PredictDays: *predictDays,
-		LimitPerDay: *limitPerDay,
+		HistoryDays: modelHistoryDays,
+		PredictDays: forecastPredictDays,
+		LimitPerDay: suggestLimitPerDay,
 		Now:         time.Now().UTC(),
 		Location:    time.Local,
 	}
@@ -1673,67 +1685,59 @@ func runSuggest(args []string) error {
 		return err
 	}
 
-	if err := applySuggestSettings(ctx, db, fs, &opts); err != nil {
-		return err
-	}
-	cities, err := resolveCities(ctx, db, fs, opts.City)
+	// One pass over the history serves every fuel.
+	scan, err := loadSnapshotScan(ctx, db, opts.Now.AddDate(0, 0, -opts.HistoryDays), opts.Now)
 	if err != nil {
 		return err
 	}
-	// The non-city options are identical across cities, so validating the
-	// first is validating them all.
-	opts.City = cities[0]
-	if err := validateSuggestOptions(opts); err != nil {
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
 		return err
 	}
 
-	// Evaluate before computing so freshly measured errors feed this run's
-	// bias correction. Evaluation is fuel-scoped, not city-scoped, so one
-	// pass covers every city.
-	var evaluated, outcomes int
-	if *persist {
-		evaluated, err = evaluateDuePredictions(ctx, db, opts.Fuel, opts.Now)
-		if err != nil {
-			return err
-		}
-		// Settle check decisions whose pricing day has finished, so a
-		// decision logged today is scored against that day's floor on a
-		// later run.
-		outcomes, err = evaluateCheckOutcomes(ctx, db, opts.Fuel, opts.Now, opts.Location)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Multiple cities: best-effort like `update` — compute and persist each
-	// city independently, report failures at the end.
-	results := make([]citySuggestResult, 0, len(cities))
+	// Best-effort across fuels like `update` is across cities: compute and
+	// persist each fuel independently, report failures at the end.
+	results := make([]fuelSuggestResult, 0, len(suggestFuels))
 	failures := 0
 	var totals persistCounts
-	for _, cityName := range cities {
-		cityOpts := opts
-		cityOpts.City = cityName
-		suggestions, counts, err := suggestOneCity(ctx, db, cityOpts, *persist)
-		if err != nil {
-			if len(cities) == 1 {
+	var evaluated, outcomes int
+	for _, fuel := range suggestFuels {
+		fuelOpts := opts
+		fuelOpts.Fuel = fuel
+		// Evaluate before computing so freshly measured errors feed this
+		// fuel's bias correction. Evaluation is fuel-scoped, so it belongs
+		// inside the loop.
+		if *persist {
+			n, err := evaluateDuePredictions(ctx, db, fuel, opts.Now)
+			if err != nil {
 				return err
 			}
+			evaluated += n
+			// Settle check decisions whose pricing day has finished, so a
+			// decision logged today is scored against that day's floor on a
+			// later run.
+			m, err := evaluateCheckOutcomes(ctx, db, fuel, opts.Now, opts.Location)
+			if err != nil {
+				return err
+			}
+			outcomes += m
+		}
+		suggestions, counts, err := suggestOneFuel(ctx, db, scan, fuelOpts, *persist)
+		if err != nil {
 			failures++
 			if quiet {
-				// Quiet suppresses the per-city sections, so this is the
-				// only place the failure detail can surface.
-				fmt.Fprintf(os.Stderr, "suggest %s: %v\n", cityName, err)
+				// Quiet suppresses the per-fuel sections, so this is the only
+				// place the failure detail can surface.
+				fmt.Fprintf(os.Stderr, "suggest %s: %v\n", fuel, err)
 			}
-			results = append(results, citySuggestResult{City: cityName, Error: err.Error()})
+			results = append(results, fuelSuggestResult{Fuel: fuel, Error: err.Error()})
 			continue
 		}
 		totals = totals.add(counts)
-		if len(cities) > 1 && suggestions == nil {
-			// Multi-city JSON: a success always carries an array; only
-			// failed cities have null suggestions.
+		if suggestions == nil {
+			// A success always carries an array; only failed fuels are null.
 			suggestions = []suggestionRow{}
 		}
-		results = append(results, citySuggestResult{City: cityName, Suggestions: suggestions})
+		results = append(results, fuelSuggestResult{Fuel: fuel, Suggestions: suggestions})
 	}
 
 	if *persist {
@@ -1753,28 +1757,22 @@ func runSuggest(args []string) error {
 	}
 
 	if !quiet {
-		if len(cities) == 1 {
-			// Single city: preserve the original output shape.
-			if output == outputJSON {
-				if err := writeJSON(results[0].Suggestions); err != nil {
-					return err
-				}
-			} else {
-				printSuggestionsText(results[0].Suggestions)
-			}
-		} else if output == outputJSON {
+		if output == outputJSON {
 			if err := writeJSON(results); err != nil {
 				return err
 			}
 		} else {
-			printCityResults(results, func(res citySuggestResult) {
+			printFuelResults(results, func(res fuelSuggestResult) {
 				printSuggestionsText(res.Suggestions)
 			})
 		}
 	}
 
+	if failures == len(suggestFuels) {
+		return fmt.Errorf("all %d fuels failed", failures)
+	}
 	if failures > 0 {
-		return fmt.Errorf("%d of %d cities failed", failures, len(cities))
+		return fmt.Errorf("%d of %d fuels failed", failures, len(suggestFuels))
 	}
 	return nil
 }
@@ -1782,12 +1780,6 @@ func runSuggest(args []string) error {
 func runCheck(args []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	dbf := addDBFlags(fs)
-	city := fs.String("city", "", "Cached city to use as the range center")
-	rangeKM := fs.Float64("range-km", 5, "Maximum station distance from the city center in km")
-	fuel := fs.String("fuel", "diesel", "Fuel type: diesel, e5, e10")
-	historyDays := fs.Int("history-days", 30, "Historical days to use for prediction")
-	predictDays := fs.Int("predict-days", 3, "Calendar days to check for lower future prices, including today when future hours remain")
-	limit := fs.Int("limit", 5, "Maximum rows to print; 0 for no limit")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1802,12 +1794,9 @@ func runCheck(args []string) error {
 	}
 
 	opts := checkOptions{
-		City:        strings.TrimSpace(*city),
-		RangeKM:     *rangeKM,
-		Fuel:        strings.TrimSpace(*fuel),
-		HistoryDays: *historyDays,
-		PredictDays: *predictDays,
-		Limit:       *limit,
+		HistoryDays: modelHistoryDays,
+		PredictDays: forecastPredictDays,
+		Limit:       checkRowLimit,
 		Now:         time.Now().UTC(),
 		Location:    time.Local,
 	}
@@ -1823,50 +1812,32 @@ func runCheck(args []string) error {
 		return err
 	}
 
-	if err := applyCheckSettings(ctx, db, fs, &opts); err != nil {
-		return err
-	}
-	cities, err := resolveCities(ctx, db, fs, opts.City)
+	// One pass over the history serves every fuel.
+	scan, err := loadSnapshotScan(ctx, db, opts.Now.AddDate(0, 0, -opts.HistoryDays), opts.Now)
 	if err != nil {
 		return err
 	}
-	// The non-city options are identical across cities, so validating the
-	// first is validating them all.
-	opts.City = cities[0]
-	if err := validateCheckOptions(opts); err != nil {
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
 		return err
 	}
 
-	// Multiple cities: best-effort — check all, report failures at the end.
-	results := make([]cityCheckResult, 0, len(cities))
+	// Best-effort across fuels: check all, report failures at the end.
+	results := make([]fuelCheckResult, 0, len(suggestFuels))
 	failures := 0
-	for _, cityName := range cities {
-		cityOpts := opts
-		cityOpts.City = cityName
-		checks, err := checkGas(ctx, db, cityOpts)
+	for _, fuel := range suggestFuels {
+		fuelOpts := opts
+		fuelOpts.Fuel = fuel
+		checks, err := checkGasFromScan(ctx, db, scan, fuelOpts)
 		if err != nil {
-			if len(cities) == 1 {
-				return err
-			}
 			failures++
-			results = append(results, cityCheckResult{City: cityName, Error: err.Error()})
+			results = append(results, fuelCheckResult{Fuel: fuel, Error: err.Error()})
 			continue
 		}
-		if len(cities) > 1 && checks == nil {
-			// Multi-city JSON: a success always carries an array; only
-			// failed cities have null checks.
+		if checks == nil {
+			// A success always carries an array; only failed fuels are null.
 			checks = []priceCheckRow{}
 		}
-		results = append(results, cityCheckResult{City: cityName, Checks: checks})
-	}
-
-	if len(cities) == 1 {
-		// Single city: preserve the original output shape.
-		if output == outputJSON {
-			return writeJSON(results[0].Checks)
-		}
-		printPriceChecksText(results[0].Checks)
-		return nil
+		results = append(results, fuelCheckResult{Fuel: fuel, Checks: checks})
 	}
 
 	if output == outputJSON {
@@ -1874,12 +1845,15 @@ func runCheck(args []string) error {
 			return err
 		}
 	} else {
-		printCityResults(results, func(res cityCheckResult) {
+		printFuelResults(results, func(res fuelCheckResult) {
 			printPriceChecksText(res.Checks)
 		})
 	}
+	if failures == len(suggestFuels) {
+		return fmt.Errorf("all %d fuels failed", failures)
+	}
 	if failures > 0 {
-		return fmt.Errorf("%d of %d cities failed", failures, len(cities))
+		return fmt.Errorf("%d of %d fuels failed", failures, len(suggestFuels))
 	}
 	return nil
 }
@@ -1989,74 +1963,39 @@ func runRename(args []string) error {
 }
 
 func validateSuggestOptions(opts suggestOptions) error {
-	if strings.TrimSpace(opts.City) == "" {
-		return errors.New("suggest requires --city")
-	}
-	if opts.RangeKM <= 0 {
-		return errors.New("--range-km must be > 0")
-	}
 	if !isSuggestFuelType(opts.Fuel) {
-		return errors.New("--fuel must be one of: diesel, e5, e10")
+		return errors.New("fuel must be one of: diesel, e5, e10")
 	}
 	if opts.HistoryDays <= 0 {
-		return errors.New("--history-days must be > 0")
+		return errors.New("history days must be > 0")
 	}
 	if opts.PredictDays <= 0 {
-		return errors.New("--predict-days must be > 0")
+		return errors.New("prediction days must be > 0")
 	}
 	if opts.LimitPerDay <= 0 {
-		return errors.New("--limit-per-day must be > 0")
+		return errors.New("suggestions per day must be > 0")
 	}
 	return nil
 }
 
 func validateCheckOptions(opts checkOptions) error {
-	if strings.TrimSpace(opts.City) == "" {
-		return errors.New("check requires --city")
-	}
-	if opts.RangeKM <= 0 {
-		return errors.New("--range-km must be > 0")
-	}
 	if !isSuggestFuelType(opts.Fuel) {
-		return errors.New("--fuel must be one of: diesel, e5, e10")
+		return errors.New("fuel must be one of: diesel, e5, e10")
 	}
 	if opts.HistoryDays <= 0 {
-		return errors.New("--history-days must be > 0")
+		return errors.New("history days must be > 0")
 	}
 	if opts.PredictDays <= 0 {
-		return errors.New("--predict-days must be > 0")
+		return errors.New("prediction days must be > 0")
 	}
 	if opts.Limit < 0 {
-		return errors.New("--limit must be >= 0")
+		return errors.New("check row limit must be >= 0")
 	}
 	return nil
 }
 
-// resolveCities returns the cities one suggest/check invocation covers: the
-// explicit --city when given, otherwise every configured update target in
-// configured order (the update_targets.city UNIQUE constraint rules out
-// duplicates). With no targets it falls back to the flag value so an empty
-// city hits the usual validation error.
-func resolveCities(ctx context.Context, db *sql.DB, fs *flag.FlagSet, flagCity string) ([]string, error) {
-	if flagWasSet(fs, "city") {
-		return []string{flagCity}, nil
-	}
-	targets, err := loadUpdateTargets(ctx, db)
-	if err != nil {
-		return nil, err
-	}
-	if len(targets) == 0 {
-		return []string{flagCity}, nil
-	}
-	cities := make([]string, 0, len(targets))
-	for _, target := range targets {
-		cities = append(cities, target.City)
-	}
-	return cities, nil
-}
-
-// persistCounts tallies what one persisted city run wrote, for the summary
-// line. Zero across the board when --persist is not set.
+// persistCounts tallies what one persisted run wrote, for the summary line.
+// Zero across the board when --persist is not set.
 type persistCounts struct {
 	Predictions    int
 	Decisions      int
@@ -2070,11 +2009,12 @@ func (c persistCounts) add(other persistCounts) persistCounts {
 	return c
 }
 
-// suggestOneCity computes one city's suggestions and, when persist is set,
-// stores the prediction run and the check decisions taken against the same
-// model. Returns the suggestions plus the counts for the persist summary.
-func suggestOneCity(ctx context.Context, db *sql.DB, opts suggestOptions, persist bool) ([]suggestionRow, persistCounts, error) {
-	computation, err := computeSuggestions(ctx, db, opts)
+// suggestOneFuel computes one fuel's suggestions from the shared history scan
+// and, when persist is set, stores the prediction run and the check decisions
+// taken against the same model. Returns the suggestions plus the counts for the
+// persist summary.
+func suggestOneFuel(ctx context.Context, db *sql.DB, scan snapshotScan, opts suggestOptions, persist bool) ([]suggestionRow, persistCounts, error) {
+	computation, err := computeSuggestionsFromScan(ctx, db, scan, opts)
 	if err != nil {
 		return nil, persistCounts{}, err
 	}
@@ -2098,39 +2038,35 @@ func suggestOneCity(ctx context.Context, db *sql.DB, opts suggestOptions, persis
 	return computation.Suggestions, counts, nil
 }
 
-// citySuggestResult is one city's outcome in a multi-city suggest run.
-// Single-city runs keep the original flat []suggestionRow output shape.
-// City is always the configured target name, so consumers can match results
-// against their configuration. Suggestions is null only for failed cities.
-type citySuggestResult struct {
-	City        string          `json:"city"`
+// fuelSuggestResult is one fuel's outcome in a suggest run. Suggestions is
+// null only for fuels whose computation failed.
+type fuelSuggestResult struct {
+	Fuel        string          `json:"fuel"`
 	Suggestions []suggestionRow `json:"suggestions"`
 	Error       string          `json:"error,omitempty"`
 }
 
-// cityCheckResult is one city's outcome in a multi-city check run.
-// Single-city runs keep the original flat []priceCheckRow output shape.
-// City is always the configured target name; Checks is null only for failed
-// cities.
-type cityCheckResult struct {
-	City   string          `json:"city"`
+// fuelCheckResult is one fuel's outcome in a check run. Checks is null only for
+// fuels whose computation failed.
+type fuelCheckResult struct {
+	Fuel   string          `json:"fuel"`
 	Checks []priceCheckRow `json:"checks"`
 	Error  string          `json:"error,omitempty"`
 }
 
-func (r citySuggestResult) header() (string, string) { return r.City, r.Error }
-func (r cityCheckResult) header() (string, string)   { return r.City, r.Error }
+func (r fuelSuggestResult) header() (string, string) { return r.Fuel, r.Error }
+func (r fuelCheckResult) header() (string, string)   { return r.Fuel, r.Error }
 
-// printCityResults renders the text output of a multi-city run: one
-// `city: <name>` section per result, blank line between sections, an
-// indented error line for failed cities.
-func printCityResults[T interface{ header() (string, string) }](results []T, printBody func(T)) {
+// printFuelResults renders the text output of a run: one `fuel: <name>`
+// section per result, blank line between sections, an indented error line for
+// fuels that failed.
+func printFuelResults[T interface{ header() (string, string) }](results []T, printBody func(T)) {
 	for i, res := range results {
 		if i > 0 {
 			fmt.Fprintln(stdout)
 		}
-		city, errMsg := res.header()
-		fmt.Fprintf(stdout, "city: %s\n", city)
+		fuel, errMsg := res.header()
+		fmt.Fprintf(stdout, "fuel: %s\n", fuel)
 		if errMsg != "" {
 			fmt.Fprintf(stdout, "  error: %s\n", errMsg)
 			continue
@@ -2143,7 +2079,6 @@ func printCityResults[T interface{ header() (string, string) }](results []T, pri
 // persistent mode can store the complete forecast grid, not just the printed
 // suggestions.
 type suggestComputation struct {
-	CityName    string
 	Now         time.Time
 	Location    *time.Location
 	Model       forecastModel
@@ -2163,45 +2098,59 @@ func suggestGas(ctx context.Context, db *sql.DB, opts suggestOptions) ([]suggest
 }
 
 func computeSuggestions(ctx context.Context, db *sql.DB, opts suggestOptions) (*suggestComputation, error) {
+	opts = opts.normalized()
 	if err := validateSuggestOptions(opts); err != nil {
 		return nil, err
 	}
-	now := opts.Now
-	if now.IsZero() {
-		now = time.Now().UTC()
-	}
-	location := opts.Location
-	if location == nil {
-		location = time.Local
-	}
-
-	city, err := loadCachedCity(ctx, db, opts.City)
+	scan, err := loadSnapshotScan(ctx, db, opts.Now.AddDate(0, 0, -opts.HistoryDays), opts.Now)
 	if err != nil {
 		return nil, err
 	}
-
-	historyStart := now.AddDate(0, 0, -opts.HistoryDays)
-	snapshots, err := loadSuggestSnapshots(ctx, db, city, opts.Fuel, opts.RangeKM, historyStart, now)
-	if err != nil {
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
 		return nil, err
 	}
-	intervals := reconstructPriceIntervals(snapshots, historyStart, now)
+	return computeSuggestionsFromScan(ctx, db, scan, opts)
+}
+
+// buildFuelForecast builds one fuel's forecast model from an already loaded
+// history. This is the part of a suggestion run that does not depend on which
+// windows end up printed, so a caller that only needs the model — notify picks
+// each city's windows from its own stations — does not pay for a candidate pass
+// it would discard.
+func buildFuelForecast(ctx context.Context, db *sql.DB, scan snapshotScan, opts suggestOptions) (forecastModel, []suggestSnapshot, error) {
+	opts = opts.normalized()
+	historyStart := opts.Now.AddDate(0, 0, -opts.HistoryDays)
+	snapshots := scan.forFuel(opts.Fuel)
+	intervals := reconstructPriceIntervals(snapshots, historyStart, opts.Now)
 	if len(intervals) == 0 {
-		return nil, errors.New("not enough historical open-price data for suggestions")
+		return forecastModel{}, nil, errors.New("not enough historical open-price data for suggestions")
 	}
+	model := buildForecastModel(intervals, opts.Now, opts.Location)
+	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, opts.Now, opts.Location); err != nil {
+		return forecastModel{}, nil, err
+	}
+	return model, snapshots, nil
+}
 
-	model := buildForecastModel(intervals, now, location)
-	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, now, location); err != nil {
+// computeSuggestionsFromScan builds one fuel's forecast from an already loaded
+// history, so a run covering every fuel reads the snapshots once instead of
+// once per fuel.
+func computeSuggestionsFromScan(ctx context.Context, db *sql.DB, scan snapshotScan, opts suggestOptions) (*suggestComputation, error) {
+	opts = opts.normalized()
+	if err := validateSuggestOptions(opts); err != nil {
 		return nil, err
 	}
-	suggestions := mergeSuggestions(generateSuggestions(model, opts.Fuel, now, location, opts.PredictDays, opts.LimitPerDay))
+	model, snapshots, err := buildFuelForecast(ctx, db, scan, opts)
+	if err != nil {
+		return nil, err
+	}
+	suggestions := mergeSuggestions(generateSuggestions(model, opts.Fuel, opts.Now, opts.Location, opts.PredictDays, opts.LimitPerDay))
 	if len(suggestions) == 0 {
 		return nil, errors.New("not enough historical price patterns for suggestions")
 	}
 	return &suggestComputation{
-		CityName:    city.Name,
-		Now:         now,
-		Location:    location,
+		Now:         opts.Now,
+		Location:    opts.Location,
 		Model:       model,
 		Suggestions: suggestions,
 		Snapshots:   snapshots,
@@ -2209,71 +2158,112 @@ func computeSuggestions(ctx context.Context, db *sql.DB, opts suggestOptions) (*
 }
 
 func checkGas(ctx context.Context, db *sql.DB, opts checkOptions) ([]priceCheckRow, error) {
+	opts = opts.normalized()
 	if err := validateCheckOptions(opts); err != nil {
 		return nil, err
 	}
-	now := opts.Now
-	if now.IsZero() {
-		now = time.Now().UTC()
-	}
-	location := opts.Location
-	if location == nil {
-		location = time.Local
-	}
-
-	city, err := loadCachedCity(ctx, db, opts.City)
+	scan, err := loadSnapshotScan(ctx, db, opts.Now.AddDate(0, 0, -opts.HistoryDays), opts.Now)
 	if err != nil {
 		return nil, err
 	}
-
-	historyStart := now.AddDate(0, 0, -opts.HistoryDays)
-	snapshots, err := loadSuggestSnapshots(ctx, db, city, opts.Fuel, opts.RangeKM, historyStart, now)
-	if err != nil {
+	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
 		return nil, err
 	}
-	intervals := reconstructPriceIntervals(snapshots, historyStart, now)
+	return checkGasFromScan(ctx, db, scan, opts)
+}
+
+// checkGasFromScan is the check counterpart of computeSuggestionsFromScan.
+func checkGasFromScan(ctx context.Context, db *sql.DB, scan snapshotScan, opts checkOptions) ([]priceCheckRow, error) {
+	opts = opts.normalized()
+	if err := validateCheckOptions(opts); err != nil {
+		return nil, err
+	}
+	historyStart := opts.Now.AddDate(0, 0, -opts.HistoryDays)
+	snapshots := scan.forFuel(opts.Fuel)
+	intervals := reconstructPriceIntervals(snapshots, historyStart, opts.Now)
 	if len(intervals) == 0 {
 		return nil, errors.New("not enough historical open-price data for checks")
 	}
 
-	model := buildForecastModel(intervals, now, location)
-	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, now, location); err != nil {
+	model := buildForecastModel(intervals, opts.Now, opts.Location)
+	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, opts.Now, opts.Location); err != nil {
 		return nil, err
 	}
-	checks := generatePriceChecks(model, snapshots, opts.Fuel, now, location, opts.PredictDays, opts.Limit, opts.Thresholds)
+	checks := generatePriceChecks(model, snapshots, opts.Fuel, opts.Now, opts.Location, opts.PredictDays, opts.Limit)
 	if len(checks) == 0 {
 		return nil, errors.New("not enough current open-price data for checks")
 	}
 	return checks, nil
 }
 
-func loadCachedCity(ctx context.Context, db *sql.DB, cityName string) (cachedCity, error) {
-	cityName = strings.TrimSpace(cityName)
-	var city cachedCity
-	row := db.QueryRowContext(ctx, `
-		SELECT name, normalized_name, display_name, lat, lng
-		FROM cities
-		WHERE name = ?
-			OR normalized_name = ?
-			OR display_name = ?
-		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
-		LIMIT 1
-	`, cityName, cityName, cityName)
-	if err := row.Scan(&city.QueryName, &city.Name, &city.DisplayName, &city.Lat, &city.Lng); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return cachedCity{}, fmt.Errorf("city %q is not cached; run gasoline update --city %q first", cityName, cityName)
-		}
-		return cachedCity{}, err
-	}
-	return city, nil
+// snapshotScan is one pass over the price history: every station still being
+// fed, plus one row per stored observation carrying all three fuels. The scan
+// is shared by every fuel a run covers.
+type snapshotScan struct {
+	// Stations is keyed by station id and carries the owning update target and
+	// the distance to its centre.
+	Stations map[string]suggestionStationRow
+	// Rows are ordered by station, then by time — the order
+	// reconstructPriceIntervals depends on to pair each observation with the
+	// next one from the same station.
+	Rows []snapshotScanRow
 }
 
-func loadSuggestSnapshots(ctx context.Context, db *sql.DB, city cachedCity, fuel string, rangeKM float64, historyStart, now time.Time) ([]suggestSnapshot, error) {
-	column, err := suggestFuelColumn(fuel)
-	if err != nil {
-		return nil, err
+// snapshotScanRow is one stored observation, kept compact because a full
+// history holds a lot of them: the station details live once in
+// snapshotScan.Stations rather than on every row.
+type snapshotScanRow struct {
+	StationID  string
+	RecordedAt time.Time
+	IsOpen     bool
+	Diesel     sql.NullFloat64
+	E5         sql.NullFloat64
+	E10        sql.NullFloat64
+}
+
+func (r snapshotScanRow) price(fuel string) sql.NullFloat64 {
+	switch fuel {
+	case "e5":
+		return r.E5
+	case "e10":
+		return r.E10
+	default:
+		return r.Diesel
 	}
-	query := fmt.Sprintf(`
+}
+
+// forFuel projects the shared scan onto one fuel, preserving scan order.
+func (s snapshotScan) forFuel(fuel string) []suggestSnapshot {
+	snapshots := make([]suggestSnapshot, 0, len(s.Rows))
+	for _, row := range s.Rows {
+		station := s.Stations[row.StationID]
+		snapshots = append(snapshots, suggestSnapshot{
+			StationID:   row.StationID,
+			StationName: station.Name,
+			DistanceKM:  station.DistanceKM,
+			Station:     station,
+			RecordedAt:  row.RecordedAt,
+			IsOpen:      row.IsOpen,
+			Price:       row.price(fuel),
+		})
+	}
+	return snapshots
+}
+
+// loadSnapshotScan reads the price history of every station currently being fed.
+//
+// There is no radius and no city centre in the selection: the station universe
+// is whatever `gasoline update` collects, bounded by each update target's own
+// radius, and a station leaves scope once it stops receiving price updates
+// (stationFreshness) — which is exactly what happens when a target is removed
+// or its radius shrinks. Each station is attributed to the target that owns it,
+// the nearest fed centre as resolved at collection time and recorded in
+// price_snapshots.city_name, and the reported distance is measured to that
+// centre.
+func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Time) (snapshotScan, error) {
+	scan := snapshotScan{Stations: map[string]suggestionStationRow{}}
+	historyStartText := historyStart.Format(time.RFC3339)
+	rows, err := db.QueryContext(ctx, `
 		SELECT
 			s.id,
 			COALESCE(s.name_override, s.name),
@@ -2288,32 +2278,42 @@ func loadSuggestSnapshots(ctx context.Context, db *sql.DB, city cachedCity, fuel
 			s.last_seen_at,
 			ps.recorded_at,
 			ps.is_open,
-			ps.%s
+			ps.city_name,
+			ps.diesel,
+			ps.e5,
+			ps.e10
 		FROM stations s
 		JOIN price_snapshots ps ON ps.station_id = s.id
-		WHERE ps.recorded_at >= ?
-			OR ps.recorded_at = (
-				SELECT MAX(prior.recorded_at)
-				FROM price_snapshots prior
-				WHERE prior.station_id = s.id
-					AND prior.recorded_at < ?
+		WHERE (
+				ps.recorded_at >= ?
+				OR ps.recorded_at = (
+					SELECT MAX(prior.recorded_at)
+					FROM price_snapshots prior
+					WHERE prior.station_id = s.id
+						AND prior.recorded_at < ?
+				)
+			)
+			AND EXISTS (
+				SELECT 1
+				FROM price_snapshots fresh
+				WHERE fresh.station_id = s.id
+					AND fresh.recorded_at >= ?
 			)
 		ORDER BY s.id ASC, ps.recorded_at ASC, ps.id ASC
-	`, column)
-	rows, err := db.QueryContext(ctx, query, historyStart.Format(time.RFC3339), historyStart.Format(time.RFC3339))
+	`, historyStartText, historyStartText, now.Add(-stationFreshness).Format(time.RFC3339))
 	if err != nil {
-		return nil, err
+		return snapshotScan{}, err
 	}
 	defer rows.Close()
 
-	var snapshots []suggestSnapshot
 	for rows.Next() {
 		var (
-			stationID, stationName, brand, street, houseNumber, place, firstSeenAt, lastSeenAt, recordedAtText string
-			postCode                                                                                           int
-			lat, lng                                                                                           float64
-			isOpen                                                                                             bool
-			price                                                                                              sql.NullFloat64
+			stationID, stationName, brand, street, houseNumber, place string
+			firstSeenAt, lastSeenAt, recordedAtText, cityName         string
+			postCode                                                  int
+			lat, lng                                                  float64
+			isOpen                                                    bool
+			diesel, e5, e10                                           sql.NullFloat64
 		)
 		if err := rows.Scan(
 			&stationID,
@@ -2329,22 +2329,23 @@ func loadSuggestSnapshots(ctx context.Context, db *sql.DB, city cachedCity, fuel
 			&lastSeenAt,
 			&recordedAtText,
 			&isOpen,
-			&price,
+			&cityName,
+			&diesel,
+			&e5,
+			&e10,
 		); err != nil {
-			return nil, err
+			return snapshotScan{}, err
 		}
 		recordedAt, err := time.Parse(time.RFC3339, recordedAtText)
 		if err != nil {
-			return nil, fmt.Errorf("parse recorded_at %q: %w", recordedAtText, err)
+			return snapshotScan{}, fmt.Errorf("parse recorded_at %q: %w", recordedAtText, err)
 		}
 		if recordedAt.After(now) {
 			continue
 		}
-		distanceKM := haversineKM(city.Lat, city.Lng, lat, lng)
-		if distanceKM > rangeKM {
-			continue
-		}
-		station := suggestionStationRow{
+		// A station's owner can move to a nearer centre; the scan is ordered
+		// oldest first, so the last row seen carries the current owner.
+		scan.Stations[stationID] = suggestionStationRow{
 			ID:          stationID,
 			Name:        stationName,
 			Brand:       brand,
@@ -2357,22 +2358,134 @@ func loadSuggestSnapshots(ctx context.Context, db *sql.DB, city cachedCity, fuel
 			FirstSeenAt: firstSeenAt,
 			LastSeenAt:  lastSeenAt,
 			Address:     formatStationAddress(street, houseNumber, postCode, place),
-			DistanceKM:  distanceKM,
+			City:        cityName,
 		}
-		snapshots = append(snapshots, suggestSnapshot{
-			StationID:   stationID,
-			StationName: stationName,
-			DistanceKM:  distanceKM,
-			Station:     station,
-			RecordedAt:  recordedAt,
-			IsOpen:      isOpen,
-			Price:       price,
+		scan.Rows = append(scan.Rows, snapshotScanRow{
+			StationID:  stationID,
+			RecordedAt: recordedAt,
+			IsOpen:     isOpen,
+			Diesel:     diesel,
+			E5:         e5,
+			E10:        e10,
 		})
 	}
 	if err := rows.Err(); err != nil {
+		return snapshotScan{}, err
+	}
+	return scan, nil
+}
+
+// fillOwningCityDistances measures each station's distance to the centre of the
+// city that owns it, for output that has no better reference point to offer.
+//
+// This is the CLI's notion of distance. Notifications do not use it: a
+// subscriber's distance is measured from their own location, so notify never
+// calls this and therefore never reads the cities cache.
+//
+// The centres are resolved after the scan, from the handful of owners it
+// actually saw, rather than joined onto every snapshot row: cities.normalized_name
+// is not unique — the same place can be cached under several query strings, e.g.
+// "Berlin" and "Berlin, Germany" — so a join would multiply the entire history by
+// the number of cached spellings and leave the distance depending on whichever
+// row the database happened to return last.
+func (s snapshotScan) fillOwningCityDistances(ctx context.Context, db *sql.DB) error {
+	owners := make([]string, 0, len(s.Stations))
+	seen := map[string]bool{}
+	for _, station := range s.Stations {
+		if station.City != "" && !seen[station.City] {
+			seen[station.City] = true
+			owners = append(owners, station.City)
+		}
+	}
+	sort.Strings(owners)
+	centres, err := loadCityCentres(ctx, db, owners)
+	if err != nil {
+		return err
+	}
+	for stationID, station := range s.Stations {
+		centre, ok := centres[station.City]
+		if !ok {
+			// The owning city is no longer cached (target deleted, cache
+			// cleared). The station's prices still count; only the reported
+			// distance is unknown.
+			continue
+		}
+		station.DistanceKM = haversineKM(centre.Lat, centre.Lng, station.Lat, station.Lng)
+		s.Stations[stationID] = station
+	}
+	return nil
+}
+
+// cityCoords is one cached city's centre.
+type cityCoords struct {
+	Lat float64
+	Lng float64
+}
+
+// loadCityCentres resolves normalized city names to one centre each. Where
+// several cached query strings share a normalized name, the row is picked by the
+// same preference rule the other city lookups use: the one whose query name
+// already is the normalized name, then the oldest.
+func loadCityCentres(ctx context.Context, db *sql.DB, names []string) (map[string]cityCoords, error) {
+	centres := map[string]cityCoords{}
+	if len(names) == 0 {
+		return centres, nil
+	}
+	args := make([]any, 0, len(names))
+	for _, name := range names {
+		args = append(args, name)
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT normalized_name, lat, lng
+		FROM cities
+		WHERE normalized_name IN (?`+strings.Repeat(", ?", len(names)-1)+`)
+		ORDER BY normalized_name ASC,
+			CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC,
+			created_at ASC,
+			name ASC
+	`, args...)
+	if err != nil {
 		return nil, err
 	}
-	return snapshots, nil
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var centre cityCoords
+		if err := rows.Scan(&name, &centre.Lat, &centre.Lng); err != nil {
+			return nil, err
+		}
+		// Ordered so the preferred row comes first; later spellings are dropped.
+		if _, taken := centres[name]; !taken {
+			centres[name] = centre
+		}
+	}
+	return centres, rows.Err()
+}
+
+// lookupCityNormalizedName resolves a city as an admin wrote it — the query
+// string, the normalized name, or the display name — to the normalized name that
+// price_snapshots.city_name records for it. Those differ whenever the geocoder
+// returns a shorter name than the query: a target added as "Berlin, Germany" owns
+// the snapshots recorded under "Berlin".
+func lookupCityNormalizedName(ctx context.Context, db *sql.DB, city string) (string, error) {
+	city = strings.TrimSpace(city)
+	var normalized string
+	err := db.QueryRowContext(ctx, `
+		SELECT normalized_name
+		FROM cities
+		WHERE name = ?
+			OR normalized_name = ?
+			OR display_name = ?
+		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
+		LIMIT 1
+	`, city, city, city).Scan(&normalized)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("city %q is not cached; run gasoline update --city %q first", city, city)
+	}
+	if err != nil {
+		return "", err
+	}
+	return normalized, nil
 }
 
 func reconstructPriceIntervals(snapshots []suggestSnapshot, historyStart, now time.Time) []priceInterval {
@@ -2803,6 +2916,28 @@ func generateSuggestions(model forecastModel, fuel string, now time.Time, locati
 	return suggestions
 }
 
+// withinRadius returns a view of the model restricted to the stations inside
+// radiusKM of a point, with each station's distance restated as the distance
+// from that point — so a suggestion reports how far the station is from whoever
+// asked, not from some administrative centre.
+//
+// The per-station sample maps are shared rather than copied: only the station
+// set that the suggestion pass iterates over changes, so this is a filter over
+// an already built model, not a rebuild.
+func (m forecastModel) withinRadius(lat, lng, radiusKM float64) forecastModel {
+	filtered := m
+	filtered.Stations = make(map[string]forecastStation, len(m.Stations))
+	for stationID, station := range m.Stations {
+		distance := haversineKM(lat, lng, station.Station.Lat, station.Station.Lng)
+		if distance > radiusKM {
+			continue
+		}
+		station.Station.DistanceKM = distance
+		filtered.Stations[stationID] = station
+	}
+	return filtered
+}
+
 func mergeSuggestions(suggestions []suggestionRow) []suggestionRow {
 	type groupKey struct {
 		Date           string
@@ -2829,7 +2964,7 @@ func mergeSuggestions(suggestions []suggestionRow) []suggestionRow {
 	return result
 }
 
-func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel string, now time.Time, location *time.Location, predictDays, limit int, thresholds verdictThresholds) []priceCheckRow {
+func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel string, now time.Time, location *time.Location, predictDays, limit int) []priceCheckRow {
 	nowLocal := now.In(location)
 	latestByStation := latestSnapshotsByStation(snapshots)
 	stationIDs := make([]string, 0, len(latestByStation))
@@ -2882,20 +3017,7 @@ func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel 
 			Confidence:            currentScore.Confidence,
 			SampleCount:           currentScore.SampleCount,
 		}
-		// The margin scales with this station's own daily swing when the
-		// admin enabled relative mode; otherwise it is the flat default.
-		// Guarded here rather than inside forStation because the argument is
-		// evaluated first: in the default fixed mode the 24-hour median scan
-		// would otherwise run for every station only to be discarded.
-		var (
-			amplitude    float64
-			hasAmplitude bool
-		)
-		if thresholds.Relative {
-			amplitude, hasAmplitude = stationDailyAmplitude(model, stationID)
-		}
-		delta := thresholds.forStation(amplitude, hasAmplitude)
-		row.Verdict = priceCheckVerdict(snapshot.Price.Float64, currentScore.PredictedPrice, percentile, delta)
+		row.Verdict = priceCheckVerdict(snapshot.Price.Float64, currentScore.PredictedPrice, percentile, defaultCheckDelta)
 
 		if future, ok := bestFutureForecast(model, stationID, nowLocal, predictDays); ok {
 			row.BestFutureDate = future.Start.Format("2006-01-02")
@@ -2907,7 +3029,7 @@ func generatePriceChecks(model forecastModel, snapshots []suggestSnapshot, fuel 
 			if drop > 0 {
 				row.ExpectedDrop = roundTo(drop, 2)
 			}
-			if drop >= delta {
+			if drop >= defaultCheckDelta {
 				row.ExpectedLower = true
 				row.Confidence = lowerConfidence(row.Confidence, future.Score.Confidence)
 			}
@@ -3158,80 +3280,6 @@ func weightedPricePercentile(samples []priceSample, price float64) (float64, boo
 		return 0, false
 	}
 	return 100 * (lowerWeight + equalWeight/2) / totalWeight, true
-}
-
-// verdictThresholds is the price-margin rule for one check run.
-//
-// Only the absolute margin is configurable. The 30/70 percentile cutoffs are
-// already station-relative — weightedPricePercentile ranks the de-baselined
-// price within that station's own distribution — so scaling them would add
-// nothing.
-type verdictThresholds struct {
-	// Delta is the flat margin in euro. Zero means the historical default.
-	Delta float64
-	// Relative switches to a margin derived from the station's own daily
-	// amplitude, with Delta as the fallback where no amplitude is available.
-	Relative bool
-	Fraction float64
-}
-
-// forStation resolves the margin to apply to one station. The zero
-// verdictThresholds yields exactly the historical flat margin, so a caller
-// that never sets thresholds keeps today's behavior.
-func (t verdictThresholds) forStation(amplitude float64, hasAmplitude bool) float64 {
-	delta := t.Delta
-	if delta <= 0 {
-		delta = defaultCheckDelta
-	}
-	if !t.Relative || !hasAmplitude || amplitude <= 0 || t.Fraction <= 0 {
-		return delta
-	}
-	scaled := amplitude * t.Fraction
-	if scaled < minRelativeCheckDelta {
-		return minRelativeCheckDelta
-	}
-	if scaled > maxRelativeCheckDelta {
-		return maxRelativeCheckDelta
-	}
-	return scaled
-}
-
-// minAmplitudeHours is how many distinct hours of the day must be represented
-// before the spread across them is treated as a daily amplitude. Below that
-// the observed range is a sample of part of the sawtooth, not its height.
-const minAmplitudeHours = 12
-
-// stationDailyAmplitude estimates how far a station's price swings within a
-// pricing day, as the spread across its hourly medians.
-//
-// It is only defined for offset-mode stations: their samples are already
-// offsets from the daily baseline, so the spread is the intraday swing alone.
-// For absolute-price stations the same spread would also contain day-to-day
-// level drift, which is exactly what the amplitude must not include.
-func stationDailyAmplitude(model forecastModel, stationID string) (float64, bool) {
-	station, ok := model.Stations[stationID]
-	if !ok || !station.OffsetMode {
-		return 0, false
-	}
-	var lowest, highest float64
-	seen := 0
-	for hour := 0; hour < 24; hour++ {
-		median, ok := weightedMedianPrice(model.Hour[stationHourKey{StationID: stationID, Hour: hour}])
-		if !ok {
-			continue
-		}
-		if seen == 0 || median < lowest {
-			lowest = median
-		}
-		if seen == 0 || median > highest {
-			highest = median
-		}
-		seen++
-	}
-	if seen < minAmplitudeHours {
-		return 0, false
-	}
-	return highest - lowest, true
 }
 
 func priceCheckVerdict(currentPrice, predictedPrice, historyPercentile, delta float64) string {
@@ -3494,10 +3542,19 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migrateUsersNotifySuggestEnabled(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateUsersNotifyLocation(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
+	if err := migrateDropUserNotifyCities(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migratePredictionsAccuracyIndex(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
 	if err := migrateSeedDefaultSettings(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
+	if err := migrateDropObsoleteSettings(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
 
@@ -3631,6 +3688,277 @@ func migrateUsersNotifyFuel(ctx context.Context, tx *sql.Tx, d dialect, result *
 	}
 	result.Applied = append(result.Applied, "users.notify_fuel")
 	return nil
+}
+
+// migrateUsersNotifyLocation adds the per-user notification location: the city
+// an admin-independent subscription is centred on, its coordinates, and its
+// radius. Pre-existing installs subscribed users to a set of admin update
+// targets instead (user_notify_cities), so the columns are backfilled from that
+// selection before migrateDropUserNotifyCities removes it.
+func migrateUsersNotifyLocation(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	textType, floatType := "TEXT", "REAL"
+	if d == dialectMySQL {
+		textType, floatType = "VARCHAR(255)", "DOUBLE"
+	}
+	added := false
+	for _, col := range []struct{ name, spec string }{
+		{"notify_city", textType + " NOT NULL DEFAULT ''"},
+		{"notify_lat", floatType + " NOT NULL DEFAULT 0"},
+		{"notify_lng", floatType + " NOT NULL DEFAULT 0"},
+		{"notify_radius_km", floatType + " NOT NULL DEFAULT 0"},
+	} {
+		hasColumn, err := tableHasColumn(ctx, tx, d, "users", col.name)
+		if err != nil {
+			return err
+		}
+		if hasColumn {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+			`ALTER TABLE users ADD COLUMN %s %s`, col.name, col.spec,
+		)); err != nil {
+			return err
+		}
+		added = true
+	}
+	if added {
+		result.Applied = append(result.Applied, "users.notify_location")
+	}
+	// Driven by the presence of the legacy table rather than by whether the
+	// columns were just added: a database can reach this point with the columns
+	// already created by initSchema and the old selection still in place.
+	return backfillNotifyLocations(ctx, tx, d, result)
+}
+
+// backfillNotifyLocations turns each user's old city selection into a location,
+// but only where the old selection says exactly what the new model can express.
+//
+// The radius comes from the legacy `range_km` setting, not from the update
+// target: that setting is what the old notify path measured with around each
+// selected city, while a target's radius only ever decided what got collected.
+// It is still readable here because migrateDropObsoleteSettings runs afterwards.
+//
+// Two selections are expressible. One selected city becomes that city's centre
+// at the legacy range. An empty selection meant *every* configured city, which
+// is the same thing whenever there is exactly one target. Anything else — several
+// cities, or none with several targets — is left unset and reported by address,
+// because picking one of them would quietly shrink what that user receives.
+// Those users receive nothing until they choose an area, which `notify` tells
+// them about on every run, and that is the point: a visible gap beats silently
+// changed coverage.
+func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasSelections, err := tableExists(ctx, tx, d, "user_notify_cities")
+	if err != nil {
+		return err
+	}
+	if !hasSelections {
+		// Either a fresh install or one that already migrated.
+		return nil
+	}
+	// The radius every migrated area gets: what the old notify path measured
+	// with. Absent or unparsable falls back to the value it defaulted to.
+	legacyRange := 5.0
+	var storedRange string
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE name = 'range_km'`).Scan(&storedRange); {
+	case err == nil:
+		if parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(storedRange), 64); parseErr == nil && parsed > 0 {
+			legacyRange = parsed
+		}
+	case errors.Is(err, sql.ErrNoRows):
+	default:
+		return err
+	}
+
+	targetRows, err := tx.QueryContext(ctx, `SELECT city FROM update_targets ORDER BY id ASC`)
+	if err != nil {
+		return err
+	}
+	var targetOrder []string
+	for targetRows.Next() {
+		var city string
+		if err := targetRows.Scan(&city); err != nil {
+			targetRows.Close()
+			return err
+		}
+		targetOrder = append(targetOrder, city)
+	}
+	targetRows.Close()
+	if err := targetRows.Err(); err != nil {
+		return err
+	}
+	if len(targetOrder) == 0 {
+		// Nothing was ever collected, so there is no location to infer.
+		return nil
+	}
+	targetRank := map[string]int{}
+	for i, city := range targetOrder {
+		targetRank[city] = i
+	}
+
+	// The city each user keeps: their selected target with the lowest configured
+	// rank, or the first target when they had selected none.
+	// The city each user keeps, and the users whose selection cannot be
+	// expressed as one area.
+	chosen := map[int64]string{}
+	ambiguous := map[int64]bool{}
+	rows, err := tx.QueryContext(ctx, `SELECT user_id, city FROM user_notify_cities`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var userID int64
+		var city string
+		if err := rows.Scan(&userID, &city); err != nil {
+			rows.Close()
+			return err
+		}
+		if _, known := targetRank[city]; !known {
+			continue
+		}
+		if _, seen := chosen[userID]; seen {
+			// More than one city: no single area covers exactly those and
+			// nothing else.
+			ambiguous[userID] = true
+			continue
+		}
+		chosen[userID] = city
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Never overwrite a location a user has already chosen. A representable
+	// selection is carried over for everyone; only a user who would actually
+	// have received something is worth reporting as needing attention.
+	type pending struct {
+		id           int64
+		email        string
+		wouldReceive bool
+	}
+	userRows, err := tx.QueryContext(ctx, `
+		SELECT id, email,
+			CASE WHEN status = 'approved' AND pushover_user_key <> '' AND pushover_token <> ''
+				AND (notify_check_enabled <> 0 OR notify_suggest_enabled <> 0)
+			THEN 1 ELSE 0 END
+		FROM users
+		WHERE notify_radius_km <= 0
+		ORDER BY id ASC`)
+	if err != nil {
+		return err
+	}
+	var users []pending
+	for userRows.Next() {
+		var u pending
+		var wouldReceive int
+		if err := userRows.Scan(&u.id, &u.email, &wouldReceive); err != nil {
+			userRows.Close()
+			return err
+		}
+		u.wouldReceive = wouldReceive != 0
+		users = append(users, u)
+	}
+	userRows.Close()
+	if err := userRows.Err(); err != nil {
+		return err
+	}
+
+	migrated := 0
+	var needReview []string
+	for _, u := range users {
+		city, selected := chosen[u.id]
+		if !selected && len(targetOrder) == 1 {
+			// An empty selection meant every configured city. With one target
+			// that is exactly one city, so it is not ambiguous at all.
+			city, selected = targetOrder[0], true
+		}
+		if !selected || ambiguous[u.id] {
+			// Several cities, or none with several targets to choose between.
+			// Inventing one of them would change their coverage without telling
+			// anyone.
+			if u.wouldReceive {
+				needReview = append(needReview, u.email)
+			}
+			continue
+		}
+		_, lat, lng, found, err := cachedCityTx(ctx, tx, city)
+		if err != nil {
+			return err
+		}
+		if !found {
+			// The city was never geocoded, so there are no coordinates to carry
+			// over.
+			if u.wouldReceive {
+				needReview = append(needReview, u.email)
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE users SET notify_city = ?, notify_lat = ?, notify_lng = ?, notify_radius_km = ? WHERE id = ?`,
+			city, lat, lng, legacyRange, u.id); err != nil {
+			return err
+		}
+		migrated++
+	}
+	if migrated > 0 {
+		result.Applied = append(result.Applied,
+			fmt.Sprintf("users.notify_location.backfilled=%d", migrated))
+	}
+	if len(needReview) > 0 {
+		result.Applied = append(result.Applied,
+			fmt.Sprintf("users.notify_location.needs_area=%d", len(needReview)))
+		// Named, not just counted: the admin has to tell these people to pick an
+		// area, and after this migration the old selection is gone.
+		fmt.Fprintf(os.Stderr,
+			"warning: %d notification user(s) had a city selection that no single area can express "+
+				"(all cities, or several of them). They receive nothing until they pick a city and radius "+
+				"in My Account -> Notifications: %s\n",
+			len(needReview), strings.Join(needReview, ", "))
+	}
+	return nil
+}
+
+// migrateDropUserNotifyCities removes the table that subscribed users to admin
+// update targets. Notifications are now a per-user point and radius, so the
+// selection has no meaning; migrateUsersNotifyLocation carries it over first.
+func migrateDropUserNotifyCities(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	exists, err := tableExists(ctx, tx, d, "user_notify_cities")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE user_notify_cities`); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "users.drop_notify_cities")
+	return nil
+}
+
+// cachedCityTx resolves a city as written — query string, normalized name or
+// display name — to its normalized name and cached coordinates, preferring the
+// canonical row.
+func cachedCityTx(ctx context.Context, tx *sql.Tx, city string) (string, float64, float64, bool, error) {
+	var normalized string
+	var lat, lng float64
+	err := tx.QueryRowContext(ctx, `
+		SELECT normalized_name, lat, lng
+		FROM cities
+		WHERE name = ?
+			OR normalized_name = ?
+			OR display_name = ?
+		ORDER BY CASE WHEN name = normalized_name THEN 0 ELSE 1 END ASC, created_at ASC, name ASC
+		LIMIT 1
+	`, city, city, city).Scan(&normalized, &lat, &lng)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, 0, false, nil
+	}
+	if err != nil {
+		return "", 0, 0, false, err
+	}
+	return normalized, lat, lng, true, nil
 }
 
 // migrateUsersNotifySuggestEnabled adds the per-user notify_suggest_enabled
@@ -4534,11 +4862,40 @@ func latestPriceSnapshots(ctx context.Context, tx *sql.Tx, stationID string) (*p
 // table that `import cities` can fill with thousands of rows, so each owner is
 // looked up at most once per sweep.
 type cityCentres struct {
-	byName map[string]*cachedCity
+	byName   map[string]*cachedCity
+	coverage cityCoverage
 }
 
-func newCityCentres() *cityCentres {
-	return &cityCentres{byName: map[string]*cachedCity{}}
+func newCityCentres(coverage cityCoverage) *cityCentres {
+	return &cityCentres{byName: map[string]*cachedCity{}, coverage: coverage}
+}
+
+// cityCoverage is which cities currently reach their stations, and whether that
+// is configuration or merely what one flag-driven sweep happened to name.
+type cityCoverage struct {
+	// radiusByCity maps a normalized city name to the radius currently reaching
+	// its stations.
+	radiusByCity map[string]float64
+	// configured is true when update_targets has rows. Without any, a sweep is
+	// driven entirely by --city flags, so a city missing from the coverage says
+	// nothing about whether it still exists — only that this invocation did not
+	// name it.
+	configured bool
+}
+
+// stillReaches reports whether a city that currently owns a station keeps a
+// claim on it, and whether the coverage is authoritative enough to say.
+//
+// An owner absent from a configured install's coverage had its target removed
+// and loses the station. The same absence in a flag-driven install means only
+// that this run did not name the city — a solo run or a failed fetch — which
+// must not move ownership.
+func (c cityCoverage) stillReaches(city string, distanceKM float64) (reaches bool, authoritative bool) {
+	radius, covered := c.radiusByCity[city]
+	if covered {
+		return distanceKM <= radius, true
+	}
+	return false, c.configured
 }
 
 // lookup returns the centre cached for a normalized city name, or nil when no
@@ -4572,8 +4929,14 @@ func (c *cityCentres) lookup(ctx context.Context, tx *sql.Tx, name string) (*cac
 // only ranks the targets a sweep actually fetched, so a single-city run — or a
 // sweep whose nearer target failed — must not take a station away from the
 // nearer city that already owns it. Ownership therefore moves only to a
-// strictly nearer centre, which keeps ownership independent of invocation
-// order and transient fetch failures.
+// strictly nearer centre, which keeps ownership independent of invocation order
+// and transient fetch failures.
+//
+// That preference is conditional on the owner still reaching the station.
+// Deleting an update target leaves its cities row behind, and shrinking a
+// target's radius leaves the row untouched, so without the coverage check a
+// removed or shrunk city would keep owning stations that another target now
+// feeds — for as long as that other target kept them fresh, which is forever.
 func resolveSnapshotOwner(ctx context.Context, tx *sql.Tx, centres *cityCentres, currentOwner string, candidate cachedCity, station tankerStation) (string, error) {
 	if currentOwner == "" || currentOwner == candidate.Name {
 		return candidate.Name, nil
@@ -4583,15 +4946,80 @@ func resolveSnapshotOwner(ctx context.Context, tx *sql.Tx, centres *cityCentres,
 		return "", err
 	}
 	if owner == nil {
-		// The owning city is no longer cached (target deleted, cache cleared),
-		// so it can no longer claim the station.
+		// The owning city is no longer cached (cache cleared), so it can no
+		// longer claim the station.
 		return candidate.Name, nil
 	}
-	if haversineKM(owner.Lat, owner.Lng, station.Lat, station.Lng) <=
-		haversineKM(candidate.Lat, candidate.Lng, station.Lat, station.Lng) {
+	ownerDistance := haversineKM(owner.Lat, owner.Lng, station.Lat, station.Lng)
+	if reaches, authoritative := centres.coverage.stillReaches(currentOwner, ownerDistance); authoritative && !reaches {
+		// The previous owner demonstrably does not reach this station any more,
+		// so the city that actually fetched it takes over.
+		return candidate.Name, nil
+	}
+	if ownerDistance <= haversineKM(candidate.Lat, candidate.Lng, station.Lat, station.Lng) {
 		return currentOwner, nil
 	}
 	return candidate.Name, nil
+}
+
+// loadCityCoverage collects the radius currently reaching each city's stations:
+// the configured update target's radius, or the radius this sweep fetched with,
+// whichever is larger. Taking the larger keeps an ad-hoc
+// `update --city X --radius 25` from handing away ownership that a scheduled
+// 5 km target would keep.
+func loadCityCoverage(ctx context.Context, tx *sql.Tx, fetches []cityFetch) (cityCoverage, error) {
+	coverage := cityCoverage{radiusByCity: map[string]float64{}}
+	record := func(name string, radius float64) {
+		if name == "" || radius <= 0 {
+			return
+		}
+		if current, ok := coverage.radiusByCity[name]; !ok || radius > current {
+			coverage.radiusByCity[name] = radius
+		}
+	}
+	for _, fetch := range fetches {
+		record(fetch.City.Name, fetch.Query.radius)
+	}
+	// Read the targets out in full before resolving any of them. A transaction is
+	// pinned to one connection and the MySQL driver speaks to it synchronously,
+	// so issuing cachedCityTx while this result set is still open would fail the
+	// whole sweep with "commands out of sync".
+	type target struct {
+		city   string
+		radius float64
+	}
+	var targets []target
+	rows, err := tx.QueryContext(ctx, `SELECT city, radius_km FROM update_targets`)
+	if err != nil {
+		return cityCoverage{}, err
+	}
+	for rows.Next() {
+		var t target
+		if err := rows.Scan(&t.city, &t.radius); err != nil {
+			rows.Close()
+			return cityCoverage{}, err
+		}
+		targets = append(targets, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return cityCoverage{}, err
+	}
+	coverage.configured = len(targets) > 0
+
+	for _, t := range targets {
+		// update_targets stores the string an admin typed; ownership is keyed by
+		// the geocoder's normalized name for the same place.
+		normalized, _, _, found, err := cachedCityTx(ctx, tx, t.city)
+		if err != nil {
+			return cityCoverage{}, err
+		}
+		if !found {
+			continue
+		}
+		record(normalized, t.radius)
+	}
+	return coverage, nil
 }
 
 func insertPriceSnapshot(ctx context.Context, tx *sql.Tx, cityName string, station tankerStation, recordedAt time.Time, searchRadiusKm float64) error {
@@ -4818,13 +5246,19 @@ func isValidFuelType(value string) bool {
 	}
 }
 
+// suggestFuels lists the fuels every suggest, check and notify run covers, in
+// display order. All of them, always: users pick which one they are notified
+// about, and measuring only a subset of what gets delivered would leave the
+// rest unmeasured.
+var suggestFuels = []string{"diesel", "e5", "e10"}
+
 func isSuggestFuelType(value string) bool {
-	switch value {
-	case "diesel", "e5", "e10":
-		return true
-	default:
-		return false
+	for _, fuel := range suggestFuels {
+		if value == fuel {
+			return true
+		}
 	}
+	return false
 }
 
 func isValidSort(value string) bool {

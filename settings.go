@@ -3,27 +3,16 @@ package main
 import (
 	"context"
 	"database/sql"
-	"flag"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 )
 
-// Canonical admin settings keys stored in the settings table. The seeded
-// values mirror today's hardcoded CLI defaults, so DB-driven configuration is
-// behavior-preserving until an admin edits it (via the web UI).
+// Canonical admin settings keys stored in the settings table. Only the
+// notification texts are configurable: they are the one piece of operational
+// configuration with no universal answer. Everything the suggest/check models
+// need is a constant below.
 const (
-	settingFuel            = "fuel"
-	settingRangeKM         = "range_km"
-	settingHistoryDays     = "history_days"
-	settingPredictDays     = "predict_days"
-	settingLimitPerDay     = "limit_per_day"
-	settingCheckLimit      = "check_limit"
-	settingSuggestTimes    = "suggest_times"
-	settingCheckResetTime  = "check_reset_time"
-	settingNotifyDays      = "notify_days"
-	settingNotifyWindows   = "notify_windows"
 	settingCheckTemplate   = "check_template"
 	settingSuggestTemplate = "suggest_template"
 
@@ -31,36 +20,57 @@ const (
 	// pushover_app_name, preserving pre-existing behavior.
 	settingCheckTitleTemplate   = "check_title_template"
 	settingSuggestTitleTemplate = "suggest_title_template"
-
-	// How the check verdict's price margin is chosen. "fixed" keeps the
-	// historical flat 2 ct margin; "relative" scales it by each station's own
-	// daily price swing, so a station that moves 12 ct a day is not judged by
-	// the same margin as one that moves 4 ct. Default "fixed": alerting does
-	// not change until an admin opts in.
-	settingCheckDeltaMode = "check_delta_mode"
-	// Fraction of a station's daily amplitude used as the margin in relative
-	// mode. Ignored in fixed mode.
-	settingCheckDeltaFraction = "check_delta_fraction"
 )
 
-// Check margin modes.
+// obsoleteSettings are keys earlier versions stored in the settings table and
+// that no longer have any effect: the station scope is global, every fuel is
+// always computed, the model parameters and delivery limits are constants, and
+// the per-user schedule fields carry their own defaults. `migrate` deletes
+// them so the table stops advertising configuration that does nothing.
+var obsoleteSettings = []string{
+	"fuel",
+	"range_km",
+	"history_days",
+	"predict_days",
+	"limit_per_day",
+	"check_limit",
+	"suggest_times",
+	"check_reset_time",
+	"notify_days",
+	"notify_windows",
+	"check_delta_mode",
+	"check_delta_fraction",
+}
+
+// Model and delivery parameters. Each of these was an admin setting; none of
+// them has a per-install answer, so they are constants with one place to change.
 const (
-	checkDeltaModeFixed    = "fixed"
-	checkDeltaModeRelative = "relative"
+	// modelHistoryDays is the training window handed to the forecast model.
+	modelHistoryDays = 30
+	// forecastPredictDays is how many calendar days ahead suggestions and the
+	// "a cheaper window is coming" veto look, including today.
+	forecastPredictDays = 3
+	// suggestLimitPerDay caps how many suggestions one day contributes to a
+	// notification, and checkRowLimit caps the check rows in one message.
+	// Both are delivery concerns: the persisted measurement path deliberately
+	// keeps every station (see persistCheckDecisions).
+	suggestLimitPerDay = 3
+	checkRowLimit      = 5
+	// checkBaselineResetTime is the local time at which notify clears the
+	// per-user price baselines, so the first cheaper price after it re-arms
+	// buy-now alerts.
+	checkBaselineResetTime = "00:00"
+	// stationFreshness bounds the station universe: a station is in scope for
+	// as long as it still receives price updates. This is what excludes
+	// stations that stopped being fed when an update target was removed or
+	// its radius shrank, without needing a radius at computation time.
+	stationFreshness = 48 * time.Hour
 )
 
 const (
-	// defaultCheckDelta is the historical flat margin, in euro, used by the
-	// low/high verdict and by the "a cheaper window is coming" veto.
+	// defaultCheckDelta is the margin, in euro, used by the low/high verdict
+	// and by the "a cheaper window is coming" veto.
 	defaultCheckDelta = 0.020
-	// defaultCheckDeltaFraction is a fifth of the daily swing, which
-	// reproduces roughly the historical margin on a typical ~10 ct sawtooth.
-	defaultCheckDeltaFraction = 0.20
-	// minRelativeCheckDelta and maxRelativeCheckDelta bound the derived
-	// margin so a freak amplitude estimate cannot silence alerting or fire on
-	// noise.
-	minRelativeCheckDelta = 0.005
-	maxRelativeCheckDelta = 0.060
 )
 
 // Default row templates, identical to gasoline-watch.sh's CHECK_ROW_TEMPLATE
@@ -70,88 +80,29 @@ const (
 	defaultSuggestTemplate = "{{date}} {{start_time}}-{{end_time}} {{fuel}} at {{station_name}} ({{distance}} km): predicted {{predicted_price}} EUR, confidence {{confidence}}"
 )
 
+// Fallbacks for the per-user notification schedule. Every user edits their own
+// values in the web UI (My Account → Notifications); these apply while a field
+// is still blank.
 const (
 	defaultNotifyDays    = "mon,tue,wed,thu,fri,sat,sun"
 	defaultNotifyWindows = "07:00-21:00"
 	defaultSuggestTimes  = "08:00,13:00"
 )
 
-// appSettings is the admin configuration that drives update/suggest/check
-// defaults and the notify command.
+// appSettings is the admin configuration that drives the notify command: the
+// notification texts, and nothing else.
 type appSettings struct {
-	Fuel                 string
-	RangeKM              float64
-	HistoryDays          int
-	PredictDays          int
-	LimitPerDay          int
-	CheckLimit           int
-	SuggestTimes         string
-	CheckResetTime       string
-	NotifyDays           string
-	NotifyWindows        string
 	CheckTemplate        string
 	SuggestTemplate      string
 	CheckTitleTemplate   string
 	SuggestTitleTemplate string
-	CheckDeltaMode       string
-	CheckDeltaFraction   float64
 }
 
-// VerdictThresholds returns the price margin rule these settings describe.
-// Callers pair it with a station's amplitude to get the concrete margin.
-func (s appSettings) VerdictThresholds() verdictThresholds {
-	if strings.EqualFold(strings.TrimSpace(s.CheckDeltaMode), checkDeltaModeRelative) {
-		return verdictThresholds{Relative: true, Fraction: s.CheckDeltaFraction, Delta: defaultCheckDelta}
-	}
-	return verdictThresholds{Delta: defaultCheckDelta}
-}
-
-// canonicalFuels lists the suggest/check fuel types in display order. The
-// admin "fuel" setting is any non-empty subset of these, stored as a
-// comma-separated string.
-var canonicalFuels = []string{"diesel", "e5", "e10"}
-
-// Fuels parses the stored comma-separated fuel setting into a normalized,
-// de-duplicated subset of canonicalFuels in canonical order. Empty or fully
-// invalid input falls back to all fuel types, preserving suggestion coverage.
-func (s appSettings) Fuels() []string {
-	seen := map[string]bool{}
-	for _, part := range strings.Split(s.Fuel, ",") {
-		part = strings.ToLower(strings.TrimSpace(part))
-		if isSuggestFuelType(part) {
-			seen[part] = true
-		}
-	}
-	var out []string
-	for _, f := range canonicalFuels {
-		if seen[f] {
-			out = append(out, f)
-		}
-	}
-	if len(out) == 0 {
-		return append([]string(nil), canonicalFuels...)
-	}
-	return out
-}
-
-// defaultAppSettings matches the hardcoded flag defaults of suggest/check.
+// defaultAppSettings matches the templates gasoline-watch.sh ships with.
 func defaultAppSettings() appSettings {
 	return appSettings{
-		Fuel:            "diesel",
-		RangeKM:         5,
-		HistoryDays:     30,
-		PredictDays:     3,
-		LimitPerDay:     3,
-		CheckLimit:      5,
-		SuggestTimes:    defaultSuggestTimes,
-		CheckResetTime:  "00:00",
-		NotifyDays:      defaultNotifyDays,
-		NotifyWindows:   defaultNotifyWindows,
 		CheckTemplate:   defaultCheckTemplate,
 		SuggestTemplate: defaultSuggestTemplate,
-		// Fixed mode reproduces the historical verdicts exactly.
-		CheckDeltaMode:     checkDeltaModeFixed,
-		CheckDeltaFraction: defaultCheckDeltaFraction,
 	}
 }
 
@@ -160,22 +111,10 @@ func defaultAppSettings() appSettings {
 func seededSettings() [][2]string {
 	d := defaultAppSettings()
 	return [][2]string{
-		{settingFuel, d.Fuel},
-		{settingRangeKM, strconv.FormatFloat(d.RangeKM, 'f', -1, 64)},
-		{settingHistoryDays, strconv.Itoa(d.HistoryDays)},
-		{settingPredictDays, strconv.Itoa(d.PredictDays)},
-		{settingLimitPerDay, strconv.Itoa(d.LimitPerDay)},
-		{settingCheckLimit, strconv.Itoa(d.CheckLimit)},
-		{settingSuggestTimes, d.SuggestTimes},
-		{settingCheckResetTime, d.CheckResetTime},
-		{settingNotifyDays, d.NotifyDays},
-		{settingNotifyWindows, d.NotifyWindows},
 		{settingCheckTemplate, d.CheckTemplate},
 		{settingSuggestTemplate, d.SuggestTemplate},
 		{settingCheckTitleTemplate, d.CheckTitleTemplate},
 		{settingSuggestTitleTemplate, d.SuggestTitleTemplate},
-		{settingCheckDeltaMode, d.CheckDeltaMode},
-		{settingCheckDeltaFraction, strconv.FormatFloat(d.CheckDeltaFraction, 'f', -1, 64)},
 	}
 }
 
@@ -200,13 +139,34 @@ func migrateSeedDefaultSettings(ctx context.Context, tx *sql.Tx, d dialect, resu
 	return nil
 }
 
+// migrateDropObsoleteSettings removes settings rows that no longer have any
+// effect. loadSettings already ignores unknown names, so this is housekeeping:
+// it keeps the table from presenting dead configuration to whoever reads it
+// next.
+func migrateDropObsoleteSettings(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	dropped := false
+	for _, name := range obsoleteSettings {
+		res, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE name = ?`, name)
+		if err != nil {
+			return fmt.Errorf("drop obsolete setting %s: %w", name, err)
+		}
+		if n, err := res.RowsAffected(); err == nil && n > 0 {
+			dropped = true
+		}
+	}
+	if dropped {
+		result.Applied = append(result.Applied, "settings.drop_obsolete")
+	}
+	return nil
+}
+
 type settingsQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 // loadSettings overlays the settings table onto the built-in defaults, so an
 // empty or partially filled table still yields today's behavior. Unknown rows
-// are ignored; unparsable numeric values fail loudly, naming the setting.
+// are ignored.
 func loadSettings(ctx context.Context, q settingsQuerier) (appSettings, error) {
 	s := defaultAppSettings()
 	rows, err := q.QueryContext(ctx, `SELECT name, value FROM settings`)
@@ -223,40 +183,9 @@ func loadSettings(ctx context.Context, q settingsQuerier) (appSettings, error) {
 		if value == "" {
 			continue
 		}
-		switch name {
-		case settingFuel:
-			s.Fuel = value
-		case settingRangeKM:
-			f, err := strconv.ParseFloat(value, 64)
-			if err != nil {
-				return appSettings{}, fmt.Errorf("invalid setting %s: %q is not a number", name, value)
-			}
-			s.RangeKM = f
-		case settingHistoryDays, settingPredictDays, settingLimitPerDay, settingCheckLimit:
-			n, err := strconv.Atoi(value)
-			if err != nil {
-				return appSettings{}, fmt.Errorf("invalid setting %s: %q is not an integer", name, value)
-			}
-			switch name {
-			case settingHistoryDays:
-				s.HistoryDays = n
-			case settingPredictDays:
-				s.PredictDays = n
-			case settingLimitPerDay:
-				s.LimitPerDay = n
-			case settingCheckLimit:
-				s.CheckLimit = n
-			}
-		case settingSuggestTimes:
-			s.SuggestTimes = value
-		case settingCheckResetTime:
-			s.CheckResetTime = value
-		case settingNotifyDays:
-			s.NotifyDays = value
-		case settingNotifyWindows:
-			s.NotifyWindows = value
 		// Templates are unescaped here (\n, \t, \\) so the single-line
 		// settings fields can express multi-line notifications.
+		switch name {
 		case settingCheckTemplate:
 			s.CheckTemplate = unescapeTemplate(value)
 		case settingSuggestTemplate:
@@ -265,29 +194,15 @@ func loadSettings(ctx context.Context, q settingsQuerier) (appSettings, error) {
 			s.CheckTitleTemplate = unescapeTemplate(value)
 		case settingSuggestTitleTemplate:
 			s.SuggestTitleTemplate = unescapeTemplate(value)
-		case settingCheckDeltaMode:
-			mode := strings.ToLower(value)
-			if mode != checkDeltaModeFixed && mode != checkDeltaModeRelative {
-				return appSettings{}, fmt.Errorf("invalid setting %s: %q is not %s or %s",
-					name, value, checkDeltaModeFixed, checkDeltaModeRelative)
-			}
-			s.CheckDeltaMode = mode
-		case settingCheckDeltaFraction:
-			f, err := strconv.ParseFloat(value, 64)
-			if err != nil {
-				return appSettings{}, fmt.Errorf("invalid setting %s: %q is not a number", name, value)
-			}
-			if f <= 0 || f > 1 {
-				return appSettings{}, fmt.Errorf("invalid setting %s: %v is outside (0, 1]", name, f)
-			}
-			s.CheckDeltaFraction = f
 		}
 	}
 	return s, rows.Err()
 }
 
 // updateTarget is one city+radius pair updated automatically by
-// `gasoline update` when no --city/--radius flags are given.
+// `gasoline update` when no --city/--radius flags are given. The radius is the
+// collection boundary — it decides which stations are fed — and is the only
+// radius in the system: suggest, check and notify cover whatever was fed.
 type updateTarget struct {
 	City     string
 	RadiusKM float64
@@ -333,59 +248,4 @@ func setNotificationState(ctx context.Context, db *sql.DB, d dialect, name, valu
 func clearCheckBaselines(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, `DELETE FROM notification_state WHERE name LIKE 'check_baseline:%'`)
 	return err
-}
-
-// applySuggestSettings overlays DB-configured defaults onto suggest options
-// for every flag the user did not set explicitly. Explicit flags always win.
-// The city is resolved separately (see resolveCities): without --city the
-// command covers every configured update target, not a single default.
-func applySuggestSettings(ctx context.Context, db *sql.DB, fs *flag.FlagSet, opts *suggestOptions) error {
-	s, err := loadSettings(ctx, db)
-	if err != nil {
-		return err
-	}
-	if !flagWasSet(fs, "fuel") {
-		opts.Fuel = s.Fuels()[0]
-	}
-	if !flagWasSet(fs, "range-km") {
-		opts.RangeKM = s.RangeKM
-	}
-	if !flagWasSet(fs, "history-days") {
-		opts.HistoryDays = s.HistoryDays
-	}
-	if !flagWasSet(fs, "predict-days") {
-		opts.PredictDays = s.PredictDays
-	}
-	if !flagWasSet(fs, "limit-per-day") {
-		opts.LimitPerDay = s.LimitPerDay
-	}
-	// Not flag-backed: the margin rule is admin-only configuration.
-	opts.Thresholds = s.VerdictThresholds()
-	return nil
-}
-
-// applyCheckSettings is the check-command counterpart of applySuggestSettings.
-func applyCheckSettings(ctx context.Context, db *sql.DB, fs *flag.FlagSet, opts *checkOptions) error {
-	s, err := loadSettings(ctx, db)
-	if err != nil {
-		return err
-	}
-	if !flagWasSet(fs, "fuel") {
-		opts.Fuel = s.Fuels()[0]
-	}
-	if !flagWasSet(fs, "range-km") {
-		opts.RangeKM = s.RangeKM
-	}
-	if !flagWasSet(fs, "history-days") {
-		opts.HistoryDays = s.HistoryDays
-	}
-	if !flagWasSet(fs, "predict-days") {
-		opts.PredictDays = s.PredictDays
-	}
-	if !flagWasSet(fs, "limit") {
-		opts.Limit = s.CheckLimit
-	}
-	// Not flag-backed: the margin rule is admin-only configuration.
-	opts.Thresholds = s.VerdictThresholds()
-	return nil
 }
