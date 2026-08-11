@@ -124,7 +124,7 @@ function flashText(string $key): string
         'passwordChanged' => 'Password changed.',
         'notifySaved' => 'Notification settings saved.',
         'invalidNotifySettings' => 'Invalid notification settings. Check days, time windows, and times.',
-    'invalidNotifyLocation' => 'Pick a city from the suggestions and a radius between 1 and 50 km.',
+    'invalidNotifyLocation' => 'Pick a city from the suggestions and a radius between 1 and 100 km.',
         'lastAdminGuard' => 'You are the last administrator and cannot delete this account.',
         'accountDeleted' => 'Your account has been deleted.',
         'confirmRequired' => 'Please confirm the deletion.',
@@ -504,10 +504,12 @@ const GASOLINE_WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 
 /**
  * Largest notification radius a user may pick, in km. Generous compared with an
- * update target's collection radius: a user can sit between two targets and
- * legitimately care about stations from both.
+ * update target's collection radius, because a user can sit between two targets
+ * and legitimately care about stations from both — and it matches the ceiling the
+ * old admin-wide range_km allowed, so any radius the migration carried over from
+ * it can still be saved from this form.
  */
-const GASOLINE_MAX_NOTIFY_RADIUS_KM = 50;
+const GASOLINE_MAX_NOTIFY_RADIUS_KM = 100;
 
 /** The suggest/check fuel types, in canonical display order. */
 const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
@@ -5732,7 +5734,7 @@ const translations = {
         notifyLocationHint: "Notifications cover every tracked station within this distance of the city you pick, and distances are measured from there. Stations only appear once your administrator's update targets actually collect them.",
         notifySaved: 'Notification settings saved.',
         invalidNotifySettings: 'Invalid notification settings. Check days, time windows, and times.',
-        invalidNotifyLocation: 'Pick a city from the suggestions and a radius between 1 and 50 km.',
+        invalidNotifyLocation: 'Pick a city from the suggestions and a radius between 1 and 100 km.',
         addWindow: 'Add window',
         addTime: 'Add time',
         removeRow: 'Remove',
@@ -6000,7 +6002,7 @@ const translations = {
         notifyLocationHint: 'Benachrichtigungen umfassen alle erfassten Tankstellen innerhalb dieser Entfernung zur gewählten Stadt, und Entfernungen werden von dort gemessen. Tankstellen erscheinen erst, wenn die Aktualisierungsziele Ihres Administrators sie tatsächlich erfassen.',
         notifySaved: 'Benachrichtigungseinstellungen gespeichert.',
         invalidNotifySettings: 'Ungültige Benachrichtigungseinstellungen. Bitte Tage, Zeitfenster und Zeiten prüfen.',
-        invalidNotifyLocation: 'Bitte eine Stadt aus den Vorschlägen und einen Radius zwischen 1 und 50 km wählen.',
+        invalidNotifyLocation: 'Bitte eine Stadt aus den Vorschlägen und einen Radius zwischen 1 und 100 km wählen.',
         addWindow: 'Zeitfenster hinzufügen',
         addTime: 'Zeit hinzufügen',
         removeRow: 'Entfernen',

@@ -3733,13 +3733,19 @@ func migrateUsersNotifyLocation(ctx context.Context, tx *sql.Tx, d dialect, resu
 // backfillNotifyLocations turns each user's old city selection into a location,
 // but only where the old selection says exactly what the new model can express.
 //
-// A user who had selected one city gets that city's centre and its target's
-// radius, which is the same coverage they had. Anything else is left unset and
-// reported by address: a selection of several cities cannot become one area, and
-// an empty selection meant *every* configured city, so picking one of them would
-// quietly shrink what that user receives. Those users receive nothing until they
-// choose an area — which `notify` tells them about on every run — and that is the
-// point: a visible gap beats silently narrowed coverage.
+// The radius comes from the legacy `range_km` setting, not from the update
+// target: that setting is what the old notify path measured with around each
+// selected city, while a target's radius only ever decided what got collected.
+// It is still readable here because migrateDropObsoleteSettings runs afterwards.
+//
+// Two selections are expressible. One selected city becomes that city's centre
+// at the legacy range. An empty selection meant *every* configured city, which
+// is the same thing whenever there is exactly one target. Anything else — several
+// cities, or none with several targets — is left unset and reported by address,
+// because picking one of them would quietly shrink what that user receives.
+// Those users receive nothing until they choose an area, which `notify` tells
+// them about on every run, and that is the point: a visible gap beats silently
+// changed coverage.
 func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
 	hasSelections, err := tableExists(ctx, tx, d, "user_notify_cities")
 	if err != nil {
@@ -3749,22 +3755,33 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 		// Either a fresh install or one that already migrated.
 		return nil
 	}
-	// city -> radius, in configured order, so "no selection" has a fallback.
-	targetRows, err := tx.QueryContext(ctx, `SELECT city, radius_km FROM update_targets ORDER BY id ASC`)
+	// The radius every migrated area gets: what the old notify path measured
+	// with. Absent or unparsable falls back to the value it defaulted to.
+	legacyRange := 5.0
+	var storedRange string
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE name = 'range_km'`).Scan(&storedRange); {
+	case err == nil:
+		if parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(storedRange), 64); parseErr == nil && parsed > 0 {
+			legacyRange = parsed
+		}
+	case errors.Is(err, sql.ErrNoRows):
+	default:
+		return err
+	}
+
+	targetRows, err := tx.QueryContext(ctx, `SELECT city FROM update_targets ORDER BY id ASC`)
 	if err != nil {
 		return err
 	}
 	var targetOrder []string
-	targetRadius := map[string]float64{}
 	for targetRows.Next() {
 		var city string
-		var radius float64
-		if err := targetRows.Scan(&city, &radius); err != nil {
+		if err := targetRows.Scan(&city); err != nil {
 			targetRows.Close()
 			return err
 		}
 		targetOrder = append(targetOrder, city)
-		targetRadius[city] = radius
 	}
 	targetRows.Close()
 	if err := targetRows.Err(); err != nil {
@@ -3850,11 +3867,16 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 	migrated := 0
 	var needReview []string
 	for _, u := range users {
-		city, unambiguous := chosen[u.id]
-		if !unambiguous || ambiguous[u.id] {
-			// Either an empty selection, which meant every configured city, or
-			// several cities. Inventing one of them would narrow their coverage
-			// without telling anyone.
+		city, selected := chosen[u.id]
+		if !selected && len(targetOrder) == 1 {
+			// An empty selection meant every configured city. With one target
+			// that is exactly one city, so it is not ambiguous at all.
+			city, selected = targetOrder[0], true
+		}
+		if !selected || ambiguous[u.id] {
+			// Several cities, or none with several targets to choose between.
+			// Inventing one of them would change their coverage without telling
+			// anyone.
 			if u.wouldReceive {
 				needReview = append(needReview, u.email)
 			}
@@ -3872,13 +3894,9 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 			}
 			continue
 		}
-		radius := targetRadius[city]
-		if radius <= 0 {
-			radius = 5
-		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE users SET notify_city = ?, notify_lat = ?, notify_lng = ?, notify_radius_km = ? WHERE id = ?`,
-			city, lat, lng, radius, u.id); err != nil {
+			city, lat, lng, legacyRange, u.id); err != nil {
 			return err
 		}
 		migrated++

@@ -389,6 +389,59 @@ func TestPriceCheckVerdictHonoursMargin(t *testing.T) {
 	}
 }
 
+func TestMigrateBackfillsNotifyLocationOnASingleTargetInstall(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE user_notify_cities (
+			user_id INTEGER NOT NULL,
+			city TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (user_id, city)
+		)`); err != nil {
+		t.Fatalf("recreate legacy table: %v", err)
+	}
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertUpdateTargetRow(t, db, "Berlin", 25)
+	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"),
+		"range_km", "8", "2026-04-01T00:00:00Z"); err != nil {
+		t.Fatalf("seed legacy range: %v", err)
+	}
+	// The ordinary case: one target, and a user on the old default of selecting
+	// nothing. "All cities" and "the one city" are the same area here, so their
+	// notifications must keep working rather than being switched off.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO users (email, password_hash, status, created_at, pushover_user_key, pushover_token, notify_check_enabled)
+		VALUES ('default@example.com', 'x', 'approved', '2026-04-01T00:00:00Z', 'k', 't', 1)`); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	result, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("migrateSchema: %v", err)
+	}
+	if !containsString(result.Applied, "users.notify_location.backfilled=1") {
+		t.Fatalf("migrate did not backfill the empty selection: %v", result.Applied)
+	}
+	for _, step := range result.Applied {
+		if strings.HasPrefix(step, "users.notify_location.needs_area") {
+			t.Fatalf("a single-target install must need no review: %v", result.Applied)
+		}
+	}
+	var city string
+	var lat, lng, radius float64
+	if err := db.QueryRowContext(ctx,
+		`SELECT notify_city, notify_lat, notify_lng, notify_radius_km FROM users WHERE email = 'default@example.com'`,
+	).Scan(&city, &lat, &lng, &radius); err != nil {
+		t.Fatalf("read location: %v", err)
+	}
+	// At the legacy range, not the 25 km collection radius.
+	if city != "Berlin" || lat != 52.517389 || lng != 13.395131 || radius != 8 {
+		t.Fatalf("location = %s %v/%v r%v, want Berlin at the legacy range 8", city, lat, lng, radius)
+	}
+}
+
 func TestMigrateBackfillsNotifyLocationFromCitySelection(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -406,8 +459,15 @@ func TestMigrateBackfillsNotifyLocationFromCitySelection(t *testing.T) {
 	}
 	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
 	insertSuggestCity(t, db, cachedCity{QueryName: "Hamburg", Name: "Hamburg", DisplayName: "Hamburg", Lat: 53.550556, Lng: 9.993333})
+	// The collection radii are deliberately unlike the notification range: the
+	// old notify path measured with settings.range_km around the selected city,
+	// while a target's radius only decided what got collected.
 	insertUpdateTargetRow(t, db, "Berlin", 7)
 	insertUpdateTargetRow(t, db, "Hamburg", 12)
+	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"),
+		"range_km", "5", "2026-04-01T00:00:00Z"); err != nil {
+		t.Fatalf("seed legacy range: %v", err)
+	}
 
 	// The first three would receive notifications; the fourth never configured
 	// Pushover, so nothing changes for them either way.
@@ -492,9 +552,10 @@ func TestMigrateBackfillsNotifyLocationFromCitySelection(t *testing.T) {
 		}
 		got[id] = l
 	}
-	// The single selection is carried over with that target's own radius.
-	if got[1] != (loc{"Hamburg", 53.550556, 9.993333, 12}) {
-		t.Errorf("user 1 = %+v, want Hamburg at radius 12", got[1])
+	// The single selection is carried over at the legacy notification range, not
+	// at Hamburg's 12 km collection radius.
+	if got[1] != (loc{"Hamburg", 53.550556, 9.993333, 5}) {
+		t.Errorf("user 1 = %+v, want Hamburg at the legacy range 5", got[1])
 	}
 	// Everyone else is left without an area rather than being narrowed to one
 	// city they never asked for.
