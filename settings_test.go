@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -439,6 +440,69 @@ func TestMigrateBackfillsNotifyLocationOnASingleTargetInstall(t *testing.T) {
 	// At the legacy range, not the 25 km collection radius.
 	if city != "Berlin" || lat != 52.517389 || lng != 13.395131 || radius != 8 {
 		t.Fatalf("location = %s %v/%v r%v, want Berlin at the legacy range 8", city, lat, lng, radius)
+	}
+}
+
+func TestMigrateBackfillsNotifyLocationKeepsAFractionalRange(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE user_notify_cities (
+			user_id INTEGER NOT NULL,
+			city TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (user_id, city)
+		)`); err != nil {
+		t.Fatalf("recreate legacy table: %v", err)
+	}
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertUpdateTargetRow(t, db, "Berlin", 25)
+	// The old range_km field stepped in halves, so a fractional range is an
+	// ordinary value and has to survive intact — the account form renders and
+	// accepts it without rounding.
+	if _, err := db.ExecContext(ctx, kvUpsertSQL(dialectSQLite, "settings"),
+		"range_km", "7.5", "2026-04-01T00:00:00Z"); err != nil {
+		t.Fatalf("seed legacy range: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO users (email, password_hash, status, created_at, pushover_user_key, pushover_token, notify_check_enabled)
+		VALUES ('half@example.com', 'x', 'approved', '2026-04-01T00:00:00Z', 'k', 't', 1)`); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	if _, err := migrateSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("migrateSchema: %v", err)
+	}
+	var radius float64
+	if err := db.QueryRowContext(ctx,
+		`SELECT notify_radius_km FROM users WHERE email = 'half@example.com'`).Scan(&radius); err != nil {
+		t.Fatalf("read radius: %v", err)
+	}
+	if radius != 7.5 {
+		t.Fatalf("radius = %v, want the legacy 7.5 unrounded", radius)
+	}
+}
+
+// The account form has to render a fractional radius exactly and accept it back,
+// or saving any unrelated notification setting would resize the area.
+func TestAccountFormRoundTripsAFractionalRadius(t *testing.T) {
+	php, err := os.ReadFile(filepath.Join("web", "index.php"))
+	if err != nil {
+		t.Fatalf("read web/index.php: %v", err)
+	}
+	source := string(php)
+	if strings.Contains(source, "round($notifyRadius)") {
+		t.Error("the radius field rounds the stored value, which resizes a fractional area on save")
+	}
+	if !strings.Contains(source, "formatRadiusKm($notifyRadius)") {
+		t.Error("the radius field no longer renders through formatRadiusKm")
+	}
+	if strings.Contains(source, "ctype_digit($radiusRaw)") {
+		t.Error("the radius is validated as an integer, which rejects a fractional area")
+	}
+	if !strings.Contains(source, "is_numeric($radiusRaw)") {
+		t.Error("the radius is no longer validated as numeric")
 	}
 }
 

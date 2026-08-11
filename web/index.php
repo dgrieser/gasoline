@@ -503,6 +503,18 @@ function validHHMM(string $value): bool
 const GASOLINE_WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 
 /**
+ * Renders a notification radius for the form: the stored value unchanged, minus a
+ * trailing ".0" so a whole number does not read as a decimal. Rounding here would
+ * silently resize a migrated fractional area the next time the form is saved.
+ * Always a period decimal separator, which is what a number input requires.
+ */
+function formatRadiusKm(float $radiusKm): string
+{
+    $text = rtrim(rtrim(number_format($radiusKm, 3, '.', ''), '0'), '.');
+    return $text === '' ? '0' : $text;
+}
+
+/**
  * Largest notification radius a user may pick, in km. Generous compared with an
  * update target's collection radius, because a user can sit between two targets
  * and legitimately care about stations from both — and it matches the ceiling the
@@ -750,8 +762,11 @@ function handlePost(PDO $pdo, string $driver): void
             $cityRow = resolveCity($pdo, $cityKey);
             $radius = 0.0;
             if ($cityKey !== '' || $radiusRaw !== '' || $wantsNotifications) {
-                if ($cityRow === null || !ctype_digit($radiusRaw)
-                    || (int) $radiusRaw < 1 || (int) $radiusRaw > GASOLINE_MAX_NOTIFY_RADIUS_KM) {
+                // Numeric rather than integer: the legacy range_km this migrates
+                // from stepped in halves, so 7.5 km subscriptions exist and must
+                // survive an unrelated save.
+                if ($cityRow === null || !is_numeric($radiusRaw)
+                    || (float) $radiusRaw < 1 || (float) $radiusRaw > GASOLINE_MAX_NOTIFY_RADIUS_KM) {
                     setFlash('error', 'invalidNotifyLocation');
                     redirectTo('?page=account');
                 }
@@ -1226,8 +1241,8 @@ function renderAccountPage(PDO $pdo, array $user): never
                 </div>
                 <div class="field">
                     <label for="nf-radius" data-i18n="notifyRadius">Radius (km)</label>
-                    <input type="number" id="nf-radius" name="notify_radius_km" min="1" max="<?= GASOLINE_MAX_NOTIFY_RADIUS_KM ?>"
-                        value="<?= $notifyRadius > 0 ? h((string) round($notifyRadius)) : '' ?>">
+                    <input type="number" id="nf-radius" name="notify_radius_km" min="1" max="<?= GASOLINE_MAX_NOTIFY_RADIUS_KM ?>" step="any"
+                        value="<?= $notifyRadius > 0 ? h(formatRadiusKm($notifyRadius)) : '' ?>">
                     <p class="field-hint" data-i18n="notifyLocationHint">Notifications cover every tracked station within this distance of the city you pick, and distances are measured from there. Stations only appear once your administrator's update targets actually collect them.</p>
                 </div>
                 <div class="field">
