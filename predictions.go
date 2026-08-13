@@ -656,11 +656,17 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 	// one city within a radius, it covers every station currently being fed.
 	// They are written empty rather than dropped, because rebuilding this table
 	// costs more than the two dead columns do.
+	//
+	// suggestion_bias is the display correction active for this run, recorded
+	// on the run row only so the dashboard can quote the same corrected price
+	// the notifier sends. The grid rows below keep storing the raw model
+	// price: training reads those, so the measurement never sees itself.
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO prediction_runs (run_at, city_name, fuel, range_km, history_days, predict_days, jump_anchor_hour, station_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO prediction_runs (run_at, city_name, fuel, range_km, history_days, predict_days, jump_anchor_hour, station_count, suggestion_bias)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, computation.Now.UTC().Format(time.RFC3339), "", opts.Fuel, 0,
-		opts.HistoryDays, opts.PredictDays, computation.Model.JumpAnchorHour, len(stationIDs))
+		opts.HistoryDays, opts.PredictDays, computation.Model.JumpAnchorHour, len(stationIDs),
+		computation.Model.SuggestionBias)
 	if err != nil {
 		return 0, 0, err
 	}

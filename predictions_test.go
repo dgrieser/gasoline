@@ -5,7 +5,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -287,6 +289,10 @@ func TestPersistPredictionRunStoresGridAndFlagsSuggestions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("computeSuggestions: %v", err)
 	}
+	// A learned display correction must land on the run row (so the dashboard
+	// can quote notifier prices) while the grid rows keep the raw model price
+	// (so training never measures the correction it applied).
+	computation.Model.SuggestionBias = 0.0279
 	_, persisted, err := persistPredictionRun(ctx, db, computation, opts)
 	if err != nil {
 		t.Fatalf("persistPredictionRun: %v", err)
@@ -299,16 +305,20 @@ func TestPersistPredictionRunStoresGridAndFlagsSuggestions(t *testing.T) {
 	var (
 		anchor, stationCount int
 		cityName             string
+		storedBias           float64
 	)
-	if err := db.QueryRowContext(ctx, `SELECT jump_anchor_hour, station_count, city_name FROM prediction_runs`).Scan(&anchor, &stationCount, &cityName); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT jump_anchor_hour, station_count, city_name, suggestion_bias FROM prediction_runs`).Scan(&anchor, &stationCount, &cityName, &storedBias); err != nil {
 		t.Fatalf("read run: %v", err)
 	}
 	// city_name is a legacy column: a run is no longer scoped to one city.
 	if anchor != 12 || stationCount != 1 || cityName != "" {
 		t.Fatalf("run = anchor %d, stations %d, city %q; want 12/1 and no city", anchor, stationCount, cityName)
 	}
+	if storedBias != 0.0279 {
+		t.Fatalf("suggestion_bias = %v, want the model's 0.0279 on the run row", storedBias)
+	}
 
-	rows, err := db.QueryContext(ctx, `SELECT target_start, lead_minutes, baseline FROM price_predictions WHERE is_suggestion = 1`)
+	rows, err := db.QueryContext(ctx, `SELECT target_start, lead_minutes, baseline, predicted_price FROM price_predictions WHERE is_suggestion = 1`)
 	if err != nil {
 		t.Fatalf("read suggestions: %v", err)
 	}
@@ -319,8 +329,9 @@ func TestPersistPredictionRunStoresGridAndFlagsSuggestions(t *testing.T) {
 			targetStart string
 			leadMinutes int
 			baseline    sql.NullFloat64
+			storedPrice float64
 		)
-		if err := rows.Scan(&targetStart, &leadMinutes, &baseline); err != nil {
+		if err := rows.Scan(&targetStart, &leadMinutes, &baseline, &storedPrice); err != nil {
 			t.Fatalf("scan suggestion row: %v", err)
 		}
 		flagged = append(flagged, targetStart)
@@ -329,6 +340,17 @@ func TestPersistPredictionRunStoresGridAndFlagsSuggestions(t *testing.T) {
 		}
 		if !baseline.Valid || baseline.Float64 < 1.94 || baseline.Float64 > 1.96 {
 			t.Fatalf("baseline = %+v, want ~1.95", baseline)
+		}
+		target, err := time.Parse(time.RFC3339, targetStart)
+		if err != nil {
+			t.Fatalf("parse target_start %q: %v", targetStart, err)
+		}
+		score, ok := scoreForecast(computation.Model, "station-1", target.In(opts.Location))
+		if !ok {
+			t.Fatalf("scoreForecast for %s: no score", targetStart)
+		}
+		if math.Abs(storedPrice-score.PredictedPrice) > 1e-9 {
+			t.Fatalf("stored price = %v, want the raw model score %v — the display correction must never reach the grid", storedPrice, score.PredictedPrice)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -1115,5 +1137,67 @@ func TestEvaluateCheckOutcomesReusesFloorPerPricingDay(t *testing.T) {
 	}
 	if distinct != 1 {
 		t.Fatalf("distinct floors = %d, want 1: decisions sharing a pricing day must agree", distinct)
+	}
+}
+
+// Since prediction runs went global, is_suggestion marks the run's *globally*
+// cheapest windows — a dashboard filtered to one area almost never contains
+// them, which is exactly the bug this pins: the card read the flags and showed
+// nothing. The dashboard has to pick windows for its own scope from the stored
+// grid, mirroring the notifier's per-area picker. The picker is PHP and cannot
+// be executed here, so this checks its source against the Go constants it
+// mirrors.
+func TestDashboardPredictionsArePickedPerScopeNotFromGlobalFlags(t *testing.T) {
+	viewer, err := os.ReadFile(filepath.Join("web", "index.php"))
+	if err != nil {
+		t.Fatalf("read web/index.php: %v", err)
+	}
+	source := string(viewer)
+
+	start := strings.Index(source, "function loadFilteredPredictions")
+	if start < 0 {
+		t.Fatal("web/index.php no longer defines loadFilteredPredictions")
+	}
+	end := strings.Index(source[start:], "\nfunction ")
+	if end < 0 {
+		t.Fatal("cannot delimit loadFilteredPredictions")
+	}
+	picker := source[start : start+end]
+
+	if strings.Contains(picker, "is_suggestion") {
+		t.Error("the dashboard picker reads the persisted is_suggestion flags, which mark global picks a filtered scope almost never contains")
+	}
+	if want := fmt.Sprintf("$limitPerDay = %d", suggestLimitPerDay); !strings.Contains(picker, want) {
+		t.Errorf("the dashboard picker no longer mirrors suggestLimitPerDay (%d): %q missing", suggestLimitPerDay, want)
+	}
+	// duplicatesNearbyStationWindow skips windows less than two hours apart at
+	// one station; the PHP mirror spells the same bound in seconds.
+	if !strings.Contains(picker, "$dupWindowSeconds = 2 * 3600") {
+		t.Error("the dashboard picker no longer mirrors the two-hour same-station duplicate window")
+	}
+	// The notifier picks cheapest-first and only then filters to medium/high
+	// (notify.go collectSuggestions); the picker has to keep that order, so
+	// the candidate query must not pre-filter confidence.
+	if strings.Contains(picker, "confidence IN") {
+		t.Error("the dashboard picker filters confidence in SQL, before selection — a cheap low-confidence window must consume a slot like it does in notify")
+	}
+	for _, want := range []string{"!== 'medium'", "!== 'high'"} {
+		if !strings.Contains(picker, want) {
+			t.Errorf("the dashboard picker no longer applies the notifier's medium/high filter after selection: %q missing", want)
+		}
+	}
+	// suggestionCandidateLess ordering: the RAW model price first — the
+	// display correction must not influence which windows are picked — then
+	// confidence.
+	if !strings.Contains(picker, "$a['raw'] <=> $b['raw']") || !strings.Contains(picker, "$confidenceRank") {
+		t.Error("the dashboard picker no longer orders candidates by raw price then confidence like suggestionCandidateLess")
+	}
+	// The displayed price carries the run's recorded suggestion display
+	// correction, so the card quotes what a notification would say.
+	if !strings.Contains(picker, "pr.suggestion_bias") {
+		t.Error("the dashboard picker no longer reads the run's suggestion_bias, so its prices drift from the notifier's")
+	}
+	if !strings.Contains(picker, "$rawPrice + (float) $row['suggestion_bias']") {
+		t.Error("the dashboard picker no longer adds the recorded display correction to the displayed price")
 	}
 }

@@ -411,6 +411,7 @@ func schemaStatements(d dialect) []string {
 				predict_days INTEGER NOT NULL,
 				jump_anchor_hour INTEGER NOT NULL DEFAULT 0,
 				station_count INTEGER NOT NULL DEFAULT 0,
+				suggestion_bias DOUBLE NOT NULL DEFAULT 0,
 				INDEX idx_prediction_runs_city_fuel_run (city_name, fuel, run_at DESC)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 			`CREATE TABLE IF NOT EXISTS price_predictions (
@@ -560,7 +561,8 @@ func schemaStatements(d dialect) []string {
 			history_days INTEGER NOT NULL,
 			predict_days INTEGER NOT NULL,
 			jump_anchor_hour INTEGER NOT NULL DEFAULT 0,
-			station_count INTEGER NOT NULL DEFAULT 0
+			station_count INTEGER NOT NULL DEFAULT 0,
+			suggestion_bias REAL NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_prediction_runs_city_fuel_run
 			ON prediction_runs(city_name, fuel, run_at DESC)`,
