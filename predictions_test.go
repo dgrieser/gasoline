@@ -5,7 +5,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1115,5 +1117,57 @@ func TestEvaluateCheckOutcomesReusesFloorPerPricingDay(t *testing.T) {
 	}
 	if distinct != 1 {
 		t.Fatalf("distinct floors = %d, want 1: decisions sharing a pricing day must agree", distinct)
+	}
+}
+
+// Since prediction runs went global, is_suggestion marks the run's *globally*
+// cheapest windows — a dashboard filtered to one area almost never contains
+// them, which is exactly the bug this pins: the card read the flags and showed
+// nothing. The dashboard has to pick windows for its own scope from the stored
+// grid, mirroring the notifier's per-area picker. The picker is PHP and cannot
+// be executed here, so this checks its source against the Go constants it
+// mirrors.
+func TestDashboardPredictionsArePickedPerScopeNotFromGlobalFlags(t *testing.T) {
+	viewer, err := os.ReadFile(filepath.Join("web", "index.php"))
+	if err != nil {
+		t.Fatalf("read web/index.php: %v", err)
+	}
+	source := string(viewer)
+
+	start := strings.Index(source, "function loadFilteredPredictions")
+	if start < 0 {
+		t.Fatal("web/index.php no longer defines loadFilteredPredictions")
+	}
+	end := strings.Index(source[start:], "\nfunction ")
+	if end < 0 {
+		t.Fatal("cannot delimit loadFilteredPredictions")
+	}
+	picker := source[start : start+end]
+
+	if strings.Contains(picker, "is_suggestion") {
+		t.Error("the dashboard picker reads the persisted is_suggestion flags, which mark global picks a filtered scope almost never contains")
+	}
+	if want := fmt.Sprintf("$limitPerDay = %d", suggestLimitPerDay); !strings.Contains(picker, want) {
+		t.Errorf("the dashboard picker no longer mirrors suggestLimitPerDay (%d): %q missing", suggestLimitPerDay, want)
+	}
+	// duplicatesNearbyStationWindow skips windows less than two hours apart at
+	// one station; the PHP mirror spells the same bound in seconds.
+	if !strings.Contains(picker, "$dupWindowSeconds = 2 * 3600") {
+		t.Error("the dashboard picker no longer mirrors the two-hour same-station duplicate window")
+	}
+	// The notifier picks cheapest-first and only then filters to medium/high
+	// (notify.go collectSuggestions); the picker has to keep that order, so
+	// the candidate query must not pre-filter confidence.
+	if strings.Contains(picker, "confidence IN") {
+		t.Error("the dashboard picker filters confidence in SQL, before selection — a cheap low-confidence window must consume a slot like it does in notify")
+	}
+	for _, want := range []string{"!== 'medium'", "!== 'high'"} {
+		if !strings.Contains(picker, want) {
+			t.Errorf("the dashboard picker no longer applies the notifier's medium/high filter after selection: %q missing", want)
+		}
+	}
+	// suggestionCandidateLess ordering: price first, then confidence.
+	if !strings.Contains(picker, "$a['price'] <=> $b['price']") || !strings.Contains(picker, "$confidenceRank") {
+		t.Error("the dashboard picker no longer orders candidates by price then confidence like suggestionCandidateLess")
 	}
 }

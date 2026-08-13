@@ -3344,23 +3344,33 @@ function buildSnapshotQuery(
 }
 
 /**
- * Load the notification-worthy future predictions for the in-scope stations.
+ * Pick the upcoming fill-up windows for the in-scope stations.
  *
- * Replicates the suggest-notification filter against already-stored data: the
- * hour windows a persisted `suggest --persist` run marked as a suggestion
- * (`is_suggestion = 1`) whose confidence is medium/high — exactly the rows the
- * notifier sends (notify.go keeps `confidence IN ('medium','high')`) — limited
- * to windows still in the future. It never triggers a suggest run.
+ * Since prediction runs went global, the stored is_suggestion flag marks the
+ * per-run *globally* cheapest windows across every station being fed — for a
+ * dashboard filtered to one area those flags almost never land in scope, so
+ * they cannot drive this card. Instead the windows are picked here, from the
+ * newest run's full forecast grid restricted to exactly the stations in
+ * scope, mirroring the notifier's per-area picker (notify.go
+ * collectSuggestions → generateSuggestions → the medium/high filter): per
+ * fuel and local day the cheapest hour windows are selected — ordered by
+ * price, then confidence, then distance, then start — up to the notifier's
+ * per-day limit, a window less than two hours from an already selected
+ * window at the same station is skipped as a duplicate, equal-priced picks
+ * of one station merge into a single span, and only medium/high confidence
+ * survives. The result is what a subscriber to this area would be sent. It
+ * never triggers a suggest run.
  *
  * Later runs supersede earlier ones for the same target hour, so only the
  * newest run per (station, fuel) is considered; a station covered by several
- * cities' runs resolves independently via its own newest run.
+ * runs resolves independently via its own newest run.
  *
  * @param array<int, string> $stationIds effective in-scope station ids
+ * @param array<string, float> $distancesKm station id -> km from the selected city
  * @return array{rows: array<int, array<string, mixed>>, as_of: array<string, string>}
  *   rows sorted by window start then station id; as_of maps fuel -> newest run_at
  */
-function loadFilteredPredictions(PDO $pdo, array $stationIds, string $selectedFuel, string $nowUtc): array
+function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm, string $selectedFuel, string $nowUtc): array
 {
     $empty = ['rows' => [], 'as_of' => []];
     if ($stationIds === []) {
@@ -3415,7 +3425,10 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, string $selectedFu
         return $empty;
     }
 
-    // Future, notification-worthy suggestion windows.
+    // Candidate windows: the newest run's full future grid for the scope.
+    // Confidence is deliberately not filtered here — the notifier picks the
+    // cheapest windows first and only then drops low confidence, so a cheap
+    // low-confidence window consumes a slot without being shown.
     $rowStmt = $pdo->prepare(
         'SELECT pp.station_id, pp.fuel, pp.target_start, pp.target_end, '
         . 'pp.predicted_price, pp.confidence, pr.run_at '
@@ -3423,8 +3436,6 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, string $selectedFu
         . 'JOIN prediction_runs pr ON pr.id = pp.run_id '
         . 'WHERE pp.station_id IN (' . $stationIn . ') '
         . 'AND pp.fuel IN (' . $fuelIn . ') '
-        . 'AND pp.is_suggestion = 1 '
-        . "AND pp.confidence IN ('medium', 'high') "
         . 'AND pp.target_start > :pred_now '
         . 'ORDER BY pp.target_start ASC, pp.station_id ASC'
     );
@@ -3434,7 +3445,11 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, string $selectedFu
     $rowStmt->bindValue(':pred_now', $nowUtc);
     $rowStmt->execute();
 
-    $rows = [];
+    // Bucket candidates per fuel and local day, like generateSuggestions does
+    // with the server's local time (the Go side groups by opts.Location, which
+    // is the server timezone there too).
+    $localZone = new DateTimeZone(date_default_timezone_get());
+    $byFuelDate = [];
     foreach ($rowStmt->fetchAll() as $row) {
         $stationId = (string) $row['station_id'];
         $fuel = (string) $row['fuel'];
@@ -3444,15 +3459,90 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, string $selectedFu
         if (!isset($latestRunByKey[$key]) || (string) $row['run_at'] !== $latestRunByKey[$key]) {
             continue;
         }
-        $rows[] = [
+        $start = new DateTimeImmutable((string) $row['target_start']);
+        $localDate = $start->setTimezone($localZone)->format('Y-m-d');
+        $byFuelDate[$fuel][$localDate][] = [
             's' => $stationId,
             'fuel' => $fuel,
             'start' => (string) $row['target_start'],
             'end' => (string) $row['target_end'],
             'price' => (float) $row['predicted_price'],
             'conf' => (string) $row['confidence'],
+            'ts' => $start->getTimestamp(),
         ];
     }
+
+    // suggestLimitPerDay and the two-hour duplicate window, mirrored from the
+    // Go picker (generateSuggestions / duplicatesNearbyStationWindow).
+    $limitPerDay = 3;
+    $dupWindowSeconds = 2 * 3600;
+    $confidenceRank = static function (string $confidence): int {
+        return $confidence === 'high' ? 3 : ($confidence === 'medium' ? 2 : 1);
+    };
+
+    $rows = [];
+    foreach ($byFuelDate as $byDate) {
+        foreach ($byDate as $candidates) {
+            // suggestionCandidateLess: price, confidence, distance (rounded to
+            // 0.1 km like the Go side reports it), start, then station id for
+            // determinism.
+            usort($candidates, static function (array $a, array $b) use ($confidenceRank, $distancesKm): int {
+                return ($a['price'] <=> $b['price'])
+                    ?: ($confidenceRank($b['conf']) <=> $confidenceRank($a['conf']))
+                    ?: (round($distancesKm[$a['s']] ?? INF, 1) <=> round($distancesKm[$b['s']] ?? INF, 1))
+                    ?: ($a['ts'] <=> $b['ts'])
+                    ?: strcmp($a['s'], $b['s']);
+            });
+
+            $selected = [];
+            foreach ($candidates as $candidate) {
+                $duplicate = false;
+                foreach ($selected as $existing) {
+                    if ($existing['s'] === $candidate['s'] && abs($candidate['ts'] - $existing['ts']) < $dupWindowSeconds) {
+                        $duplicate = true;
+                        break;
+                    }
+                }
+                if ($duplicate) {
+                    continue;
+                }
+                $selected[] = $candidate;
+                if (count($selected) === $limitPerDay) {
+                    break;
+                }
+            }
+
+            // The notifier's confidence filter, then mergeSuggestions: picks of
+            // one station with the same cent-rounded price and confidence
+            // collapse into one span (the Go side compares display prices,
+            // which are cent-rounded).
+            $merged = [];
+            foreach ($selected as $candidate) {
+                if ($candidate['conf'] !== 'medium' && $candidate['conf'] !== 'high') {
+                    continue;
+                }
+                $mergeKey = $candidate['s'] . '|' . number_format($candidate['price'], 2, '.', '') . '|' . $candidate['conf'];
+                if (isset($merged[$mergeKey])) {
+                    if (strcmp($candidate['end'], $merged[$mergeKey]['end']) > 0) {
+                        $merged[$mergeKey]['end'] = $candidate['end'];
+                    }
+                    if (strcmp($candidate['start'], $merged[$mergeKey]['start']) < 0) {
+                        $merged[$mergeKey]['start'] = $candidate['start'];
+                    }
+                    continue;
+                }
+                $merged[$mergeKey] = $candidate;
+            }
+            foreach ($merged as $pick) {
+                unset($pick['ts']);
+                $rows[] = $pick;
+            }
+        }
+    }
+
+    usort($rows, static function (array $a, array $b): int {
+        return strcmp($a['start'], $b['start']) ?: strcmp($a['s'], $b['s']);
+    });
 
     return ['rows' => $rows, 'as_of' => $asOf];
 }
@@ -3598,7 +3688,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
 
             if ($predictionStationIds !== []) {
                 $nowUtc = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format(DateTimeInterface::RFC3339);
-                $predictions = loadFilteredPredictions($pdo, $predictionStationIds, $selectedFuel, $nowUtc);
+                $predictions = loadFilteredPredictions($pdo, $predictionStationIds, $distances, $selectedFuel, $nowUtc);
                 $out['predictions'] = $predictions['rows'];
                 $out['predictions_as_of'] = $predictions['as_of'];
                 // Predicted stations may have no snapshot in the current date
@@ -7474,11 +7564,13 @@ function renderHighest() {
 
 const ICON_CLOCK = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`;
 
-// Upcoming predictions the notifier would send: for the in-scope stations, the
-// stored future suggestion windows with medium/high confidence, grouped per
-// fuel then per day. Within a day the cheapest window is shown large and the
-// rest follow as a compact price-ranked list. Data comes from ?action=data
-// (predictionData / predictionAsOf); the page never triggers a suggest run.
+// Upcoming predictions the notifier would send: windows picked server-side
+// from the stored forecast grid for exactly the in-scope stations (medium/high
+// confidence, cheapest-first per day like a notify subscriber to this area),
+// grouped per fuel then per day. Within a day the cheapest window is shown
+// large and the rest follow as a compact price-ranked list. Data comes from
+// ?action=data (predictionData / predictionAsOf); the page never triggers a
+// suggest run.
 function renderPredictions() {
     const t = translations[currentLang];
     if (!predictionsCard) return;
