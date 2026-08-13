@@ -3536,6 +3536,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migratePredictionsAppliedCorrection(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateRunsSuggestionBias(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migrateUsersNotifyFuel(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -3623,6 +3626,31 @@ func migratePredictionsAppliedCorrection(ctx context.Context, tx *sql.Tx, d dial
 		return err
 	}
 	result.Applied = append(result.Applied, "price_predictions.applied_correction")
+	return nil
+}
+
+// migrateRunsSuggestionBias adds the column recording the suggestion display
+// correction active for a run, so the dashboard can quote the same corrected
+// price the notifier sends. Only the run row carries it — the grid keeps
+// storing the raw model price, which is what keeps the bias measurement from
+// feeding back on itself. Pre-existing runs default to 0: their bias was never
+// recorded, and showing their raw price is what the dashboard always did.
+func migrateRunsSuggestionBias(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "prediction_runs", "suggestion_bias")
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	colType := "REAL"
+	if d == dialectMySQL {
+		colType = "DOUBLE"
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE prediction_runs ADD COLUMN suggestion_bias %s NOT NULL DEFAULT 0`, colType)); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "prediction_runs.suggestion_bias")
 	return nil
 }
 

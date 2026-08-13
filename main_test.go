@@ -2296,6 +2296,56 @@ func TestMigratePredictionsAccuracyIndexBackfills(t *testing.T) {
 	}
 }
 
+// TestMigrateRunsSuggestionBiasBackfills covers the upgrade path: a database
+// created before prediction_runs.suggestion_bias existed must gain the column
+// on migrate, defaulting old runs to 0 (their bias was never recorded, and a
+// raw price is what the dashboard displayed for them anyway).
+func TestMigrateRunsSuggestionBiasBackfills(t *testing.T) {
+	ctx := context.Background()
+	db, err := openDB(filepath.Join(t.TempDir(), "suggestion-bias.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE prediction_runs DROP COLUMN suggestion_bias`); err != nil {
+		t.Fatalf("drop column: %v", err)
+	}
+	// A run persisted by the old schema, present before the upgrade.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO prediction_runs (run_at, city_name, fuel, range_km, history_days, predict_days, jump_anchor_hour, station_count)
+		VALUES ('2026-04-25T09:00:00Z', '', 'diesel', 0, 30, 3, 12, 1)
+	`); err != nil {
+		t.Fatalf("insert legacy run: %v", err)
+	}
+
+	result, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("migrateSchema: %v", err)
+	}
+	if !containsString(result.Applied, "prediction_runs.suggestion_bias") {
+		t.Fatalf("applied migrations = %v, want prediction_runs.suggestion_bias", result.Applied)
+	}
+	var legacyBias float64
+	if err := db.QueryRowContext(ctx, `SELECT suggestion_bias FROM prediction_runs`).Scan(&legacyBias); err != nil {
+		t.Fatalf("read legacy run: %v", err)
+	}
+	if legacyBias != 0 {
+		t.Fatalf("legacy suggestion_bias = %v, want 0", legacyBias)
+	}
+
+	// Idempotent: a second pass must not report or attempt the change again.
+	again, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("migrateSchema second pass: %v", err)
+	}
+	if containsString(again.Applied, "prediction_runs.suggestion_bias") {
+		t.Fatalf("second migrate re-applied the column: %v", again.Applied)
+	}
+}
+
 func TestTableHasIndexReportsMissingIndex(t *testing.T) {
 	ctx := context.Background()
 	db, err := openDB(filepath.Join(t.TempDir(), "index-probe.db"))

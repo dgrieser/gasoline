@@ -23,7 +23,7 @@ var migrationTables = []struct {
 	// (compaction and latest-snapshot queries break ties by id).
 	{"price_snapshots", []string{"id", "station_id", "city_name", "recorded_at", "search_radius_km", "is_open", "e5", "e10", "diesel"}},
 	// ids are copied so price_predictions.run_id keeps pointing at its run.
-	{"prediction_runs", []string{"id", "run_at", "city_name", "fuel", "range_km", "history_days", "predict_days", "jump_anchor_hour", "station_count"}},
+	{"prediction_runs", []string{"id", "run_at", "city_name", "fuel", "range_km", "history_days", "predict_days", "jump_anchor_hour", "station_count", "suggestion_bias"}},
 	{"price_predictions", []string{"id", "run_id", "station_id", "fuel", "target_start", "target_end", "predicted_price", "baseline", "confidence", "sample_count", "is_suggestion", "lead_minutes", "applied_correction", "actual_price", "error", "evaluated_at"}},
 	{"price_check_decisions", []string{"id", "run_id", "station_id", "fuel", "decided_at", "target_start", "target_end", "observed_price", "observed_at", "predicted_price", "error", "history_percentile", "confidence", "sample_count", "verdict", "recommendation", "expected_lower", "expected_drop", "day_floor_price", "day_floor_at", "regret", "outcome_evaluated_at"}},
 }

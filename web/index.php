@@ -3358,8 +3358,11 @@ function buildSnapshotQuery(
  * per-day limit, a window less than two hours from an already selected
  * window at the same station is skipped as a duplicate, equal-priced picks
  * of one station merge into a single span, and only medium/high confidence
- * survives. The result is what a subscriber to this area would be sent. It
- * never triggers a suggest run.
+ * survives. Displayed prices carry the run's recorded suggestion display
+ * correction (prediction_runs.suggestion_bias) on top of the raw grid price,
+ * again like the notifier — ordering stays on the raw price. The result is
+ * what a subscriber to this area would be sent. It never triggers a suggest
+ * run.
  *
  * Later runs supersede earlier ones for the same target hour, so only the
  * newest run per (station, fuel) is considered; a station covered by several
@@ -3431,7 +3434,7 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm
     // low-confidence window consumes a slot without being shown.
     $rowStmt = $pdo->prepare(
         'SELECT pp.station_id, pp.fuel, pp.target_start, pp.target_end, '
-        . 'pp.predicted_price, pp.confidence, pr.run_at '
+        . 'pp.predicted_price, pp.confidence, pr.run_at, pr.suggestion_bias '
         . 'FROM price_predictions pp '
         . 'JOIN prediction_runs pr ON pr.id = pp.run_id '
         . 'WHERE pp.station_id IN (' . $stationIn . ') '
@@ -3461,13 +3464,20 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm
         }
         $start = new DateTimeImmutable((string) $row['target_start']);
         $localDate = $start->setTimezone($localZone)->format('Y-m-d');
+        // The displayed price carries the run's suggestion display correction
+        // (the measured winner's curse of picking the cheapest window), so the
+        // card quotes the same price a notification would. Ordering below
+        // stays on the raw model price, exactly like the Go picker — the grid
+        // keeps storing raw prices, so the learning never sees the correction.
+        $rawPrice = (float) $row['predicted_price'];
         $byFuelDate[$fuel][$localDate][] = [
             's' => $stationId,
             'fuel' => $fuel,
             'start' => (string) $row['target_start'],
             'end' => (string) $row['target_end'],
-            'price' => (float) $row['predicted_price'],
+            'price' => $rawPrice + (float) $row['suggestion_bias'],
             'conf' => (string) $row['confidence'],
+            'raw' => $rawPrice,
             'ts' => $start->getTimestamp(),
         ];
     }
@@ -3483,11 +3493,11 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm
     $rows = [];
     foreach ($byFuelDate as $byDate) {
         foreach ($byDate as $candidates) {
-            // suggestionCandidateLess: price, confidence, distance (rounded to
-            // 0.1 km like the Go side reports it), start, then station id for
-            // determinism.
+            // suggestionCandidateLess: raw price, confidence, distance
+            // (rounded to 0.1 km like the Go side reports it), start, then
+            // station id for determinism.
             usort($candidates, static function (array $a, array $b) use ($confidenceRank, $distancesKm): int {
-                return ($a['price'] <=> $b['price'])
+                return ($a['raw'] <=> $b['raw'])
                     ?: ($confidenceRank($b['conf']) <=> $confidenceRank($a['conf']))
                     ?: (round($distancesKm[$a['s']] ?? INF, 1) <=> round($distancesKm[$b['s']] ?? INF, 1))
                     ?: ($a['ts'] <=> $b['ts'])
@@ -3513,9 +3523,9 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm
             }
 
             // The notifier's confidence filter, then mergeSuggestions: picks of
-            // one station with the same cent-rounded price and confidence
-            // collapse into one span (the Go side compares display prices,
-            // which are cent-rounded).
+            // one station with the same cent-rounded display price and
+            // confidence collapse into one span, matching the Go side's
+            // compare of rounded display prices.
             $merged = [];
             foreach ($selected as $candidate) {
                 if ($candidate['conf'] !== 'medium' && $candidate['conf'] !== 'high') {
@@ -3534,7 +3544,7 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm
                 $merged[$mergeKey] = $candidate;
             }
             foreach ($merged as $pick) {
-                unset($pick['ts']);
+                unset($pick['ts'], $pick['raw']);
                 $rows[] = $pick;
             }
         }
