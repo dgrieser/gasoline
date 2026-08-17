@@ -358,16 +358,37 @@ The grouped commands above are the canonical interface shown by `gasoline help`.
 
 ### Diagnosing a slow database (`gasoline doctor`)
 
-`gasoline doctor` inspects a live database without changing it. It reports table sizes, every index with its key columns and on-disk size, and then — the reason it exists — runs each query behind the admin **Prediction accuracy** page, timing it and showing what the planner did with it:
+`gasoline doctor` inspects a live database without changing it. It reports table sizes, every index with its key columns and on-disk size, which stations are in scope and why, and then — the reason it exists — runs each query behind the admin **Prediction accuracy** page, timing it and showing what the planner did with it:
 
 ```bash
 gasoline doctor                                     # default 14-day window, fuel diesel
 gasoline doctor --db-driver mysql --explain         # print the full plan per query
 gasoline doctor --analyze                           # real per-step timings (MySQL 8.0.18+)
 gasoline doctor --range 30d --fuel e5               # reproduce a specific page filter
-gasoline doctor --skip-queries                      # schema, sizes and indexes only
+gasoline doctor --skip-queries                      # schema, sizes, indexes and scope only
 gasoline doctor -o json | jq '.findings'            # machine-readable
+gasoline doctor -o json | jq '.scope'               # the station universe, city by city
 ```
+
+#### Why a city you removed still appears
+
+The `scope` section answers that, and the answer is one of two things that need opposite responses. `suggest`, `check` and `notify` cover every station fed within the last 48 hours (see [`gasoline suggest`](#cli-usage)), so `doctor` lists each city that owns stations next to the update target meant to feed it:
+
+```
+scope: stations are in scope while fed within 48h; predictions are kept 30 days
+  city                               target  stations  in scope  latest run  newest price update    newest prediction
+  lübbecke                          25.0 km       140       140         140  2026-08-17T16:00:22Z   -
+  mönsheim                                -        37         0           0  2026-08-14T09:00:11Z   2026-08-16T12:00:00Z
+  uchte                             25.0 km        51        51          51  2026-08-17T16:00:31Z   -
+  newest run: 2026-08-17T15:08:17Z diesel, 191 stations
+```
+
+- **`in scope` above zero for a city that is not a target** is a live problem: something is still feeding it — an ad-hoc `update --city` in a cron entry, or a target whose spelling resolves to a different normalized name than you expect — and every computation still covers it. The finding is a warning.
+- **`in scope` at zero, with a `newest prediction`** is history, not scope: the city left the station universe when it stopped being fed, and the rows already stored keep it on the **Prediction accuracy** page until they age out 30 days after their target window. Nothing is recomputing it. The finding is informational and names the date the last of it was predicted for.
+
+A configured target with no stations in scope is the inverse failure — the sweep is not reaching it — and a target that owns nothing at all has never been geocoded or has never fetched. Both are warnings. The `latest run` column is the pipeline's own answer to the same question: it counts the stations the newest `suggest --persist` run actually stored predictions for, so a station appearing there while out of scope means that run drew from something other than the fed universe.
+
+The section is built from indexed lookups only — one seek per station, plus one pass over the newest run's predictions — so it runs even under `--skip-queries` and costs nothing next to the page timings. Stored predictions are looked up only for stations that have *left* scope, newest first and capped at 500 stations.
 
 Its filter flags (`--fuel`, `--confidence`, `--range`, or `--from`/`--to`) mirror the page's own controls, so you can reproduce exactly the filter that felt slow in the browser. Each query line ends in a verdict: `covering <index>` means the query was answered from an index alone, a bare index name means it used that index but still fetched table rows, and `TABLE SCAN` means it read the whole table. The `findings` section collects the actionable parts — a missing index, a query over `--slow-ms` (default 1000), a table scan.
 

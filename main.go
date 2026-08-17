@@ -3910,7 +3910,7 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 			}
 			continue
 		}
-		_, lat, lng, found, err := cachedCityTx(ctx, tx, city)
+		_, lat, lng, found, err := cachedCityFor(ctx, tx, city)
 		if err != nil {
 			return err
 		}
@@ -3965,13 +3965,14 @@ func migrateDropUserNotifyCities(ctx context.Context, tx *sql.Tx, d dialect, res
 	return nil
 }
 
-// cachedCityTx resolves a city as written — query string, normalized name or
+// cachedCityFor resolves a city as written — query string, normalized name or
 // display name — to its normalized name and cached coordinates, preferring the
-// canonical row.
-func cachedCityTx(ctx context.Context, tx *sql.Tx, city string) (string, float64, float64, bool, error) {
+// canonical row. It takes a queryer so the sweep can call it inside its
+// transaction and doctor can call it against the database directly.
+func cachedCityFor(ctx context.Context, q queryer, city string) (string, float64, float64, bool, error) {
 	var normalized string
 	var lat, lng float64
-	err := tx.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT normalized_name, lat, lng
 		FROM cities
 		WHERE name = ?
@@ -5010,7 +5011,7 @@ func loadCityCoverage(ctx context.Context, tx *sql.Tx, fetches []cityFetch) (cit
 	}
 	// Read the targets out in full before resolving any of them. A transaction is
 	// pinned to one connection and the MySQL driver speaks to it synchronously,
-	// so issuing cachedCityTx while this result set is still open would fail the
+	// so issuing cachedCityFor while this result set is still open would fail the
 	// whole sweep with "commands out of sync".
 	type target struct {
 		city   string
@@ -5038,7 +5039,7 @@ func loadCityCoverage(ctx context.Context, tx *sql.Tx, fetches []cityFetch) (cit
 	for _, t := range targets {
 		// update_targets stores the string an admin typed; ownership is keyed by
 		// the geocoder's normalized name for the same place.
-		normalized, _, _, found, err := cachedCityTx(ctx, tx, t.city)
+		normalized, _, _, found, err := cachedCityFor(ctx, tx, t.city)
 		if err != nil {
 			return cityCoverage{}, err
 		}
