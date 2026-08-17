@@ -912,6 +912,91 @@ func prunePredictions(ctx context.Context, db *sql.DB, now time.Time) (int, erro
 	return int(pruned), nil
 }
 
+// pruneUnfedStations drops the stored predictions and decisions of stations
+// that have left scope: those with no price update within stationFreshness,
+// which is the same test loadSnapshotScan applies when it decides what to
+// compute over.
+//
+// Retention alone keeps a removed update target on display for 30 more days.
+// Those rows were computed while the target was still being fed, so nothing
+// about them violates the retention rule — but the accuracy page has no notion
+// of scope, so a city nobody collects any more sits in its statistics next to
+// the cities that are still being collected. A station that stopped receiving
+// prices also cannot have its remaining predictions evaluated, because
+// evaluation needs a recorded actual price, so what is left is history nobody
+// can finish measuring.
+//
+// 48 hours without a price update means 48 consecutive failed sweeps, so a
+// transient fetch failure cannot trigger this. A station that returns after a
+// longer outage keeps every price snapshot — only its measurement history goes,
+// and the bias correction it feeds re-learns from a handful of evaluations.
+//
+// The deletes are issued one station at a time rather than as a single
+// statement over a subquery: each is a range on the station's own index, which
+// keeps every transaction small on a table that holds millions of rows and hands
+// back a per-station count. The first run after a target is removed can have
+// hundreds of thousands of rows to clear.
+func pruneUnfedStations(ctx context.Context, db *sql.DB, now time.Time) (int, int, int, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	cutoff := now.Add(-stationFreshness).UTC().Format(time.RFC3339)
+	rows, err := db.QueryContext(ctx, `
+		SELECT s.id
+		FROM stations s
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM price_snapshots fresh
+			WHERE fresh.station_id = s.id
+				AND fresh.recorded_at >= ?
+		)
+		ORDER BY s.id ASC
+	`, cutoff)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	var unfed []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, 0, 0, err
+		}
+		unfed = append(unfed, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+
+	var stations, predictions, decisions int
+	for _, id := range unfed {
+		var cleared int
+		for _, table := range []string{"price_predictions", "price_check_decisions"} {
+			result, err := db.ExecContext(ctx, `DELETE FROM `+table+` WHERE station_id = ?`, id)
+			if err != nil {
+				return stations, predictions, decisions, err
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return stations, predictions, decisions, err
+			}
+			cleared += int(affected)
+			if table == "price_predictions" {
+				predictions += int(affected)
+			} else {
+				decisions += int(affected)
+			}
+		}
+		// Most unfed stations are cleared by the first run that notices them, so
+		// only count the ones that actually had something left to drop.
+		if cleared > 0 {
+			stations++
+		}
+	}
+	return stations, predictions, decisions, nil
+}
+
 // pruneCheckDecisions enforces the same retention window on decision rows.
 // Runs it leaves orphaned are collected by prunePredictions.
 func pruneCheckDecisions(ctx context.Context, db *sql.DB, now time.Time) (int, error) {

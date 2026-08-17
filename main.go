@@ -1741,8 +1741,13 @@ func runSuggest(args []string) error {
 	}
 
 	if *persist {
-		// Decisions first: prunePredictions collects the runs both tables
-		// leave behind, so it has to run last.
+		// Stations that left scope go before the retention sweeps, and
+		// prunePredictions runs last of the three: it collects the runs all of
+		// them leave behind.
+		unfedStations, unfedPredictions, unfedDecisions, err := pruneUnfedStations(ctx, db, opts.Now)
+		if err != nil {
+			return err
+		}
 		prunedDecisions, err := pruneCheckDecisions(ctx, db, opts.Now)
 		if err != nil {
 			return err
@@ -1752,8 +1757,10 @@ func runSuggest(args []string) error {
 			return err
 		}
 		fmt.Fprintf(os.Stderr,
-			"persist: stored %d predictions, %d decisions, evaluated %d, outcomes %d, bias-corrected %d stations, pruned %d/%d\n",
-			totals.Predictions, totals.Decisions, evaluated, outcomes, totals.BiasedStations, pruned, prunedDecisions)
+			"persist: stored %d predictions, %d decisions, evaluated %d, outcomes %d, bias-corrected %d stations, "+
+				"pruned %d/%d by retention, %d/%d for %d stations that left scope\n",
+			totals.Predictions, totals.Decisions, evaluated, outcomes, totals.BiasedStations,
+			pruned, prunedDecisions, unfedPredictions, unfedDecisions, unfedStations)
 	}
 
 	if !quiet {

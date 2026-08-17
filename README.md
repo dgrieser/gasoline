@@ -227,11 +227,11 @@ The margin that decides "low", and that suppresses a buy when a cheaper window i
    The forecast additionally extrapolates a **damped baseline drift** (median day-over-day baseline move across stations of the last 7 pricing days, halved and capped at ±2 ct/day), so predictions crossing pricing-day boundaries no longer assume a perfectly flat market.
 4. **Persists** the new grid; newer runs supersede older ones for the same target hour, older rows remain as learning history.
 5. **Records** the check decisions taken against that same model: per open station the observed price, the model's reference price for the current hour, the history percentile, and the resulting verdict and recommendation.
-6. **Prunes** predictions and decisions older than 30 days.
+6. **Prunes** predictions and decisions older than 30 days, and everything stored for stations that have **left scope** — a station with no price update for 48 hours, which is what happens when an update target is removed or its radius shrinks. Retention alone would keep a removed city in the accuracy statistics for 30 more days even though nothing recomputes it, and its remaining predictions can never be evaluated because evaluation needs a recorded actual price. The station row and its price snapshots stay, so a station that comes back is modelled from its own history again; only the measurement rows go, and 48 hours without an update means 48 consecutive failed sweeps, so a transient fetch failure cannot trigger it.
 
 The recorded decisions exist because the notification path itself keeps no record: `notify` computes each verdict and discards it, so without this there is no way to tell whether the numbers that trigger low-price alerts are any good. They are a faithful **proxy**, not a delivery log — the same model and bias as `notify` uses, for every fuel `notify` delivers, but computed on the suggestion timer's schedule and before `notify` applies its row limit, per-user city selection, notification windows and repeat-suppression baseline. Read them as "what the model decided", not "what users received".
 
-The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. One invocation persists a run per fuel over every fed station, so all of them accrue evaluation data for the bias learning; per-fuel failures are reported on stderr and via the exit code. The accrued evaluation data also feeds the bias learning and is surfaced in the web UI on the admin **Prediction accuracy** page (hamburger menu → Prediction accuracy), which compares each past predicted price with the actual price recorded for that window — raw rows, accuracy statistics (MAE, bias, RMSE, share within ±1/±2 ct, per-confidence breakdown), breakdowns by lead time and by hour of day, the alert outcomes described above, and a predicted-vs-actual graph.
+The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ..., pruned A/B by retention, C/D for E stations that left scope`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. One invocation persists a run per fuel over every fed station, so all of them accrue evaluation data for the bias learning; per-fuel failures are reported on stderr and via the exit code. The accrued evaluation data also feeds the bias learning and is surfaced in the web UI on the admin **Prediction accuracy** page (hamburger menu → Prediction accuracy), which compares each past predicted price with the actual price recorded for that window — raw rows, accuracy statistics (MAE, bias, RMSE, share within ±1/±2 ct, per-confidence breakdown), breakdowns by lead time and by hour of day, the alert outcomes described above, and a predicted-vs-actual graph.
 
 ### Server-stored configuration (admin settings)
 
@@ -375,7 +375,7 @@ gasoline doctor -o json | jq '.scope'               # the station universe, city
 The `scope` section answers that, and the answer is one of two things that need opposite responses. `suggest`, `check` and `notify` cover every station fed within the last 48 hours (see [`gasoline suggest`](#cli-usage)), so `doctor` lists each city that owns stations next to the update target meant to feed it:
 
 ```
-scope: stations are in scope while fed within 48h; predictions are kept 30 days
+scope: stations are in scope while fed within 48h; in-scope predictions are kept 30 days
   city                               target  stations  in scope  latest run  newest price update    newest prediction
   lübbecke                          25.0 km       140       140         140  2026-08-17T16:00:22Z   -
   mönsheim                                -        37         0           0  2026-08-14T09:00:11Z   2026-08-16T12:00:00Z
@@ -384,7 +384,7 @@ scope: stations are in scope while fed within 48h; predictions are kept 30 days
 ```
 
 - **`in scope` above zero for a city that is not a target** is a live problem: something is still feeding it — an ad-hoc `update --city` in a cron entry, or a target whose spelling resolves to a different normalized name than you expect — and every computation still covers it. The finding is a warning.
-- **`in scope` at zero, with a `newest prediction`** is history, not scope: the city left the station universe when it stopped being fed, and the rows already stored keep it on the **Prediction accuracy** page until they age out 30 days after their target window. Nothing is recomputing it. The finding is informational and names the date the last of it was predicted for.
+- **`in scope` at zero, with a `newest prediction`** is history, not scope: the city left the station universe when it stopped being fed, and what remains are rows stored while it was still being collected. Nothing is recomputing it, and the next `suggest --persist` run drops those rows (see [above](#persistent-predictions-and-learning-suggest---persist)), so a `newest prediction` older than the last persist run means that pruning is not running. The finding is informational and names the date the last of it was predicted for.
 
 A configured target with no stations in scope is the inverse failure — the sweep is not reaching it — and a target that owns nothing at all has never been geocoded or has never fetched. Both are warnings. The `latest run` column is the pipeline's own answer to the same question: it counts the stations the newest `suggest --persist` run actually stored predictions for, so a station appearing there while out of scope means that run drew from something other than the fed universe.
 
@@ -437,6 +437,8 @@ Features:
 - filter by fuel type
 - compare multiple stations
 - inspect summary stats and historical price points
+
+The station list, the price rows and the recommended fill-ups card all cover the **stations currently being fed** — the same 48-hour freshness rule the CLI applies (`GASOLINE_STATION_FRESHNESS_HOURS` mirrors Go's `stationFreshness`). A station whose update target was removed therefore disappears from the dashboard instead of showing its last known price as though it were current; its snapshots stay in the database and reappear if the station is collected again.
 
 Serve it locally from the repo root:
 

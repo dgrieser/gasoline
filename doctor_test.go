@@ -1447,7 +1447,7 @@ func TestDoctorScopeTellsStaleHistoryFromLiveScope(t *testing.T) {
 			strings.Contains(finding.Message, "not an update target"):
 			warnedLeak = true
 		case finding.Severity == "info" && strings.Contains(finding.Message, "mönsheim") &&
-			strings.Contains(finding.Message, "accuracy page"):
+			strings.Contains(finding.Message, "suggest --persist` run drops them"):
 			explainedStale = true
 		}
 	}

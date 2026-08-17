@@ -129,9 +129,9 @@ type doctorIndex struct {
 // any more still shows up in prediction output. There are two different answers
 // and they need different fixes. Either its stations are genuinely still in
 // scope — they had a price update within stationFreshness, so every computation
-// still covers them — or only stored rows remain, which the accuracy page keeps
-// showing until they age out of the retention window. The first is a live
-// collection problem, the second is history doing what it is meant to do.
+// still covers them — or only stored rows remain, which the next
+// `suggest --persist` run drops (pruneUnfedStations). The first is a live
+// collection problem; the second clears itself within the hour.
 type doctorScope struct {
 	FreshnessHours float64 `json:"freshness_hours"`
 	RetentionDays  int     `json:"retention_days"`
@@ -185,8 +185,9 @@ type doctorScopeCity struct {
 	InLatestRun    int    `json:"in_latest_run"`
 	NewestSnapshot string `json:"newest_snapshot,omitempty"`
 	// NewestPrediction is the latest target window stored for any of this
-	// city's out-of-scope stations, for the doctor's --fuel. It is what keeps a
-	// dropped city visible on the accuracy page.
+	// city's out-of-scope stations, for the doctor's --fuel. Rows should not
+	// outlive scope by more than one persist run, so anything here that is not
+	// from the last hour means pruneUnfedStations is not running.
 	NewestPrediction string `json:"newest_prediction,omitempty"`
 }
 
@@ -1483,9 +1484,9 @@ func doctorScopeFindings(s doctorScope) []doctorFinding {
 			warn("%s is not an update target, yet %d of its %d %s in scope (newest price update %s) — suggest, check and notify still cover it",
 				city.City, city.InScope, city.Stations, plural(city.Stations, "station is", "stations are"), city.NewestSnapshot)
 		case !city.Target && city.NewestPrediction != "":
-			info("%s is no longer fed (newest price update %s) and none of its %d %s in scope, but predictions stored up to %s stay on the accuracy page until they age out %d days after their target window",
+			info("%s is no longer fed (newest price update %s) and none of its %d %s in scope; predictions stored up to %s are still there and the next `gasoline suggest --persist` run drops them",
 				city.City, city.NewestSnapshot, city.Stations, plural(city.Stations, "station is", "stations are"),
-				city.NewestPrediction, s.RetentionDays)
+				city.NewestPrediction)
 		}
 	}
 	if total > 0 {
@@ -1723,7 +1724,7 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 // with the update target that is meant to feed it alongside what the data says
 // it actually feeds.
 func writeDoctorScopeText(s doctorScope) {
-	fmt.Fprintf(stdout, "\nscope: stations are in scope while fed within %.0fh; predictions are kept %d days\n",
+	fmt.Fprintf(stdout, "\nscope: stations are in scope while fed within %.0fh; in-scope predictions are kept %d days\n",
 		s.FreshnessHours, s.RetentionDays)
 	if s.Skipped {
 		fmt.Fprintf(stdout, "  skipped: %s\n", s.Reason)

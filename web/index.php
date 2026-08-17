@@ -526,6 +526,22 @@ const GASOLINE_MAX_NOTIFY_RADIUS_KM = 100;
 /** The suggest/check fuel types, in canonical display order. */
 const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
 
+/**
+ * How long a station stays in scope after its last price update, mirroring Go's
+ * stationFreshness (settings.go). A station leaves scope when it stops being
+ * fed, which is what happens when an update target is removed or its radius
+ * shrinks, and the dashboard shows only stations still in it: otherwise a
+ * station nobody collects any more renders its last known price as though that
+ * were today's, and its card sits next to stations that are actually current.
+ */
+const GASOLINE_STATION_FRESHNESS_HOURS = 48;
+
+/** The RFC3339 instant a station's newest snapshot must reach to be in scope. */
+function stationFreshnessCutoff(): string
+{
+    return gmdate('Y-m-d\TH:i:s\Z', time() - GASOLINE_STATION_FRESHNESS_HOURS * 3600);
+}
+
 
 
 /** Normalizes a submitted weekday list to canonical order; null when invalid/empty. */
@@ -3163,14 +3179,31 @@ function resolveCity(PDO $pdo, string $selectedCity): ?array
  * With a city: the stations inside the radius (bbox pre-filter + haversine),
  * sorted by distance. Without a city: every station, sorted by name.
  *
+ * Both forms are restricted to stations still being fed
+ * (GASOLINE_STATION_FRESHNESS_HOURS), so the dashboard covers the same station
+ * universe as `gasoline suggest`. The station list, the snapshot rows and the
+ * fill-up card all derive from this result, so this is the one place the rule
+ * has to be applied.
+ *
  * @return array{0: array<int, array<string, mixed>>, 1: array<string, float>}
  *   [$stations, $distancesById]
  */
 function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
 {
+    // EXISTS against idx_price_snapshots_station_recorded: one index seek per
+    // candidate station, rather than an aggregate over the snapshot history.
+    $fedRecently = <<<'SQL'
+        EXISTS (
+            SELECT 1
+            FROM price_snapshots fresh
+            WHERE fresh.station_id = s.id
+              AND fresh.recorded_at >= :fresh_cutoff
+        )
+        SQL;
+
     if ($cityRow === null) {
-        $stations = $pdo->query(
-            <<<'SQL'
+        $stmt = $pdo->prepare(
+            <<<SQL
             SELECT
                 s.id,
                 COALESCE(s.name_override, s.name) AS name,
@@ -3183,16 +3216,19 @@ function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
                 s.lat,
                 s.lng
             FROM stations s
+            WHERE {$fedRecently}
             ORDER BY COALESCE(s.name_override, s.name) ASC, s.id ASC
             SQL
-        )->fetchAll();
+        );
+        $stmt->bindValue(':fresh_cutoff', stationFreshnessCutoff());
+        $stmt->execute();
 
-        return [$stations, []];
+        return [$stmt->fetchAll(), []];
     }
 
     $bbox = boundingBox((float) $cityRow['lat'], (float) $cityRow['lng'], $radiusKm);
     $stmt = $pdo->prepare(
-        <<<'SQL'
+        <<<SQL
         SELECT
             s.id,
             COALESCE(s.name_override, s.name) AS name,
@@ -3207,11 +3243,13 @@ function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
         FROM stations s
         WHERE s.lat BETWEEN :min_lat AND :max_lat
           AND s.lng BETWEEN :min_lng AND :max_lng
+          AND {$fedRecently}
         SQL
     );
     foreach ($bbox as $key => $value) {
         $stmt->bindValue(':' . $key, $value);
     }
+    $stmt->bindValue(':fresh_cutoff', stationFreshnessCutoff());
     $stmt->execute();
     $candidateStations = $stmt->fetchAll();
 
@@ -5739,7 +5777,7 @@ const translations = {
         fuelE5: 'E5',
         fuelE10: 'E10',
         stations: 'Stations',
-        stationsHint: '(hold Ctrl to multi-select)',
+        stationsHint: '(hold Ctrl to multi-select; only stations updated in the last 48h)',
         reset: 'Reset',
         snapshots: 'Snapshots',
         stationsCount: 'Stations',
@@ -6007,7 +6045,7 @@ const translations = {
         fuelE5: 'E5',
         fuelE10: 'E10',
         stations: 'Tankstellen',
-        stationsHint: '(Strg für Mehrfachauswahl)',
+        stationsHint: '(Strg für Mehrfachauswahl; nur in den letzten 48 h aktualisierte Tankstellen)',
         reset: 'Zurücksetzen',
         snapshots: 'Einträge',
         stationsCount: 'Tankstellen',
@@ -6674,7 +6712,7 @@ renderDocumentHead('Price History');
                 </div>
 
                 <div class="field">
-                    <label><span data-i18n="stations">Stations</span> <span style="color:var(--border-hi)" data-i18n="stationsHint">(hold Ctrl to multi-select)</span></label>
+                    <label><span data-i18n="stations">Stations</span> <span style="color:var(--border-hi)" data-i18n="stationsHint">(hold Ctrl to multi-select; only stations updated in the last 48h)</span></label>
                     <select name="station_ids[]" multiple onchange="this.form.submit()">
                         <?php foreach ($stations as $station): ?>
                             <?php
