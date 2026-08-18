@@ -1201,3 +1201,176 @@ func TestDashboardPredictionsArePickedPerScopeNotFromGlobalFlags(t *testing.T) {
 		t.Error("the dashboard picker no longer adds the recorded display correction to the displayed price")
 	}
 }
+
+// insertCheckDecisionRow stores one decision for a station, so pruning can be
+// observed on both persisted tables.
+func insertCheckDecisionRow(t *testing.T, db *sql.DB, runID int64, stationID string, targetStart time.Time) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO price_check_decisions (run_id, station_id, fuel, decided_at, target_start, target_end,
+			observed_price, observed_at, predicted_price, error, history_percentile, confidence, sample_count,
+			verdict, recommendation, expected_lower, expected_drop)
+		VALUES (?, ?, 'diesel', ?, ?, ?, 1.60, ?, 1.62, -0.02, 20, 'high', 9, 'low', 'buy', 0, NULL)
+	`, runID, stationID,
+		targetStart.UTC().Format(time.RFC3339), targetStart.UTC().Format(time.RFC3339),
+		targetStart.Add(time.Hour).UTC().Format(time.RFC3339), targetStart.UTC().Format(time.RFC3339),
+	); err != nil {
+		t.Fatalf("insert decision: %v", err)
+	}
+}
+
+// TestPruneUnfedStationsDropsRowsForStationsThatLeftScope is the case an
+// operator sees: an update target is removed, its stations stop being fed, and
+// their stored predictions would otherwise stay on the accuracy page for the
+// rest of the retention window even though nothing recomputes them.
+func TestPruneUnfedStationsDropsRowsForStationsThatLeftScope(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	insertSuggestStation(t, db, "fed", "Fed Station", 52.5, 13.4)
+	insertSuggestStation(t, db, "unfed", "Unfed Station", 48.8, 8.9)
+	// The fed station is inside the freshness window; the unfed one left scope
+	// two days after its target was removed.
+	insertSuggestSnapshot(t, db, "fed", "Berlin", now.Add(-time.Hour), 1.70, true)
+	insertSuggestSnapshot(t, db, "unfed", "Enzberg", now.Add(-5*24*time.Hour), 1.70, true)
+
+	runID := insertPredictionRunRow(t, db, now.Add(-time.Hour))
+	insertPredictionRow(t, db, runID, "fed", now.Add(time.Hour), 1.70, 60)
+	insertPredictionRow(t, db, runID, "unfed", now.Add(time.Hour), 1.70, 60)
+	insertPredictionRow(t, db, runID, "unfed", now.Add(2*time.Hour), 1.71, 120)
+	insertCheckDecisionRow(t, db, runID, "fed", now.Add(-2*time.Hour))
+	insertCheckDecisionRow(t, db, runID, "unfed", now.Add(-2*time.Hour))
+
+	stations, predictions, decisions, err := pruneUnfedStations(ctx, db, now)
+	if err != nil {
+		t.Fatalf("pruneUnfedStations: %v", err)
+	}
+	if stations != 1 || predictions != 2 || decisions != 1 {
+		t.Fatalf("pruned %d stations / %d predictions / %d decisions, want 1/2/1", stations, predictions, decisions)
+	}
+
+	var remaining []string
+	rows, err := db.QueryContext(ctx, `SELECT station_id FROM price_predictions ORDER BY station_id`)
+	if err != nil {
+		t.Fatalf("query predictions: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		remaining = append(remaining, id)
+	}
+	if strings.Join(remaining, ",") != "fed" {
+		t.Fatalf("remaining predictions = %v, want only the fed station", remaining)
+	}
+
+	var decisionsLeft int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM price_check_decisions WHERE station_id = 'unfed'`).Scan(&decisionsLeft); err != nil {
+		t.Fatalf("count decisions: %v", err)
+	}
+	if decisionsLeft != 0 {
+		t.Fatalf("decisions left for the unfed station = %d, want 0", decisionsLeft)
+	}
+
+	// The station itself and its price history stay: only the measurement rows
+	// go, so a station that comes back is modelled from its own snapshots again.
+	var snapshots, stationRows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM price_snapshots WHERE station_id = 'unfed'`).Scan(&snapshots); err != nil {
+		t.Fatalf("count snapshots: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM stations WHERE id = 'unfed'`).Scan(&stationRows); err != nil {
+		t.Fatalf("count stations: %v", err)
+	}
+	if snapshots != 1 || stationRows != 1 {
+		t.Fatalf("unfed station snapshots/rows = %d/%d, want 1/1 kept", snapshots, stationRows)
+	}
+
+	// Nothing is left to drop on the next run, so the station count stops
+	// reporting it.
+	stations, predictions, decisions, err = pruneUnfedStations(ctx, db, now)
+	if err != nil {
+		t.Fatalf("second pruneUnfedStations: %v", err)
+	}
+	if stations != 0 || predictions != 0 || decisions != 0 {
+		t.Fatalf("second run pruned %d/%d/%d, want nothing", stations, predictions, decisions)
+	}
+}
+
+// TestPruneUnfedStationsKeepsStationsWithinTheFreshnessWindow pins the boundary:
+// a single failed sweep must not cost a station its measurement history.
+func TestPruneUnfedStationsKeepsStationsWithinTheFreshnessWindow(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	insertSuggestStation(t, db, "just-fresh", "Just Fresh", 52.5, 13.4)
+	insertSuggestSnapshot(t, db, "just-fresh", "Berlin", now.Add(-stationFreshness).Add(time.Minute), 1.70, true)
+	runID := insertPredictionRunRow(t, db, now.Add(-time.Hour))
+	insertPredictionRow(t, db, runID, "just-fresh", now.Add(time.Hour), 1.70, 60)
+
+	stations, predictions, _, err := pruneUnfedStations(ctx, db, now)
+	if err != nil {
+		t.Fatalf("pruneUnfedStations: %v", err)
+	}
+	if stations != 0 || predictions != 0 {
+		t.Fatalf("pruned %d stations / %d predictions inside the freshness window, want none", stations, predictions)
+	}
+
+	// One minute past the window and the same station is pruned, so the rule is
+	// the freshness boundary itself and not something looser.
+	stations, predictions, _, err = pruneUnfedStations(ctx, db, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("pruneUnfedStations past the window: %v", err)
+	}
+	if stations != 1 || predictions != 1 {
+		t.Fatalf("pruned %d stations / %d predictions past the window, want 1/1", stations, predictions)
+	}
+}
+
+// TestDashboardScopeStationsFilterOnFreshness pins the PHP dashboard's station
+// scope against Go's stationFreshness: the dashboard must cover the same station
+// universe the CLI computes over, or it presents the last known price of a
+// station nobody feeds as though it were current.
+func TestDashboardScopeStationsFilterOnFreshness(t *testing.T) {
+	viewer, err := os.ReadFile(filepath.Join("web", "index.php"))
+	if err != nil {
+		t.Fatalf("read web/index.php: %v", err)
+	}
+	source := string(viewer)
+
+	want := fmt.Sprintf("const GASOLINE_STATION_FRESHNESS_HOURS = %d;", int(stationFreshness.Hours()))
+	if !strings.Contains(source, want) {
+		t.Errorf("web/index.php no longer mirrors stationFreshness (%v): %q missing", stationFreshness, want)
+	}
+
+	start := strings.Index(source, "function loadScopeStations")
+	if start < 0 {
+		t.Fatal("web/index.php no longer defines loadScopeStations")
+	}
+	end := strings.Index(source[start:], "\nfunction ")
+	if end < 0 {
+		t.Fatal("cannot delimit loadScopeStations")
+	}
+	scope := source[start : start+end]
+
+	// Both forms — with a city and without — have to carry the filter, and the
+	// cutoff has to be bound in each.
+	if strings.Count(scope, ":fresh_cutoff") < 3 {
+		t.Errorf("loadScopeStations does not apply the freshness cutoff to both queries: %q", scope)
+	}
+	if !strings.Contains(scope, "stationFreshnessCutoff()") {
+		t.Error("loadScopeStations no longer binds stationFreshnessCutoff()")
+	}
+	if !strings.Contains(scope, "FROM price_snapshots fresh") {
+		t.Error("loadScopeStations no longer tests freshness against price_snapshots")
+	}
+	if strings.Contains(scope, "$pdo->query(") {
+		t.Error("loadScopeStations still issues an unparameterised query, so one of its forms cannot be filtered")
+	}
+}

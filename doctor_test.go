@@ -1238,3 +1238,312 @@ func TestRunDoctorQueriesSurviveMissingAccuracyIndex(t *testing.T) {
 		}
 	}
 }
+
+// seedDoctorScopeDB builds the situation an operator actually reports: two
+// configured targets, one of which is being fed; a city whose target was
+// removed days ago and which now only has stored predictions left; and a city
+// that is not a target but is still receiving price updates, which is the one
+// case that means suggest and check still cover it.
+func seedDoctorScopeDB(t *testing.T, now time.Time) (string, *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "scope.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+
+	cities := []struct {
+		name string
+		lat  float64
+		lng  float64
+	}{
+		{"lübbecke", 52.302721, 8.618305},
+		{"uchte", 52.499750, 8.909280},
+		{"mönsheim", 48.849000, 8.882000},
+		{"hameln", 52.103500, 9.356600},
+	}
+	for _, city := range cities {
+		if _, err := db.ExecContext(ctx, `INSERT INTO cities
+			(name, normalized_name, display_name, lat, lng, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			city.name, city.name, city.name, city.lat, city.lng, now.Format(time.RFC3339)); err != nil {
+			t.Fatalf("insert city: %v", err)
+		}
+	}
+	for _, target := range []string{"lübbecke", "uchte"} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO update_targets (city, radius_km, created_at) VALUES (?, 25, ?)`,
+			target, now.Format(time.RFC3339)); err != nil {
+			t.Fatalf("insert target: %v", err)
+		}
+	}
+
+	// stations: owner city, and how long ago it was last fed.
+	stations := []struct {
+		id    string
+		city  string
+		aged  time.Duration
+		runID bool
+	}{
+		{id: "fed-1", city: "lübbecke", aged: time.Hour, runID: true},
+		{id: "fed-2", city: "lübbecke", aged: time.Hour, runID: true},
+		{id: "stale-1", city: "mönsheim", aged: 72 * time.Hour},
+		{id: "stale-2", city: "mönsheim", aged: 96 * time.Hour},
+		{id: "leak-1", city: "hameln", aged: 2 * time.Hour, runID: true},
+	}
+	var runID int64
+	res, err := db.ExecContext(ctx, `INSERT INTO prediction_runs
+		(run_at, city_name, fuel, range_km, history_days, predict_days, station_count)
+		VALUES (?, '', 'diesel', 0, 30, 3, 3)`, now.Add(-30*time.Minute).Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	if runID, err = res.LastInsertId(); err != nil {
+		t.Fatalf("run id: %v", err)
+	}
+	// A stale city's last run before it dropped out, so its predictions have a
+	// run to belong to without being part of the newest one.
+	staleRes, err := db.ExecContext(ctx, `INSERT INTO prediction_runs
+		(run_at, city_name, fuel, range_km, history_days, predict_days, station_count)
+		VALUES (?, '', 'diesel', 0, 30, 3, 2)`, now.Add(-72*time.Hour).Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("insert stale run: %v", err)
+	}
+	staleRunID, err := staleRes.LastInsertId()
+	if err != nil {
+		t.Fatalf("stale run id: %v", err)
+	}
+
+	for _, station := range stations {
+		recordedAt := now.Add(-station.aged)
+		if _, err := db.ExecContext(ctx, `INSERT INTO stations
+			(id, name, brand, street, house_number, post_code, place, lat, lng, first_seen_at, last_seen_at)
+			VALUES (?, ?, 'Brand', 'Street', '1', 12345, ?, 52.0, 8.0, ?, ?)`,
+			station.id, "Station "+station.id, station.city,
+			recordedAt.Format(time.RFC3339), recordedAt.Format(time.RFC3339)); err != nil {
+			t.Fatalf("insert station: %v", err)
+		}
+		// Two snapshots each, so the newest one is what decides ownership.
+		for _, offset := range []time.Duration{2 * time.Hour, 0} {
+			if _, err := db.ExecContext(ctx, `INSERT INTO price_snapshots
+				(station_id, city_name, recorded_at, search_radius_km, is_open, e5, e10, diesel)
+				VALUES (?, ?, ?, 25, 1, 1.80, 1.75, 1.70)`,
+				station.id, station.city, recordedAt.Add(-offset).Format(time.RFC3339)); err != nil {
+				t.Fatalf("insert snapshot: %v", err)
+			}
+		}
+		run := runID
+		if !station.runID {
+			run = staleRunID
+		}
+		target := now.Add(time.Hour)
+		if !station.runID {
+			target = now.Add(-70 * time.Hour)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO price_predictions
+			(run_id, station_id, fuel, target_start, target_end, predicted_price, confidence,
+			 sample_count, is_suggestion, lead_minutes)
+			VALUES (?, ?, 'diesel', ?, ?, 1.70, 'medium', 20, 1, 60)`,
+			run, station.id, target.Format(time.RFC3339), target.Add(time.Hour).Format(time.RFC3339)); err != nil {
+			t.Fatalf("insert prediction: %v", err)
+		}
+	}
+	return dbPath, db
+}
+
+func doctorScopeFor(t *testing.T, dbPath string) doctorScope {
+	t.Helper()
+	output := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--skip-queries", "--output", "json"})
+	})
+	var result doctorResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal doctor output: %v\noutput=%s", err, output)
+	}
+	return result.Scope
+}
+
+func scopeCity(t *testing.T, s doctorScope, name string) doctorScopeCity {
+	t.Helper()
+	for _, city := range s.Cities {
+		if city.City == name {
+			return city
+		}
+	}
+	t.Fatalf("city %q missing from scope report; got %+v", name, s.Cities)
+	return doctorScopeCity{}
+}
+
+// TestDoctorScopeTellsStaleHistoryFromLiveScope is the whole point of the scope
+// check: "a city I removed still shows up" has two causes, and they need
+// opposite responses.
+func TestDoctorScopeTellsStaleHistoryFromLiveScope(t *testing.T) {
+	now := time.Now().UTC()
+	dbPath, db := seedDoctorScopeDB(t, now)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	scope := doctorScopeFor(t, dbPath)
+	if scope.Skipped {
+		t.Fatalf("scope check skipped: %s", scope.Reason)
+	}
+	if !scope.Configured {
+		t.Fatal("targets are configured, but the report says otherwise")
+	}
+	if scope.FreshnessHours != stationFreshness.Hours() {
+		t.Fatalf("freshness = %v, want %v", scope.FreshnessHours, stationFreshness.Hours())
+	}
+
+	fed := scopeCity(t, scope, "lübbecke")
+	if fed.Stations != 2 || fed.InScope != 2 || fed.InLatestRun != 2 || !fed.Target {
+		t.Fatalf("fed target city = %+v, want 2 stations, all in scope and in the latest run", fed)
+	}
+	if fed.NewestPrediction != "" {
+		t.Fatalf("a fed city needs no stored-prediction lookup, got %q", fed.NewestPrediction)
+	}
+
+	// The target that owns nothing still gets a row, so a target the sweep
+	// never reaches is visible rather than absent.
+	empty := scopeCity(t, scope, "uchte")
+	if !empty.Target || empty.Stations != 0 {
+		t.Fatalf("target owning no station = %+v, want a target row with no stations", empty)
+	}
+
+	stale := scopeCity(t, scope, "mönsheim")
+	if stale.Target {
+		t.Fatal("mönsheim is not an update target")
+	}
+	if stale.Stations != 2 || stale.InScope != 0 || stale.InLatestRun != 0 {
+		t.Fatalf("stale city = %+v, want 2 stations, none in scope, none in the latest run", stale)
+	}
+	if stale.NewestPrediction == "" {
+		t.Fatal("a stale city's stored predictions are what keeps it on the accuracy page; none reported")
+	}
+
+	leak := scopeCity(t, scope, "hameln")
+	if leak.Target || leak.InScope != 1 {
+		t.Fatalf("leaking city = %+v, want a non-target city with a station in scope", leak)
+	}
+
+	if scope.LatestRun == nil {
+		t.Fatal("no latest run reported")
+	}
+	if scope.LatestRun.Stations != 3 {
+		t.Fatalf("latest run stations = %d, want 3", scope.LatestRun.Stations)
+	}
+	if scope.LatestRun.OutOfScope != 0 {
+		t.Fatalf("latest run out-of-scope stations = %d, want 0", scope.LatestRun.OutOfScope)
+	}
+
+	findings := doctorScopeFindings(scope)
+	var warnedLeak, explainedStale bool
+	for _, finding := range findings {
+		switch {
+		case finding.Severity == "warn" && strings.Contains(finding.Message, "hameln") &&
+			strings.Contains(finding.Message, "not an update target"):
+			warnedLeak = true
+		case finding.Severity == "info" && strings.Contains(finding.Message, "mönsheim") &&
+			strings.Contains(finding.Message, "suggest --persist` run drops them"):
+			explainedStale = true
+		}
+	}
+	if !warnedLeak {
+		t.Fatalf("a non-target city still in scope must be a warning; findings=%+v", findings)
+	}
+	if !explainedStale {
+		t.Fatalf("a dropped city with retained predictions must be explained; findings=%+v", findings)
+	}
+}
+
+// TestDoctorScopeFlagsATargetThatStoppedBeingFed separates a broken sweep from a
+// removed city: the target is still configured, so its stations leaving scope is
+// a collection failure, not retention.
+func TestDoctorScopeFlagsATargetThatStoppedBeingFed(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	dbPath, db := seedDoctorScopeDB(t, now)
+	if _, err := db.ExecContext(ctx,
+		`UPDATE price_snapshots SET recorded_at = ? WHERE city_name = 'lübbecke'`,
+		now.Add(-96*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("age snapshots: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	scope := doctorScopeFor(t, dbPath)
+	fed := scopeCity(t, scope, "lübbecke")
+	if fed.InScope != 0 {
+		t.Fatalf("aged target city in scope = %d, want 0", fed.InScope)
+	}
+	// The run still names those stations, which is the inconsistency to report.
+	if scope.LatestRun == nil || scope.LatestRun.OutOfScope != 2 {
+		t.Fatalf("latest run = %+v, want 2 out-of-scope stations", scope.LatestRun)
+	}
+
+	findings := doctorScopeFindings(scope)
+	var warnedTarget, warnedRun bool
+	for _, finding := range findings {
+		if finding.Severity != "warn" {
+			continue
+		}
+		if strings.Contains(finding.Message, "lübbecke") && strings.Contains(finding.Message, "no price update since") {
+			warnedTarget = true
+		}
+		if strings.Contains(finding.Message, "newest prediction run") {
+			warnedRun = true
+		}
+	}
+	if !warnedTarget {
+		t.Fatalf("a configured target that stopped being fed must warn; findings=%+v", findings)
+	}
+	if !warnedRun {
+		t.Fatalf("a run covering out-of-scope stations must warn; findings=%+v", findings)
+	}
+}
+
+// TestDoctorScopeSkipsWithoutTheTables keeps the scope section from failing the
+// whole report on a database that predates it.
+func TestDoctorScopeSkipsWithoutTheTables(t *testing.T) {
+	ctx := context.Background()
+	dbPath, db := seedDoctorDB(t)
+	if _, err := db.ExecContext(ctx, `DROP TABLE price_snapshots`); err != nil {
+		t.Fatalf("drop table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	scope := doctorScopeFor(t, dbPath)
+	if !scope.Skipped || scope.Reason == "" {
+		t.Fatalf("scope = %+v, want a skip with a reason", scope)
+	}
+	findings := doctorScopeFindings(scope)
+	if len(findings) != 1 || findings[0].Severity != "info" {
+		t.Fatalf("findings = %+v, want a single info line", findings)
+	}
+}
+
+// TestDoctorScopeTextListsEveryCity covers the text rendering, which is what an
+// operator actually reads.
+func TestDoctorScopeTextListsEveryCity(t *testing.T) {
+	now := time.Now().UTC()
+	dbPath, db := seedDoctorScopeDB(t, now)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--skip-queries"})
+	})
+	for _, want := range []string{"scope:", "lübbecke", "uchte", "mönsheim", "hameln",
+		"newest price update", "newest run:", "25.0 km"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("doctor text output missing %q\noutput=%s", want, output)
+		}
+	}
+}

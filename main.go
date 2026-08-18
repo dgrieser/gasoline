@@ -1741,8 +1741,13 @@ func runSuggest(args []string) error {
 	}
 
 	if *persist {
-		// Decisions first: prunePredictions collects the runs both tables
-		// leave behind, so it has to run last.
+		// Stations that left scope go before the retention sweeps, and
+		// prunePredictions runs last of the three: it collects the runs all of
+		// them leave behind.
+		unfedStations, unfedPredictions, unfedDecisions, err := pruneUnfedStations(ctx, db, opts.Now)
+		if err != nil {
+			return err
+		}
 		prunedDecisions, err := pruneCheckDecisions(ctx, db, opts.Now)
 		if err != nil {
 			return err
@@ -1752,8 +1757,10 @@ func runSuggest(args []string) error {
 			return err
 		}
 		fmt.Fprintf(os.Stderr,
-			"persist: stored %d predictions, %d decisions, evaluated %d, outcomes %d, bias-corrected %d stations, pruned %d/%d\n",
-			totals.Predictions, totals.Decisions, evaluated, outcomes, totals.BiasedStations, pruned, prunedDecisions)
+			"persist: stored %d predictions, %d decisions, evaluated %d, outcomes %d, bias-corrected %d stations, "+
+				"pruned %d/%d by retention, %d/%d for %d stations that left scope\n",
+			totals.Predictions, totals.Decisions, evaluated, outcomes, totals.BiasedStations,
+			pruned, prunedDecisions, unfedPredictions, unfedDecisions, unfedStations)
 	}
 
 	if !quiet {
@@ -3910,7 +3917,7 @@ func backfillNotifyLocations(ctx context.Context, tx *sql.Tx, d dialect, result 
 			}
 			continue
 		}
-		_, lat, lng, found, err := cachedCityTx(ctx, tx, city)
+		_, lat, lng, found, err := cachedCityFor(ctx, tx, city)
 		if err != nil {
 			return err
 		}
@@ -3965,13 +3972,14 @@ func migrateDropUserNotifyCities(ctx context.Context, tx *sql.Tx, d dialect, res
 	return nil
 }
 
-// cachedCityTx resolves a city as written — query string, normalized name or
+// cachedCityFor resolves a city as written — query string, normalized name or
 // display name — to its normalized name and cached coordinates, preferring the
-// canonical row.
-func cachedCityTx(ctx context.Context, tx *sql.Tx, city string) (string, float64, float64, bool, error) {
+// canonical row. It takes a queryer so the sweep can call it inside its
+// transaction and doctor can call it against the database directly.
+func cachedCityFor(ctx context.Context, q queryer, city string) (string, float64, float64, bool, error) {
 	var normalized string
 	var lat, lng float64
-	err := tx.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT normalized_name, lat, lng
 		FROM cities
 		WHERE name = ?
@@ -5010,7 +5018,7 @@ func loadCityCoverage(ctx context.Context, tx *sql.Tx, fetches []cityFetch) (cit
 	}
 	// Read the targets out in full before resolving any of them. A transaction is
 	// pinned to one connection and the MySQL driver speaks to it synchronously,
-	// so issuing cachedCityTx while this result set is still open would fail the
+	// so issuing cachedCityFor while this result set is still open would fail the
 	// whole sweep with "commands out of sync".
 	type target struct {
 		city   string
@@ -5038,7 +5046,7 @@ func loadCityCoverage(ctx context.Context, tx *sql.Tx, fetches []cityFetch) (cit
 	for _, t := range targets {
 		// update_targets stores the string an admin typed; ownership is keyed by
 		// the geocoder's normalized name for the same place.
-		normalized, _, _, found, err := cachedCityTx(ctx, tx, t.city)
+		normalized, _, _, found, err := cachedCityFor(ctx, tx, t.city)
 		if err != nil {
 			return cityCoverage{}, err
 		}

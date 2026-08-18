@@ -87,6 +87,7 @@ type doctorResult struct {
 	Database doctorDatabase  `json:"database"`
 	Tables   []doctorTable   `json:"tables"`
 	Indexes  []doctorIndex   `json:"indexes"`
+	Scope    doctorScope     `json:"scope"`
 	Filters  doctorFilters   `json:"filters"`
 	Queries  []doctorQuery   `json:"queries"`
 	Findings []doctorFinding `json:"findings"`
@@ -119,6 +120,92 @@ type doctorIndex struct {
 	// Unexpected marks an index doctor found but does not know about: usually
 	// a MySQL foreign-key index, sometimes a hand-added one.
 	Unexpected bool `json:"unexpected"`
+}
+
+// doctorScope is the station universe suggest, check and notify work from,
+// held against the update targets that are supposed to define it.
+//
+// It answers the question the rest of doctor cannot: why a city nobody feeds
+// any more still shows up in prediction output. There are two different answers
+// and they need different fixes. Either its stations are genuinely still in
+// scope — they had a price update within stationFreshness, so every computation
+// still covers them — or only stored rows remain, which the next
+// `suggest --persist` run drops (pruneUnfedStations). The first is a live
+// collection problem; the second clears itself within the hour.
+type doctorScope struct {
+	FreshnessHours float64 `json:"freshness_hours"`
+	RetentionDays  int     `json:"retention_days"`
+	// Configured is whether update_targets has any rows. Without them a sweep
+	// is driven entirely by `update --city` flags, so a city that is not a
+	// target says nothing about whether it should be there.
+	Configured bool                `json:"configured"`
+	Targets    []doctorScopeTarget `json:"targets"`
+	Cities     []doctorScopeCity   `json:"cities"`
+	LatestRun  *doctorScopeRun     `json:"latest_run"`
+	// ProbeLimited marks a report that stopped looking up stored predictions
+	// after doctorScopeProbeLimit stations, so the newest-prediction column is
+	// incomplete rather than wrong.
+	ProbeLimited bool `json:"probe_limited"`
+	// Skipped covers a database too old — or too empty — to have the tables the
+	// scope picture is built from.
+	Skipped bool   `json:"skipped"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// doctorScopeTarget is one configured update target, resolved through the
+// cities cache the way the update sweep resolves it.
+type doctorScopeTarget struct {
+	// City is the string an admin typed; Normalized is the geocoder's name for
+	// the same place, which is what snapshots record as their owner.
+	City       string  `json:"city"`
+	Normalized string  `json:"normalized"`
+	RadiusKM   float64 `json:"radius_km"`
+	// Geocoded is false when the city has never been resolved, so the target
+	// has never fetched anything.
+	Geocoded bool `json:"geocoded"`
+}
+
+// doctorScopeCity is one owning city — every station whose newest snapshot
+// names it — counted against what the pipeline currently does with it.
+type doctorScopeCity struct {
+	City   string `json:"city"`
+	Target bool   `json:"target"`
+	// RadiusKM is the configured target's radius, zero for a city that is not
+	// one.
+	RadiusKM float64 `json:"radius_km,omitempty"`
+	// Geocoded is only meaningful for a target: false means the target names a
+	// place the cities cache does not know.
+	Geocoded bool `json:"geocoded"`
+	Stations int  `json:"stations"`
+	// InScope counts the owned stations fed within stationFreshness, which is
+	// exactly the set suggest, check and notify compute over.
+	InScope int `json:"in_scope"`
+	// InLatestRun counts the owned stations the newest prediction run actually
+	// stored predictions for.
+	InLatestRun    int    `json:"in_latest_run"`
+	NewestSnapshot string `json:"newest_snapshot,omitempty"`
+	// NewestPrediction is the latest target window stored for any of this
+	// city's out-of-scope stations, for the doctor's --fuel. Rows should not
+	// outlive scope by more than one persist run, so anything here that is not
+	// from the last hour means pruneUnfedStations is not running.
+	NewestPrediction string `json:"newest_prediction,omitempty"`
+}
+
+// doctorScopeRun is the newest prediction run, which is the pipeline's own
+// record of what it last considered in scope.
+type doctorScopeRun struct {
+	ID    int64  `json:"id"`
+	RunAt string `json:"run_at"`
+	Fuel  string `json:"fuel"`
+	// StationCount is what the run row claims; Stations is how many distinct
+	// stations its prediction rows actually name.
+	StationCount int `json:"station_count"`
+	Stations     int `json:"stations"`
+	// OutOfScope counts stations the run covered that have had no price update
+	// within stationFreshness. On a run younger than that window this should be
+	// zero, and anything else means the run drew from something other than the
+	// fed universe.
+	OutOfScope int `json:"out_of_scope"`
 }
 
 type doctorFilters struct {
@@ -860,6 +947,12 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 		}
 	}
 
+	present := map[string]bool{}
+	for _, t := range tables {
+		present[t.Name] = !t.Missing
+	}
+	result.Scope = doctorScopeReport(ctx, db, d, opts, present, time.Now().UTC())
+
 	// Without the table there is nothing to time, and running the queries anyway
 	// would report the same missing-table error eight times over the one finding
 	// that matters.
@@ -926,6 +1019,296 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 	return result, nil
 }
 
+// doctorScopeProbeLimit bounds how many out-of-scope stations are looked up in
+// price_predictions. One lookup is a single index seek, but a database that has
+// collected many cities over time could hold thousands of dropped stations, and
+// a diagnostic must not turn into the slowest thing on the box.
+const doctorScopeProbeLimit = 500
+
+// stationScopeRow is one station's newest snapshot: the city that owns it and
+// when it was last fed.
+type stationScopeRow struct {
+	StationID  string
+	City       string
+	RecordedAt time.Time
+}
+
+// doctorScopeReport builds the scope picture. It is cheap by construction: one
+// indexed seek per station for the snapshots, one run row, one pass over that
+// run's predictions, and a capped number of seeks for dropped stations. Nothing
+// here scans price_predictions.
+func doctorScopeReport(ctx context.Context, db *sql.DB, d dialect, opts doctorOptions, present map[string]bool, now time.Time) doctorScope {
+	scope := doctorScope{
+		FreshnessHours: stationFreshness.Hours(),
+		RetentionDays:  predictionRetentionDays,
+	}
+	if !present["stations"] || !present["price_snapshots"] {
+		scope.Skipped = true
+		scope.Reason = "stations and price_snapshots are needed to tell what is in scope — run `gasoline migrate`"
+		return scope
+	}
+
+	hasTargets, err := tableExists(ctx, db, d, "update_targets")
+	if err != nil {
+		scope.Skipped = true
+		scope.Reason = err.Error()
+		return scope
+	}
+	if hasTargets {
+		targets, err := doctorScopeTargets(ctx, db)
+		if err != nil {
+			scope.Skipped = true
+			scope.Reason = err.Error()
+			return scope
+		}
+		scope.Targets = targets
+		scope.Configured = len(targets) > 0
+	}
+
+	stations, err := loadStationScope(ctx, db)
+	if err != nil {
+		scope.Skipped = true
+		scope.Reason = err.Error()
+		return scope
+	}
+
+	// The newest run is the pipeline's own answer to "what is in scope", which
+	// is worth comparing against the snapshots' answer.
+	runStations := map[string]bool{}
+	if present["prediction_runs"] && present["price_predictions"] {
+		run, ids, err := loadLatestRunStations(ctx, db)
+		if err != nil {
+			scope.Skipped = true
+			scope.Reason = err.Error()
+			return scope
+		}
+		scope.LatestRun = run
+		runStations = ids
+	}
+
+	cities := map[string]*doctorScopeCity{}
+	cityFor := func(name string) *doctorScopeCity {
+		city, ok := cities[name]
+		if !ok {
+			city = &doctorScopeCity{City: name}
+			cities[name] = city
+		}
+		return city
+	}
+	// Targets come first so one that owns nothing at all still gets a row: a
+	// target feeding no station is precisely the kind of thing to notice.
+	for _, target := range scope.Targets {
+		name := target.Normalized
+		if name == "" {
+			name = target.City
+		}
+		city := cityFor(name)
+		city.Target = true
+		city.Geocoded = target.Geocoded
+		if target.RadiusKM > city.RadiusKM {
+			city.RadiusKM = target.RadiusKM
+		}
+	}
+
+	freshCutoff := now.Add(-stationFreshness)
+	retentionCutoff := now.AddDate(0, 0, -predictionRetentionDays)
+	var dropped []stationScopeRow
+	for _, station := range stations {
+		city := cityFor(station.City)
+		city.Stations++
+		if station.RecordedAt.After(city.newestSnapshot()) {
+			city.NewestSnapshot = station.RecordedAt.UTC().Format(time.RFC3339)
+		}
+		inScope := !station.RecordedAt.Before(freshCutoff)
+		if inScope {
+			city.InScope++
+		}
+		if runStations[station.StationID] {
+			city.InLatestRun++
+			if !inScope && scope.LatestRun != nil {
+				scope.LatestRun.OutOfScope++
+			}
+		}
+		// Only stations that left scope need their stored predictions looked
+		// up: for anything still fed, "there are predictions" is the expected
+		// state and says nothing.
+		if !inScope && station.RecordedAt.After(retentionCutoff) {
+			dropped = append(dropped, station)
+		}
+	}
+
+	if present["price_predictions"] {
+		sort.Slice(dropped, func(i, j int) bool {
+			return dropped[i].RecordedAt.After(dropped[j].RecordedAt)
+		})
+		if len(dropped) > doctorScopeProbeLimit {
+			dropped = dropped[:doctorScopeProbeLimit]
+			scope.ProbeLimited = true
+		}
+		for _, station := range dropped {
+			target, err := newestPredictionTarget(ctx, db, station.StationID, opts.Filters.Fuel)
+			if err != nil {
+				scope.Reason = err.Error()
+				break
+			}
+			city := cityFor(station.City)
+			if target > city.NewestPrediction {
+				city.NewestPrediction = target
+			}
+		}
+	}
+
+	scope.Cities = make([]doctorScopeCity, 0, len(cities))
+	for _, city := range cities {
+		scope.Cities = append(scope.Cities, *city)
+	}
+	sort.Slice(scope.Cities, func(i, j int) bool {
+		return scope.Cities[i].City < scope.Cities[j].City
+	})
+	return scope
+}
+
+// newestSnapshot re-reads the stored timestamp so the running maximum needs no
+// second field. An unparsable value would have failed loadStationScope, and an
+// empty one is older than anything.
+func (c *doctorScopeCity) newestSnapshot() time.Time {
+	if c.NewestSnapshot == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339, c.NewestSnapshot)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
+}
+
+// doctorScopeTargets reads update_targets and resolves each city the way the
+// update sweep does, so the names line up with the owners snapshots record.
+func doctorScopeTargets(ctx context.Context, db *sql.DB) ([]doctorScopeTarget, error) {
+	rows, err := db.QueryContext(ctx, `SELECT city, radius_km FROM update_targets ORDER BY city ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var targets []doctorScopeTarget
+	for rows.Next() {
+		var target doctorScopeTarget
+		if err := rows.Scan(&target.City, &target.RadiusKM); err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Resolved after the result set is closed: the MySQL driver speaks to one
+	// connection synchronously, so querying while these rows are open would
+	// fail the whole report.
+	for i, target := range targets {
+		normalized, _, _, found, err := cachedCityFor(ctx, db, target.City)
+		if err != nil {
+			return nil, err
+		}
+		targets[i].Normalized = normalized
+		targets[i].Geocoded = found
+	}
+	return targets, nil
+}
+
+// loadStationScope reads the newest snapshot of every station. The owner is
+// taken from that one row, which is how loadSnapshotScan attributes a station
+// too: ownership can move to a nearer centre, and the last row wins.
+func loadStationScope(ctx context.Context, db *sql.DB) ([]stationScopeRow, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT s.id, ps.city_name, ps.recorded_at
+		FROM stations s
+		JOIN price_snapshots ps ON ps.id = (
+			SELECT newest.id
+			FROM price_snapshots newest
+			WHERE newest.station_id = s.id
+			ORDER BY newest.recorded_at DESC, newest.id DESC
+			LIMIT 1
+		)
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var scope []stationScopeRow
+	for rows.Next() {
+		var row stationScopeRow
+		var recordedAt string
+		if err := rows.Scan(&row.StationID, &row.City, &recordedAt); err != nil {
+			return nil, err
+		}
+		parsed, err := time.Parse(time.RFC3339, recordedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse recorded_at %q: %w", recordedAt, err)
+		}
+		row.RecordedAt = parsed
+		scope = append(scope, row)
+	}
+	return scope, rows.Err()
+}
+
+// loadLatestRunStations reads the newest prediction run and the stations it
+// stored predictions for.
+func loadLatestRunStations(ctx context.Context, db *sql.DB) (*doctorScopeRun, map[string]bool, error) {
+	var run doctorScopeRun
+	err := db.QueryRowContext(ctx, `
+		SELECT id, run_at, fuel, station_count
+		FROM prediction_runs
+		ORDER BY run_at DESC, id DESC
+		LIMIT 1
+	`).Scan(&run.ID, &run.RunAt, &run.Fuel, &run.StationCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err := db.QueryContext(ctx, `SELECT DISTINCT station_id FROM price_predictions WHERE run_id = ?`, run.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	ids := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, nil, err
+		}
+		ids[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	run.Stations = len(ids)
+	return &run, ids, nil
+}
+
+// newestPredictionTarget returns the latest target window stored for one
+// station and fuel, or "" when there is none. Reading it in target order off
+// idx_price_predictions_station_fuel_target makes this a single seek rather
+// than an aggregate over the station's whole prediction history.
+func newestPredictionTarget(ctx context.Context, db *sql.DB, stationID, fuel string) (string, error) {
+	var target string
+	err := db.QueryRowContext(ctx, `
+		SELECT target_start
+		FROM price_predictions
+		WHERE station_id = ? AND fuel = ?
+		ORDER BY target_start DESC
+		LIMIT 1
+	`, stationID, fuel).Scan(&target)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
 // countQueryRows runs a query for its cost and drains it, discarding values:
 // doctor measures how long the page's SQL takes, not what it returns.
 func countQueryRows(ctx context.Context, db *sql.DB, query string, args []any) (int, error) {
@@ -957,6 +1340,8 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 			warn("index %s on %s is missing — run `gasoline migrate`", idx.Name, idx.Table)
 		}
 	}
+
+	findings = append(findings, doctorScopeFindings(r.Scope)...)
 
 	// scanWorthWarningAbout keeps a full scan from being reported as a problem
 	// when the table is small enough that scanning it is the right plan. On a
@@ -1059,6 +1444,71 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 	return findings
 }
 
+// doctorScopeFindings turns the scope picture into the two verdicts an operator
+// needs: a city that should have left scope but has not, and a city that has
+// left scope but whose stored rows are still on display.
+func doctorScopeFindings(s doctorScope) []doctorFinding {
+	var findings []doctorFinding
+	warn := func(format string, a ...any) {
+		findings = append(findings, doctorFinding{Severity: "warn", Message: fmt.Sprintf(format, a...)})
+	}
+	info := func(format string, a ...any) {
+		findings = append(findings, doctorFinding{Severity: "info", Message: fmt.Sprintf(format, a...)})
+	}
+
+	if s.Skipped {
+		info("scope check skipped: %s", s.Reason)
+		return findings
+	}
+	if s.Reason != "" {
+		warn("scope check incomplete: %s", s.Reason)
+	}
+	freshness := fmt.Sprintf("%.0fh", s.FreshnessHours)
+
+	var inScope, total int
+	for _, city := range s.Cities {
+		inScope += city.InScope
+		total += city.Stations
+		switch {
+		case city.Target && !city.Geocoded:
+			warn("update target %s has never been geocoded, so no sweep has ever fetched it — check the geocoder and the spelling", city.City)
+		case city.Target && city.Stations == 0:
+			warn("update target %s owns no station; a sweep has never stored a snapshot for it", city.City)
+		case city.Target && city.InScope == 0:
+			warn("update target %s has had no price update since %s, so all %d of its %s left scope — `gasoline update` is not reaching it",
+				city.City, city.NewestSnapshot, city.Stations, plural(city.Stations, "station has", "stations have"))
+		case city.Target && city.InScope < city.Stations:
+			info("update target %s owns %d stations but only %d are in scope; the rest moved to a nearer target or fell out of its radius",
+				city.City, city.Stations, city.InScope)
+		case !city.Target && city.InScope > 0 && s.Configured:
+			warn("%s is not an update target, yet %d of its %d %s in scope (newest price update %s) — suggest, check and notify still cover it",
+				city.City, city.InScope, city.Stations, plural(city.Stations, "station is", "stations are"), city.NewestSnapshot)
+		case !city.Target && city.NewestPrediction != "":
+			info("%s is no longer fed (newest price update %s) and none of its %d %s in scope; predictions stored up to %s are still there and the next `gasoline suggest --persist` run drops them",
+				city.City, city.NewestSnapshot, city.Stations, plural(city.Stations, "station is", "stations are"),
+				city.NewestPrediction)
+		}
+	}
+	if total > 0 {
+		info("scope: %d of %d stations in %d cities are in scope (fed within %s)", inScope, total, len(s.Cities), freshness)
+	}
+	if !s.Configured {
+		info("no update targets are configured, so every city here was fed by an ad-hoc `update --city` run rather than by the schedule")
+	}
+	if run := s.LatestRun; run != nil {
+		if run.OutOfScope > 0 {
+			warn("the newest prediction run (%s, %s) covered %d stations that have had no price update within %s — that run drew from something other than the fed universe",
+				run.RunAt, run.Fuel, run.OutOfScope, freshness)
+		} else {
+			info("the newest prediction run (%s, %s) covered %d stations, all of them in scope", run.RunAt, run.Fuel, run.Stations)
+		}
+	}
+	if s.ProbeLimited {
+		info("stopped looking up stored predictions after %d out-of-scope stations, newest first; the newest-prediction column is incomplete below that", doctorScopeProbeLimit)
+	}
+	return findings
+}
+
 type doctorOptions struct {
 	Filters doctorFilters
 	// TryIndex names an index to force on price_predictions for a second,
@@ -1087,7 +1537,7 @@ func runDoctor(args []string) error {
 	rangeName := fs.String("range", "", "Target-date range: 7d, 14d (default) or 30d")
 	from := fs.String("from", "", "Range start as YYYY-MM-DD (needs --to)")
 	to := fs.String("to", "", "Range end as YYYY-MM-DD (needs --from)")
-	skipQueries := fs.Bool("skip-queries", false, "Only report schema, sizes and indexes; do not run the accuracy-page queries")
+	skipQueries := fs.Bool("skip-queries", false, "Only report schema, sizes, indexes and scope; do not run the accuracy-page queries")
 	tryIndex := fs.String("try-index", "", "Also time every price_predictions query with this index forced, to measure what a different index choice would cost (read-only)")
 	analyze := fs.Bool("analyze", false, "Use EXPLAIN ANALYZE for real per-step timings (MySQL 8.0.18+; ignored on SQLite)")
 	explain := fs.Bool("explain", false, "Print the full query plan for each query")
@@ -1212,6 +1662,8 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 		fmt.Fprintf(stdout, "    %s %-46s %8s  (%s)\n", marker, idx.Name, size, strings.Join(idx.Columns, ", "))
 	}
 
+	writeDoctorScopeText(r.Scope)
+
 	fmt.Fprintf(stdout, "\naccuracy page queries: fuel=%s, confidence=%s, %s .. %s\n",
 		r.Filters.Fuel, r.Filters.Confidence, r.Filters.From, r.Filters.To)
 	for _, q := range r.Queries {
@@ -1266,6 +1718,59 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 	for _, f := range r.Findings {
 		fmt.Fprintf(stdout, "  %-4s %s\n", f.Severity, f.Message)
 	}
+}
+
+// writeDoctorScopeText prints the station universe: one row per owning city,
+// with the update target that is meant to feed it alongside what the data says
+// it actually feeds.
+func writeDoctorScopeText(s doctorScope) {
+	fmt.Fprintf(stdout, "\nscope: stations are in scope while fed within %.0fh; in-scope predictions are kept %d days\n",
+		s.FreshnessHours, s.RetentionDays)
+	if s.Skipped {
+		fmt.Fprintf(stdout, "  skipped: %s\n", s.Reason)
+		return
+	}
+	if len(s.Cities) == 0 {
+		fmt.Fprintln(stdout, "  no station has a snapshot yet")
+		return
+	}
+	fmt.Fprintf(stdout, "  %-28s %12s %9s %9s %11s  %-22s %s\n",
+		"city", "target", "stations", "in scope", "latest run", "newest price update", "newest prediction")
+	for _, city := range s.Cities {
+		target := "-"
+		switch {
+		case city.Target && !city.Geocoded:
+			target = "NOT GEOCODED"
+		case city.Target:
+			target = fmt.Sprintf("%.1f km", city.RadiusKM)
+		}
+		newest := city.NewestSnapshot
+		if newest == "" {
+			newest = "never fed"
+		}
+		prediction := city.NewestPrediction
+		if prediction == "" {
+			prediction = "-"
+		}
+		fmt.Fprintf(stdout, "  %-28s %12s %9d %9d %11d  %-22s %s\n",
+			city.City, target, city.Stations, city.InScope, city.InLatestRun, newest, prediction)
+	}
+	if run := s.LatestRun; run != nil {
+		fmt.Fprintf(stdout, "  newest run: %s %s, %d stations", run.RunAt, run.Fuel, run.Stations)
+		if run.OutOfScope > 0 {
+			fmt.Fprintf(stdout, ", %d of them out of scope", run.OutOfScope)
+		}
+		fmt.Fprintln(stdout)
+	}
+}
+
+// plural picks between two phrasings so a finding about one station does not
+// read like a bug in the finding.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // formatCount groups digits so an eight-figure row count is readable at a

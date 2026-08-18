@@ -227,11 +227,11 @@ The margin that decides "low", and that suppresses a buy when a cheaper window i
    The forecast additionally extrapolates a **damped baseline drift** (median day-over-day baseline move across stations of the last 7 pricing days, halved and capped at ±2 ct/day), so predictions crossing pricing-day boundaries no longer assume a perfectly flat market.
 4. **Persists** the new grid; newer runs supersede older ones for the same target hour, older rows remain as learning history.
 5. **Records** the check decisions taken against that same model: per open station the observed price, the model's reference price for the current hour, the history percentile, and the resulting verdict and recommendation.
-6. **Prunes** predictions and decisions older than 30 days.
+6. **Prunes** predictions and decisions older than 30 days, and everything stored for stations that have **left scope** — a station with no price update for 48 hours, which is what happens when an update target is removed or its radius shrinks. Retention alone would keep a removed city in the accuracy statistics for 30 more days even though nothing recomputes it, and its remaining predictions can never be evaluated because evaluation needs a recorded actual price. The station row and its price snapshots stay, so a station that comes back is modelled from its own history again; only the measurement rows go, and 48 hours without an update means 48 consecutive failed sweeps, so a transient fetch failure cannot trigger it.
 
 The recorded decisions exist because the notification path itself keeps no record: `notify` computes each verdict and discards it, so without this there is no way to tell whether the numbers that trigger low-price alerts are any good. They are a faithful **proxy**, not a delivery log — the same model and bias as `notify` uses, for every fuel `notify` delivers, but computed on the suggestion timer's schedule and before `notify` applies its row limit, per-user city selection, notification windows and repeat-suppression baseline. Read them as "what the model decided", not "what users received".
 
-The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ...`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. One invocation persists a run per fuel over every fed station, so all of them accrue evaluation data for the bias learning; per-fuel failures are reported on stderr and via the exit code. The accrued evaluation data also feeds the bias learning and is surfaced in the web UI on the admin **Prediction accuracy** page (hamburger menu → Prediction accuracy), which compares each past predicted price with the actual price recorded for that window — raw rows, accuracy statistics (MAE, bias, RMSE, share within ±1/±2 ct, per-confidence breakdown), breakdowns by lead time and by hour of day, the alert outcomes described above, and a predicted-vs-actual graph.
+The normal suggestion output is unchanged; a one-line summary (`persist: stored N predictions, evaluated M, ..., pruned A/B by retention, C/D for E stations that left scope`) goes to stderr. Pass `--quiet` (or `-q`) to suppress the suggestion output entirely and only store — useful for timer runs whose stdout nobody reads. One invocation persists a run per fuel over every fed station, so all of them accrue evaluation data for the bias learning; per-fuel failures are reported on stderr and via the exit code. The accrued evaluation data also feeds the bias learning and is surfaced in the web UI on the admin **Prediction accuracy** page (hamburger menu → Prediction accuracy), which compares each past predicted price with the actual price recorded for that window — raw rows, accuracy statistics (MAE, bias, RMSE, share within ±1/±2 ct, per-confidence breakdown), breakdowns by lead time and by hour of day, the alert outcomes described above, and a predicted-vs-actual graph.
 
 ### Server-stored configuration (admin settings)
 
@@ -358,16 +358,37 @@ The grouped commands above are the canonical interface shown by `gasoline help`.
 
 ### Diagnosing a slow database (`gasoline doctor`)
 
-`gasoline doctor` inspects a live database without changing it. It reports table sizes, every index with its key columns and on-disk size, and then — the reason it exists — runs each query behind the admin **Prediction accuracy** page, timing it and showing what the planner did with it:
+`gasoline doctor` inspects a live database without changing it. It reports table sizes, every index with its key columns and on-disk size, which stations are in scope and why, and then — the reason it exists — runs each query behind the admin **Prediction accuracy** page, timing it and showing what the planner did with it:
 
 ```bash
 gasoline doctor                                     # default 14-day window, fuel diesel
 gasoline doctor --db-driver mysql --explain         # print the full plan per query
 gasoline doctor --analyze                           # real per-step timings (MySQL 8.0.18+)
 gasoline doctor --range 30d --fuel e5               # reproduce a specific page filter
-gasoline doctor --skip-queries                      # schema, sizes and indexes only
+gasoline doctor --skip-queries                      # schema, sizes, indexes and scope only
 gasoline doctor -o json | jq '.findings'            # machine-readable
+gasoline doctor -o json | jq '.scope'               # the station universe, city by city
 ```
+
+#### Why a city you removed still appears
+
+The `scope` section answers that, and the answer is one of two things that need opposite responses. `suggest`, `check` and `notify` cover every station fed within the last 48 hours (see [`gasoline suggest`](#cli-usage)), so `doctor` lists each city that owns stations next to the update target meant to feed it:
+
+```
+scope: stations are in scope while fed within 48h; in-scope predictions are kept 30 days
+  city                               target  stations  in scope  latest run  newest price update    newest prediction
+  lübbecke                          25.0 km       140       140         140  2026-08-17T16:00:22Z   -
+  mönsheim                                -        37         0           0  2026-08-14T09:00:11Z   2026-08-16T12:00:00Z
+  uchte                             25.0 km        51        51          51  2026-08-17T16:00:31Z   -
+  newest run: 2026-08-17T15:08:17Z diesel, 191 stations
+```
+
+- **`in scope` above zero for a city that is not a target** is a live problem: something is still feeding it — an ad-hoc `update --city` in a cron entry, or a target whose spelling resolves to a different normalized name than you expect — and every computation still covers it. The finding is a warning.
+- **`in scope` at zero, with a `newest prediction`** is history, not scope: the city left the station universe when it stopped being fed, and what remains are rows stored while it was still being collected. Nothing is recomputing it, and the next `suggest --persist` run drops those rows (see [above](#persistent-predictions-and-learning-suggest---persist)), so a `newest prediction` older than the last persist run means that pruning is not running. The finding is informational and names the date the last of it was predicted for.
+
+A configured target with no stations in scope is the inverse failure — the sweep is not reaching it — and a target that owns nothing at all has never been geocoded or has never fetched. Both are warnings. The `latest run` column is the pipeline's own answer to the same question: it counts the stations the newest `suggest --persist` run actually stored predictions for, so a station appearing there while out of scope means that run drew from something other than the fed universe.
+
+The section is built from indexed lookups only — one seek per station, plus one pass over the newest run's predictions — so it runs even under `--skip-queries` and costs nothing next to the page timings. Stored predictions are looked up only for stations that have *left* scope, newest first and capped at 500 stations.
 
 Its filter flags (`--fuel`, `--confidence`, `--range`, or `--from`/`--to`) mirror the page's own controls, so you can reproduce exactly the filter that felt slow in the browser. Each query line ends in a verdict: `covering <index>` means the query was answered from an index alone, a bare index name means it used that index but still fetched table rows, and `TABLE SCAN` means it read the whole table. The `findings` section collects the actionable parts — a missing index, a query over `--slow-ms` (default 1000), a table scan.
 
@@ -416,6 +437,8 @@ Features:
 - filter by fuel type
 - compare multiple stations
 - inspect summary stats and historical price points
+
+The station list, the price rows and the recommended fill-ups card all cover the **stations currently being fed** — the same 48-hour freshness rule the CLI applies (`GASOLINE_STATION_FRESHNESS_HOURS` mirrors Go's `stationFreshness`). A station whose update target was removed therefore disappears from the dashboard instead of showing its last known price as though it were current; its snapshots stay in the database and reappear if the station is collected again.
 
 Serve it locally from the repo root:
 
