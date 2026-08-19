@@ -65,6 +65,8 @@ The PHP viewer requires a login (see [Web viewer & user accounts](#web-viewer--u
 | `GASOLINE_SMTP_USER` / `GASOLINE_SMTP_PASSWORD` | SMTP credentials (AUTH LOGIN/PLAIN); leave the user empty for an unauthenticated relay. |
 | `GASOLINE_SMTP_FROM` | Sender address. |
 | `GASOLINE_SMTP_TLS` | `starttls` (default for port 587), `implicit` (SMTPS, default for 465), or `none`. |
+| `GASOLINE_SESSION_DAYS` | How long a signed-in browser stays signed in without retyping the password (default `30`, clamped to 1–365). |
+| `GASOLINE_SESSION_PATH` | Directory for PHP session files (default `<temp>/gasoline-sessions`). Falls back to PHP's own path when it cannot be created or written. |
 
 ### Migrating an existing SQLite database to MySQL
 
@@ -486,6 +488,8 @@ The hamburger menu in the header opens:
 - **Stations** (admins) — set the same persistent display-name overrides as `gasoline rename`: search a station by name or address, enter a new name, and apply. All existing renames are listed with their original name and address, editable inline or removable to restore the Tankerkönig name.
 - **Settings** (admins) — manage the update targets (cities + radii updated automatically by the CLI), the suggestion/check parameters, the notification templates, and the schedule defaults. These are the values the CLI picks up as described in [Server-stored configuration](#server-stored-configuration-admin-settings); notification templates are admin-only and never editable by regular users.
 - **Prediction accuracy** (admins) — compare past predicted prices with the actual prices recorded for those windows, from the evaluated `price_predictions` data (see [Persistent predictions and learning](#persistent-predictions-and-learning-suggest---persist)). Filter by fuel, city, target date range, and confidence; view accuracy statistics (count, MAE, bias, RMSE, share within ±1/±2 ct, and a per-confidence breakdown), a predicted-vs-actual graph (timeline with an error band, or a predicted-vs-actual scatter), and the raw evaluated rows.
+
+Signing in lasts: alongside the PHP session the viewer sets a second, long-lived cookie (`gasoline_remember`, 30 days by default — see `GASOLINE_SESSION_DAYS`) whose token is stored hashed in the `user_sessions` table. Closing the browser, an idle afternoon, or the host clearing out PHP's session files no longer means retyping the password — the token restores the login and its expiry slides forward with use. Signing out drops the token for that browser only; changing the password drops it everywhere else and keeps the browser you changed it in. Run `gasoline migrate` once to create `user_sessions`; until then the viewer simply keeps using plain sessions.
 
 The dashboard itself is unchanged — same filters, chart, and tables as before, now behind the login.
 

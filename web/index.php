@@ -60,19 +60,136 @@ function gasolineConnect(string $driver, string $sqlitePath): PDO
 
 // ── Auth: session / CSRF / flash helpers ─────────────────────────────────────
 
-function gasolineStartSession(): void
+function gasolineRequestIsHTTPS(): bool
 {
-    $isHttps = (($_SERVER['HTTPS'] ?? '') !== '' && strtolower((string) $_SERVER['HTTPS']) !== 'off')
+    return (($_SERVER['HTTPS'] ?? '') !== '' && strtolower((string) $_SERVER['HTTPS']) !== 'off')
         || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
-    ini_set('session.use_strict_mode', '1');
-    session_set_cookie_params([
+}
+
+/**
+ * How long a signed-in browser stays signed in without retyping the password.
+ * GASOLINE_SESSION_DAYS overrides the default; values outside 1..365 days are
+ * clamped rather than rejected, so a typo cannot lock everyone out.
+ */
+function gasolineSessionDays(): int
+{
+    $raw = trim((string) getenv('GASOLINE_SESSION_DAYS'));
+    if ($raw === '' || !ctype_digit($raw)) {
+        return 30;
+    }
+    return max(1, min(365, (int) $raw));
+}
+
+function gasolineSessionTTL(): int
+{
+    return gasolineSessionDays() * 86400;
+}
+
+// Shared cookie attributes for both cookies the viewer sets, so the session and
+// the persistent-login cookie can never disagree about scope or protection.
+function gasolineCookieOptions(int $expires): array
+{
+    return [
+        'expires' => $expires,
+        'path' => '/',
         'httponly' => true,
         'samesite' => 'Lax',
-        'secure' => $isHttps,
+        'secure' => gasolineRequestIsHTTPS(),
+    ];
+}
+
+/**
+ * Point PHP's session storage at a directory of our own.
+ *
+ * Session files in the shared default directory are garbage-collected by every
+ * PHP process on the host, and most of them still run the 24-minute default
+ * gc_maxlifetime — so raising ours only holds in a directory nothing else
+ * sweeps. When the directory cannot be created or written (open_basedir, a
+ * read-only temp), the default path stays in place: a short session beats no
+ * session at all, and the persistent-login cookie carries the login anyway.
+ */
+function gasolineSessionSavePath(): void
+{
+    $dir = trim((string) getenv('GASOLINE_SESSION_PATH'));
+    if ($dir === '') {
+        $dir = rtrim(sys_get_temp_dir(), '/\\') . '/gasoline-sessions';
+    }
+    try {
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0700, true);
+        }
+        if (!is_dir($dir) || !is_writable($dir)) {
+            return;
+        }
+        @session_save_path($dir);
+    } catch (Throwable $e) {
+        error_log('gasoline session path error: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Re-send the session cookie so an in-use login keeps sliding forward.
+ *
+ * PHP sends the cookie only when it creates or regenerates a session id, so
+ * without this the cookie would expire a fixed window after sign-in no matter
+ * how often the viewer is used. Once a day is enough and keeps a Set-Cookie
+ * header off almost every response.
+ */
+function gasolineRefreshSessionCookie(): void
+{
+    if (headers_sent() || session_status() !== PHP_SESSION_ACTIVE) {
+        return;
+    }
+    $now = time();
+    $last = (int) ($_SESSION['cookie_refreshed_at'] ?? 0);
+    if ($last > 0 && $now - $last < 86400) {
+        return;
+    }
+    $_SESSION['cookie_refreshed_at'] = $now;
+    if (!isset($_COOKIE[session_name()])) {
+        // Brand-new or regenerated id: session_start() has already sent the
+        // cookie with the full lifetime, so a second header would only repeat it.
+        return;
+    }
+    setcookie(session_name(), session_id(), gasolineCookieOptions($now + gasolineSessionTTL()));
+}
+
+function gasolineStartSession(): void
+{
+    $ttl = gasolineSessionTTL();
+    ini_set('session.use_strict_mode', '1');
+    // Without this the login dies after PHP's default 24 idle minutes, which is
+    // what made the viewer ask for the password over and over.
+    ini_set('session.gc_maxlifetime', (string) $ttl);
+    gasolineSessionSavePath();
+    session_set_cookie_params([
+        'lifetime' => $ttl,
+        'httponly' => true,
+        'samesite' => 'Lax',
+        'secure' => gasolineRequestIsHTTPS(),
         'path' => '/',
     ]);
     session_name('gasoline_session');
     session_start();
+    gasolineRefreshSessionCookie();
+}
+
+// Drop the session and its cookie. Used wherever the viewer signs someone out;
+// the persistent-login cookie is cleared separately by the caller, because
+// signing out of one browser must not always forget every other one.
+function gasolineDestroySession(): void
+{
+    $_SESSION = [];
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_destroy();
+    }
+    if (!headers_sent()) {
+        setcookie(session_name(), '', gasolineCookieOptions(time() - 86400));
+    }
+    // Keep $_COOKIE honest: a session started again in the same request (the
+    // account-deletion flow does that to carry a flash message) then knows it
+    // is issuing a fresh cookie rather than refreshing the one just dropped.
+    unset($_COOKIE[session_name()]);
 }
 
 function csrfToken(): string
@@ -285,7 +402,7 @@ function findUserByID(PDO $pdo, int $id): ?array
     return $user === false ? null : $user;
 }
 
-function currentUser(PDO $pdo): ?array
+function currentUser(PDO $pdo, string $driver): ?array
 {
     static $cached = false;
     static $user = null;
@@ -299,9 +416,10 @@ function currentUser(PDO $pdo): ?array
     }
     $row = findUserByID($pdo, (int) $userId);
     if ($row === null || $row['status'] !== 'approved') {
-        // Deleted, demoted to pending, or otherwise stale: sign out.
-        $_SESSION = [];
-        session_destroy();
+        // Deleted, demoted to pending, or otherwise stale: sign out, and drop
+        // the persistent login too so the next request cannot restore it.
+        rememberForget($pdo, $driver);
+        gasolineDestroySession();
         return $user = null;
     }
     return $user = $row;
@@ -322,6 +440,221 @@ function nowUTC(): string
 function adminEmailFromEnv(): string
 {
     return normalizeEmail((string) getenv('GASOLINE_ADMIN_EMAIL'));
+}
+
+// ── Auth: persistent login ───────────────────────────────────────────────────
+//
+// PHP's session storage is not a place to keep a login: the files are garbage-
+// collected, wiped by shared hosts, and lost whenever the session path or the
+// PHP worker changes — which is what made the viewer demand the password again
+// and again. The durable half of the login therefore lives in the database.
+//
+// The cookie carries "selector:validator". The selector is the lookup key; only
+// a SHA-256 of the validator is stored, so read access to `user_sessions`
+// cannot be replayed as a cookie, and the row is found by an indexed equality
+// match while the secret is still compared in constant time.
+//
+// The validator is not rotated on use. Rotation would buy a little theft
+// detection but races with the parallel requests a page load fires (the
+// dashboard fetches JSON alongside the HTML), and losing that race would sign
+// the user out — exactly the bug this code exists to fix.
+
+const REMEMBER_COOKIE = 'gasoline_remember';
+
+// Sliding window: an in-use login is extended at most once an hour, so a busy
+// browser costs one small UPDATE per hour rather than one per request.
+const REMEMBER_TOUCH_INTERVAL = 3600;
+
+function utcAt(int $timestamp): string
+{
+    return gmdate('Y-m-d\TH:i:s\Z', $timestamp);
+}
+
+// Deployments whose database predates this table keep working (with plain
+// sessions) until `gasoline migrate` runs, the same way the rest of the viewer
+// degrades instead of erroring on an older schema.
+function rememberReady(PDO $pdo, string $driver): bool
+{
+    static $ready = null;
+    if ($ready === null) {
+        $ready = gasolineTableExists($pdo, $driver, 'user_sessions');
+    }
+    return $ready;
+}
+
+function rememberSetCookie(string $value, int $expires): void
+{
+    if (headers_sent()) {
+        return;
+    }
+    setcookie(REMEMBER_COOKIE, $value, gasolineCookieOptions($expires));
+    $_COOKIE[REMEMBER_COOKIE] = $value;
+}
+
+function rememberClearCookie(): void
+{
+    if (!headers_sent()) {
+        setcookie(REMEMBER_COOKIE, '', gasolineCookieOptions(time() - 86400));
+    }
+    unset($_COOKIE[REMEMBER_COOKIE]);
+}
+
+/** Split the cookie into [selector, validator], or null when it is malformed. */
+function rememberParseCookie(): ?array
+{
+    $raw = (string) ($_COOKIE[REMEMBER_COOKIE] ?? '');
+    if ($raw === '' || substr_count($raw, ':') !== 1) {
+        return null;
+    }
+    [$selector, $validator] = explode(':', $raw, 2);
+    if (!ctype_xdigit($selector) || !ctype_xdigit($validator) || $selector === '' || $validator === '') {
+        return null;
+    }
+    return [$selector, $validator];
+}
+
+function rememberDeleteSelector(PDO $pdo, string $selector): void
+{
+    $stmt = $pdo->prepare('DELETE FROM user_sessions WHERE selector = :selector');
+    $stmt->bindValue(':selector', $selector);
+    $stmt->execute();
+}
+
+// Expired rows are swept on sign-in, which is rare enough to keep the delete
+// off the hot path and often enough that the table cannot grow without bound.
+function rememberPurgeExpired(PDO $pdo): void
+{
+    $stmt = $pdo->prepare('DELETE FROM user_sessions WHERE expires_at < :now');
+    $stmt->bindValue(':now', nowUTC());
+    $stmt->execute();
+}
+
+/** Start a persistent login for this browser. */
+function rememberIssue(PDO $pdo, string $driver, int $userId): void
+{
+    if (!rememberReady($pdo, $driver)) {
+        return;
+    }
+    try {
+        rememberPurgeExpired($pdo);
+        $selector = bin2hex(random_bytes(16));
+        $validator = bin2hex(random_bytes(32));
+        $now = time();
+        $expires = $now + gasolineSessionTTL();
+        $stmt = $pdo->prepare(
+            'INSERT INTO user_sessions (user_id, selector, validator_hash, created_at, last_used_at, expires_at)
+             VALUES (:user_id, :selector, :hash, :created_at, :last_used_at, :expires_at)'
+        );
+        $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+        $stmt->bindValue(':selector', $selector);
+        $stmt->bindValue(':hash', hash('sha256', $validator));
+        $stmt->bindValue(':created_at', utcAt($now));
+        $stmt->bindValue(':last_used_at', utcAt($now));
+        $stmt->bindValue(':expires_at', utcAt($expires));
+        $stmt->execute();
+        rememberSetCookie($selector . ':' . $validator, $expires);
+    } catch (Throwable $e) {
+        error_log('gasoline persistent login error: ' . $e->getMessage());
+        rememberClearCookie();
+    }
+}
+
+/** Forget this browser only (sign-out). */
+function rememberForget(PDO $pdo, string $driver): void
+{
+    $parsed = rememberParseCookie();
+    rememberClearCookie();
+    if ($parsed === null || !rememberReady($pdo, $driver)) {
+        return;
+    }
+    try {
+        rememberDeleteSelector($pdo, $parsed[0]);
+    } catch (Throwable $e) {
+        error_log('gasoline persistent login error: ' . $e->getMessage());
+    }
+}
+
+/** Forget every browser of one user (password change, account deletion). */
+function rememberForgetUser(PDO $pdo, string $driver, int $userId): void
+{
+    if (!rememberReady($pdo, $driver)) {
+        return;
+    }
+    try {
+        $stmt = $pdo->prepare('DELETE FROM user_sessions WHERE user_id = :user_id');
+        $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+        $stmt->execute();
+    } catch (Throwable $e) {
+        error_log('gasoline persistent login error: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Restore the login from the cookie when the PHP session is gone, and slide the
+ * window forward while it is in use. Called once per request, right after the
+ * session starts and before anything reads $_SESSION['user_id'].
+ */
+function rememberSync(PDO $pdo, string $driver): void
+{
+    $parsed = rememberParseCookie();
+    if ($parsed === null) {
+        if (isset($_COOKIE[REMEMBER_COOKIE])) {
+            rememberClearCookie();
+        }
+        return;
+    }
+    if (!rememberReady($pdo, $driver)) {
+        return;
+    }
+    [$selector, $validator] = $parsed;
+    try {
+        $stmt = $pdo->prepare('SELECT * FROM user_sessions WHERE selector = :selector');
+        $stmt->bindValue(':selector', $selector);
+        $stmt->execute();
+        $row = $stmt->fetch();
+        $now = time();
+        if ($row === false || (string) $row['expires_at'] < utcAt($now)) {
+            if ($row !== false) {
+                rememberDeleteSelector($pdo, $selector);
+            }
+            rememberClearCookie();
+            return;
+        }
+        if (!hash_equals((string) $row['validator_hash'], hash('sha256', $validator))) {
+            // Right selector, wrong secret: the cookie is forged or stale, and
+            // the token it points at is no longer trustworthy either.
+            rememberDeleteSelector($pdo, $selector);
+            rememberClearCookie();
+            return;
+        }
+        $user = findUserByID($pdo, (int) $row['user_id']);
+        if ($user === null || $user['status'] !== 'approved') {
+            rememberDeleteSelector($pdo, $selector);
+            rememberClearCookie();
+            return;
+        }
+        $sessionUser = $_SESSION['user_id'] ?? null;
+        if ((int) $sessionUser !== (int) $user['id']) {
+            // The session was lost (garbage-collected, or the browser dropped
+            // its cookie); rebuild it under a fresh id.
+            session_regenerate_id(true);
+            $_SESSION['user_id'] = (int) $user['id'];
+        }
+        if ((string) $row['last_used_at'] < utcAt($now - REMEMBER_TOUCH_INTERVAL)) {
+            $expires = $now + gasolineSessionTTL();
+            $stmt = $pdo->prepare(
+                'UPDATE user_sessions SET last_used_at = :last_used_at, expires_at = :expires_at
+                 WHERE selector = :selector'
+            );
+            $stmt->bindValue(':last_used_at', utcAt($now));
+            $stmt->bindValue(':expires_at', utcAt($expires));
+            $stmt->bindValue(':selector', $selector);
+            $stmt->execute();
+            rememberSetCookie($selector . ':' . $validator, $expires);
+        }
+    } catch (Throwable $e) {
+        error_log('gasoline persistent login error: ' . $e->getMessage());
+    }
 }
 
 // ── Email: minimal dependency-free SMTP client ───────────────────────────────
@@ -629,7 +962,7 @@ function handlePost(PDO $pdo, string $driver): void
         setFlash('error', 'csrfError');
         redirectTo(in_array($action, ['login', 'register'], true) ? '?page=' . $action : '');
     }
-    $user = currentUser($pdo);
+    $user = currentUser($pdo, $driver);
 
     switch ($action) {
         case 'login':
@@ -654,6 +987,7 @@ function handlePost(PDO $pdo, string $driver): void
             }
             session_regenerate_id(true);
             $_SESSION['user_id'] = (int) $row['id'];
+            rememberIssue($pdo, $driver, (int) $row['id']);
             if (password_needs_rehash($hash, PASSWORD_DEFAULT)) {
                 $stmt = $pdo->prepare('UPDATE users SET password_hash = :hash WHERE id = :id');
                 $stmt->bindValue(':hash', password_hash($password, PASSWORD_DEFAULT));
@@ -716,8 +1050,8 @@ function handlePost(PDO $pdo, string $driver): void
 
         case 'logout':
             if ($user !== null) {
-                $_SESSION = [];
-                session_destroy();
+                rememberForget($pdo, $driver);
+                gasolineDestroySession();
             }
             redirectTo('?page=login');
             // no break
@@ -750,6 +1084,11 @@ function handlePost(PDO $pdo, string $driver): void
             $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
             $stmt->execute();
             session_regenerate_id(true);
+            // A new password invalidates every persistent login, including this
+            // browser's — which then gets a fresh one, so changing the password
+            // does not sign you out of the tab you changed it in.
+            rememberForgetUser($pdo, $driver, (int) $user['id']);
+            rememberIssue($pdo, $driver, (int) $user['id']);
             setFlash('success', 'passwordChanged');
             redirectTo('?page=account');
             // no break
@@ -835,11 +1174,12 @@ function handlePost(PDO $pdo, string $driver): void
                 setFlash('error', 'lastAdminGuard');
                 redirectTo('?page=account');
             }
+            rememberForgetUser($pdo, $driver, (int) $user['id']);
             $stmt = $pdo->prepare('DELETE FROM users WHERE id = :id');
             $stmt->bindValue(':id', (int) $user['id'], PDO::PARAM_INT);
             $stmt->execute();
-            $_SESSION = [];
-            session_destroy();
+            rememberClearCookie();
+            gasolineDestroySession();
             gasolineStartSession();
             setFlash('success', 'accountDeleted');
             redirectTo('?page=login');
@@ -872,6 +1212,7 @@ function handlePost(PDO $pdo, string $driver): void
                 setFlash('error', 'cannotActOnSelf');
                 redirectTo('?page=admin_users');
             }
+            rememberForgetUser($pdo, $driver, $targetId);
             $stmt = $pdo->prepare('DELETE FROM users WHERE id = :id');
             $stmt->bindValue(':id', $targetId, PDO::PARAM_INT);
             $stmt->execute();
@@ -2493,9 +2834,11 @@ if ($schemaGuardReason !== null) {
     renderSchemaGuardPage($schemaGuardReason);
 }
 
+rememberSync($authPdo, $dbDriver);
+
 handlePost($authPdo, $dbDriver);
 
-$currentUser = currentUser($authPdo);
+$currentUser = currentUser($authPdo, $dbDriver);
 
 if ($isJSONRequest && $currentUser === null) {
     http_response_code(401);

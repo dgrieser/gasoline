@@ -618,3 +618,129 @@ func isCommand(name string) bool {
 	}
 	return false
 }
+
+// The PHP viewer keeps the durable half of a login in user_sessions: without
+// that table every visit falls back to a plain PHP session, which the host
+// garbage-collects, and the viewer starts asking for the password again. So
+// `gasoline migrate` has to create it, with the columns the viewer writes.
+func TestMigrateCreatesUserSessions(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	columns := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(user_sessions)`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid        int
+			name, typ  string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultVal, &pk); err != nil {
+			t.Fatalf("scan table_info: %v", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("table_info rows: %v", err)
+	}
+	if len(columns) == 0 {
+		t.Fatal("migrate no longer creates user_sessions, so the PHP viewer cannot keep anyone signed in")
+	}
+	for _, want := range []string{"user_id", "selector", "validator_hash", "created_at", "last_used_at", "expires_at"} {
+		if !columns[want] {
+			t.Errorf("user_sessions is missing the %q column the PHP viewer writes", want)
+		}
+	}
+
+	// One token per browser, and the selector is the lookup key: two rows may
+	// never share one, or a stolen selector would match another browser's row.
+	for _, email := range []string{"one@example.com", "two@example.com"} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO users (email, password_hash, status, created_at) VALUES (?, 'x', 'approved', '2026-01-01T00:00:00Z')`,
+			email,
+		); err != nil {
+			t.Fatalf("insert user: %v", err)
+		}
+	}
+	insert := `INSERT INTO user_sessions (user_id, selector, validator_hash, created_at, last_used_at, expires_at)
+		VALUES ((SELECT id FROM users WHERE email = ?), ?, ?, ?, ?, ?)`
+	if _, err := db.ExecContext(ctx, insert, "one@example.com", "abc", "hash", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert token: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, insert, "two@example.com", "abc", "hash2", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"); err == nil {
+		t.Error("user_sessions accepts a duplicate selector, so one browser's cookie could resolve to another's token")
+	}
+
+	// Deleting the account has to take its tokens with it, or a deleted user's
+	// cookie would still resolve to a row.
+	if _, err := db.ExecContext(ctx, `DELETE FROM users WHERE email = 'one@example.com'`); err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+	var left int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_sessions`).Scan(&left); err != nil {
+		t.Fatalf("count tokens: %v", err)
+	}
+	if left != 0 {
+		t.Errorf("%d persistent logins outlived their deleted user", left)
+	}
+}
+
+// Both dialects have to declare the same columns: a login issued against MySQL
+// and one issued against SQLite are read back by the same PHP.
+func TestUserSessionsSchemaMatchesAcrossDialects(t *testing.T) {
+	for _, want := range []string{"user_id", "selector", "validator_hash", "created_at", "last_used_at", "expires_at"} {
+		for _, d := range []dialect{dialectSQLite, dialectMySQL} {
+			var table string
+			for _, stmt := range schemaStatements(d) {
+				if strings.Contains(stmt, "CREATE TABLE IF NOT EXISTS user_sessions") {
+					table = stmt
+				}
+			}
+			if table == "" {
+				t.Fatalf("%v schema no longer creates user_sessions", d)
+			}
+			if !strings.Contains(table, want) {
+				t.Errorf("%v user_sessions is missing the %q column", d, want)
+			}
+		}
+	}
+}
+
+// The viewer is PHP and cannot be exercised from a Go test, so the SQL it runs
+// against user_sessions is checked here instead: a column renamed on the Go
+// side has to be renamed in the viewer too, or every login silently falls back
+// to a session-only one.
+func TestViewerPersistentLoginUsesTheSchemaColumns(t *testing.T) {
+	viewer, err := os.ReadFile(filepath.Join("web", "index.php"))
+	if err != nil {
+		t.Fatalf("read web/index.php: %v", err)
+	}
+	source := string(viewer)
+
+	if !strings.Contains(source, "INSERT INTO user_sessions (user_id, selector, validator_hash, created_at, last_used_at, expires_at)") {
+		t.Error("web/index.php no longer issues persistent-login tokens with the schema's column list")
+	}
+	if !strings.Contains(source, "SELECT * FROM user_sessions WHERE selector = :selector") {
+		t.Error("web/index.php no longer looks a persistent login up by its selector")
+	}
+	// The validator must never be stored as it travels in the cookie.
+	if !strings.Contains(source, "hash('sha256', $validator)") {
+		t.Error("web/index.php no longer hashes the cookie's validator before comparing or storing it")
+	}
+	if !strings.Contains(source, "hash_equals((string) $row['validator_hash'], hash('sha256', $validator))") {
+		t.Error("web/index.php no longer compares the validator in constant time")
+	}
+	// Expired rows have to go, both as a login check and as table hygiene.
+	if !strings.Contains(source, "DELETE FROM user_sessions WHERE expires_at < :now") {
+		t.Error("web/index.php no longer purges expired persistent logins")
+	}
+	if !strings.Contains(source, "DELETE FROM user_sessions WHERE user_id = :user_id") {
+		t.Error("web/index.php no longer revokes a user's persistent logins on password change or deletion")
+	}
+}
