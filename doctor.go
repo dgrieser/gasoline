@@ -8,16 +8,21 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 )
 
 // doctor inspects a live database instead of changing it: what the prediction
-// tables cost, which indexes exist, and — the part that matters for the admin
-// accuracy page — what the planner actually does with that page's queries and
-// how long each one takes. Everything it runs is read-only, so it is safe
-// against production.
+// tables cost, which indexes exist, which stations are still in scope, and — the
+// part that matters for the admin accuracy page — what the planner actually does
+// with that page's queries and how long each one takes. Everything it runs is
+// read-only, so it is safe against production.
+//
+// The single exception is --optimize, which rebuilds tables to hand freed pages
+// back to the filesystem. It writes, it is opt-in, and it runs after every
+// measurement so the report still describes the database as it was found.
 //
 // The queries live here rather than being read out of web/index.php because
 // the page builds them in PHP. accuracyQuerySpecs documents that duplication
@@ -88,6 +93,7 @@ type doctorResult struct {
 	Tables   []doctorTable   `json:"tables"`
 	Indexes  []doctorIndex   `json:"indexes"`
 	Scope    doctorScope     `json:"scope"`
+	Optimize *doctorOptimize `json:"optimize,omitempty"`
 	Filters  doctorFilters   `json:"filters"`
 	Queries  []doctorQuery   `json:"queries"`
 	Findings []doctorFinding `json:"findings"`
@@ -206,6 +212,47 @@ type doctorScopeRun struct {
 	// zero, and anything else means the run drew from something other than the
 	// fed universe.
 	OutOfScope int `json:"out_of_scope"`
+}
+
+// doctorOptimize is the one thing doctor does that writes: rebuilding a table
+// to hand its freed pages back to the filesystem.
+//
+// Deleting rows does not shrink a table. InnoDB keeps the emptied pages for
+// reuse, and SQLite keeps them on its free list, so after a large prune — a
+// removed update target taking half the prediction rows with it — the size
+// doctor reports stays where it was until the table is rebuilt. That rebuild is
+// exactly what OPTIMIZE TABLE (MySQL) and VACUUM (SQLite) do, and it is opt-in
+// because it is the only part of doctor that is not read-only.
+type doctorOptimize struct {
+	// Statement is the form doctor issued, so an operator can audit or repeat it
+	// by hand.
+	Statement string                `json:"statement"`
+	Tables    []doctorOptimizeTable `json:"tables"`
+	// FileBytesBefore / FileBytesAfter bracket the SQLite database file, which
+	// is where that engine's reclaimed space actually becomes visible: VACUUM
+	// rewrites the whole file, not one table.
+	FileBytesBefore *int64 `json:"file_bytes_before,omitempty"`
+	FileBytesAfter  *int64 `json:"file_bytes_after,omitempty"`
+	Skipped         bool   `json:"skipped"`
+	Reason          string `json:"reason,omitempty"`
+}
+
+// doctorOptimizeTable is one rebuilt table, measured on both sides of the
+// rebuild. On SQLite there is a single entry named for the database, because
+// VACUUM cannot be pointed at one table.
+type doctorOptimizeTable struct {
+	Name             string  `json:"name"`
+	DurationMS       float64 `json:"duration_ms"`
+	DataBytesBefore  *int64  `json:"data_bytes_before,omitempty"`
+	DataBytesAfter   *int64  `json:"data_bytes_after,omitempty"`
+	IndexBytesBefore *int64  `json:"index_bytes_before,omitempty"`
+	IndexBytesAfter  *int64  `json:"index_bytes_after,omitempty"`
+	// Notes carry the engine's own commentary. InnoDB answers OPTIMIZE TABLE
+	// with "Table does not support optimize, doing recreate + analyze instead",
+	// which is the rebuild working as intended rather than a refusal, and an
+	// operator who has not seen it before reads it as an error.
+	Notes []string `json:"notes,omitempty"`
+	Error string   `json:"error,omitempty"`
 }
 
 type doctorFilters struct {
@@ -516,14 +563,36 @@ func serverVersion(ctx context.Context, q queryer, d dialect) string {
 	return v.String
 }
 
+// mysqlStatsConn pins one connection and disables information_schema's
+// statistics cache on it.
+//
+// MySQL 8 answers data_length and index_length from a snapshot it keeps for
+// information_schema_stats_expiry seconds — 86400 by default. A table that was
+// just pruned, or just rebuilt, therefore keeps reporting its old size for up to
+// a day, which would make both the sizes doctor prints and the space --optimize
+// reports it returned quietly wrong. The setting is per session, and a pooled
+// *sql.DB hands out whichever connection is free, so the session and the queries
+// that rely on it have to be the same connection.
+//
+// Servers without the variable (MariaDB) reject the SET; the connection is still
+// usable and their statistics are not cached this way, so the error is ignored.
+func mysqlStatsConn(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = conn.ExecContext(ctx, "SET SESSION information_schema_stats_expiry = 0")
+	return conn, nil
+}
+
 // doctorTableStats reports size and row counts. SQLite counts exactly (cheap
 // enough, and dbstat gives real byte sizes); MySQL reads information_schema so
 // that diagnosing a huge table does not require scanning it.
-func doctorTableStats(ctx context.Context, db *sql.DB, d dialect) ([]doctorTable, error) {
+func doctorTableStats(ctx context.Context, q queryer, d dialect) ([]doctorTable, error) {
 	out := make([]doctorTable, 0, len(doctorTables))
 	for _, name := range doctorTables {
 		table := doctorTable{Name: name}
-		exists, err := tableExists(ctx, db, d, name)
+		exists, err := tableExists(ctx, q, d, name)
 		if err != nil {
 			return nil, err
 		}
@@ -534,7 +603,7 @@ func doctorTableStats(ctx context.Context, db *sql.DB, d dialect) ([]doctorTable
 		}
 		if d == dialectMySQL {
 			var rows, dataLen, indexLen sql.NullInt64
-			err := db.QueryRowContext(ctx, `
+			err := q.QueryRowContext(ctx, `
 				SELECT table_rows, data_length, index_length
 				FROM information_schema.tables
 				WHERE table_schema = DATABASE() AND table_name = ?
@@ -547,10 +616,10 @@ func doctorTableStats(ctx context.Context, db *sql.DB, d dialect) ([]doctorTable
 			table.DataBytes = nullInt64Ptr(dataLen)
 			table.IndexBytes = nullInt64Ptr(indexLen)
 		} else {
-			if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+name).Scan(&table.Rows); err != nil {
+			if err := q.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+name).Scan(&table.Rows); err != nil {
 				return nil, err
 			}
-			if size, ok := sqliteBtreeBytes(ctx, db, name); ok {
+			if size, ok := sqliteBtreeBytes(ctx, q, name); ok {
 				table.DataBytes = &size
 			}
 		}
@@ -907,7 +976,17 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 		Filters:  opts.Filters,
 	}
 
-	tables, err := doctorTableStats(ctx, db, d)
+	// Sizes are read over one pinned connection so MySQL's cached
+	// information_schema statistics cannot make them stale (mysqlStatsConn).
+	stats := queryer(db)
+	if d == dialectMySQL {
+		if conn, connErr := mysqlStatsConn(ctx, db); connErr == nil {
+			defer conn.Close()
+			stats = conn
+		}
+	}
+
+	tables, err := doctorTableStats(ctx, stats, d)
 	if err != nil {
 		return doctorResult{}, err
 	}
@@ -1013,6 +1092,12 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 			Purpose: "skipped via --skip-queries",
 			Skipped: true,
 		})
+	}
+
+	// Last, and only on request: this is the one step that writes, so everything
+	// reported above it describes the database as the operator found it.
+	if opts.Optimize {
+		result.Optimize = runDoctorOptimize(ctx, db, stats, d, opts, tables)
 	}
 
 	result.Findings = doctorFindings(result, d, opts)
@@ -1309,6 +1394,321 @@ func newestPredictionTarget(ctx context.Context, db *sql.DB, stationID, fuel str
 	return target, nil
 }
 
+// runDoctorOptimize rebuilds the requested tables and measures what came back.
+//
+// It runs last, after every measurement, so the sizes and query timings above it
+// describe the database an operator actually complained about rather than the one
+// doctor just rewrote.
+//
+// Cost warning worth knowing before running it: both engines rebuild by writing
+// a fresh copy, so each needs free space on the order of the object being
+// rebuilt — one table for MySQL, the whole database for SQLite. MySQL performs
+// it online (concurrent reads and writes keep working); SQLite's VACUUM takes an
+// exclusive lock for its duration.
+func runDoctorOptimize(ctx context.Context, db *sql.DB, stats queryer, d dialect, opts doctorOptions, before []doctorTable) *doctorOptimize {
+	report := &doctorOptimize{}
+	sizes := map[string]doctorTable{}
+	for _, table := range before {
+		sizes[table.Name] = table
+	}
+
+	if d != dialectMySQL {
+		// VACUUM is whole-database and cannot be pointed at one table, so a
+		// narrowing flag would be a promise the engine cannot keep.
+		report.Statement = "VACUUM"
+		if len(opts.OptimizeTables) > 0 {
+			report.Reason = "SQLite reclaims space with VACUUM, which rewrites the whole database; --optimize-table cannot narrow it"
+		}
+		entry := doctorOptimizeTable{Name: "database"}
+		entry.DataBytesBefore = fileSizeBytes(opts.SQLitePath)
+		report.FileBytesBefore = entry.DataBytesBefore
+		fmt.Fprintf(os.Stderr, "optimize: VACUUM %s\n", opts.SQLitePath)
+		started := time.Now()
+		if _, err := db.ExecContext(ctx, "VACUUM"); err != nil {
+			entry.Error = err.Error()
+		}
+		entry.DurationMS = float64(time.Since(started).Microseconds()) / 1000
+		if entry.Error == "" {
+			// VACUUM rebuilds the b-trees but leaves the statistics alone, and
+			// doctor's whole purpose is telling an operator why the planner
+			// chose what it chose.
+			if _, err := db.ExecContext(ctx, "ANALYZE"); err != nil {
+				entry.Notes = append(entry.Notes, "ANALYZE failed: "+err.Error())
+			} else {
+				report.Statement = "VACUUM; ANALYZE"
+			}
+		}
+		entry.DataBytesAfter = fileSizeBytes(opts.SQLitePath)
+		report.FileBytesAfter = entry.DataBytesAfter
+		report.Tables = append(report.Tables, entry)
+		return report
+	}
+
+	report.Statement = "OPTIMIZE TABLE <table>"
+	targets := opts.OptimizeTables
+	if len(targets) == 0 {
+		targets = doctorTables
+	}
+	for _, name := range targets {
+		table, known := sizes[name]
+		if !known {
+			// Only reachable if doctorTables and the stats disagree; treated as
+			// absent rather than guessed at.
+			report.Tables = append(report.Tables, doctorOptimizeTable{
+				Name:  name,
+				Error: "not reported by this database",
+			})
+			continue
+		}
+		if table.Missing {
+			report.Tables = append(report.Tables, doctorOptimizeTable{
+				Name:  name,
+				Error: "table does not exist",
+			})
+			continue
+		}
+		entry := doctorOptimizeTable{
+			Name:             name,
+			DataBytesBefore:  table.DataBytes,
+			IndexBytesBefore: table.IndexBytes,
+		}
+		// A rebuild of a multi-gigabyte table takes minutes, and a CLI that
+		// prints nothing for that long reads as hung. Progress goes to stderr so
+		// --output json stays a single document.
+		fmt.Fprintf(os.Stderr, "optimize: rebuilding %s (%s data, %s indexes)\n",
+			name, formatBytesPtr(table.DataBytes), formatBytesPtr(table.IndexBytes))
+		started := time.Now()
+		notes, err := optimizeMySQLTable(ctx, db, name)
+		entry.DurationMS = float64(time.Since(started).Microseconds()) / 1000
+		entry.Notes = notes
+		if err != nil {
+			entry.Error = err.Error()
+		}
+		report.Tables = append(report.Tables, entry)
+	}
+
+	// Re-read the sizes once, after every rebuild: information_schema is the
+	// same source the tables section used, so before and after are comparable.
+	after, err := doctorTableStats(ctx, stats, d)
+	if err != nil {
+		report.Reason = "sizes after the rebuild could not be read: " + err.Error()
+		return report
+	}
+	afterByName := map[string]doctorTable{}
+	for _, table := range after {
+		afterByName[table.Name] = table
+	}
+	for i, entry := range report.Tables {
+		table, ok := afterByName[entry.Name]
+		if !ok || table.Missing {
+			continue
+		}
+		report.Tables[i].DataBytesAfter = table.DataBytes
+		report.Tables[i].IndexBytesAfter = table.IndexBytes
+	}
+	return report
+}
+
+// optimizeMySQLTable runs OPTIMIZE TABLE and collects the engine's own report
+// rows. The statement answers with a result set rather than a plain OK, and
+// InnoDB's "recreate + analyze instead" line arrives as one of those rows, so it
+// has to be drained and kept.
+//
+// The name is interpolated because a table name cannot be a bound parameter; it
+// is validated against doctorTables in runDoctor before it reaches here.
+func optimizeMySQLTable(ctx context.Context, db *sql.DB, name string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "OPTIMIZE TABLE "+name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var notes []string
+	for rows.Next() {
+		cells := make([]sql.NullString, len(columns))
+		targets := make([]any, len(columns))
+		for i := range cells {
+			targets[i] = &cells[i]
+		}
+		if err := rows.Scan(targets...); err != nil {
+			return notes, err
+		}
+		// Msg_type / Msg_text is the pair worth keeping; "status: OK" is the
+		// uninteresting normal case and would only pad the output.
+		var msgType, msgText string
+		for i, column := range columns {
+			switch column {
+			case "Msg_type":
+				msgType = cells[i].String
+			case "Msg_text":
+				msgText = cells[i].String
+			}
+		}
+		if msgType == "status" && strings.EqualFold(msgText, "OK") {
+			continue
+		}
+		if msgType != "" || msgText != "" {
+			notes = append(notes, strings.TrimSpace(msgType+": "+msgText))
+		}
+	}
+	return notes, rows.Err()
+}
+
+// fileSizeBytes is the database file's size, or nil when it cannot be measured
+// (MySQL, or a path the process cannot stat).
+func fileSizeBytes(path string) *int64 {
+	if path == "" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	size := info.Size()
+	return &size
+}
+
+// doctorOptimizeFindings reports what the rebuild bought, in the terms that
+// prompted it: bytes handed back, and anything that refused to rebuild.
+func doctorOptimizeFindings(o *doctorOptimize) []doctorFinding {
+	if o == nil {
+		return nil
+	}
+	var findings []doctorFinding
+	warn := func(format string, a ...any) {
+		findings = append(findings, doctorFinding{Severity: "warn", Message: fmt.Sprintf(format, a...)})
+	}
+	info := func(format string, a ...any) {
+		findings = append(findings, doctorFinding{Severity: "info", Message: fmt.Sprintf(format, a...)})
+	}
+
+	if o.Skipped {
+		info("optimize skipped: %s", o.Reason)
+		return findings
+	}
+	if o.Reason != "" {
+		info("optimize: %s", o.Reason)
+	}
+	var reclaimed int64
+	var rebuilt int
+	var measured bool
+	for _, table := range o.Tables {
+		if table.Error != "" {
+			warn("optimize %s failed after %.0f ms: %s", table.Name, table.DurationMS, table.Error)
+			continue
+		}
+		rebuilt++
+		if delta, ok := optimizeReclaimed(table); ok {
+			measured = true
+			reclaimed += delta
+		}
+	}
+	switch {
+	case rebuilt == 0:
+	case !measured:
+		info("optimize rebuilt %d %s; this database does not report sizes, so the space returned cannot be measured",
+			rebuilt, plural(rebuilt, "table", "tables"))
+	case reclaimed > 0:
+		info("optimize returned %s to the filesystem across %d %s", formatBytes(reclaimed), rebuilt,
+			plural(rebuilt, "table", "tables"))
+	case reclaimed == 0:
+		info("optimize rebuilt %d %s and returned nothing: there was no free space held back",
+			rebuilt, plural(rebuilt, "table", "tables"))
+	default:
+		// A rebuild can end up larger — a freshly built index is denser but
+		// fill-factor and statistics both move — and reporting that as a
+		// negative reclaim is more honest than hiding it.
+		info("optimize rebuilt %d %s and the database grew by %s", rebuilt,
+			plural(rebuilt, "table", "tables"), formatBytes(-reclaimed))
+	}
+	return findings
+}
+
+// optimizeReclaimed is how many bytes one rebuild gave back, and whether both
+// sides of it were measurable at all.
+func optimizeReclaimed(table doctorOptimizeTable) (int64, bool) {
+	var delta int64
+	var measured bool
+	for _, pair := range [2][2]*int64{
+		{table.DataBytesBefore, table.DataBytesAfter},
+		{table.IndexBytesBefore, table.IndexBytesAfter},
+	} {
+		if pair[0] == nil || pair[1] == nil {
+			continue
+		}
+		measured = true
+		delta += *pair[0] - *pair[1]
+	}
+	return delta, measured
+}
+
+// writeDoctorOptimizeText prints the rebuild: what it cost and what it returned.
+func writeDoctorOptimizeText(o *doctorOptimize) {
+	if o == nil {
+		return
+	}
+	fmt.Fprintf(stdout, "\noptimize (%s):\n", o.Statement)
+	if o.Skipped {
+		fmt.Fprintf(stdout, "  skipped: %s\n", o.Reason)
+		return
+	}
+	if o.Reason != "" {
+		fmt.Fprintf(stdout, "  note: %s\n", o.Reason)
+	}
+	// On SQLite the single entry measures the database file, not a table's data
+	// pages, and calling that "data" would misname the one number that matters.
+	sizeLabel := "data"
+	if o.FileBytesBefore != nil || o.FileBytesAfter != nil {
+		sizeLabel = "file"
+	}
+	for _, table := range o.Tables {
+		// Assembled rather than printed field by field: the size columns are
+		// optional, so the padding of whichever one comes last would otherwise
+		// trail off the end of the line.
+		line := fmt.Sprintf("  %-24s %9s", table.Name, formatDurationMS(table.DurationMS))
+		if table.Error != "" {
+			fmt.Fprintf(stdout, "%s  failed: %s\n", line, table.Error)
+			continue
+		}
+		if table.DataBytesBefore != nil && table.DataBytesAfter != nil {
+			line += fmt.Sprintf("  %s %8s -> %-8s", sizeLabel, formatBytesPtr(table.DataBytesBefore), formatBytesPtr(table.DataBytesAfter))
+		}
+		if table.IndexBytesBefore != nil && table.IndexBytesAfter != nil {
+			line += fmt.Sprintf("  indexes %8s -> %-8s", formatBytesPtr(table.IndexBytesBefore), formatBytesPtr(table.IndexBytesAfter))
+		}
+		fmt.Fprintln(stdout, strings.TrimRight(line, " "))
+		for _, note := range table.Notes {
+			fmt.Fprintf(stdout, "      | %s\n", note)
+		}
+	}
+}
+
+// formatDurationMS keeps a rebuild's cost readable at both ends of its range: a
+// vacuum of an empty database takes milliseconds, a multi-gigabyte table takes
+// minutes, and "0.0 s" for the first one looks like nothing ran.
+func formatDurationMS(ms float64) string {
+	switch {
+	case ms < 1000:
+		return fmt.Sprintf("%.0f ms", ms)
+	case ms < 60_000:
+		return fmt.Sprintf("%.1f s", ms/1000)
+	default:
+		return fmt.Sprintf("%.1f min", ms/60_000)
+	}
+}
+
+// formatBytesPtr renders an optional size, so a database that cannot report one
+// prints a dash instead of a zero that reads as "empty".
+func formatBytesPtr(bytes *int64) string {
+	if bytes == nil {
+		return "-"
+	}
+	return formatBytes(*bytes)
+}
+
 // countQueryRows runs a query for its cost and drains it, discarding values:
 // doctor measures how long the page's SQL takes, not what it returns.
 func countQueryRows(ctx context.Context, db *sql.DB, query string, args []any) (int, error) {
@@ -1342,6 +1742,7 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 	}
 
 	findings = append(findings, doctorScopeFindings(r.Scope)...)
+	findings = append(findings, doctorOptimizeFindings(r.Optimize)...)
 
 	// scanWorthWarningAbout keeps a full scan from being reported as a problem
 	// when the table is small enough that scanning it is the right plan. On a
@@ -1519,6 +1920,15 @@ type doctorOptions struct {
 	Analyze     bool
 	ShowSQL     bool
 	SlowMS      float64
+	// Optimize rebuilds the reported tables after everything else has been
+	// measured. The only write doctor performs, and only on request.
+	Optimize bool
+	// OptimizeTables narrows the rebuild to these tables; empty means every
+	// table doctor reports on. Validated against doctorTables before use,
+	// because a table name cannot be a bound parameter.
+	OptimizeTables []string
+	// SQLitePath is the database file, needed to measure what VACUUM gave back.
+	SQLitePath string
 }
 
 func nullInt64Ptr(v sql.NullInt64) *int64 {
@@ -1527,6 +1937,39 @@ func nullInt64Ptr(v sql.NullInt64) *int64 {
 	}
 	value := v.Int64
 	return &value
+}
+
+// resolveOptimizeTables validates --optimize-table against the tables doctor
+// knows. A table name cannot be a bound parameter, so this whitelist is what
+// keeps an arbitrary string out of the OPTIMIZE statement — and it also catches
+// the ordinary typo before a long rebuild starts.
+func resolveOptimizeTables(list string, optimize bool) ([]string, error) {
+	list = strings.TrimSpace(list)
+	if list == "" {
+		return nil, nil
+	}
+	if !optimize {
+		return nil, errors.New("--optimize-table requires --optimize")
+	}
+	var tables []string
+	seen := map[string]bool{}
+	for _, name := range strings.Split(list, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !slices.Contains(doctorTables, name) {
+			return nil, fmt.Errorf("--optimize-table %q is not one of: %s", name, strings.Join(doctorTables, ", "))
+		}
+		if !seen[name] {
+			seen[name] = true
+			tables = append(tables, name)
+		}
+	}
+	if len(tables) == 0 {
+		return nil, errors.New("--optimize-table needs at least one table name")
+	}
+	return tables, nil
 }
 
 func runDoctor(args []string) error {
@@ -1543,6 +1986,8 @@ func runDoctor(args []string) error {
 	explain := fs.Bool("explain", false, "Print the full query plan for each query")
 	showSQL := fs.Bool("sql", false, "Print the SQL of each query")
 	slowMS := fs.Float64("slow-ms", 1000, "Flag queries at or above this duration in milliseconds")
+	optimize := fs.Bool("optimize", false, "Rebuild the reported tables afterwards to return freed space to the filesystem (OPTIMIZE TABLE on MySQL, VACUUM on SQLite). The only part of doctor that writes")
+	optimizeTable := fs.String("optimize-table", "", "Restrict --optimize to these tables (comma-separated); MySQL only, since VACUUM rewrites the whole SQLite database")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1568,11 +2013,19 @@ func runDoctor(args []string) error {
 	if err != nil {
 		return err
 	}
+	optimizeTables, err := resolveOptimizeTables(*optimizeTable, *optimize)
+	if err != nil {
+		return err
+	}
 
 	// Opening a SQLite path creates the file, which every other command wants
 	// and this one must not: doctor is a diagnostic, and conjuring an empty
 	// database would both leave a stray file behind and answer "everything is
 	// absent" when the truth is that there is no database at this path.
+	sqlitePath := ""
+	if dbCfg.Driver != dialectMySQL {
+		sqlitePath = dbCfg.Path
+	}
 	if dbCfg.Driver != dialectMySQL {
 		if _, statErr := os.Stat(dbCfg.Path); errors.Is(statErr, os.ErrNotExist) {
 			return fmt.Errorf("no database at %s — pass --db, set GASOLINE_DB_PATH, "+
@@ -1599,11 +2052,14 @@ func runDoctor(args []string) error {
 			From:       fromTS,
 			To:         toTS,
 		},
-		TryIndex:    strings.TrimSpace(*tryIndex),
-		SkipQueries: *skipQueries,
-		Analyze:     *analyze,
-		ShowSQL:     *showSQL,
-		SlowMS:      *slowMS,
+		TryIndex:       strings.TrimSpace(*tryIndex),
+		SkipQueries:    *skipQueries,
+		Analyze:        *analyze,
+		ShowSQL:        *showSQL,
+		SlowMS:         *slowMS,
+		Optimize:       *optimize,
+		OptimizeTables: optimizeTables,
+		SQLitePath:     sqlitePath,
 	}
 	result, err := runDoctorChecks(ctx, db, dbCfg.Driver, dbCfg.Description(), opts)
 	if err != nil {
@@ -1709,6 +2165,8 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 			}
 		}
 	}
+
+	writeDoctorOptimizeText(r.Optimize)
 
 	fmt.Fprintln(stdout, "\nfindings:")
 	if len(r.Findings) == 0 {

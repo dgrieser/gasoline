@@ -1547,3 +1547,195 @@ func TestDoctorScopeTextListsEveryCity(t *testing.T) {
 		}
 	}
 }
+
+// TestRunDoctorOptimizeReclaimsSpace is the case that prompted --optimize: rows
+// were deleted in bulk (a removed update target taking its predictions with it)
+// and the database kept the freed pages, so every size doctor reports stayed
+// where it was.
+func TestRunDoctorOptimizeReclaimsSpace(t *testing.T) {
+	ctx := context.Background()
+	dbPath, db := seedDoctorDB(t)
+	// Enough rows for the free list to be visible against SQLite's page size.
+	for i := 0; i < 20000; i++ {
+		if _, err := db.ExecContext(ctx, `INSERT INTO price_predictions
+			(run_id, station_id, fuel, target_start, target_end, predicted_price, confidence,
+			 sample_count, is_suggestion, lead_minutes, applied_correction)
+			VALUES ((SELECT MIN(id) FROM prediction_runs), 'st-1', 'e10', ?, ?, 1.70, 'low', 1, 0, 60, 0)`,
+			time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(i)*time.Minute).Format(time.RFC3339),
+			time.Date(2026, 6, 1, 1, 0, 0, 0, time.UTC).Add(time.Duration(i)*time.Minute).Format(time.RFC3339),
+		); err != nil {
+			t.Fatalf("insert bulk prediction: %v", err)
+		}
+	}
+	var seeded int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM price_predictions WHERE fuel = 'diesel'`).Scan(&seeded); err != nil {
+		t.Fatalf("count seeded: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM price_predictions WHERE fuel = 'e10'`); err != nil {
+		t.Fatalf("delete bulk predictions: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	before, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat before: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--skip-queries", "--optimize", "--output", "json"})
+	})
+	var result doctorResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	if result.Optimize == nil {
+		t.Fatal("--optimize produced no optimize section")
+	}
+	if !strings.Contains(result.Optimize.Statement, "VACUUM") {
+		t.Fatalf("statement = %q, want the SQLite rebuild", result.Optimize.Statement)
+	}
+	if len(result.Optimize.Tables) != 1 || result.Optimize.Tables[0].Error != "" {
+		t.Fatalf("optimize tables = %+v, want one successful entry", result.Optimize.Tables)
+	}
+	if result.Optimize.FileBytesBefore == nil || result.Optimize.FileBytesAfter == nil {
+		t.Fatalf("optimize = %+v, want the file measured on both sides", result.Optimize)
+	}
+	if *result.Optimize.FileBytesAfter >= *result.Optimize.FileBytesBefore {
+		t.Fatalf("file went from %d to %d bytes, want it smaller after the rebuild",
+			*result.Optimize.FileBytesBefore, *result.Optimize.FileBytesAfter)
+	}
+
+	after, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+	if after.Size() >= before.Size() {
+		t.Fatalf("database file is %d bytes, was %d — nothing was returned", after.Size(), before.Size())
+	}
+
+	var reported bool
+	for _, finding := range result.Findings {
+		if strings.Contains(finding.Message, "optimize returned") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatalf("findings do not report the reclaimed space: %+v", result.Findings)
+	}
+
+	// The rows that were not deleted have to survive a rebuild.
+	reopened, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	var kept int
+	if err := reopened.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM price_predictions WHERE fuel = 'diesel'`).Scan(&kept); err != nil {
+		t.Fatalf("count kept: %v", err)
+	}
+	if kept != seeded {
+		t.Fatalf("diesel predictions = %d after the rebuild, want the seeded %d", kept, seeded)
+	}
+}
+
+// TestRunDoctorOptimizeIsOptIn keeps the default read-only: the report must not
+// even carry an optimize section unless it was asked for.
+func TestRunDoctorOptimizeIsOptIn(t *testing.T) {
+	dbPath, db := seedDoctorDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--skip-queries", "--output", "json"})
+	})
+	var result doctorResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	if result.Optimize != nil {
+		t.Fatalf("optimize section present without --optimize: %+v", result.Optimize)
+	}
+	if strings.Contains(output, "VACUUM") {
+		t.Error("doctor mentions a rebuild it did not run")
+	}
+}
+
+// TestRunDoctorOptimizeTableIsMySQLOnly documents the engine difference instead
+// of silently pretending one SQLite table was rebuilt.
+func TestRunDoctorOptimizeTableIsMySQLOnly(t *testing.T) {
+	dbPath, db := seedDoctorDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--skip-queries",
+			"--optimize", "--optimize-table", "price_predictions", "--output", "json"})
+	})
+	var result doctorResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	if result.Optimize == nil || !strings.Contains(result.Optimize.Reason, "whole database") {
+		t.Fatalf("optimize = %+v, want a note that VACUUM cannot be narrowed", result.Optimize)
+	}
+}
+
+func TestResolveOptimizeTables(t *testing.T) {
+	cases := []struct {
+		name     string
+		list     string
+		optimize bool
+		want     []string
+		wantErr  string
+	}{
+		{name: "empty is off", list: "", optimize: false},
+		{name: "needs the flag", list: "price_predictions", optimize: false, wantErr: "requires --optimize"},
+		{name: "one table", list: "price_predictions", optimize: true, want: []string{"price_predictions"}},
+		{
+			name: "trimmed and de-duplicated", list: " price_snapshots , price_predictions ,price_snapshots",
+			optimize: true, want: []string{"price_snapshots", "price_predictions"},
+		},
+		{name: "unknown table", list: "users", optimize: true, wantErr: "is not one of"},
+		{name: "only separators", list: " , ", optimize: true, wantErr: "at least one table"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveOptimizeTables(tc.list, tc.optimize)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveOptimizeTables: %v", err)
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("tables = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatDurationMS(t *testing.T) {
+	cases := []struct {
+		ms   float64
+		want string
+	}{
+		{ms: 0, want: "0 ms"},
+		{ms: 12.4, want: "12 ms"},
+		{ms: 1500, want: "1.5 s"},
+		{ms: 59_999, want: "60.0 s"},
+		{ms: 90_000, want: "1.5 min"},
+	}
+	for _, tc := range cases {
+		if got := formatDurationMS(tc.ms); got != tc.want {
+			t.Errorf("formatDurationMS(%v) = %q, want %q", tc.ms, got, tc.want)
+		}
+	}
+}
