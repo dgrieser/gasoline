@@ -368,6 +368,7 @@ gasoline doctor --range 30d --fuel e5               # reproduce a specific page 
 gasoline doctor --skip-queries                      # schema, sizes, indexes and scope only
 gasoline doctor -o json | jq '.findings'            # machine-readable
 gasoline doctor -o json | jq '.scope'               # the station universe, city by city
+gasoline doctor --optimize                          # rebuild the tables to reclaim freed space
 ```
 
 #### Why a city you removed still appears
@@ -408,6 +409,28 @@ gasoline doctor --try-index idx_price_predictions_accuracy
 It ends with a verdict — whether forcing the index would be faster, slower, or much the same. This stays read-only: the hint applies to that one run, never to the page. Because an index hint changes the plan and not the answer, `doctor` compares row counts between the two runs and tells you to disregard the timings if they ever disagree.
 
 If forcing the covering index is much faster, the optimizer is mis-costing it. Refreshing the statistics it reasons from is worth trying first — `ANALYZE TABLE price_predictions`, or `ANALYZE TABLE price_predictions UPDATE HISTOGRAM ON target_start` when the range estimate looks wrong (a `filtered` value pinned near 10% is the tell). Where that does not change the choice, the accuracy page forces the index itself: five of its aggregate queries carry `FORCE INDEX`/`INDEXED BY`, which measured 66–73% faster per query on a live MySQL after both of those statistics commands had failed to move it. The hint is omitted when the index is absent, so an un-migrated database still renders the page. `series` and the raw-row query are deliberately left unhinted — the hint measured +1% and −2% there, so there is nothing to buy. Re-run `--try-index` after a schema or data-shape change: if forcing stops winning, the hint should go rather than be kept on faith.
+
+#### Reclaiming space after a large prune (`--optimize`)
+
+Deleting rows does not shrink a table. InnoDB keeps the emptied pages for reuse and SQLite keeps them on its free list, so after a prune that drops a lot at once — a removed update target taking half of `price_predictions` with it — the sizes above stay where they were. `--optimize` rebuilds the tables so that space goes back to the filesystem:
+
+```bash
+gasoline doctor --optimize                                     # every reported table
+gasoline doctor --optimize --optimize-table price_predictions   # just the big one (MySQL)
+gasoline doctor --skip-queries --optimize                       # skip the page timings first
+```
+
+```
+optimize (OPTIMIZE TABLE <table>):
+  price_predictions          4.6 min  data   1.5 GB -> 712.4 MB  indexes   2.1 GB -> 1.0 GB
+      | note: Table does not support optimize, doing recreate + analyze instead
+  price_snapshots             38.2 s  data 218.7 MB -> 214.1 MB  indexes 330.0 MB -> 268.9 MB
+```
+
+- On **MySQL** each table is rebuilt with `OPTIMIZE TABLE`, which InnoDB performs as a recreate plus `ANALYZE` — the `note:` line above is that substitution being reported, not a refusal. It runs online (concurrent reads and writes keep working) and needs free space on the order of the table being rebuilt. Because it re-analyses as it goes, it also refreshes the statistics the planner reasons from, which is the other reason to reach for it when an index is being mis-costed.
+- On **SQLite** the equivalent is `VACUUM`, which rewrites the whole database file and therefore cannot be narrowed to one table — `--optimize-table` is reported as inapplicable rather than silently ignored. It takes an exclusive lock for its duration and needs free space on the order of the database. `ANALYZE` follows it, since `VACUUM` alone leaves the statistics untouched.
+- Sizes are measured on both sides of the rebuild and the findings state what came back (`optimize returned 2.0 GB to the filesystem across 2 tables`). MySQL 8 normally answers size questions from a statistics snapshot it keeps for a day (`information_schema_stats_expiry`), which would report the pre-rebuild size afterwards, so `doctor` pins one connection and disables that cache on it — the sizes it prints are the live ones, before and after.
+- This is the one part of `doctor` that writes. It runs last, after every measurement, so the table sizes and query timings in the same report still describe the database you were complaining about rather than the one that was just rewritten. Everything else stays read-only, so a plain `gasoline doctor` remains safe to point at production.
 
 Notes on reading the output:
 
