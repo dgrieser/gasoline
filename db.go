@@ -385,6 +385,18 @@ func schemaStatements(d dialect) []string {
 				notify_lng DOUBLE NOT NULL DEFAULT 0,
 				notify_radius_km DOUBLE NOT NULL DEFAULT 0
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS user_sessions (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				user_id BIGINT NOT NULL,
+				selector VARCHAR(64) NOT NULL UNIQUE,
+				validator_hash VARCHAR(64) NOT NULL,
+				created_at VARCHAR(64) NOT NULL,
+				last_used_at VARCHAR(64) NOT NULL,
+				expires_at VARCHAR(64) NOT NULL,
+				INDEX idx_user_sessions_user (user_id),
+				INDEX idx_user_sessions_expires (expires_at),
+				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 			`CREATE TABLE IF NOT EXISTS settings (
 				name VARCHAR(191) PRIMARY KEY,
 				value TEXT NOT NULL,
@@ -536,6 +548,20 @@ func schemaStatements(d dialect) []string {
 			notify_lng REAL NOT NULL DEFAULT 0,
 			notify_radius_km REAL NOT NULL DEFAULT 0
 		)`,
+		`CREATE TABLE IF NOT EXISTS user_sessions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			selector TEXT NOT NULL UNIQUE,
+			validator_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			last_used_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_sessions_user
+			ON user_sessions(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_sessions_expires
+			ON user_sessions(expires_at)`,
 		`CREATE TABLE IF NOT EXISTS settings (
 			name TEXT PRIMARY KEY,
 			value TEXT NOT NULL,
