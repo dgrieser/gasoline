@@ -2408,15 +2408,10 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         // Re-assigned by drawTimeline so hideTooltip also drops the crosshair.
         let hideCrosshair = () => {};
 
+        // Placed clear of the plot (positionChartTooltip, shared script) so
+        // the curves stay visible while the crosshair is up.
         function positionTooltip(clientX, clientY) {
-            tooltip.style.left = (clientX + 14) + 'px';
-            tooltip.style.top  = (clientY - 14) + 'px';
-            // Clamp to the viewport after paint, once the size is known.
-            requestAnimationFrame(() => {
-                const r = tooltip.getBoundingClientRect();
-                if (r.right  > window.innerWidth  - 8) tooltip.style.left = Math.max(8, window.innerWidth  - r.width  - 8) + 'px';
-                if (r.bottom > window.innerHeight - 8) tooltip.style.top  = Math.max(8, window.innerHeight - r.height - 8) + 'px';
-            });
+            positionChartTooltip(chartEl, clientX, clientY);
         }
 
         function hideTooltip() {
@@ -5735,6 +5730,9 @@ function renderDocumentHead(string $titleSuffix): void
         .theme-toggle svg { width: 16px; height: 16px; pointer-events: none; }
 
         /* ── Price tooltip ─────────────────────────────────────── */
+        /* Parked in the free strip below (or above) the plot by
+           positionChartTooltip, which also caps the height to that strip and
+           picks the column layout a long station list needs to fit it. */
         #price-tooltip {
             position: fixed;
             z-index: 200;
@@ -5751,9 +5749,22 @@ function renderDocumentHead(string $titleSuffix): void
             display: none;
             min-width: 130px;
             max-width: min(320px, calc(100vw - 16px));
-            max-height: calc(100vh - 16px);
             overflow: hidden;
         }
+
+        /* Long station lists: spread over columns (wide screens) and/or
+           tightened (phones) so the whole list fits without covering the plot. */
+        #price-tooltip.tt-cols {
+            max-width: calc(100vw - 16px);
+            column-gap: 1.1rem;
+            column-rule: 1px solid var(--border);
+        }
+
+        #price-tooltip.tt-cols .tt-meta { column-span: all; }
+        #price-tooltip .tt-row { break-inside: avoid; }
+
+        #price-tooltip.tt-dense { line-height: 1.35; padding: 0.45rem 0.7rem; }
+        #price-tooltip.tt-dense .tt-row { margin-top: 1px; }
 
         #price-tooltip .tt-meta {
             color: var(--muted);
@@ -6918,6 +6929,92 @@ function fillSvgPrice(textEl, v, fontSize, fallback) {
     return textEl;
 }
 
+/* ── Crosshair reading placement ─────────────────────────────────────
+   The reading is parked in the free strip below the plot (above it when
+   there is more room up there) instead of following the pointer across the
+   lines, so the chart stays visible the whole time the crosshair is up.
+   Its height is capped to that strip; a station list too tall for it is
+   spread over columns (wide screens) and tightened (narrow ones) rather
+   than allowed to grow back over the plot. Horizontally it tracks the
+   pointer, clamped to the viewport. */
+function positionChartTooltip(plotEl, clientX, clientY) {
+    const tip = document.getElementById('price-tooltip');
+    if (!tip || !plotEl) return;
+
+    const GAP = 10;      // breathing room between plot and reading
+    const EDGE = 8;      // keep clear of the viewport edges
+    const MIN_FIT = 120; // strip too thin to be worth using (~4 rows)
+    const COL_W = 240;   // target width per column when columns are used
+    const MAX_COLS = 5;
+
+    tip.classList.remove('tt-cols', 'tt-dense');
+    tip.style.columnCount = '';
+    tip.style.width = '';
+
+    const plot = plotEl.getBoundingClientRect();
+    const below = window.innerHeight - plot.bottom - GAP - EDGE;
+    const above = plot.top - GAP - EDGE;
+    const under = below >= above;
+    const strip = under ? below : above;
+
+    // Neither strip can hold a readable list (a very short window, or a plot
+    // filling it): fall back to following the pointer, since there is nowhere
+    // to put the reading that would keep the plot clear anyway.
+    if (strip < MIN_FIT) {
+        tip.style.maxHeight = (window.innerHeight - 2 * EDGE) + 'px';
+        tip.style.left = (clientX + 14) + 'px';
+        tip.style.top  = (clientY - 14) + 'px';
+        const r = tip.getBoundingClientRect();
+        if (r.right  > window.innerWidth  - EDGE) tip.style.left = Math.max(EDGE, window.innerWidth  - r.width  - EDGE) + 'px';
+        if (r.bottom > window.innerHeight - EDGE) tip.style.top  = Math.max(EDGE, window.innerHeight - r.height - EDGE) + 'px';
+        return;
+    }
+
+    const maxH = Math.floor(strip);
+    const availW = Math.max(COL_W, window.innerWidth - 2 * EDGE);
+    tip.style.maxHeight = maxH + 'px';
+
+    // How many rows one column of the strip holds, and how many columns the
+    // list therefore needs. Measured single-column: scrollHeight reports the
+    // untruncated height while the overflow is clipped, but once the box is
+    // multi-column the surplus spills into columns outside it and scrollHeight
+    // stops growing, so it could no longer tell what fits.
+    const measure = () => {
+        const rows = tip.querySelectorAll('.tt-row');
+        const n = rows.length;
+        const rowH = n > 0 ? rows[0].getBoundingClientRect().height : 0;
+        // Everything that is not a row: the box padding plus the timestamp
+        // line, which spans all columns and so costs each of them its height.
+        const chrome = tip.scrollHeight - n * rowH;
+        const perCol = rowH > 0 ? Math.max(1, Math.floor((maxH - chrome) / rowH)) : n;
+        return { need: Math.max(1, Math.ceil(n / perCol)) };
+    };
+
+    if (tip.scrollHeight > maxH) {
+        const maxCols = Math.max(1, Math.min(MAX_COLS, Math.floor(availW / COL_W)));
+        let need = measure().need;
+        // More columns than the width allows: tighten the rows too, so a long
+        // list keeps its tail instead of losing it to the clip.
+        if (need > maxCols) {
+            tip.classList.add('tt-dense');
+            need = measure().need;
+        }
+        const cols = Math.min(maxCols, need);
+        if (cols >= 2) {
+            tip.classList.add('tt-cols');
+            tip.style.columnCount = String(cols);
+            tip.style.width = Math.min(availW, cols * COL_W) + 'px';
+        }
+    }
+
+    const box = tip.getBoundingClientRect();
+    const left = Math.min(Math.max(clientX - box.width / 2, EDGE),
+                          Math.max(EDGE, window.innerWidth - box.width - EDGE));
+    tip.style.left = Math.round(left) + 'px';
+    tip.style.top  = Math.round(under ? plot.bottom + GAP
+                                      : plot.top - GAP - box.height) + 'px';
+}
+
 /* ── Long-press crosshair for touch ─────────────────────────────────
    On touch devices the chart crosshair/tooltip appears only after a
    long-press on the plot, so a swipe across a chart scrolls the page
@@ -7492,17 +7589,10 @@ const toggles = [...document.querySelectorAll('.fuel-toggle')];
 /* ── Tooltip helpers ───────────────────────────────────────────── */
 const tooltip = document.getElementById('price-tooltip');
 
-function positionTooltip(e) {
-    const x = e.clientX ?? 0;
-    const y = e.clientY ?? 0;
-    tooltip.style.left = (x + 14) + 'px';
-    tooltip.style.top  = (y - 14) + 'px';
-    // Clamp to viewport after paint
-    requestAnimationFrame(() => {
-        const r = tooltip.getBoundingClientRect();
-        if (r.right  > window.innerWidth  - 8) tooltip.style.left = Math.max(8, window.innerWidth  - r.width  - 8) + 'px';
-        if (r.bottom > window.innerHeight - 8) tooltip.style.top  = Math.max(8, window.innerHeight - r.height - 8) + 'px';
-    });
+// Placed clear of the plot (positionChartTooltip, shared script) so the
+// price lines stay visible while the crosshair is up.
+function positionTooltip(clientX, clientY) {
+    positionChartTooltip(chartEl, clientX, clientY);
 }
 
 // Re-assigned by renderChart so hideTooltip can also drop the crosshair line.
@@ -7904,7 +7994,7 @@ if (!chartEl) {
                     `</div>`;
                 }).join('');
             tooltip.style.display = 'block';
-            positionTooltip({ clientX, clientY });
+            positionTooltip(clientX, clientY);
         };
 
         hideCrosshair = () => crossLine.setAttribute('opacity', 0);
