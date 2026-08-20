@@ -2985,6 +2985,23 @@ if ($selectedRange !== '') {
     $toDate = '';
 }
 
+// Days covered by the active date filter — decides which chart quick-range
+// toggles are worth rendering (a 14d toggle is dead weight when the filter
+// only loads 7 days; "All" already shows the whole payload). null means
+// unbounded: no From date, so the full history loads.
+$filterSpanDays = null;
+if ($selectedRange !== '') {
+    $filterSpanDays = $rangeDays[$selectedRange];
+} elseif ($fromDate !== '') {
+    $spanFrom = DateTimeImmutable::createFromFormat('Y-m-d', $fromDate, new DateTimeZone('UTC'));
+    $spanTo = $toDate !== ''
+        ? DateTimeImmutable::createFromFormat('Y-m-d', $toDate, new DateTimeZone('UTC'))
+        : new DateTimeImmutable('now', new DateTimeZone('UTC'));
+    if ($spanFrom !== false && $spanTo !== false && $spanTo >= $spanFrom) {
+        $filterSpanDays = max(1, (int) ceil(($spanTo->getTimestamp() - $spanFrom->getTimestamp()) / 86400));
+    }
+}
+
 $selectedFuel = trim((string) ($_GET['fuel'] ?? 'all'));
 $selectedCity = trim((string) ($_GET['city'] ?? ''));
 $selectedRadiusKmRaw = trim((string) ($_GET['radius_km'] ?? ''));
@@ -4561,20 +4578,63 @@ function renderDocumentHead(string $titleSuffix): void
             box-shadow: 0 0 0 3px var(--amber-dim);
         }
 
-        .field select[multiple] {
-            min-height: 13rem;
+        /* ── Station picker (filterable checkbox list) ─────────── */
+        .station-picker {
+            background: var(--surface-hi);
+            border: 1px solid var(--border-hi);
+            border-radius: 8px;
+            overflow: hidden;
+            transition: border-color 0.15s;
+        }
+
+        .station-picker:focus-within {
+            border-color: var(--amber);
+            box-shadow: 0 0 0 3px var(--amber-dim);
+        }
+
+        /* Overrides the generic .field input skin: the filter box is a row
+           inside the picker frame, not a standalone control. */
+        .field .station-filter-input {
+            background: transparent;
+            border: none;
+            border-bottom: 1px solid var(--border-hi);
+            border-radius: 0;
+            padding: 0.55rem 0.8rem;
+        }
+
+        .field .station-filter-input:focus {
+            border-color: var(--border-hi);
+            box-shadow: none;
+            outline: none;
+        }
+
+        .station-options {
+            max-height: 13rem;
+            overflow-y: auto;
             padding: 0.4rem;
         }
 
-        .field select[multiple] option {
+        .station-option {
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
             padding: 0.35rem 0.5rem;
             border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            color: var(--ink);
         }
 
-        .field select[multiple] option:checked {
-            background: var(--amber-dim);
-            color: var(--amber);
-        }
+        .station-option:hover { background: var(--amber-dim); }
+
+        .station-option:has(input:checked) { color: var(--amber); }
+
+        /* The filter hides non-matching rows; checked state lives on the
+           (still-submitting) hidden checkboxes. Class instead of [hidden]
+           because the row's display:flex would win over the UA rule. */
+        .station-option.filtered-out { display: none; }
+
+        .station-option-label { min-width: 0; overflow-wrap: anywhere; }
 
         /* ── City autocomplete ─────────────────────────────────────── */
         .city-ac { position: relative; }
@@ -4730,13 +4790,19 @@ function renderDocumentHead(string $titleSuffix): void
         }
 
         /* ── Stats row ─────────────────────────────────────────── */
+        /* Card frame around the stats grid so a header can scope the
+           numbers to the selected range. */
+        .stats-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            overflow: hidden;
+        }
+
         .stats {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
             gap: 1px;
-            border-radius: 14px;
-            overflow: hidden;
-            border: 1px solid var(--border);
             background: var(--border);
         }
 
@@ -4812,6 +4878,15 @@ function renderDocumentHead(string $titleSuffix): void
             letter-spacing: 0.12em;
             font-weight: 700;
             color: var(--muted);
+            font-family: var(--mono);
+        }
+
+        /* Lighter scope note next to a card title ("in range"): lowercase
+           and faded so it reads as a qualifier, not part of the title. */
+        .cheapest-scope {
+            font-size: 0.72rem;
+            color: var(--muted);
+            opacity: 0.6;
             font-family: var(--mono);
         }
 
@@ -6170,28 +6245,20 @@ const translations = {
         fuelE5: 'E5',
         fuelE10: 'E10',
         stations: 'Stations',
-        stationsHint: '(hold Ctrl to multi-select; only stations updated in the last 48h)',
+        filterStations: 'Filter stations...',
         reset: 'Reset',
+        statsTitle: 'Selected range',
         snapshots: 'Snapshots',
         stationsCount: 'Stations',
         firstRecorded: 'First recorded',
         lastRecorded: 'Last recorded',
         priceTimeline: 'Price timeline',
-        rawSnapshots: 'Raw snapshots',
-        recordedAt: 'Recorded at',
         station: 'Station',
         brand: 'Brand',
-        street: 'Street',
-        place: 'Place',
-        cityCol: 'City',
-        open: 'Open',
-        dist: 'Dist',
         openYes: 'open',
         openNo: 'closed',
-        noData: 'No data',
         loading: 'Loading…',
         showMore: 'Show more',
-        showingRows: 'Showing {shown} of {total}',
         loadError: 'Could not load data. Please retry.',
         retry: 'Retry',
         cityNotFound: 'Selected city not found.',
@@ -6204,6 +6271,7 @@ const translations = {
         cheapestRangeNoData: 'No price data available.',
         highestPrefix: 'Highest price',
         highestNoData: 'No price data available.',
+        rangeScopeHint: 'in range',
         predictionsTitle: 'Recommended fill-ups',
         predictionsNoData: 'No upcoming predictions in the database for these stations.',
         predictionsAsOf: 'as of {time}',
@@ -6438,28 +6506,20 @@ const translations = {
         fuelE5: 'E5',
         fuelE10: 'E10',
         stations: 'Tankstellen',
-        stationsHint: '(Strg für Mehrfachauswahl; nur in den letzten 48 h aktualisierte Tankstellen)',
+        filterStations: 'Tankstellen filtern...',
         reset: 'Zurücksetzen',
+        statsTitle: 'Gewählter Zeitraum',
         snapshots: 'Einträge',
         stationsCount: 'Tankstellen',
         firstRecorded: 'Erste Aufzeichnung',
         lastRecorded: 'Letzte Aufzeichnung',
         priceTimeline: 'Preisverlauf',
-        rawSnapshots: 'Alle Einträge',
-        recordedAt: 'Aufgezeichnet um',
         station: 'Tankstelle',
         brand: 'Marke',
-        street: 'Straße',
-        place: 'Ort',
-        cityCol: 'Stadt',
-        open: 'Geöffnet',
-        dist: 'Entf.',
         openYes: 'offen',
         openNo: 'geschlossen',
-        noData: 'Keine Daten',
         loading: 'Wird geladen…',
         showMore: 'Mehr anzeigen',
-        showingRows: 'Zeige {shown} von {total}',
         loadError: 'Daten konnten nicht geladen werden. Bitte erneut versuchen.',
         retry: 'Erneut versuchen',
         cityNotFound: 'Ausgewählte Stadt nicht gefunden.',
@@ -6472,6 +6532,7 @@ const translations = {
         cheapestRangeNoData: 'Keine Preisdaten vorhanden.',
         highestPrefix: 'Höchstpreis',
         highestNoData: 'Keine Preisdaten vorhanden.',
+        rangeScopeHint: 'im Zeitraum',
         predictionsTitle: 'Tankempfehlungen',
         predictionsNoData: 'Keine kommenden Vorhersagen für diese Tankstellen in der Datenbank.',
         predictionsAsOf: 'Stand {time}',
@@ -6878,25 +6939,10 @@ function applyLang(lang) {
     document.querySelectorAll('[data-recorded-at]').forEach((el) => {
         el.textContent = formatDateTime(el.dataset.recordedAt);
     });
-    // Re-format date-only stat cells (first/last recorded)
-    document.querySelectorAll('[data-date-only]').forEach((el) => {
-        el.textContent = formatDateOnly(el.dataset.dateOnly);
-    });
-    // Re-format prices and distances rendered once and paged (snapshot table,
-    // station picker), which the page-specific renderers do not rebuild.
-    document.querySelectorAll('[data-price-value]').forEach((el) => {
-        el.innerHTML = fmtPriceHtml(el.dataset.priceValue, '-');
-    });
+    // Re-format distances rendered once server-side (station picker rows),
+    // which the page-specific renderers do not rebuild.
     document.querySelectorAll('[data-dist-km]').forEach((el) => {
         const base = el.dataset.nameBase || '';
-        // An <option> label cannot carry markup, so the station picker keeps
-        // the full-size separator.
-        if (el.tagName === 'OPTION') {
-            const plain = fmtDistanceKm(el.dataset.distKm);
-            if (plain === null) return;
-            el.textContent = base === '' ? plain : `${base} (${plain})`;
-            return;
-        }
         const dist = fmtDistanceKmHtml(el.dataset.distKm);
         if (dist === null) return;
         // The station name goes in as text and the distance as markup, which
@@ -7105,25 +7151,43 @@ renderDocumentHead('Price History');
                 </div>
 
                 <div class="field">
-                    <label><span data-i18n="stations">Stations</span> <span style="color:var(--border-hi)" data-i18n="stationsHint">(hold Ctrl to multi-select; only stations updated in the last 48h)</span></label>
-                    <select name="station_ids[]" multiple onchange="this.form.submit()">
-                        <?php foreach ($stations as $station): ?>
-                            <?php
-                            $stationId = (string) $station['id'];
-                            // The distance is re-formatted client-side per language,
-                            // so hand over the raw value and the label without it.
-                            $stationDistKm = $station['selected_dist_km'] ?? null;
-                            $distAttrs = $stationDistKm === null ? '' : sprintf(
-                                ' data-name-base="%s" data-dist-km="%s"',
-                                h(stationLabel($station, false)),
-                                h(number_format((float) $stationDistKm, 1, '.', ''))
-                            );
-                            ?>
-                            <option value="<?= h($stationId) ?>"<?= $distAttrs ?> <?= in_array($stationId, $selectedStationIds, true) ? 'selected' : '' ?>>
-                                <?= h(stationLabel($station)) ?>
-                            </option>
-                        <?php endforeach; ?>
-                    </select>
+                    <label for="f-station-filter" data-i18n="stations">Stations</label>
+                    <div class="station-picker">
+                        <input
+                            type="text"
+                            id="f-station-filter"
+                            class="station-filter-input"
+                            data-i18n-placeholder="filterStations"
+                            placeholder="Filter stations..."
+                            autocomplete="off"
+                            spellcheck="false"
+                        >
+                        <div class="station-options" id="station-options">
+                            <?php foreach ($stations as $station): ?>
+                                <?php
+                                $stationId = (string) $station['id'];
+                                // The distance is re-formatted client-side per language,
+                                // so hand over the raw value and the label without it.
+                                $stationDistKm = $station['selected_dist_km'] ?? null;
+                                $distAttrs = $stationDistKm === null ? '' : sprintf(
+                                    ' data-name-base="%s" data-dist-km="%s"',
+                                    h(stationLabel($station, false)),
+                                    h(number_format((float) $stationDistKm, 1, '.', ''))
+                                );
+                                ?>
+                                <label class="station-option">
+                                    <input
+                                        type="checkbox"
+                                        name="station_ids[]"
+                                        value="<?= h($stationId) ?>"
+                                        onchange="this.form.submit()"
+                                        <?= in_array($stationId, $selectedStationIds, true) ? 'checked' : '' ?>
+                                    >
+                                    <span class="station-option-label"<?= $distAttrs ?>><?= h(stationLabel($station)) ?></span>
+                                </label>
+                            <?php endforeach; ?>
+                        </div>
+                    </div>
                 </div>
             </form>
 
@@ -7154,17 +7218,32 @@ renderDocumentHead('Price History');
                 <div class="chart-header">
                     <span class="chart-title" data-i18n="priceTimeline">Price timeline</span>
                     <div class="range-toggles">
-                        <button type="button" class="range-toggle active" data-range="all"   data-i18n="rangeAll">All</button>
-                        <button type="button" class="range-toggle"        data-range="30d"   data-i18n="range30d">30d</button>
-                        <button type="button" class="range-toggle"        data-range="14d"   data-i18n="range14d">14d</button>
-                        <button type="button" class="range-toggle"        data-range="7d"    data-i18n="range7d">7d</button>
-                        <button type="button" class="range-toggle"        data-range="3d"    data-i18n="range3d">3d</button>
-                        <button type="button" class="range-toggle"        data-range="today" data-i18n="rangeToday">Today</button>
+                        <?php
+                        // Only sub-ranges the filtered payload can actually
+                        // narrow: a toggle spanning the whole filter (or more)
+                        // duplicates "All", so it is not rendered. "All" and
+                        // "Today" always make sense.
+                        $chartRangeOptions = [
+                            ['all',   'rangeAll',   'All',   null],
+                            ['30d',   'range30d',   '30d',   30],
+                            ['14d',   'range14d',   '14d',   14],
+                            ['7d',    'range7d',    '7d',    7],
+                            ['3d',    'range3d',    '3d',    3],
+                            ['today', 'rangeToday', 'Today', null],
+                        ];
+                        foreach ($chartRangeOptions as [$rangeValue, $rangeI18n, $rangeLabel, $rangeSpan]):
+                            if ($rangeSpan !== null && $filterSpanDays !== null && $rangeSpan >= $filterSpanDays) {
+                                continue;
+                            }
+                        ?>
+                            <button type="button" class="range-toggle<?= $rangeValue === 'all' ? ' active' : '' ?>" data-range="<?= h($rangeValue) ?>" data-i18n="<?= h($rangeI18n) ?>"><?= h($rangeLabel) ?></button>
+                        <?php endforeach; ?>
                     </div>
                     <div class="fuel-toggles">
-                        <button type="button" class="fuel-toggle active" data-fuel="e5">E5</button>
-                        <button type="button" class="fuel-toggle active" data-fuel="e10">E10</button>
-                        <button type="button" class="fuel-toggle active" data-fuel="diesel" data-i18n="fuelDiesel">Diesel</button>
+                        <?php // Only fuels in scope — a toggle for a filtered-out fuel is dead weight. ?>
+                        <?php foreach (($selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [$selectedFuel]) as $chartFuel): ?>
+                            <button type="button" class="fuel-toggle active" data-fuel="<?= h($chartFuel) ?>"<?= $chartFuel === 'diesel' ? ' data-i18n="fuelDiesel"' : '' ?>><?= h($fuelLabels[$chartFuel]) ?></button>
+                        <?php endforeach; ?>
                     </div>
                 </div>
                 <div class="chart-body" id="chart-body">
@@ -7184,53 +7263,28 @@ renderDocumentHead('Price History');
             <!-- Highest in selected range -->
             <div class="cheapest-card" id="highest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
-            <!-- Stats -->
-            <div class="stats" aria-live="polite">
-                <div class="stat">
-                    <div class="stat-label" data-i18n="snapshots">Snapshots</div>
-                    <div class="stat-value skeleton" id="stat-points" aria-busy="true">&nbsp;</div>
+            <!-- Stats: what the selected range (sidebar filters) loaded -->
+            <div class="stats-card">
+                <div class="cheapest-header">
+                    <span class="cheapest-title" data-i18n="statsTitle">Selected range</span>
                 </div>
-                <div class="stat">
-                    <div class="stat-label" data-i18n="stationsCount">Stations</div>
-                    <div class="stat-value skeleton" id="stat-stations" aria-busy="true">&nbsp;</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label" data-i18n="firstRecorded">First recorded</div>
-                    <div class="stat-value skeleton" id="stat-first" style="font-size:1rem" aria-busy="true">&nbsp;</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label" data-i18n="lastRecorded">Last recorded</div>
-                    <div class="stat-value skeleton" id="stat-last" style="font-size:1rem" aria-busy="true">&nbsp;</div>
-                </div>
-            </div>
-
-            <!-- Table -->
-            <div class="table-card">
-                <div class="table-card-header">
-                    <span class="table-card-title" data-i18n="rawSnapshots">Raw snapshots</span>
-                </div>
-                <div class="table-wrap">
-                    <table>
-                        <thead>
-                        <tr>
-                            <th data-i18n="recordedAt">Recorded at</th>
-                            <th data-i18n="station">Station</th>
-                            <th data-i18n="brand">Brand</th>
-                            <th data-i18n="street">Street</th>
-                            <th data-i18n="place">Place</th>
-                            <th data-i18n="open">Open</th>
-                            <th>E5</th>
-                            <th>E10</th>
-                            <th data-i18n="fuelDiesel">Diesel</th>
-                        </tr>
-                        </thead>
-                        <tbody id="snapshot-tbody">
-                            <tr><td colspan="9" class="table-loading" role="status" aria-busy="true"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></td></tr>
-                        </tbody>
-                    </table>
-                </div>
-                <div class="table-more" id="table-more" hidden>
-                    <button type="button" class="btn-reset" id="table-more-btn"></button>
+                <div class="stats" aria-live="polite">
+                    <div class="stat">
+                        <div class="stat-label" data-i18n="snapshots">Snapshots</div>
+                        <div class="stat-value skeleton" id="stat-points" aria-busy="true">&nbsp;</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label" data-i18n="stationsCount">Stations</div>
+                        <div class="stat-value skeleton" id="stat-stations" aria-busy="true">&nbsp;</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label" data-i18n="firstRecorded">First recorded</div>
+                        <div class="stat-value skeleton" id="stat-first" style="font-size:1rem" aria-busy="true">&nbsp;</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label" data-i18n="lastRecorded">Last recorded</div>
+                        <div class="stat-value skeleton" id="stat-last" style="font-size:1rem" aria-busy="true">&nbsp;</div>
+                    </div>
                 </div>
             </div>
 
@@ -7274,16 +7328,6 @@ function formatTickTime(isoString) {
         timeZone: _tz(),
         hour: '2-digit', minute: '2-digit',
         hour12: false,
-    });
-}
-
-// Locale-aware date-only string (day + month + year, no time) for the stat cards.
-function formatDateOnly(isoString) {
-    const d = new Date(isoString);
-    if (isNaN(d)) return '—';
-    return d.toLocaleDateString(_loc(), {
-        timeZone: _tz(),
-        day: '2-digit', month: '2-digit', year: 'numeric',
     });
 }
 
@@ -7457,11 +7501,10 @@ if (!chartEl) {
 
     const rangeToggleEls = [...document.querySelectorAll('.range-toggle')];
 
+    // Only in-scope fuels are rendered (the shell drops filtered-out ones),
+    // so every toggle starts active.
     toggles.forEach((toggle) => {
-        const fuel = toggle.dataset.fuel;
-        toggle.classList.toggle('active', activeFuels.has(fuel));
-        toggle.disabled = selectedFuel !== 'all' && fuel !== selectedFuel;
-        if (toggle.disabled) toggle.classList.remove('active');
+        toggle.classList.toggle('active', activeFuels.has(toggle.dataset.fuel));
     });
 
     rangeToggleEls.forEach((btn) => {
@@ -7898,8 +7941,12 @@ function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
 
     const colClass = results.length === 1 ? 'single' : results.length === 2 ? 'two-col' : '';
 
+    // Scope note instead of a range name in the title: the card always shows
+    // the extreme of whatever range the chart toggles currently narrow to.
+    const scopeHint = translations[currentLang].rangeScopeHint;
+
     el.innerHTML =
-        `<div class="cheapest-header">${icon}<span class="cheapest-title">${title}</span></div>` +
+        `<div class="cheapest-header">${icon}<span class="cheapest-title">${title}</span><span class="cheapest-scope">${h(scopeHint)}</span></div>` +
         (results.length === 0
             ? `<div class="cheapest-empty">${emptyMsg}</div>`
             : `<div class="cheapest-grid${colClass ? ' ' + colClass : ''}">` +
@@ -7921,12 +7968,6 @@ function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
                 }).join('') +
               `</div>`
         );
-}
-
-function rangeTitle(prefix) {
-    const t = translations[currentLang];
-    const rangeKey = 'range' + chartRange.charAt(0).toUpperCase() + chartRange.slice(1);
-    return `${prefix} — ${t[rangeKey]}`;
 }
 
 // Newest snapshot per station id, keyed by station id.
@@ -7995,12 +8036,12 @@ function renderCheapest() {
 
 function renderCheapestRange() {
     const t = translations[currentLang];
-    renderPriceCard(cheapestRangeCard, getRangeFilteredData(), rangeTitle(t.cheapestPrefix), (a, b) => a < b, ICON_DOWN, t.cheapestRangeNoData);
+    renderPriceCard(cheapestRangeCard, getRangeFilteredData(), t.cheapestPrefix, (a, b) => a < b, ICON_DOWN, t.cheapestRangeNoData);
 }
 
 function renderHighest() {
     const t = translations[currentLang];
-    renderPriceCard(highestCard, getRangeFilteredData(), rangeTitle(t.highestPrefix), (a, b) => a > b, ICON_UP, t.highestNoData);
+    renderPriceCard(highestCard, getRangeFilteredData(), t.highestPrefix, (a, b) => a > b, ICON_UP, t.highestNoData);
 }
 
 const ICON_CLOCK = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`;
@@ -8269,6 +8310,26 @@ function onDateChange(el) {
     updateActiveStates();
 })();
 
+/* ── Station picker filter ─────────────────────────────────────── */
+// Narrows the checkbox list to rows matching the typed text. Only display is
+// touched: checked boxes stay checked (and keep submitting) while hidden, so
+// filtering can never lose a selection.
+(function () {
+    const input = document.getElementById('f-station-filter');
+    if (!input) return;
+    const options = [...document.querySelectorAll('#station-options .station-option')];
+
+    input.addEventListener('input', () => {
+        const query = input.value.trim().toLowerCase();
+        for (const option of options) {
+            option.classList.toggle(
+                'filtered-out',
+                query !== '' && !option.textContent.toLowerCase().includes(query)
+            );
+        }
+    });
+})();
+
 /* ── City autocomplete ─────────────────────────────────────────── */
 (function () {
     const wrap   = document.getElementById('city-ac');
@@ -8392,78 +8453,6 @@ function onDateChange(el) {
 /* ── Async snapshot data ───────────────────────────────────────── */
 // The shell paints immediately; the (potentially huge) snapshot payload is
 // fetched here and rendered client-side, so first paint is never blocked on it.
-const tbodyEl       = document.getElementById('snapshot-tbody');
-const tableMoreWrap = document.getElementById('table-more');
-const tableMoreBtn  = document.getElementById('table-more-btn');
-const TABLE_PAGE    = 1000; // rows rendered per chunk — nobody scrolls 100k <tr>
-
-let tableRendered = 0;
-
-// Price cell. The raw value rides along in data-price-value so a language
-// switch can re-format the already-rendered rows without rebuilding the
-// table (which would throw away however far the reader has paged).
-function priceCell(cls, v) {
-    const raw = (v === null || v === undefined) ? '' : String(v);
-    return `<td class="${cls}" data-price-value="${h(raw)}">${fmtPriceHtml(v, '-')}</td>`;
-}
-
-function tableRowHtml(row) {
-    const t = translations[currentLang];
-    const dist = stationDistancesById[row.station_id];
-    const distSuffix = (dist !== undefined && dist !== null) ? ` (${fmtDistanceKmHtml(dist)})` : '';
-    const openClass = row.is_open ? 'open-yes' : 'open-no';
-    const openKey   = row.is_open ? 'openYes' : 'openNo';
-    const hasDist   = dist !== undefined && dist !== null;
-    return '<tr>' +
-        `<td class="td-muted" data-recorded-at="${h(row.recorded_at)}">${h(formatDateTime(row.recorded_at))}</td>` +
-        `<td${hasDist ? ` data-name-base="${h(row.station_name)}" data-dist-km="${h(String(dist))}"` : ''}>` +
-            `${h(row.station_name)}${distSuffix}</td>` +
-        `<td class="td-muted">${h(row.brand)}</td>` +
-        `<td class="td-muted">${h(row.street)}</td>` +
-        `<td class="td-muted">${h(row.place)}</td>` +
-        `<td class="${openClass}" data-i18n="${openKey}">${h(t[openKey])}</td>` +
-        priceCell('price-e5', row.e5) +
-        priceCell('price-e10', row.e10) +
-        priceCell('price-diesel', row.diesel) +
-    '</tr>';
-}
-
-function updateShowMore() {
-    if (!tableMoreWrap || !tableMoreBtn) return;
-    const remaining = chartData.length - tableRendered;
-    if (remaining <= 0) { tableMoreWrap.hidden = true; return; }
-    const t = translations[currentLang];
-    tableMoreBtn.textContent = `${t.showMore} (${remaining})`;
-    tableMoreWrap.hidden = false;
-}
-
-function renderMoreRows() {
-    if (!tbodyEl) return;
-    // Newest-first without copying the whole dataset: take a page-sized window
-    // from the end of chartData (sorted oldest→newest) and reverse only that.
-    const upper = chartData.length - tableRendered;
-    const lower = Math.max(0, upper - TABLE_PAGE);
-    const slice = chartData.slice(lower, upper).reverse();
-    tbodyEl.insertAdjacentHTML('beforeend', slice.map(tableRowHtml).join(''));
-    tableRendered += slice.length;
-    updateShowMore();
-}
-
-function renderTable() {
-    if (!tbodyEl) return;
-    tableRendered = 0;
-    tbodyEl.innerHTML = '';
-    if (chartData.length === 0) {
-        const t = translations[currentLang];
-        tbodyEl.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:2rem;font-family:var(--mono);font-size:.82rem">${h(t.noData)}</td></tr>`;
-        updateShowMore();
-        return;
-    }
-    renderMoreRows();
-}
-
-if (tableMoreBtn) tableMoreBtn.addEventListener('click', renderMoreRows);
-
 function setStat(id, value) {
     const el = document.getElementById(id);
     if (!el) return;
@@ -8472,13 +8461,14 @@ function setStat(id, value) {
     el.removeAttribute('aria-busy');
 }
 
-// Like setStat, but formats a raw date-time string locale-aware and stashes the
-// raw value so applyLang() can re-format it when the language changes.
+// Like setStat, but formats a raw timestamp locale-aware (date AND time, so
+// the range boundaries are exact) and stashes the raw value in
+// data-recorded-at, which applyLang() re-formats on a language change.
 function setStatDate(id, isoValue) {
     const el = document.getElementById(id);
     if (!el) return;
-    if (isoValue) el.dataset.dateOnly = isoValue; else el.removeAttribute('data-date-only');
-    setStat(id, isoValue ? formatDateOnly(isoValue) : '—');
+    if (isoValue) el.dataset.recordedAt = isoValue; else el.removeAttribute('data-recorded-at');
+    setStat(id, isoValue ? formatDateTime(isoValue) : '—');
 }
 
 function applyData(payload) {
@@ -8525,7 +8515,6 @@ function applyData(payload) {
     renderPredictions();
     renderCheapestRange();
     renderHighest();
-    renderTable();
     if (chartEl) renderChart();
 }
 
@@ -8550,10 +8539,6 @@ function showDataError(err) {
     }
     if (chartEl)  chartEl.toggleAttribute('hidden', true);
     if (legendEl) legendEl.hidden = true;
-    if (tableMoreWrap) tableMoreWrap.hidden = true;
-    if (tbodyEl) {
-        tbodyEl.innerHTML = `<tr><td colspan="9" role="alert" style="text-align:center;color:var(--red);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="${key}">${h(msg)}</td></tr>`;
-    }
     if (retryWrap) retryWrap.hidden = false;
 }
 
@@ -8567,7 +8552,6 @@ function resetLoadingUI() {
         const el = document.getElementById(id);
         if (el) { el.textContent = ' '; el.classList.add('skeleton'); el.setAttribute('aria-busy', 'true'); }
     });
-    if (tbodyEl) tbodyEl.innerHTML = '<tr><td colspan="9" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
 }
 
 async function loadData() {
@@ -8603,7 +8587,6 @@ window.onLangChange = () => {
         renderCheapestRange();
         renderHighest();
         if (chartEl) renderChart();
-        updateShowMore(); // re-translate the "Show more (N)" button label
         // The dialog is rendered imperatively, so re-render it while it is open.
         if (openStationId) openStationDialog(openStationId);
     }
