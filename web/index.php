@@ -3628,10 +3628,53 @@ function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
     return [$stations, $distances];
 }
 
+/* ── Raised-9 price normalization ──────────────────────────────────
+   German pump boards end every price in a raised 9 (1,89⁹), but the feed
+   records whatever milli digit a station happened to report (1.891,
+   2.137, …). The dashboard shows board prices only, so every price is
+   normalized to the board style — keep the cents, force the
+   tenth-of-a-cent digit to 9 — before it reaches the client.
+
+   Snapshot rows are normalized inside the SQL projection (the history
+   query returns thousands of rows, so a per-row PHP pass would be pure
+   overhead); predicted prices are normalized in PHP instead, AFTER the
+   winner's-curse display correction is added, so that calculation keeps
+   operating on the raw model price (see loadFilteredPredictions).
+
+   Both flavours implement the same rule: round to milli precision to
+   shake off float noise, drop the milli digit, add 9. NULL and
+   non-positive prices pass through untouched.
+   ──────────────────────────────────────────────────────────────── */
+
+/**
+ * SQL expression normalizing $column to the raised-9 board price.
+ * ROUND, % and / behave identically here on SQLite and MySQL (unlike
+ * FLOOR/TRUNCATE, which SQLite only has with the optional math extension,
+ * or CAST AS INTEGER, which MySQL rounds instead of truncating).
+ */
+function raisedNinePriceSql(string $column): string
+{
+    $milli = "ROUND({$column} * 1000)";
+    return "CASE WHEN {$column} > 0 THEN ({$milli} - {$milli} % 10 + 9) / 1000.0 ELSE {$column} END";
+}
+
+/**
+ * PHP twin of raisedNinePriceSql() for prices assembled after the query.
+ */
+function raisedNinePrice(float $price): float
+{
+    if ($price <= 0.0) {
+        return $price;
+    }
+    $milli = (int) round($price * 1000);
+    return ($milli - $milli % 10 + 9) / 1000.0;
+}
+
 /**
  * Assemble the price-snapshot query for the active filters.
  * Station metadata is intentionally NOT joined in — the client joins rows to the
  * separately-sent station map — so the row payload stays small.
+ * Prices are normalized to the raised-9 board style in the projection.
  *
  * @return array{0: string, 1: array<string, mixed>, 2: bool, 3: array<int, array<string, mixed>>}
  *   [$sql, $params, $shouldRun, $errors]
@@ -3704,14 +3747,17 @@ function buildSnapshotQuery(
         $shouldRun = false;
     }
 
-    $sql = <<<'SQL'
+    $e5 = raisedNinePriceSql('ps.e5');
+    $e10 = raisedNinePriceSql('ps.e10');
+    $diesel = raisedNinePriceSql('ps.diesel');
+    $sql = <<<SQL
         SELECT
             ps.station_id,
             ps.recorded_at,
             ps.is_open,
-            ps.e5,
-            ps.e10,
-            ps.diesel
+            {$e5} AS e5,
+            {$e10} AS e10,
+            {$diesel} AS diesel
         FROM price_snapshots ps
         SQL;
 
@@ -3741,7 +3787,8 @@ function buildSnapshotQuery(
  * of one station merge into a single span, and only medium/high confidence
  * survives. Displayed prices carry the run's recorded suggestion display
  * correction (prediction_runs.suggestion_bias) on top of the raw grid price,
- * again like the notifier — ordering stays on the raw price. The result is
+ * again like the notifier, and are then normalized to the raised-9 board
+ * style — ordering stays on the raw price. The result is
  * what a subscriber to this area would be sent. It never triggers a suggest
  * run.
  *
@@ -3847,8 +3894,11 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm
         $localDate = $start->setTimezone($localZone)->format('Y-m-d');
         // The displayed price carries the run's suggestion display correction
         // (the measured winner's curse of picking the cheapest window), so the
-        // card quotes the same price a notification would. Ordering below
-        // stays on the raw model price, exactly like the Go picker — the grid
+        // card quotes the same price a notification would, and is then
+        // normalized to the raised-9 board style — the correction has to be
+        // applied to the raw model price first, so it is not folded into the
+        // SQL projection like the snapshot prices are. Ordering below stays
+        // on the raw model price, exactly like the Go picker — the grid
         // keeps storing raw prices, so the learning never sees the correction.
         $rawPrice = (float) $row['predicted_price'];
         $byFuelDate[$fuel][$localDate][] = [
@@ -3856,7 +3906,7 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm
             'fuel' => $fuel,
             'start' => (string) $row['target_start'],
             'end' => (string) $row['target_end'],
-            'price' => $rawPrice + (float) $row['suggestion_bias'],
+            'price' => raisedNinePrice($rawPrice + (float) $row['suggestion_bias']),
             'conf' => (string) $row['confidence'],
             'raw' => $rawPrice,
             'ts' => $start->getTimestamp(),
