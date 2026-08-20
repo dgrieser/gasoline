@@ -1983,7 +1983,9 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         .pred-layout { max-width: 1180px; }
         .pred-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0 1.1rem; }
         .pred-filters .field { margin-bottom: 0.6rem; }
-        #pred-chart { width: 100%; display: block; height: auto; }
+        /* Long-press summons the crosshair on touch, so keep the browser's
+           own long-press reactions (selection, iOS callout) off the chart. */
+        #pred-chart { width: 100%; display: block; height: auto; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
         .pred-note { font-family: var(--mono); font-size: 0.76rem; color: var(--muted); margin-bottom: 0.85rem; }
         .pred-err-good { color: var(--e10); }
         .pred-err-bad  { color: var(--red); }
@@ -2460,15 +2462,19 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 x: c.m.left, y: c.m.top, width: c.iW, height: c.iH,
                 fill: 'transparent', style: 'cursor:crosshair',
             });
-            overlay.addEventListener('mousemove', (e) => onPoint(e.clientX, e.clientY));
-            overlay.addEventListener('mouseleave', hideTooltip);
-            const onTouch = (e) => {
-                e.preventDefault();
-                const touch = e.touches[0];
-                if (touch) onPoint(touch.clientX, touch.clientY);
-            };
-            overlay.addEventListener('touchstart', onTouch, { passive: false });
-            overlay.addEventListener('touchmove', onTouch, { passive: false });
+            // Hover via pointer events gated on a real mouse: a tap also fires
+            // compatibility mousemove/mouseleave, which would leak the
+            // crosshair past the long-press gate below.
+            overlay.addEventListener('pointermove', (e) => {
+                if (e.pointerType === 'mouse') onPoint(e.clientX, e.clientY);
+            });
+            overlay.addEventListener('pointerleave', (e) => {
+                if (e.pointerType === 'mouse') hideTooltip();
+            });
+            // Touch: long-press only (attachLongPressCrosshair, shared script),
+            // so swiping across the chart scrolls the page; the tooltip
+            // auto-hides a few seconds after the finger lifts.
+            attachLongPressCrosshair(overlay, onPoint, hideTooltip);
         }
 
         // Pointer position in viewBox units (the viewBox is 1:1 with CSS pixels).
@@ -5410,6 +5416,11 @@ function renderDocumentHead(string $titleSuffix): void
             width: 100%;
             display: block;
             height: auto;
+            /* Long-press summons the crosshair on touch, so keep the browser's
+               own long-press reactions (selection, iOS callout) off the chart. */
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-touch-callout: none;
         }
 
         .chart-legend {
@@ -6907,6 +6918,78 @@ function fillSvgPrice(textEl, v, fontSize, fallback) {
     return textEl;
 }
 
+/* ── Long-press crosshair for touch ─────────────────────────────────
+   On touch devices the chart crosshair/tooltip appears only after a
+   long-press on the plot, so a swipe across a chart scrolls the page
+   instead of getting swallowed by the tooltip. Once the press activates,
+   moving the finger drags the crosshair (and scrolling is suppressed for
+   that gesture). A tap or a scroll-intent move cancels the press. After
+   the finger lifts the tooltip stays readable, then hides on its own
+   after IDLE_MS without further touch interaction. Mouse hover is
+   untouched, so desktop behaves exactly as before. */
+function attachLongPressCrosshair(el, show, hide) {
+    const HOLD_MS = 450;
+    const SLOP_PX = 10;   // finger drift allowed before it counts as a scroll
+    const IDLE_MS = 3000; // lifted-finger grace before the tooltip auto-hides
+
+    let timer = null;
+    let idleTimer = null;
+    let active = false;       // finger down and crosshair engaged
+    let shownByTouch = false; // tooltip on screen because of a long-press
+    let startX = 0, startY = 0, lastX = 0, lastY = 0;
+    const cancelHold = () => { if (timer !== null) { clearTimeout(timer); timer = null; } };
+    const cancelIdle = () => { if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; } };
+    const hideNow = () => { cancelIdle(); shownByTouch = false; hide(); };
+    // No countdown while the finger is down — holding still IS interacting.
+    const scheduleIdleHide = () => { cancelIdle(); idleTimer = setTimeout(hideNow, IDLE_MS); };
+
+    el.addEventListener('touchstart', (e) => {
+        active = false;
+        cancelHold();
+        cancelIdle();
+        if (e.touches.length !== 1) return; // pinch/second finger: not a press
+        startX = lastX = e.touches[0].clientX;
+        startY = lastY = e.touches[0].clientY;
+        timer = setTimeout(() => {
+            timer = null;
+            active = true;
+            shownByTouch = true;
+            show(lastX, lastY);
+        }, HOLD_MS);
+    }, { passive: true });
+
+    // Non-passive so an ACTIVE crosshair drag can suppress scrolling; before
+    // activation the default is left alone and real movement cancels the hold.
+    el.addEventListener('touchmove', (e) => {
+        const touch = e.touches[0];
+        if (!touch) return;
+        lastX = touch.clientX;
+        lastY = touch.clientY;
+        if (active) {
+            e.preventDefault();
+            show(lastX, lastY);
+        } else if (Math.abs(lastX - startX) > SLOP_PX || Math.abs(lastY - startY) > SLOP_PX) {
+            cancelHold();
+        }
+    }, { passive: false });
+
+    const endPress = () => {
+        cancelHold();
+        active = false;
+        // Also re-arms after a later tap on the chart while the tooltip is
+        // still up, so it can never get stuck on screen.
+        if (shownByTouch) scheduleIdleHide();
+    };
+    el.addEventListener('touchend', endPress);
+    el.addEventListener('touchcancel', endPress);
+
+    // Android fires contextmenu on long-press; swallow it only while a touch
+    // press is pending or active so desktop right-click stays intact.
+    el.addEventListener('contextmenu', (e) => {
+        if (active || timer !== null) e.preventDefault();
+    });
+}
+
 function applyLang(lang) {
     currentLang = lang;
     localStorage.setItem('lang', lang);
@@ -7830,15 +7913,20 @@ if (!chartEl) {
             x: margin.left, y: margin.top, width: iW, height: iH,
             fill: 'transparent', style: 'cursor:crosshair',
         });
-        overlay.addEventListener('mousemove', (e) => showCrosshair(e.clientX, e.clientY));
-        overlay.addEventListener('mouseleave', hideTooltip);
-        const onTouch = (e) => {
-            e.preventDefault();
-            const touch = e.touches[0];
-            if (touch) showCrosshair(touch.clientX, touch.clientY);
-        };
-        overlay.addEventListener('touchstart', onTouch, { passive: false });
-        overlay.addEventListener('touchmove', onTouch, { passive: false });
+        // Hover via pointer events gated on a real mouse: a tap also fires
+        // compatibility mousemove/mouseleave, which would leak the crosshair
+        // past the long-press gate below (compat mouse events never come back
+        // as pointer events, so the gate is airtight).
+        overlay.addEventListener('pointermove', (e) => {
+            if (e.pointerType === 'mouse') showCrosshair(e.clientX, e.clientY);
+        });
+        overlay.addEventListener('pointerleave', (e) => {
+            if (e.pointerType === 'mouse') hideTooltip();
+        });
+        // Touch: long-press only (attachLongPressCrosshair, shared script),
+        // so swiping across the chart scrolls the page; the tooltip auto-hides
+        // a few seconds after the finger lifts.
+        attachLongPressCrosshair(overlay, showCrosshair, hideTooltip);
 
         drawLegend();
     }
