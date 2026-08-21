@@ -458,6 +458,58 @@ func TestClassifyPlanScopesVerdictsToTheDrivingTable(t *testing.T) {
 		}
 	})
 
+	// A tree plan has none of the traditional format's vocabulary, and it is
+	// not a rare path: EXPLAIN ANALYZE always answers with one, and so does a
+	// plain EXPLAIN on a server whose explain_format says TREE. Reading a tree
+	// with only the tabular keywords is what reported every one of these as
+	// "no index" against the production MySQL.
+	t.Run("mysql tree plan covering read", func(t *testing.T) {
+		plan := []string{
+			"-> Group aggregate: max(pr.run_at)",
+			"    -> Covering index range scan on pp using idx_price_predictions_accuracy  (cost=1.2 rows=610978)",
+		}
+		uses, covering, fullScan := classifyPlan(plan, nil, dialectMySQL, indexes, "pp")
+		if uses != "idx_price_predictions_accuracy" || !covering {
+			t.Fatalf("uses=%q covering=%v, want the accuracy index, covering", uses, covering)
+		}
+		if fullScan {
+			t.Fatal("a covering index scan is not a table scan")
+		}
+	})
+
+	t.Run("mysql tree plan index read that still fetches rows", func(t *testing.T) {
+		plan := []string{
+			"-> Nested loop inner join",
+			"    -> Index lookup on pp using idx_price_predictions_station_fuel_target (station_id='a', fuel='e5')",
+			"    -> Single-row index lookup on pr using PRIMARY (id=pp.run_id)",
+		}
+		uses, covering, fullScan := classifyPlan(plan, nil, dialectMySQL, indexes, "pp")
+		if uses != "idx_price_predictions_station_fuel_target" {
+			t.Fatalf("uses = %q, want the station index", uses)
+		}
+		if covering {
+			t.Fatal("an index lookup that is not covering must not be reported as one")
+		}
+		if fullScan {
+			t.Fatal("an index lookup is not a table scan")
+		}
+	})
+
+	t.Run("mysql tree plan table scan", func(t *testing.T) {
+		plan := []string{
+			"-> Limit: 1 row(s)",
+			"    -> Filter: (cities.normalized_name = 'berlin')",
+			"        -> Table scan on cities  (cost=5500 rows=54280)",
+		}
+		uses, covering, fullScan := classifyPlan(plan, nil, dialectMySQL, []string{"PRIMARY"}, "cities")
+		if uses != "" || covering {
+			t.Fatalf("uses=%q covering=%v, want neither", uses, covering)
+		}
+		if !fullScan {
+			t.Fatal("a tree plan's table scan must be reported as a table scan")
+		}
+	})
+
 	// The MySQL fixtures below are real EXPLAIN rows from the production
 	// database, which is where the two bugs these cases pin were found: the
 	// verdict was read out of the rendered text, so `possible_keys` was

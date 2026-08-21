@@ -853,14 +853,30 @@ func indexSizes(ctx context.Context, q queryer, d dialect, table string) map[str
 // No column layout is assumed: SQLite returns four fixed columns, MySQL a
 // dozen that vary by version, and EXPLAIN ANALYZE a single text blob.
 func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args []any, analyze bool) ([]string, []map[string]string, error) {
-	prefix := "EXPLAIN QUERY PLAN "
-	if d == dialectMySQL {
-		prefix = "EXPLAIN "
-		if analyze {
-			prefix = "EXPLAIN ANALYZE "
-		}
+	if d != dialectMySQL {
+		return renderPlan(ctx, db, "EXPLAIN QUERY PLAN "+query, args)
 	}
-	rows, err := db.QueryContext(ctx, prefix+query, args...)
+	if analyze {
+		return renderPlan(ctx, db, "EXPLAIN ANALYZE "+query, args)
+	}
+	// FORMAT=TRADITIONAL pins the tabular plan whatever the server's
+	// explain_format is set to. It matters more than it looks: on a server
+	// configured for TREE (MySQL 8.3+ made that settable) a plain EXPLAIN
+	// answers with one text column, and then there is no `key`, no `Extra` and
+	// no `possible_keys` to read — so doctor reported "no index" for a table
+	// scan and never saw a covering read at all. MariaDB does not know the
+	// keyword, hence the fallback.
+	plan, cells, err := renderPlan(ctx, db, "EXPLAIN FORMAT=TRADITIONAL "+query, args)
+	if err == nil {
+		return plan, cells, nil
+	}
+	return renderPlan(ctx, db, "EXPLAIN "+query, args)
+}
+
+// renderPlan runs one already-prefixed EXPLAIN and returns it both as text and,
+// where the server answered in columns, as parsed cells.
+func renderPlan(ctx context.Context, db *sql.DB, stmt string, args []any) ([]string, []map[string]string, error) {
+	rows, err := db.QueryContext(ctx, stmt, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -881,14 +897,15 @@ func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args 
 		if err := rows.Scan(targets...); err != nil {
 			return nil, nil, err
 		}
-		// SQLite's plan is one meaningful column; printing it bare reads far
-		// better than labelling it.
-		if d != dialectMySQL && len(columns) == 4 {
+		// SQLite's plan is four columns of which one is meaningful; printing it
+		// bare reads far better than labelling it.
+		if len(columns) == 4 && columns[0] == "id" && columns[3] == "detail" {
 			out = append(out, cells[3].String)
 			continue
 		}
-		// EXPLAIN ANALYZE returns a multi-line blob; keep its own line breaks
-		// and leave the cells empty so classification falls back to text.
+		// A tree plan (EXPLAIN ANALYZE, or a server set to explain_format=TREE)
+		// is one multi-line blob; keep its own line breaks and leave the cells
+		// empty so classification falls back to reading the text.
 		if len(columns) == 1 {
 			out = append(out, strings.Split(strings.TrimRight(cells[0].String, "\n"), "\n")...)
 			continue
@@ -920,9 +937,14 @@ func mysqlExtraHas(extra, note string) bool {
 	return false
 }
 
-// classifyPlan pulls the two facts that decide whether the accuracy page is
-// healthy out of a rendered plan: which of the table's indexes the planner
-// chose, and whether it is reading table rows anyway.
+// classifyPlan pulls the two facts that decide whether a page is healthy out of
+// a rendered plan: which of the table's indexes the planner chose, and whether
+// it is reading table rows anyway.
+//
+// It reads the parsed cells where the server answered in columns, and falls back
+// to the text otherwise. The fallback is not a rare path — EXPLAIN ANALYZE is
+// always a tree, and so is a plain EXPLAIN on a server whose explain_format
+// says so — so it has to know the tree vocabulary as well as the tabular one.
 //
 // Every judgement is scoped to the alias of the big table the query drives
 // from, because these plans also touch things whose scans are harmless — a
@@ -960,11 +982,19 @@ func classifyPlan(plan []string, cells []map[string]string, d dialect, indexName
 			}
 		}
 		if d == dialectMySQL {
-			// EXPLAIN ANALYZE fallback: no cells to read, so match the text.
-			if strings.Contains(line, "Using index") && !strings.Contains(line, "Using index condition") {
+			// No cells to read, so the verdict comes out of the text. Two
+			// vocabularies land here and both have to be understood: a rendered
+			// traditional row ("type=ALL", "Extra=Using index") and a tree plan
+			// from EXPLAIN ANALYZE or a server set to explain_format=TREE, which
+			// says none of those words. Teaching this branch only the
+			// traditional ones is what made every tree plan read as "no index".
+			switch {
+			case strings.Contains(line, "Covering index"):
+				covering = true
+			case strings.Contains(line, "Using index") && !strings.Contains(line, "Using index condition"):
 				covering = true
 			}
-			if strings.Contains(line, "type=ALL") {
+			if strings.Contains(line, "type=ALL") || strings.Contains(line, "Table scan on ") {
 				fullScan = true
 			}
 			continue

@@ -448,33 +448,38 @@ With no `--city` it measures the city with the most stations in scope, which is 
 The output shows how the scope narrowed, then one line per query:
 
 ```
-dashboard queries: city=berlin (auto), radius=5 km, fuel=all (e5+e10+diesel), 2026-08-14T00:00:00Z .. now
-  scope: 120 in the bounding box, 20 within the radius, 20 queried
-  city                    41.2 ms        1 rows  TABLE SCAN
-  city_search             38.7 ms       20 rows  TABLE SCAN
-  scope_stations           9.4 ms       20 rows  idx_stations_lat_lng
-  snapshots             3401.2 ms    58204 rows  idx_price_snapshots_station_recorded
-    probe/keys only      502.1 ms    58204 rows  covering idx_price_snapshots_station_recorded
-  predictions_latest    8100.0 ms       60 rows  idx_price_predictions_station_fuel_target
-    probe/rows walked   3900.0 ms  3104928 rows  covering idx_price_predictions_station_fuel_target
-  predictions_grid      1200.0 ms    30248 rows  idx_price_predictions_station_fuel_target
-    probe/keys only      180.0 ms    30248 rows  covering idx_price_predictions_station_fuel_target
+dashboard queries: city=Lübbecke (auto), radius=5 km, fuel=all (e5+e10+diesel), 2026-08-14T00:00:00Z .. now
+  scope: 10 in the bounding box, 8 within the radius, 8 queried
+  city                     9.1 ms        1 rows  TABLE SCAN
+  city_search             22.5 ms       20 rows  TABLE SCAN
+  scope_stations           0.4 ms       10 rows  idx_stations_lat_lng
+  snapshots                6.9 ms     2164 rows  idx_price_snapshots_station_recorded
+    probe/keys only        2.8 ms     2164 rows  covering idx_price_snapshots_station_recorded
+  predictions_latest  181085.1 ms       23 rows  idx_price_predictions_station_fuel_target
+    probe/rows walked     256.3 ms   610978 rows  covering idx_price_predictions_station_fuel_target
+  predictions_grid       196.2 ms    40290 rows  idx_price_predictions_station_fuel_target
+    probe/keys only       52.5 ms    40290 rows  covering idx_price_predictions_station_fuel_target
 ```
+
+Those are real numbers from a production MySQL 8.4, and they are the reason the probes exist. One query is 99.87% of the load — and the probe beside it shows that reading its 610,978 rows takes 256 ms, so the row count is *not* what costs three minutes.
 
 ##### Probes: what a query's time is actually spent on
 
 A verdict of `covering <index>` or a bare index name says which index was used, but not why a query that used the right index still took three seconds. The `probe/` lines answer that. Each is the same query with a narrower projection, run alongside the real one:
 
 - **`probe/keys only`** projects just the indexed columns. The query and the probe read exactly the same rows via exactly the same index, so the difference between their timings is what fetching the *unindexed* columns from table rows costs. When that difference is most of the query's time, an index carrying those columns would make the read index-only — which is precisely what `idx_price_predictions_accuracy` did for the accuracy page.
-- **`probe/rows walked`** counts the rows an aggregate reduces. `predictions_latest` returns one row per station and fuel; the probe says how many stored predictions it walked to get there.
+- **`probe/rows walked`** counts the rows an aggregate reduces, and how long walking them takes. `predictions_latest` returns one row per station and fuel; the probe says how many stored predictions it walked to get there and what that walk alone cost.
+
+Where a probe shows the query paying for something its index could have carried, the finding also reports the cost **per row** in microseconds. That is the number that decides the fix: a few microseconds per lookup is a buffer-pool hit and the row count is the thing to reduce; hundreds of microseconds is a disk seek, and then the table has outgrown the cache and rewriting one query will not hide it.
 
 Probes are read-only and cost roughly one extra read each. `--probe=false` turns them off, and the report then says it cannot account for where the time went.
 
 ##### The three findings this produces
 
-- **`predictions_latest` walks the whole retention window.** It bounds station and fuel but nothing in time, so it reads every prediction the scope has accumulated over the 30 days predictions are kept — millions of rows — to produce one row per station and fuel, of which only the newest run's is used. This scales with how often `suggest --persist` runs, not with anything the visitor chose, so it is the one cost a wider date filter or a smaller radius will not reduce.
-- **`snapshots` pays for a row lookup per row.** `idx_price_snapshots_station_recorded` stops at `(station_id, recorded_at)`, and the projection needs `is_open`, `e5`, `e10` and `diesel`, so every matching row costs a second lookup into the table. The probe prices it. This one *does* scale with the date filter and the radius.
-- **`cities` has no index to use.** The dashboard resolves its city filter against `normalized_name`, which carries no index, and the typeahead wraps it in `LOWER()` besides — so both read the whole table on every load. On a hand-fed install that is a few rows; after `gasoline import cities DE` it is the whole of a country's populated places, and the finding is a warning rather than a note.
+- **`predictions_latest` pays a table lookup per index entry.** `idx_price_predictions_station_fuel_target` is `(station_id, fuel, target_start)`; an InnoDB secondary index appends the primary key, not `run_id`. So the join to `prediction_runs` needs `run_id` from a table row for every entry the query walks. On the production run above that is 610,978 lookups at ~296 µs each, which is seek latency rather than a cache hit. An index carrying `run_id` would answer the query from the index alone.
+  The reason there are that many entries is a second, separate problem: the query bounds station and fuel but nothing in time, so it reads every prediction the scope has accumulated over the 30 days predictions are kept, though only the newest run's rows are used. That half scales with how often `suggest --persist` runs, not with anything the visitor chose, so no date filter or smaller radius touches it.
+- **`snapshots` pays for a row lookup per row.** `idx_price_snapshots_station_recorded` stops at `(station_id, recorded_at)`, and the projection needs `is_open`, `e5`, `e10` and `diesel`, so every matching row costs a second lookup into the table. The probe prices it. This one *does* scale with the date filter and the radius — and on a scope this small it is single-digit milliseconds, which is why the finding needs an absolute floor and not just a share of the query.
+- **`cities` has no index to use.** The dashboard resolves its city filter against `normalized_name`, which carries no index, and the typeahead wraps it in `LOWER()` besides — so both read the whole table on every load. On a hand-fed install that is a few rows; after `gasoline import cities DE` it is the whole of a country's populated places.
 
 `predictions_grid` gets a note rather than a finding: it returns every future window for the scope and PHP then discards the rows that are not from that station's newest run, so the run filter is applied after the rows have crossed the wire. It is bounded by `target_start > now`, so it is smaller than `predictions_latest` by roughly the ratio of the forecast horizon to the retention window.
 
@@ -503,7 +508,8 @@ optimize (OPTIMIZE TABLE <table>):
 Notes on reading the output:
 
 - `doctor` never creates or migrates anything — not the schema, and not the database. Run without arguments it uses the same SQLite path or MySQL settings as every other command (`--db`, `GASOLINE_DB_PATH`, `--db-driver mysql`, …); if that SQLite file does not exist it says so and stops, rather than leaving an empty database behind and reporting every table as absent. On a database that exists but has not been migrated it reports the missing tables and indexes and skips the query timings — run `gasoline migrate` for that.
-- A `TABLE SCAN` verdict on a small table is reported as information, not a warning: below roughly 100k rows a scan is often the cheapest plan, and flagging it buries the findings that matter.
+- A `TABLE SCAN` verdict on a small table is reported as information, not a warning: below roughly 100k rows a scan is often the cheapest plan, and flagging it buries the findings that matter. The same applies to the time a query spends on row lookups: a share of a query is only reported once it is also worth a person's attention in absolute terms, since half of a seven-millisecond query is still nothing.
+- On MySQL the plan is read from `EXPLAIN FORMAT=TRADITIONAL`, so the index verdicts come from the `key` and `Extra` columns whatever the server's `explain_format` default is. Where only a tree plan is available — `--analyze` always is one, and MariaDB does not know the `TRADITIONAL` keyword — the verdicts are read from the tree's own wording instead.
 - Row counts are exact on SQLite and InnoDB estimates on MySQL, which can be off by a large factor; the text output prefixes the estimates with `~`.
 - Per-index sizes need `mysql.innodb_index_stats` on MySQL and the optional `dbstat` module on SQLite. Where the account or build lacks them the sizes are simply omitted.
 - Timings include running each query for real, so on a large database each page's section costs about what one load of that page costs — `doctor all` costs both, and probes add roughly one extra read per probed query. Use `--skip-queries` when you only want the schema picture.

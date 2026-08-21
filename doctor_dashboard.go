@@ -865,18 +865,16 @@ func dashboardSnapshotFindings(byName map[string]doctorQuery, opts doctorOptions
 		return findings
 	}
 	lookups := q.DurationMS - probe.DurationMS
-	if lookups <= 0 {
+	severity, report := lookupSeverity(lookups, q.DurationMS, opts.SlowMS)
+	if !report {
 		return findings
-	}
-	severity := "info"
-	if lookups >= opts.SlowMS || lookups >= q.DurationMS/2 {
-		severity = "warn"
 	}
 	findings = append(findings, doctorFinding{
 		Severity: severity,
-		Message: fmt.Sprintf("snapshots spends %.0f ms of its %.0f ms fetching is_open/e5/e10/diesel from table rows: %s stops at (station_id, recorded_at), so each of the %s matching rows costs a second lookup. "+
+		Message: fmt.Sprintf("snapshots spends %.0f ms of its %.0f ms fetching is_open/e5/e10/diesel from table rows: %s stops at (station_id, recorded_at), so each of the %s matching rows costs a second lookup, about %.0f µs each. "+
 			"An index carrying those four columns would make this read index-only, which is what idx_price_predictions_accuracy did for the accuracy page",
-			lookups, q.DurationMS, indexOrPlan(q), formatCount(int64(q.Rows))),
+			lookups, q.DurationMS, indexOrPlan(q), formatCount(int64(q.Rows)),
+			perLookupMicros(lookups, q.Rows)),
 	})
 	return findings
 }
@@ -889,23 +887,36 @@ func dashboardPredictionFindings(byName map[string]doctorQuery, opts doctorOptio
 	var findings []doctorFinding
 
 	if q, ok := byName["predictions_latest"]; ok && q.Error == "" {
-		walked := int64(q.Rows)
-		measured := false
-		if q.Probe != nil && q.Probe.Error == "" {
-			walked = int64(q.Probe.Rows)
-			measured = true
-		}
-		if measured && q.Rows > 0 && walked > int64(q.Rows) {
-			severity := "info"
-			if walked >= 100_000 || q.DurationMS >= opts.SlowMS {
-				severity = "warn"
+		probe := q.Probe
+		if probe != nil && probe.Error == "" && probe.Rows > q.Rows {
+			walked := int64(probe.Rows)
+			// Lead with what the probe measured, not with the row count. The
+			// two are not the same finding and the difference decides the fix:
+			// walking the index entries is usually cheap, and where the time
+			// actually goes is the run_id the index does not carry, fetched
+			// once per entry from the table row.
+			lookups := q.DurationMS - probe.DurationMS
+			if severity, report := lookupSeverity(lookups, q.DurationMS, opts.SlowMS); report {
+				perLookup := perLookupMicros(lookups, probe.Rows)
+				message := fmt.Sprintf("predictions_latest walks %s index entries in %.0f ms but takes %.0f ms in total: run_id is not among %s's columns, "+
+					"so every entry costs a lookup into the price_predictions row, about %.0f µs each",
+					formatCount(walked), probe.DurationMS, q.DurationMS, indexOrPlan(q), perLookup)
+				// A few microseconds is a buffer-pool hit; hundreds is a seek,
+				// and then the table has outgrown the cache and no rewrite of
+				// this query alone will hide that.
+				if perLookup >= 50 {
+					message += ". That is seek latency rather than a cache hit, so the table is not staying in the buffer pool"
+				}
+				message += ". An index carrying run_id would answer this from the index alone"
+				findings = append(findings, doctorFinding{Severity: severity, Message: message})
 			}
+			// Why there are that many entries in the first place, which is the
+			// separate half of the problem: nothing bounds the query in time.
 			findings = append(findings, doctorFinding{
-				Severity: severity,
-				Message: fmt.Sprintf("predictions_latest walks %s stored predictions to produce %d rows — one per station and fuel. "+
-					"It bounds station and fuel but nothing in time, so it reads every prediction the scope has accumulated over the %d-day retention window "+
-					"even though only the newest run's rows are used",
-					formatCount(walked), q.Rows, predictionRetentionDays),
+				Severity: "info",
+				Message: fmt.Sprintf("those %s entries are every prediction the scope accumulated over the %d-day retention window, reduced to %d rows — "+
+					"one per station and fuel. predictions_latest bounds station and fuel but nothing in time, so only the newest run's rows are used and all of them are read",
+					formatCount(walked), predictionRetentionDays, q.Rows),
 			})
 		}
 	}
@@ -918,20 +929,47 @@ func dashboardPredictionFindings(byName map[string]doctorQuery, opts doctorOptio
 		})
 		if probe := q.Probe; probe != nil && probe.Error == "" && !q.CoveringHit {
 			lookups := q.DurationMS - probe.DurationMS
-			if lookups > 0 {
-				severity := "info"
-				if lookups >= opts.SlowMS {
-					severity = "warn"
-				}
+			if severity, report := lookupSeverity(lookups, q.DurationMS, opts.SlowMS); report {
 				findings = append(findings, doctorFinding{
 					Severity: severity,
-					Message: fmt.Sprintf("predictions_grid spends %.0f ms of its %.0f ms on the row lookups and the prediction_runs join that %s cannot satisfy",
-						lookups, q.DurationMS, indexOrPlan(q)),
+					Message: fmt.Sprintf("predictions_grid spends %.0f ms of its %.0f ms on the row lookups and the prediction_runs join that %s cannot satisfy, about %.0f µs per row",
+						lookups, q.DurationMS, indexOrPlan(q), perLookupMicros(lookups, q.Rows)),
 				})
 			}
 		}
 	}
 	return findings
+}
+
+// A share of a query's time is not on its own a reason to warn: 4 ms out of
+// 7 ms is half the query and still nobody's problem. Both an absolute floor and
+// a share have to be crossed, and below the note floor there is nothing worth
+// saying at all.
+const (
+	dashboardLookupNoteMS = 5
+	dashboardLookupWarnMS = 100
+)
+
+// lookupSeverity rates the time a query spends on work its index could have
+// carried instead. The second return says whether it is worth reporting.
+func lookupSeverity(lookupsMS, totalMS, slowMS float64) (string, bool) {
+	if lookupsMS < dashboardLookupNoteMS {
+		return "", false
+	}
+	if lookupsMS >= slowMS || (lookupsMS >= dashboardLookupWarnMS && lookupsMS >= totalMS/2) {
+		return "warn", true
+	}
+	return "info", true
+}
+
+// perLookupMicros is what one row lookup cost. It is the number that separates a
+// query reading a lot of rows from a cache (a few microseconds each) from one
+// seeking to disk for every one of them, and those need different fixes.
+func perLookupMicros(lookupsMS float64, rows int) float64 {
+	if rows <= 0 {
+		return 0
+	}
+	return lookupsMS * 1000 / float64(rows)
 }
 
 // indexOrPlan names the index a query took, or says there was none, so a

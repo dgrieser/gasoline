@@ -280,9 +280,15 @@ func TestDashboardFindingsNameTheStructuralCosts(t *testing.T) {
 	joined := renderFindings(findings)
 
 	for _, want := range []string{
-		// The newest-run aggregate reading the whole retention window is the
-		// finding this whole check exists to produce.
-		"predictions_latest walks 3,104,928 stored predictions to produce 60 rows",
+		// The newest-run aggregate has to be reported as what the probe
+		// measured — the lookups — and not as the row count, which the probe
+		// shows to be the cheap part.
+		"walks 3,104,928 index entries in 3900 ms but takes 8100 ms in total",
+		"run_id is not among idx_price_predictions_station_fuel_target's columns",
+		"about 1 µs each",
+		"An index carrying run_id would answer this from the index alone",
+		// The unbounded read is the separate half, and stays a note.
+		"every prediction the scope accumulated over the 30-day retention window",
 		"bounds station and fuel but nothing in time",
 		// The snapshot read's row lookups, priced against a covering index.
 		"fetching is_open/e5/e10/diesel from table rows",
@@ -300,8 +306,38 @@ func TestDashboardFindingsNameTheStructuralCosts(t *testing.T) {
 		}
 	}
 	for _, finding := range findings {
-		if strings.Contains(finding.Message, "predictions_latest walks") && finding.Severity != "warn" {
-			t.Errorf("a multi-million-row aggregate is a warning, got %q", finding.Severity)
+		if strings.Contains(finding.Message, "index entries in") && finding.Severity != "warn" {
+			t.Errorf("four seconds of row lookups is a warning, got %q", finding.Severity)
+		}
+	}
+	// Seek-rate latency earns the extra sentence; a cache hit must not get it.
+	if strings.Contains(joined, "not staying in the buffer pool") {
+		t.Errorf("1 µs per lookup is a cache hit, not a seek:\n%s", joined)
+	}
+}
+
+func TestDashboardFindingsCallOutSeekLatency(t *testing.T) {
+	opts := dashboardOptions(doctorDashboardFilters{City: "berlin", RadiusKM: 5, Fuel: "all"})
+	// The production shape: walking the index entries is nearly free, and the
+	// whole cost is one lookup per entry at seek latency.
+	dash := &doctorDashboard{
+		Filters: opts.Dashboard,
+		Scope:   doctorDashboardScope{Candidates: 10, Stations: 8, Selected: 8, CityFound: true},
+		Queries: []doctorQuery{
+			{Name: "predictions_latest", Table: "price_predictions", DurationMS: 181085, Rows: 23,
+				UsesIndex: "idx_price_predictions_station_fuel_target",
+				Probe: &doctorQueryProbe{Name: "rows walked", DurationMS: 256, Rows: 610978,
+					UsesIndex: "idx_price_predictions_station_fuel_target"}},
+		},
+	}
+	joined := renderFindings(doctorDashboardFindings(dash, []doctorTable{{Name: "price_predictions", Rows: 6_908_248}}, opts))
+	for _, want := range []string{
+		"walks 610,978 index entries in 256 ms but takes 181085 ms in total",
+		"about 296 µs each",
+		"That is seek latency rather than a cache hit, so the table is not staying in the buffer pool",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("findings are missing %q:\n%s", want, joined)
 		}
 	}
 }
@@ -319,10 +355,51 @@ func TestDashboardFindingsStayQuietOnASmallDatabase(t *testing.T) {
 		},
 	}
 	tables := []doctorTable{{Name: "cities", Rows: 3}, {Name: "price_snapshots", Rows: 240}}
-	for _, finding := range doctorDashboardFindings(dash, tables, opts) {
-		if finding.Severity == "warn" {
-			t.Errorf("nothing here is worth a warning, got %q", finding.Message)
+	joined := renderFindings(doctorDashboardFindings(dash, tables, opts))
+	if strings.Contains(joined, "warn") {
+		t.Errorf("nothing here is worth a warning:\n%s", joined)
+	}
+	// 0.4 ms of the 2 ms is a fifth of the query and still nothing: a share
+	// without an absolute floor reports every fast query as a problem.
+	if strings.Contains(joined, "fetching is_open") {
+		t.Errorf("sub-millisecond lookups must not be reported at all:\n%s", joined)
+	}
+}
+
+func TestLookupSeverityNeedsBothAFloorAndAShare(t *testing.T) {
+	cases := []struct {
+		name                       string
+		lookupsMS, totalMS, slowMS float64
+		want                       string
+		report                     bool
+	}{
+		// The production shape both bugs were found in: 4 ms of a 7 ms query is
+		// more than half of it and must not warn.
+		{"tiny query", 4, 7, 1000, "", false},
+		{"noticeable but small", 40, 60, 1000, "info", true},
+		{"most of a slow query", 600, 900, 1000, "warn", true},
+		{"over the slow threshold on its own", 1200, 4000, 1000, "warn", true},
+		// Big in absolute terms but a small share, and the query is under
+		// --slow-ms: worth a note, not an alarm.
+		{"small share of a fast query", 150, 900, 1000, "info", true},
+		{"probe slower than the query", -3, 10, 1000, "", false},
+	}
+	for _, tc := range cases {
+		got, report := lookupSeverity(tc.lookupsMS, tc.totalMS, tc.slowMS)
+		if got != tc.want || report != tc.report {
+			t.Errorf("%s: lookupSeverity(%v, %v, %v) = %q, %v; want %q, %v",
+				tc.name, tc.lookupsMS, tc.totalMS, tc.slowMS, got, report, tc.want, tc.report)
 		}
+	}
+}
+
+func TestPerLookupMicros(t *testing.T) {
+	if got := perLookupMicros(181085-256, 610978); math.Round(got) != 296 {
+		t.Errorf("perLookupMicros = %v, want about 296 µs", got)
+	}
+	// No rows means no rate, rather than a division by zero.
+	if got := perLookupMicros(100, 0); got != 0 {
+		t.Errorf("perLookupMicros with no rows = %v, want 0", got)
 	}
 }
 
