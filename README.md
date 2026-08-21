@@ -360,10 +360,12 @@ The grouped commands above are the canonical interface shown by `gasoline help`.
 
 ### Diagnosing a slow database (`gasoline doctor`)
 
-`gasoline doctor` inspects a live database without changing it. It reports table sizes, every index with its key columns and on-disk size, which stations are in scope and why, and then — the reason it exists — runs each query behind the admin **Prediction accuracy** page, timing it and showing what the planner did with it:
+`gasoline doctor` inspects a live database without changing it. It reports table sizes, every index with its key columns and on-disk size, which stations are in scope and why, and then — the reason it exists — reproduces the SQL behind one of the web pages, timing each query and showing what the planner did with it.
+
+Which page it measures is a subcommand. Bare `doctor` measures the admin **Prediction accuracy** page, `doctor dashboard` the dashboard, and `doctor all` both:
 
 ```bash
-gasoline doctor                                     # default 14-day window, fuel diesel
+gasoline doctor                                     # accuracy page, 14-day window, fuel diesel
 gasoline doctor --db-driver mysql --explain         # print the full plan per query
 gasoline doctor --analyze                           # real per-step timings (MySQL 8.0.18+)
 gasoline doctor --range 30d --fuel e5               # reproduce a specific page filter
@@ -371,7 +373,11 @@ gasoline doctor --skip-queries                      # schema, sizes, indexes and
 gasoline doctor -o json | jq '.findings'            # machine-readable
 gasoline doctor -o json | jq '.scope'               # the station universe, city by city
 gasoline doctor --optimize                          # rebuild the tables to reclaim freed space
+gasoline doctor dashboard                           # the dashboard's SQL instead
+gasoline doctor all                                 # both pages in one report
 ```
+
+Each page costs about what one of its loads costs, which is why they are asked for by name rather than measured together every time. Everything below the subcommand — the table, index and scope sections, `--explain`, `--analyze`, `--sql`, `--slow-ms`, `--skip-queries`, `-o json`, `--optimize` — is shared.
 
 #### Why a city you removed still appears
 
@@ -412,6 +418,66 @@ It ends with a verdict — whether forcing the index would be faster, slower, or
 
 If forcing the covering index is much faster, the optimizer is mis-costing it. Refreshing the statistics it reasons from is worth trying first — `ANALYZE TABLE price_predictions`, or `ANALYZE TABLE price_predictions UPDATE HISTOGRAM ON target_start` when the range estimate looks wrong (a `filtered` value pinned near 10% is the tell). Where that does not change the choice, the accuracy page forces the index itself: five of its aggregate queries carry `FORCE INDEX`/`INDEXED BY`, which measured 66–73% faster per query on a live MySQL after both of those statistics commands had failed to move it. The hint is omitted when the index is absent, so an un-migrated database still renders the page. `series` and the raw-row query are deliberately left unhinted — the hint measured +1% and −2% there, so there is nothing to buy. Re-run `--try-index` after a schema or data-shape change: if forcing stops winning, the hint should go rather than be kept on faith.
 
+#### Why the dashboard is slow (`doctor dashboard`)
+
+The dashboard is slow for different reasons than the accuracy page, so it gets its own mirror of its own SQL. A load issues six queries, and `doctor dashboard` reproduces all of them — including the station list the page inlines into `IN (...)`, because the length of that list is part of the cost:
+
+| query | what the page does with it |
+| --- | --- |
+| `city` | resolves the selected city (`resolveCity`) |
+| `city_search` | the city dropdown's typeahead, measured with the first three letters of the selected city |
+| `scope_stations` | the stations inside the radius that are still being fed (`loadScopeStations`) |
+| `snapshots` | the price history the chart and table are drawn from (`buildSnapshotQuery`) |
+| `predictions_latest` | the newest run per station and fuel (`loadFilteredPredictions`) |
+| `predictions_grid` | the future forecast windows for the scope, filtered to the newest run in PHP |
+
+Its flags mirror the page's own controls, so you can reproduce the load that felt slow in the browser:
+
+```bash
+gasoline doctor dashboard                                  # busiest city, 5 km, all fuels, 7 days
+gasoline doctor dashboard --city berlin --radius 20        # a specific scope
+gasoline doctor dashboard --range 30d --fuel diesel        # a specific date filter and fuel
+gasoline doctor dashboard --station abc-123,def-456        # what the station picker had selected
+gasoline doctor dashboard --no-city                        # the unscoped view
+gasoline doctor dashboard --explain --sql                  # plans and SQL per query
+gasoline doctor dashboard -o json | jq '.dashboard'        # machine-readable
+```
+
+With no `--city` it measures the city with the most stations in scope, which is the slowest dashboard anyone can load, and says which one it picked. `--radius` accepts only the radii the dropdown offers (5, 10, 20) and `--fuel` defaults to the page's own `all`, which expands to three fuels and so to three times the prediction rows. `--no-city` reproduces the unscoped view, where the page loads the station list for the sidebar and skips the snapshot and prediction queries entirely — `doctor` skips them with it rather than inventing a load the page never issues.
+
+The output shows how the scope narrowed, then one line per query:
+
+```
+dashboard queries: city=berlin (auto), radius=5 km, fuel=all (e5+e10+diesel), 2026-08-14T00:00:00Z .. now
+  scope: 120 in the bounding box, 20 within the radius, 20 queried
+  city                    41.2 ms        1 rows  TABLE SCAN
+  city_search             38.7 ms       20 rows  TABLE SCAN
+  scope_stations           9.4 ms       20 rows  idx_stations_lat_lng
+  snapshots             3401.2 ms    58204 rows  idx_price_snapshots_station_recorded
+    probe/keys only      502.1 ms    58204 rows  covering idx_price_snapshots_station_recorded
+  predictions_latest    8100.0 ms       60 rows  idx_price_predictions_station_fuel_target
+    probe/rows walked   3900.0 ms  3104928 rows  covering idx_price_predictions_station_fuel_target
+  predictions_grid      1200.0 ms    30248 rows  idx_price_predictions_station_fuel_target
+    probe/keys only      180.0 ms    30248 rows  covering idx_price_predictions_station_fuel_target
+```
+
+##### Probes: what a query's time is actually spent on
+
+A verdict of `covering <index>` or a bare index name says which index was used, but not why a query that used the right index still took three seconds. The `probe/` lines answer that. Each is the same query with a narrower projection, run alongside the real one:
+
+- **`probe/keys only`** projects just the indexed columns. The query and the probe read exactly the same rows via exactly the same index, so the difference between their timings is what fetching the *unindexed* columns from table rows costs. When that difference is most of the query's time, an index carrying those columns would make the read index-only — which is precisely what `idx_price_predictions_accuracy` did for the accuracy page.
+- **`probe/rows walked`** counts the rows an aggregate reduces. `predictions_latest` returns one row per station and fuel; the probe says how many stored predictions it walked to get there.
+
+Probes are read-only and cost roughly one extra read each. `--probe=false` turns them off, and the report then says it cannot account for where the time went.
+
+##### The three findings this produces
+
+- **`predictions_latest` walks the whole retention window.** It bounds station and fuel but nothing in time, so it reads every prediction the scope has accumulated over the 30 days predictions are kept — millions of rows — to produce one row per station and fuel, of which only the newest run's is used. This scales with how often `suggest --persist` runs, not with anything the visitor chose, so it is the one cost a wider date filter or a smaller radius will not reduce.
+- **`snapshots` pays for a row lookup per row.** `idx_price_snapshots_station_recorded` stops at `(station_id, recorded_at)`, and the projection needs `is_open`, `e5`, `e10` and `diesel`, so every matching row costs a second lookup into the table. The probe prices it. This one *does* scale with the date filter and the radius.
+- **`cities` has no index to use.** The dashboard resolves its city filter against `normalized_name`, which carries no index, and the typeahead wraps it in `LOWER()` besides — so both read the whole table on every load. On a hand-fed install that is a few rows; after `gasoline import cities DE` it is the whole of a country's populated places, and the finding is a warning rather than a note.
+
+`predictions_grid` gets a note rather than a finding: it returns every future window for the scope and PHP then discards the rows that are not from that station's newest run, so the run filter is applied after the rows have crossed the wire. It is bounded by `target_start > now`, so it is smaller than `predictions_latest` by roughly the ratio of the forecast horizon to the retention window.
+
 #### Reclaiming space after a large prune (`--optimize`)
 
 Deleting rows does not shrink a table. InnoDB keeps the emptied pages for reuse and SQLite keeps them on its free list, so after a prune that drops a lot at once — a removed update target taking half of `price_predictions` with it — the sizes above stay where they were. `--optimize` rebuilds the tables so that space goes back to the filesystem:
@@ -440,7 +506,8 @@ Notes on reading the output:
 - A `TABLE SCAN` verdict on a small table is reported as information, not a warning: below roughly 100k rows a scan is often the cheapest plan, and flagging it buries the findings that matter.
 - Row counts are exact on SQLite and InnoDB estimates on MySQL, which can be off by a large factor; the text output prefixes the estimates with `~`.
 - Per-index sizes need `mysql.innodb_index_stats` on MySQL and the optional `dbstat` module on SQLite. Where the account or build lacks them the sizes are simply omitted.
-- Timings include running each query for real, so on a large database `doctor` costs about what one page load costs. Use `--skip-queries` when you only want the schema picture.
+- Timings include running each query for real, so on a large database each page's section costs about what one load of that page costs — `doctor all` costs both, and probes add roughly one extra read per probed query. Use `--skip-queries` when you only want the schema picture.
+- The tables section includes `cities`, which carries no index beyond its primary key. That is deliberate: the dashboard filters on `normalized_name` on every load, and `gasoline import cities` can grow this table by five orders of magnitude, so its row count is worth seeing next to the queries that scan it.
 
 ## Output Formats
 

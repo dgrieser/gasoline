@@ -589,8 +589,10 @@ Commands:
   rename        set a persistent display-name override for a station
   merge-stations merge duplicate station identities into one canonical station
   doctor        inspect a live database read-only: table sizes, indexes, scope,
-                and timings plus query plans for the admin accuracy page's SQL
-                (--optimize additionally rebuilds tables to reclaim space)
+                and timings plus query plans for one page's SQL. Bare "doctor"
+                measures the admin accuracy page, "doctor dashboard" the
+                dashboard, "doctor all" both (--optimize additionally rebuilds
+                tables to reclaim space)
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
   version       print build version information
@@ -626,6 +628,9 @@ Examples:
   gasoline doctor --explain --analyze --db-driver mysql
   gasoline doctor --skip-queries --output json
   gasoline doctor --optimize --optimize-table price_predictions
+  gasoline doctor dashboard
+  gasoline doctor dashboard --city berlin --radius 10 --range 30d --explain
+  gasoline doctor all -o json
   gasoline import cities DE
   gasoline clear cities`)
 }
