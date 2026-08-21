@@ -3814,6 +3814,22 @@ function buildSnapshotQuery(
  * newest run per (station, fuel) is considered; a station covered by several
  * runs resolves independently via its own newest run.
  *
+ * That newest run is resolved from the candidate rows themselves rather than by
+ * a second query. Asking the database for it separately meant an aggregate over
+ * every prediction the scope had ever accumulated — bounded by station and fuel
+ * but not in time — which `gasoline doctor dashboard` measured at 158 seconds
+ * against 612,665 rows on a production database, to produce 23 rows of which
+ * only the newest run's were used. The candidates below are already the newest
+ * run's rows plus its predecessors', so the maximum run_id among them is the
+ * same answer for one pass instead of two.
+ *
+ * The one case where that differs: a station the newest run stored nothing
+ * future for (too little history to forecast it, say) used to show nothing at
+ * all, because its rows all belonged to a superseded run. It now shows the most
+ * recent run that did cover it, which is the more useful of the two answers.
+ * Runs are compared by run_id rather than by run_at, so two runs recorded in the
+ * same second no longer collide.
+ *
  * @param array<int, string> $stationIds effective in-scope station ids
  * @param array<string, float> $distancesKm station id -> km from the selected city
  * @return array{rows: array<int, array<string, mixed>>, as_of: array<string, string>}
@@ -3845,41 +3861,13 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm
     $stationIn = implode(', ', $stationPlaceholders);
     $fuelIn = implode(', ', $fuelPlaceholders);
 
-    // The newest persisted run per (station, fuel), from the full grid — the
-    // authoritative "current" run whose suggestion picks we display.
-    $latestStmt = $pdo->prepare(
-        'SELECT pp.station_id, pp.fuel, MAX(pr.run_at) AS max_run_at '
-        . 'FROM price_predictions pp '
-        . 'JOIN prediction_runs pr ON pr.id = pp.run_id '
-        . 'WHERE pp.station_id IN (' . $stationIn . ') '
-        . 'AND pp.fuel IN (' . $fuelIn . ') '
-        . 'GROUP BY pp.station_id, pp.fuel'
-    );
-    foreach ($scopeParams as $key => $value) {
-        $latestStmt->bindValue($key, $value);
-    }
-    $latestStmt->execute();
-
-    $latestRunByKey = [];   // "station|fuel" -> newest run_at
-    $asOf = [];             // fuel -> newest run_at across the scope
-    foreach ($latestStmt->fetchAll() as $row) {
-        $fuel = (string) $row['fuel'];
-        $runAt = (string) $row['max_run_at'];
-        $latestRunByKey[(string) $row['station_id'] . '|' . $fuel] = $runAt;
-        if (!isset($asOf[$fuel]) || strcmp($runAt, $asOf[$fuel]) > 0) {
-            $asOf[$fuel] = $runAt;
-        }
-    }
-    if ($latestRunByKey === []) {
-        return $empty;
-    }
-
-    // Candidate windows: the newest run's full future grid for the scope.
-    // Confidence is deliberately not filtered here — the notifier picks the
-    // cheapest windows first and only then drops low confidence, so a cheap
-    // low-confidence window consumes a slot without being shown.
+    // Candidate windows: every future window the scope has, across whichever
+    // runs produced them. Confidence is deliberately not filtered here — the
+    // notifier picks the cheapest windows first and only then drops low
+    // confidence, so a cheap low-confidence window consumes a slot without
+    // being shown.
     $rowStmt = $pdo->prepare(
-        'SELECT pp.station_id, pp.fuel, pp.target_start, pp.target_end, '
+        'SELECT pp.station_id, pp.fuel, pp.run_id, pp.target_start, pp.target_end, '
         . 'pp.predicted_price, pp.confidence, pr.run_at, pr.suggestion_bias '
         . 'FROM price_predictions pp '
         . 'JOIN prediction_runs pr ON pr.id = pp.run_id '
@@ -3893,19 +3881,46 @@ function loadFilteredPredictions(PDO $pdo, array $stationIds, array $distancesKm
     }
     $rowStmt->bindValue(':pred_now', $nowUtc);
     $rowStmt->execute();
+    $candidateRows = $rowStmt->fetchAll();
+
+    // First pass: the newest run per (station, fuel) among these candidates,
+    // which is the run whose picks we display. run_id ordering is insert
+    // ordering, so the largest is the newest.
+    $latestRunByKey = [];   // "station|fuel" -> newest run_id
+    $runAtById = [];        // run_id -> run_at, for the "as of" stamp
+    foreach ($candidateRows as $row) {
+        $runId = (int) $row['run_id'];
+        $runAtById[$runId] = (string) $row['run_at'];
+        $key = (string) $row['station_id'] . '|' . (string) $row['fuel'];
+        if (!isset($latestRunByKey[$key]) || $runId > $latestRunByKey[$key]) {
+            $latestRunByKey[$key] = $runId;
+        }
+    }
+    if ($latestRunByKey === []) {
+        return $empty;
+    }
+
+    $asOf = [];             // fuel -> newest run_at across the scope
+    foreach ($latestRunByKey as $key => $runId) {
+        $fuel = substr($key, strpos($key, '|') + 1);
+        $runAt = $runAtById[$runId] ?? '';
+        if ($runAt !== '' && (!isset($asOf[$fuel]) || strcmp($runAt, $asOf[$fuel]) > 0)) {
+            $asOf[$fuel] = $runAt;
+        }
+    }
 
     // Bucket candidates per fuel and local day, like generateSuggestions does
     // with the server's local time (the Go side groups by opts.Location, which
     // is the server timezone there too).
     $localZone = new DateTimeZone(date_default_timezone_get());
     $byFuelDate = [];
-    foreach ($rowStmt->fetchAll() as $row) {
+    foreach ($candidateRows as $row) {
         $stationId = (string) $row['station_id'];
         $fuel = (string) $row['fuel'];
         // Keep only rows from that station/fuel's newest run — older runs are
         // history whose picks the newest run has already superseded.
         $key = $stationId . '|' . $fuel;
-        if (!isset($latestRunByKey[$key]) || (string) $row['run_at'] !== $latestRunByKey[$key]) {
+        if (!isset($latestRunByKey[$key]) || (int) $row['run_id'] !== $latestRunByKey[$key]) {
             continue;
         }
         $start = new DateTimeImmutable((string) $row['target_start']);

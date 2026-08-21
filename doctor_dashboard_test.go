@@ -141,7 +141,7 @@ func TestRunDashboardChecksReproducesAPageLoad(t *testing.T) {
 		got[q.Name] = q
 	}
 	for _, name := range []string{"city", "city_search", "scope_stations", "snapshots",
-		"predictions_latest", "predictions_grid"} {
+		"predictions_grid"} {
 		q, ok := got[name]
 		if !ok {
 			t.Fatalf("dashboard check did not run %q (ran %v)", name, dash.Queries)
@@ -153,15 +153,10 @@ func TestRunDashboardChecksReproducesAPageLoad(t *testing.T) {
 	if got["snapshots"].Rows != 12 {
 		t.Errorf("snapshots returned %d rows, want the 12 the two in-scope stations have", got["snapshots"].Rows)
 	}
-	// One row per station and fuel, from a grid holding two runs' worth.
-	if got["predictions_latest"].Rows != 6 {
-		t.Errorf("predictions_latest returned %d rows, want 6 (2 stations x 3 fuels)", got["predictions_latest"].Rows)
-	}
-	if walked := got["predictions_latest"].Probe; walked == nil {
-		t.Fatal("predictions_latest has no probe, so nothing prices its aggregate")
-	} else if walked.Rows <= got["predictions_latest"].Rows {
-		t.Errorf("probe walked %d rows for %d result rows; the probe must show the wider read",
-			walked.Rows, got["predictions_latest"].Rows)
+	// The grid carries run_id, which is what lets the page reduce these rows to
+	// the newest run per station without a second query.
+	if !strings.Contains(got["predictions_grid"].SQL, "pp.run_id") {
+		t.Errorf("predictions_grid must select run_id:\n%s", got["predictions_grid"].SQL)
 	}
 	if probe := got["snapshots"].Probe; probe == nil {
 		t.Fatal("snapshots has no probe, so nothing prices its row lookups")
@@ -257,15 +252,17 @@ func TestDashboardFindingsNameTheStructuralCosts(t *testing.T) {
 		Fuels:   []string{"e5", "e10", "diesel"},
 		Scope:   doctorDashboardScope{Candidates: 120, Stations: 20, Selected: 20, CityFound: true},
 		Queries: []doctorQuery{
-			{Name: "city", Table: "cities", DurationMS: 40, Rows: 1, FullScan: true},
+			{Name: "city", Table: "cities", DurationMS: 40, Rows: 1,
+				UsesIndex: "idx_cities_normalized"},
+			// The plan says it used the index; it still reads all of it.
+			{Name: "city_search", Table: "cities", DurationMS: 95, Rows: 20,
+				UsesIndex: "idx_cities_normalized"},
+			// 400 ms of lookups over 58,204 rows is ~7 µs each: a lot of cheap
+			// buffer-pool reads, so the row count is the thing to reduce.
 			{Name: "snapshots", Table: "price_snapshots", DurationMS: 3400, Rows: 58204,
 				UsesIndex: "idx_price_snapshots_station_recorded",
-				Probe: &doctorQueryProbe{Name: "keys only", DurationMS: 500, Rows: 58204,
+				Probe: &doctorQueryProbe{Name: "keys only", DurationMS: 3000, Rows: 58204,
 					UsesIndex: "idx_price_snapshots_station_recorded", CoveringHit: true}},
-			{Name: "predictions_latest", Table: "price_predictions", DurationMS: 8100, Rows: 60,
-				UsesIndex: "idx_price_predictions_station_fuel_target",
-				Probe: &doctorQueryProbe{Name: "rows walked", DurationMS: 3900, Rows: 3104928,
-					UsesIndex: "idx_price_predictions_station_fuel_target", CoveringHit: true}},
 			{Name: "predictions_grid", Table: "price_predictions", DurationMS: 1200, Rows: 30248,
 				UsesIndex: "idx_price_predictions_station_fuel_target",
 				Probe:     &doctorQueryProbe{Name: "keys only", DurationMS: 180, Rows: 30248, CoveringHit: true}},
@@ -280,37 +277,29 @@ func TestDashboardFindingsNameTheStructuralCosts(t *testing.T) {
 	joined := renderFindings(findings)
 
 	for _, want := range []string{
-		// The newest-run aggregate has to be reported as what the probe
-		// measured — the lookups — and not as the row count, which the probe
-		// shows to be the cheap part.
-		"walks 3,104,928 index entries in 3900 ms but takes 8100 ms in total",
-		"run_id is not among idx_price_predictions_station_fuel_target's columns",
-		"about 1 µs each",
-		"An index carrying run_id would answer this from the index alone",
-		// The unbounded read is the separate half, and stays a note.
-		"every prediction the scope accumulated over the 30-day retention window",
-		"bounds station and fuel but nothing in time",
 		// The snapshot read's row lookups, priced against a covering index.
 		"fetching is_open/e5/e10/diesel from table rows",
+		"about 7 µs each",
 		"idx_price_predictions_accuracy did for the accuracy page",
-		// The unindexed cities scan.
-		"cities (120,000 rows) with no index",
-		// The grid filtered in PHP rather than in SQL.
-		"PHP then discards every row that is not from that station's newest run",
+		// The typeahead scan no index can remove.
+		"city_search reads all 120,000 rows of cities on every keystroke",
+		"a column inside a function cannot be seeked",
+		// The grid reduced in PHP rather than in SQL.
+		"PHP then reduces them to the newest run per station and fuel",
 		// The bounding box overshooting the radius.
 		"bounding box admits 120 stations for the 20",
-		"dashboard page SQL total 12740 ms; slowest predictions_latest",
+		"dashboard page SQL total 4735 ms; slowest snapshots",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("findings are missing %q:\n%s", want, joined)
 		}
 	}
 	for _, finding := range findings {
-		if strings.Contains(finding.Message, "index entries in") && finding.Severity != "warn" {
-			t.Errorf("four seconds of row lookups is a warning, got %q", finding.Severity)
+		if strings.Contains(finding.Message, "fetching is_open") && finding.Severity != "warn" {
+			t.Errorf("nearly three seconds of row lookups is a warning, got %q", finding.Severity)
 		}
 	}
-	// Seek-rate latency earns the extra sentence; a cache hit must not get it.
+	// Seek latency earns the extra sentence; a cache hit must not get it.
 	if strings.Contains(joined, "not staying in the buffer pool") {
 		t.Errorf("1 µs per lookup is a cache hit, not a seek:\n%s", joined)
 	}
@@ -318,22 +307,23 @@ func TestDashboardFindingsNameTheStructuralCosts(t *testing.T) {
 
 func TestDashboardFindingsCallOutSeekLatency(t *testing.T) {
 	opts := dashboardOptions(doctorDashboardFilters{City: "berlin", RadiusKM: 5, Fuel: "all"})
-	// The production shape: walking the index entries is nearly free, and the
-	// whole cost is one lookup per entry at seek latency.
+	// A lookup-bound read where each lookup costs a seek rather than a cache
+	// hit. Reducing the row count is the wrong fix for this and the finding has
+	// to say so, whichever query it lands on.
 	dash := &doctorDashboard{
 		Filters: opts.Dashboard,
 		Scope:   doctorDashboardScope{Candidates: 10, Stations: 8, Selected: 8, CityFound: true},
 		Queries: []doctorQuery{
-			{Name: "predictions_latest", Table: "price_predictions", DurationMS: 181085, Rows: 23,
-				UsesIndex: "idx_price_predictions_station_fuel_target",
-				Probe: &doctorQueryProbe{Name: "rows walked", DurationMS: 256, Rows: 610978,
-					UsesIndex: "idx_price_predictions_station_fuel_target"}},
+			{Name: "snapshots", Table: "price_snapshots", DurationMS: 30256, Rows: 100000,
+				UsesIndex: "idx_price_snapshots_station_recorded",
+				Probe: &doctorQueryProbe{Name: "keys only", DurationMS: 256, Rows: 100000,
+					UsesIndex: "idx_price_snapshots_station_recorded", CoveringHit: true}},
 		},
 	}
-	joined := renderFindings(doctorDashboardFindings(dash, []doctorTable{{Name: "price_predictions", Rows: 6_908_248}}, opts))
+	joined := renderFindings(doctorDashboardFindings(dash, []doctorTable{{Name: "price_snapshots", Rows: 8_670_000}}, opts))
 	for _, want := range []string{
-		"walks 610,978 index entries in 256 ms but takes 181085 ms in total",
-		"about 296 µs each",
+		"spends 30000 ms of its 30256 ms",
+		"about 300 µs each",
 		"That is seek latency rather than a cache hit, so the table is not staying in the buffer pool",
 	} {
 		if !strings.Contains(joined, want) {
@@ -560,14 +550,14 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 			"ps.station_id IN (",
 			"ORDER BY ps.recorded_at ASC, ps.station_id ASC",
 		},
-		"predictions_latest": {
-			"MAX(pr.run_at) AS max_run_at",
-			"GROUP BY pp.station_id, pp.fuel",
-		},
 		"predictions_grid": {
 			"pp.predicted_price, pp.confidence, pr.run_at, pr.suggestion_bias",
 			"AND pp.target_start > :pred_now",
 			"ORDER BY pp.target_start ASC, pp.station_id ASC",
+			// run_id is what lets the page reduce these rows to the newest run
+			// without the second query that used to aggregate over the whole
+			// retention window.
+			"pp.run_id",
 		},
 	}
 
@@ -612,11 +602,23 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	}
 	// The page's fuel filter expands to three fuels, which is three times the
 	// prediction rows; both prediction queries must carry the expansion.
-	for _, name := range []string{"predictions_latest", "predictions_grid"} {
+	for _, name := range []string{"predictions_grid"} {
 		if !strings.Contains(specs[name].sql, "pp.fuel IN (?, ?, ?)") {
 			t.Errorf("doctor's %s query does not expand --fuel all to three fuels:\n%s", name, specs[name].sql)
 		}
 	}
+	// The query this replaced cost 158 s on production because it bounded
+	// station and fuel but nothing in time. Neither side may grow it back.
+	for _, gone := range []string{"MAX(pr.run_at)", "max_run_at"} {
+		if strings.Contains(php, gone) {
+			t.Errorf("web/index.php has regrown the unbounded newest-run aggregate (%q); "+
+				"the newest run is derived from the grid rows instead", gone)
+		}
+	}
+	if _, ok := specs["predictions_latest"]; ok {
+		t.Error("doctor still measures a predictions_latest query the page no longer issues")
+	}
+
 	// The freshness constant is mirrored on both sides; predictions_test.go
 	// guards the PHP literal, this guards that doctor applies it as a bound.
 	if got := specs["scope_stations"].args[len(specs["scope_stations"].args)-1]; got != "2026-08-19T12:00:00Z" {
@@ -638,8 +640,6 @@ func TestRunDoctorDashboardEndToEnd(t *testing.T) {
 		"scope_stations",
 		"snapshots",
 		"probe/keys only",
-		"predictions_latest",
-		"probe/rows walked",
 		"predictions_grid",
 	} {
 		if !strings.Contains(out, want) {
@@ -684,8 +684,8 @@ func TestRunDoctorDashboardEndToEnd(t *testing.T) {
 			probed++
 		}
 	}
-	if probed != 3 {
-		t.Errorf("%d queries carry a probe, want the 3 that have one", probed)
+	if probed != 2 {
+		t.Errorf("%d queries carry a probe, want the 2 that have one", probed)
 	}
 }
 

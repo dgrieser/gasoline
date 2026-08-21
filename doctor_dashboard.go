@@ -300,35 +300,23 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 	}
 	predWhere := "pp.station_id IN (" + stationIn + ") AND pp.fuel IN (" + fuelIn + ")"
 
-	specs = append(specs, dashboardQuerySpec{
-		name:    "predictions_latest",
-		purpose: "newest run per station and fuel (loadFilteredPredictions)",
-		sql: "SELECT pp.station_id, pp.fuel, MAX(pr.run_at) AS max_run_at " +
-			"FROM price_predictions pp JOIN prediction_runs pr ON pr.id = pp.run_id " +
-			"WHERE " + predWhere + " GROUP BY pp.station_id, pp.fuel",
-		args:  predArgs,
-		table: "price_predictions",
-		alias: "pp",
-		probe: &dashboardProbeSpec{
-			name:    "rows walked",
-			purpose: "how many stored predictions the aggregate above reduces to one row per station and fuel",
-			sql:     "SELECT 1 FROM price_predictions pp WHERE " + predWhere,
-			args:    predArgs,
-			alias:   "pp",
-		},
-	})
-
 	// The page binds RFC3339 with a numeric offset here, which is what it
 	// compares against target_start values stored with a trailing Z. Mirroring
 	// the format keeps doctor's row counts equal to the page's.
+	//
+	// This is the only prediction query left. There used to be a second one
+	// resolving the newest run per station and fuel, which bounded station and
+	// fuel but nothing in time and so aggregated over the whole retention
+	// window; doctor measured it at 158 s against 612,665 rows on production and
+	// the page now derives the same answer from these rows instead.
 	nowBound := qc.Now.UTC().Format("2006-01-02T15:04:05-07:00")
 	gridArgs := append(append([]any{}, predArgs...), nowBound)
 	gridWhere := predWhere + " AND pp.target_start > ?"
 	gridOrder := " ORDER BY pp.target_start ASC, pp.station_id ASC"
 	specs = append(specs, dashboardQuerySpec{
 		name:    "predictions_grid",
-		purpose: "future forecast windows for the scope, filtered to the newest run in PHP",
-		sql: "SELECT pp.station_id, pp.fuel, pp.target_start, pp.target_end, " +
+		purpose: "future forecast windows for the scope, reduced to the newest run per station in PHP",
+		sql: "SELECT pp.station_id, pp.fuel, pp.run_id, pp.target_start, pp.target_end, " +
 			"pp.predicted_price, pp.confidence, pr.run_at, pr.suggestion_bias " +
 			"FROM price_predictions pp JOIN prediction_runs pr ON pr.id = pp.run_id " +
 			"WHERE " + gridWhere + gridOrder,
@@ -777,10 +765,10 @@ func doctorDashboardFindings(dash *doctorDashboard, tables []doctorTable, opts d
 		if q.DurationMS >= opts.SlowMS {
 			warn("dashboard query %s took %.0f ms (%s)", q.Name, q.DurationMS, q.Purpose)
 		}
-		// The two cities queries have no index to use by construction, so
-		// dashboardCityFindings covers them in one finding rather than having
-		// the generic verdicts report the same scan twice.
-		if q.Table == "cities" {
+		// city_search can never seek, whatever the schema says, so
+		// dashboardTypeaheadFinding reports it structurally rather than having
+		// the generic verdicts describe the same scan twice.
+		if q.Name == "city_search" {
 			continue
 		}
 		switch {
@@ -794,7 +782,7 @@ func doctorDashboardFindings(dash *doctorDashboard, tables []doctorTable, opts d
 		}
 	}
 
-	findings = append(findings, dashboardCityFindings(byName, rowsByTable, opts)...)
+	findings = append(findings, dashboardTypeaheadFinding(byName, rowsByTable)...)
 	findings = append(findings, dashboardSnapshotFindings(byName, opts)...)
 	findings = append(findings, dashboardPredictionFindings(byName, opts)...)
 
@@ -807,40 +795,30 @@ func doctorDashboardFindings(dash *doctorDashboard, tables []doctorTable, opts d
 	return findings
 }
 
-// dashboardCityFindings covers the two queries against cities. Neither has an
-// index to use: normalized_name is not indexed, and the typeahead wraps it in
-// LOWER() besides, so both read the whole table on every dashboard load.
-func dashboardCityFindings(byName map[string]doctorQuery, rowsByTable map[string]int64, opts doctorOptions) []doctorFinding {
-	var findings []doctorFinding
-	cityRows := rowsByTable["cities"]
-	scanning := []string{}
-	slow := false
-	for _, name := range []string{"city", "city_search"} {
-		q, ok := byName[name]
-		if !ok || q.Error != "" || !(q.FullScan || q.UsesIndex == "") {
-			continue
-		}
-		scanning = append(scanning, name)
-		if q.DurationMS >= opts.SlowMS {
-			slow = true
-		}
-	}
-	if len(scanning) == 0 {
+// dashboardTypeaheadFinding covers the city dropdown's search, which is the one
+// dashboard query no index can help. It matches on LOWER(normalized_name), and
+// wrapping the column in a function rules out a seek whatever indexes exist — so
+// this is reported from the shape of the query rather than from the plan, which
+// otherwise stops mentioning it the moment idx_cities_normalized is installed
+// and the scan merely moves from the table to the index.
+func dashboardTypeaheadFinding(byName map[string]doctorQuery, rowsByTable map[string]int64) []doctorFinding {
+	q, ok := byName["city_search"]
+	if !ok || q.Error != "" {
 		return nil
 	}
-	// Below the threshold doctor uses everywhere else, scanning is often the
-	// cheapest plan and saying so would bury the findings that matter.
+	cityRows := rowsByTable["cities"]
+	// Below the threshold doctor uses everywhere else, reading the whole thing
+	// is often the cheapest plan and saying so would bury what matters.
 	severity := "info"
-	if cityRows >= 100_000 || slow {
+	if cityRows >= 100_000 {
 		severity = "warn"
 	}
-	findings = append(findings, doctorFinding{
+	return []doctorFinding{{
 		Severity: severity,
-		Message: fmt.Sprintf("%s %s cities (%s rows) with no index: normalized_name is not indexed, and the typeahead wraps it in LOWER() as well. "+
-			"`gasoline import cities` grows this table, so what is a cheap scan on a hand-fed install is not on a country-wide one",
-			strings.Join(scanning, " and "), plural(len(scanning), "reads", "each read"), formatCount(cityRows)),
-	})
-	return findings
+		Message: fmt.Sprintf("city_search reads all %s rows of cities on every keystroke past the third: it matches on LOWER(normalized_name), and a column inside a function cannot be seeked, "+
+			"so no index removes this scan. `gasoline import cities` grows this table, so what is cheap on a hand-fed install is not on a country-wide one",
+			formatCount(cityRows)),
+	}}
 }
 
 // dashboardSnapshotFindings prices the snapshot history read, which is the query
@@ -871,10 +849,10 @@ func dashboardSnapshotFindings(byName map[string]doctorQuery, opts doctorOptions
 	}
 	findings = append(findings, doctorFinding{
 		Severity: severity,
-		Message: fmt.Sprintf("snapshots spends %.0f ms of its %.0f ms fetching is_open/e5/e10/diesel from table rows: %s stops at (station_id, recorded_at), so each of the %s matching rows costs a second lookup, about %.0f µs each. "+
+		Message: fmt.Sprintf("snapshots spends %.0f ms of its %.0f ms fetching is_open/e5/e10/diesel from table rows: %s stops at (station_id, recorded_at), so each of the %s matching rows costs a second lookup, %s. "+
 			"An index carrying those four columns would make this read index-only, which is what idx_price_predictions_accuracy did for the accuracy page",
 			lookups, q.DurationMS, indexOrPlan(q), formatCount(int64(q.Rows)),
-			perLookupMicros(lookups, q.Rows)),
+			lookupRate(lookups, q.Rows)),
 	})
 	return findings
 }
@@ -886,45 +864,10 @@ func dashboardSnapshotFindings(byName map[string]doctorQuery, opts doctorOptions
 func dashboardPredictionFindings(byName map[string]doctorQuery, opts doctorOptions) []doctorFinding {
 	var findings []doctorFinding
 
-	if q, ok := byName["predictions_latest"]; ok && q.Error == "" {
-		probe := q.Probe
-		if probe != nil && probe.Error == "" && probe.Rows > q.Rows {
-			walked := int64(probe.Rows)
-			// Lead with what the probe measured, not with the row count. The
-			// two are not the same finding and the difference decides the fix:
-			// walking the index entries is usually cheap, and where the time
-			// actually goes is the run_id the index does not carry, fetched
-			// once per entry from the table row.
-			lookups := q.DurationMS - probe.DurationMS
-			if severity, report := lookupSeverity(lookups, q.DurationMS, opts.SlowMS); report {
-				perLookup := perLookupMicros(lookups, probe.Rows)
-				message := fmt.Sprintf("predictions_latest walks %s index entries in %.0f ms but takes %.0f ms in total: run_id is not among %s's columns, "+
-					"so every entry costs a lookup into the price_predictions row, about %.0f µs each",
-					formatCount(walked), probe.DurationMS, q.DurationMS, indexOrPlan(q), perLookup)
-				// A few microseconds is a buffer-pool hit; hundreds is a seek,
-				// and then the table has outgrown the cache and no rewrite of
-				// this query alone will hide that.
-				if perLookup >= 50 {
-					message += ". That is seek latency rather than a cache hit, so the table is not staying in the buffer pool"
-				}
-				message += ". An index carrying run_id would answer this from the index alone"
-				findings = append(findings, doctorFinding{Severity: severity, Message: message})
-			}
-			// Why there are that many entries in the first place, which is the
-			// separate half of the problem: nothing bounds the query in time.
-			findings = append(findings, doctorFinding{
-				Severity: "info",
-				Message: fmt.Sprintf("those %s entries are every prediction the scope accumulated over the %d-day retention window, reduced to %d rows — "+
-					"one per station and fuel. predictions_latest bounds station and fuel but nothing in time, so only the newest run's rows are used and all of them are read",
-					formatCount(walked), predictionRetentionDays, q.Rows),
-			})
-		}
-	}
-
 	if q, ok := byName["predictions_grid"]; ok && q.Error == "" && q.Rows > 0 {
 		findings = append(findings, doctorFinding{
 			Severity: "info",
-			Message: fmt.Sprintf("predictions_grid returns %s future windows for the whole scope and PHP then discards every row that is not from that station's newest run — the run filter is applied after the rows are transferred, not in SQL",
+			Message: fmt.Sprintf("predictions_grid returns %s future windows for the whole scope and PHP then reduces them to the newest run per station and fuel — the run filter is applied after the rows are transferred, not in SQL",
 				formatCount(int64(q.Rows))),
 		})
 		if probe := q.Probe; probe != nil && probe.Error == "" && !q.CoveringHit {
@@ -932,8 +875,8 @@ func dashboardPredictionFindings(byName map[string]doctorQuery, opts doctorOptio
 			if severity, report := lookupSeverity(lookups, q.DurationMS, opts.SlowMS); report {
 				findings = append(findings, doctorFinding{
 					Severity: severity,
-					Message: fmt.Sprintf("predictions_grid spends %.0f ms of its %.0f ms on the row lookups and the prediction_runs join that %s cannot satisfy, about %.0f µs per row",
-						lookups, q.DurationMS, indexOrPlan(q), perLookupMicros(lookups, q.Rows)),
+					Message: fmt.Sprintf("predictions_grid spends %.0f ms of its %.0f ms on the row lookups and the prediction_runs join that %s cannot satisfy, %s",
+						lookups, q.DurationMS, indexOrPlan(q), lookupRate(lookups, q.Rows)),
 				})
 			}
 		}
@@ -970,6 +913,23 @@ func perLookupMicros(lookupsMS float64, rows int) float64 {
 		return 0
 	}
 	return lookupsMS * 1000 / float64(rows)
+}
+
+// dashboardSeekMicros is where a per-lookup cost stops looking like a cache hit.
+// Above it the table is being read from disk a row at a time, and then reducing
+// the row count is treating a symptom.
+const dashboardSeekMicros = 50
+
+// lookupRate renders the per-lookup cost, and says so when it is seek latency
+// rather than a cache hit — the two want different fixes, so the distinction is
+// worth a sentence wherever a finding reports lookups at all.
+func lookupRate(lookupsMS float64, rows int) string {
+	perLookup := perLookupMicros(lookupsMS, rows)
+	out := fmt.Sprintf("about %.0f µs each", perLookup)
+	if perLookup >= dashboardSeekMicros {
+		out += ". That is seek latency rather than a cache hit, so the table is not staying in the buffer pool"
+	}
+	return out
 }
 
 // indexOrPlan names the index a query took, or says there was none, so a

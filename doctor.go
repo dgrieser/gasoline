@@ -63,10 +63,10 @@ var doctorTables = []string{
 	"prediction_runs",
 	"price_snapshots",
 	"stations",
-	// cities carries no index beyond its primary key, which is the point: the
-	// dashboard resolves its city filter against normalized_name on every load
-	// and `gasoline import cities` can grow this table by five orders of
-	// magnitude, so its row count belongs in the report.
+	// cities is here because the dashboard resolves its city filter against it
+	// on every load and `gasoline import cities` can grow it by five orders of
+	// magnitude, so both its row count and whether idx_cities_normalized is
+	// present belong in the report.
 	"cities",
 }
 
@@ -91,6 +91,7 @@ func doctorExpectedIndexes(d dialect) map[string][]string {
 			"idx_price_snapshots_city_recorded",
 		},
 		"stations": {"idx_stations_lat_lng"},
+		"cities":   {"idx_cities_normalized"},
 	}
 	if d != dialectMySQL {
 		expected["price_predictions"] = append(expected["price_predictions"], "idx_price_predictions_run")

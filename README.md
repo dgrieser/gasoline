@@ -420,7 +420,7 @@ If forcing the covering index is much faster, the optimizer is mis-costing it. R
 
 #### Why the dashboard is slow (`doctor dashboard`)
 
-The dashboard is slow for different reasons than the accuracy page, so it gets its own mirror of its own SQL. A load issues six queries, and `doctor dashboard` reproduces all of them — including the station list the page inlines into `IN (...)`, because the length of that list is part of the cost:
+The dashboard is slow for different reasons than the accuracy page, so it gets its own mirror of its own SQL. A load issues five queries, and `doctor dashboard` reproduces all of them — including the station list the page inlines into `IN (...)`, because the length of that list is part of the cost:
 
 | query | what the page does with it |
 | --- | --- |
@@ -428,8 +428,7 @@ The dashboard is slow for different reasons than the accuracy page, so it gets i
 | `city_search` | the city dropdown's typeahead, measured with the first three letters of the selected city |
 | `scope_stations` | the stations inside the radius that are still being fed (`loadScopeStations`) |
 | `snapshots` | the price history the chart and table are drawn from (`buildSnapshotQuery`) |
-| `predictions_latest` | the newest run per station and fuel (`loadFilteredPredictions`) |
-| `predictions_grid` | the future forecast windows for the scope, filtered to the newest run in PHP |
+| `predictions_grid` | the future forecast windows for the scope, reduced to the newest run per station in PHP (`loadFilteredPredictions`) |
 
 Its flags mirror the page's own controls, so you can reproduce the load that felt slow in the browser:
 
@@ -461,27 +460,38 @@ dashboard queries: city=Lübbecke (auto), radius=5 km, fuel=all (e5+e10+diesel),
     probe/keys only       52.5 ms    40290 rows  covering idx_price_predictions_station_fuel_target
 ```
 
-Those are real numbers from a production MySQL 8.4, and they are the reason the probes exist. One query is 99.87% of the load — and the probe beside it shows that reading its 610,978 rows takes 256 ms, so the row count is *not* what costs three minutes.
+Those are real numbers from a production MySQL 8.4, taken **before** the fix below, and they are the reason the probes exist. One query was 99.87% of the load — and the probe beside it showed that reading its 610,978 rows took 256 ms, so the row count was *not* what cost three minutes. `predictions_latest` no longer exists; see [what this found](#what-doctor-dashboard-found-and-what-was-done-about-it).
 
 ##### Probes: what a query's time is actually spent on
 
 A verdict of `covering <index>` or a bare index name says which index was used, but not why a query that used the right index still took three seconds. The `probe/` lines answer that. Each is the same query with a narrower projection, run alongside the real one:
 
 - **`probe/keys only`** projects just the indexed columns. The query and the probe read exactly the same rows via exactly the same index, so the difference between their timings is what fetching the *unindexed* columns from table rows costs. When that difference is most of the query's time, an index carrying those columns would make the read index-only — which is precisely what `idx_price_predictions_accuracy` did for the accuracy page.
-- **`probe/rows walked`** counts the rows an aggregate reduces, and how long walking them takes. `predictions_latest` returns one row per station and fuel; the probe says how many stored predictions it walked to get there and what that walk alone cost.
+- **`probe/rows walked`** counts the rows an aggregate reduces, and how long walking them takes — so an aggregate returning a handful of rows off millions can be told apart from one that is genuinely cheap.
 
 Where a probe shows the query paying for something its index could have carried, the finding also reports the cost **per row** in microseconds. That is the number that decides the fix: a few microseconds per lookup is a buffer-pool hit and the row count is the thing to reduce; hundreds of microseconds is a disk seek, and then the table has outgrown the cache and rewriting one query will not hide it.
 
 Probes are read-only and cost roughly one extra read each. `--probe=false` turns them off, and the report then says it cannot account for where the time went.
 
-##### The three findings this produces
+##### The findings this produces
 
-- **`predictions_latest` pays a table lookup per index entry.** `idx_price_predictions_station_fuel_target` is `(station_id, fuel, target_start)`; an InnoDB secondary index appends the primary key, not `run_id`. So the join to `prediction_runs` needs `run_id` from a table row for every entry the query walks. On the production run above that is 610,978 lookups at ~296 µs each, which is seek latency rather than a cache hit. An index carrying `run_id` would answer the query from the index alone.
-  The reason there are that many entries is a second, separate problem: the query bounds station and fuel but nothing in time, so it reads every prediction the scope has accumulated over the 30 days predictions are kept, though only the newest run's rows are used. That half scales with how often `suggest --persist` runs, not with anything the visitor chose, so no date filter or smaller radius touches it.
-- **`snapshots` pays for a row lookup per row.** `idx_price_snapshots_station_recorded` stops at `(station_id, recorded_at)`, and the projection needs `is_open`, `e5`, `e10` and `diesel`, so every matching row costs a second lookup into the table. The probe prices it. This one *does* scale with the date filter and the radius — and on a scope this small it is single-digit milliseconds, which is why the finding needs an absolute floor and not just a share of the query.
-- **`cities` has no index to use.** The dashboard resolves its city filter against `normalized_name`, which carries no index, and the typeahead wraps it in `LOWER()` besides — so both read the whole table on every load. On a hand-fed install that is a few rows; after `gasoline import cities DE` it is the whole of a country's populated places.
+- **A query paying a table lookup per index entry.** Where the probe reads the same rows through the same index far faster than the query does, the gap is the columns the index does not carry, fetched a row at a time. The finding names the index, the gap, and the per-lookup rate.
+- **`snapshots` is the standing example.** `idx_price_snapshots_station_recorded` stops at `(station_id, recorded_at)`, and the projection needs `is_open`, `e5`, `e10` and `diesel`, so every matching row costs a second lookup into the table. This scales with the date filter and the radius — and on a small scope it is single-digit milliseconds, which is why the finding needs an absolute floor and not just a share of the query.
+- **`city_search` scans whatever the schema says.** It matches on `LOWER(normalized_name)`, and a column inside a function cannot be seeked, so no index removes the scan — installing `idx_cities_normalized` just moves it from the table to the index. This one is reported from the shape of the query rather than from the plan, precisely so it does not fall silent when that happens.
 
-`predictions_grid` gets a note rather than a finding: it returns every future window for the scope and PHP then discards the rows that are not from that station's newest run, so the run filter is applied after the rows have crossed the wire. It is bounded by `target_start > now`, so it is smaller than `predictions_latest` by roughly the ratio of the forecast horizon to the retention window.
+`predictions_grid` gets a note, not a finding: it returns every future window for the scope and PHP reduces them to the newest run per station afterwards, so the run filter lands after the rows have crossed the wire. It is bounded by `target_start > now`, which is what keeps it small.
+
+#### What `doctor dashboard` found, and what was done about it
+
+The production run above is what this command exists to produce, so it is worth recording what it changed.
+
+**`predictions_latest` was deleted.** `loadFilteredPredictions` used to resolve the newest run per station and fuel with its own aggregate over `price_predictions`, bounded by station and fuel but not in time — so it read every prediction the scope had accumulated across the whole retention window to produce a couple of dozen rows. That was 158 of the page's 158.5 seconds. The probe is what identified the cause: walking those 612,665 index entries took 262 ms, and the rest was one lookup into the 1.5 GB clustered index per entry, at ~258 µs each, to fetch the `run_id` that `(station_id, fuel, target_start)` does not carry. The page now takes the maximum `run_id` from the forecast-grid rows it already reads, so the answer comes out of one query instead of two and the aggregate is gone.
+
+Two things changed with it, both improvements. Runs are compared by `run_id` rather than by `run_at`, so two runs recorded in the same second no longer both count as newest. And a station the newest run stored no future window for — too little history to forecast it, say — now shows the most recent run that did cover it, where before it showed nothing at all. `web_picker_test.php` pins both.
+
+**`idx_cities_normalized` was added.** `resolveCity` runs on every dashboard load and matched `normalized_name`, which had no index; where `import cities` had loaded a country's populated places that was a 54,280-row scan, twice per load. `gasoline migrate` adds it — small and quick, unlike the accuracy index.
+
+**A covering index for `snapshots` was measured and deliberately not added.** The probe prices its row lookups at ~5 ms of an 8 ms query, about 2 µs each: a lot of cheap buffer-pool reads. An index carrying the four price columns would remove them, at the cost of tens of megabytes and slower `update` writes, to save five milliseconds. `doctor` reports it as information rather than a warning for exactly that reason. Re-measure with a wider radius and date range, or once the finding escalates to a warning, and reconsider then.
 
 #### Reclaiming space after a large prune (`--optimize`)
 

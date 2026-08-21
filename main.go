@@ -3568,6 +3568,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migratePredictionsAccuracyIndex(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateCitiesNormalizedIndex(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migrateSeedDefaultSettings(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -3705,6 +3708,32 @@ func migratePredictionsAccuracyIndex(ctx context.Context, tx *sql.Tx, d dialect,
 		return err
 	}
 	result.Applied = append(result.Applied, "price_predictions.idx_price_predictions_accuracy")
+	return nil
+}
+
+// migrateCitiesNormalizedIndex adds the index the dashboard's city filter needs
+// to pre-existing installs. resolveCity in the viewer looks a city up by
+// normalized_name on every dashboard load, and without this index that is a full
+// scan — cheap on a hand-fed install, and not on one where `import cities` has
+// loaded a country's populated places. Unlike the accuracy index this one is
+// small and quick to build: the table holds one row per known place, not one per
+// prediction.
+func migrateCitiesNormalizedIndex(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasIndex, err := tableHasIndex(ctx, tx, d, "cities", "idx_cities_normalized")
+	if err != nil {
+		return err
+	}
+	if hasIndex {
+		return nil
+	}
+	stmt := `CREATE INDEX idx_cities_normalized ON cities(normalized_name)`
+	if d == dialectMySQL {
+		stmt = `ALTER TABLE cities ADD INDEX idx_cities_normalized (normalized_name)`
+	}
+	if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		return err
+	}
+	result.Applied = append(result.Applied, "cities.idx_cities_normalized")
 	return nil
 }
 

@@ -312,6 +312,11 @@ func openMySQL(ctx context.Context, dsn string) (*sql.DB, error) {
 // (MySQL needs bounded VARCHARs for indexed columns and does not support
 // CREATE INDEX IF NOT EXISTS, so indexes are declared inline).
 //
+// idx_cities_normalized is the other index that exists for a page rather than
+// for the CLI: the dashboard resolves its city filter against normalized_name
+// on every load, and `import cities` can grow this table from a handful of rows
+// to a whole country's populated places. Without it that filter is a full scan.
+//
 // idx_price_predictions_accuracy deserves a note: it exists solely for the
 // admin accuracy page, which runs seven aggregate passes over the same
 // (fuel, target_start range) slice of price_predictions. Its leading columns
@@ -329,7 +334,8 @@ func schemaStatements(d dialect) []string {
 				display_name TEXT NOT NULL,
 				lat DOUBLE NOT NULL,
 				lng DOUBLE NOT NULL,
-				created_at VARCHAR(64) NOT NULL
+				created_at VARCHAR(64) NOT NULL,
+				INDEX idx_cities_normalized (normalized_name)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 			`CREATE TABLE IF NOT EXISTS stations (
 				id VARCHAR(64) PRIMARY KEY,
@@ -524,6 +530,12 @@ func schemaStatements(d dialect) []string {
 			ON price_snapshots(city_name, recorded_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_stations_lat_lng
 			ON stations(lat, lng)`,
+		// idx_cities_normalized is deliberately absent here and created by
+		// migrateCitiesNormalizedIndex instead: normalized_name is younger than
+		// the cities table, so on an install that predates the column this
+		// statement would fail before the migration that adds it has run.
+		// MySQL declares it inline above, where CREATE TABLE IF NOT EXISTS makes
+		// it a no-op on an existing table rather than an error.
 		`CREATE TABLE IF NOT EXISTS users (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			email TEXT NOT NULL UNIQUE,

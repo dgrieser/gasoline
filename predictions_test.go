@@ -1144,9 +1144,9 @@ func TestEvaluateCheckOutcomesReusesFloorPerPricingDay(t *testing.T) {
 // cheapest windows — a dashboard filtered to one area almost never contains
 // them, which is exactly the bug this pins: the card read the flags and showed
 // nothing. The dashboard has to pick windows for its own scope from the stored
-// grid, mirroring the notifier's per-area picker. The picker is PHP and cannot
-// be executed here, so this checks its source against the Go constants it
-// mirrors.
+// grid, mirroring the notifier's per-area picker. This checks its source against
+// the Go constants it mirrors; its behaviour is exercised for real by
+// web_picker_test.php, which lifts the function out of the viewer and runs it.
 func TestDashboardPredictionsArePickedPerScopeNotFromGlobalFlags(t *testing.T) {
 	viewer, err := os.ReadFile(filepath.Join("web", "index.php"))
 	if err != nil {
