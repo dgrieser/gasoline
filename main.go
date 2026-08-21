@@ -1105,7 +1105,8 @@ func persistSweep(ctx context.Context, db *sql.DB, d dialect, fetches []cityFetc
 
 	for _, f := range fetches {
 		if _, err := tx.ExecContext(ctx, citiesInsertIgnoreSQL(d),
-			f.City.QueryName, f.City.Name, f.City.DisplayName, f.City.Lat, f.City.Lng, f.RecordedAt.Format(time.RFC3339),
+			f.City.QueryName, f.City.Name, citySearchKey(f.City.Name), f.City.DisplayName,
+			f.City.Lat, f.City.Lng, f.RecordedAt.Format(time.RFC3339),
 		); err != nil {
 			return err
 		}
@@ -3571,6 +3572,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 	if err := migrateCitiesNormalizedIndex(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
+	if err := migrateCitiesSearchColumn(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
 	if err := migrateSeedDefaultSettings(ctx, tx, d, &result); err != nil {
 		return migrateResult{}, err
 	}
@@ -3718,6 +3722,24 @@ func migratePredictionsAccuracyIndex(ctx context.Context, tx *sql.Tx, d dialect,
 // loaded a country's populated places. Unlike the accuracy index this one is
 // small and quick to build: the table holds one row per known place, not one per
 // prediction.
+// citySearchKey folds a city's normalized name for the dropdown's prefix search,
+// and is the only thing that writes cities.normalized_lower.
+//
+// The typeahead needs a case-insensitive prefix match. Folding inside the query
+// (LOWER(normalized_name)) rules out every index, so the folded form is stored
+// instead — which makes the fold a contract rather than an implementation
+// detail: whatever writes the column and whatever folds the search term have to
+// agree, or a city stops being findable by its own name. The viewer's half is
+// mb_strtolower, which implements the same Unicode lowercase mapping as
+// strings.ToLower; TestCitySearchKeyMatchesTheViewer pins the pairing.
+//
+// Deliberately not the engine's LOWER(): MySQL folds Ü to ü and SQLite, whose
+// lower() is ASCII-only, does not — so a generated column would have meant two
+// different answers for the same row depending on where the database lives.
+func citySearchKey(normalized string) string {
+	return strings.ToLower(normalized)
+}
+
 func migrateCitiesNormalizedIndex(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
 	hasIndex, err := tableHasIndex(ctx, tx, d, "cities", "idx_cities_normalized")
 	if err != nil {
@@ -3735,6 +3757,99 @@ func migrateCitiesNormalizedIndex(ctx context.Context, tx *sql.Tx, d dialect, re
 	}
 	result.Applied = append(result.Applied, "cities.idx_cities_normalized")
 	return nil
+}
+
+// migrateCitiesSearchColumn adds the folded search column the city typeahead
+// needs, backfills it, and indexes it. It runs after
+// migrateCitiesNormalizedName, which is what settles the normalized_name this
+// column is derived from.
+//
+// The backfill happens in Go rather than as UPDATE ... SET normalized_lower =
+// LOWER(normalized_name), because the engines disagree about what LOWER means:
+// SQLite's is ASCII-only, so on SQLite an existing "LÜBBECKE" would fold to
+// "lÜbbecke" and never be found by anyone typing its name. citySearchKey is one
+// answer for both.
+func migrateCitiesSearchColumn(ctx context.Context, tx *sql.Tx, d dialect, result *migrateResult) error {
+	hasColumn, err := tableHasColumn(ctx, tx, d, "cities", "normalized_lower")
+	if err != nil {
+		return err
+	}
+	if !hasColumn {
+		// MySQL forbids DEFAULT on TEXT columns, so use a bounded VARCHAR there.
+		columnDef := `normalized_lower TEXT NOT NULL DEFAULT ''`
+		if d == dialectMySQL {
+			columnDef = `normalized_lower VARCHAR(255) NOT NULL DEFAULT ''`
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE cities ADD COLUMN `+columnDef); err != nil {
+			return err
+		}
+		result.Applied = append(result.Applied, "cities.normalized_lower")
+	}
+
+	filled, err := backfillCitySearchKeys(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if filled > 0 {
+		result.Applied = append(result.Applied, fmt.Sprintf("cities.normalized_lower_backfill (%d rows)", filled))
+	}
+
+	hasIndex, err := tableHasIndex(ctx, tx, d, "cities", "idx_cities_search")
+	if err != nil {
+		return err
+	}
+	if !hasIndex {
+		stmt := `CREATE INDEX idx_cities_search ON cities(normalized_lower)`
+		if d == dialectMySQL {
+			stmt = `ALTER TABLE cities ADD INDEX idx_cities_search (normalized_lower)`
+		}
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+		result.Applied = append(result.Applied, "cities.idx_cities_search")
+	}
+	return nil
+}
+
+// backfillCitySearchKeys folds every row whose search key does not match its
+// normalized name. It rewrites rather than only filling blanks, so a row whose
+// normalized_name was changed by an earlier migration cannot keep a stale key.
+func backfillCitySearchKeys(ctx context.Context, tx *sql.Tx) (int, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name, normalized_name, normalized_lower FROM cities`)
+	if err != nil {
+		return 0, err
+	}
+	type stale struct {
+		name string
+		key  string
+	}
+	var pending []stale
+	for rows.Next() {
+		var name, normalized, lower string
+		if err := rows.Scan(&name, &normalized, &lower); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if want := citySearchKey(normalized); want != lower {
+			pending = append(pending, stale{name: name, key: want})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	// Written after the result set is closed: the MySQL driver speaks to one
+	// connection synchronously, so updating while these rows are open would
+	// fail the whole migration.
+	for _, row := range pending {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE cities SET normalized_lower = ? WHERE name = ?`, row.key, row.name); err != nil {
+			return 0, err
+		}
+	}
+	return len(pending), nil
 }
 
 // migrateUsersNotifyFuel adds the per-user notify_fuel column to pre-existing
@@ -4448,7 +4563,8 @@ func importCities(ctx context.Context, db *sql.DB, d dialect, cities []cachedCit
 
 	createdAt := time.Now().UTC().Format(time.RFC3339)
 	for _, city := range cities {
-		if _, err := stmt.ExecContext(ctx, city.Name, city.Name, city.DisplayName, city.Lat, city.Lng, createdAt); err != nil {
+		if _, err := stmt.ExecContext(ctx, city.Name, city.Name, citySearchKey(city.Name),
+			city.DisplayName, city.Lat, city.Lng, createdAt); err != nil {
 			return 0, err
 		}
 	}

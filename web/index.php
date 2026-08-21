@@ -3033,14 +3033,28 @@ if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
     }
     try {
         $searchPdo = gasolineConnect($dbDriver, $dbPath);
+        // Prefix match as a half-open range over the stored folded name, which
+        // is what lets idx_cities_search answer it. The alternatives both lose
+        // the index: LOWER(normalized_name) puts the column inside a function,
+        // and LIKE on a BINARY-collated column is not a range SQLite will seek.
+        //
+        // The upper bound appends the highest code point there is. Any character
+        // that could follow the prefix sorts below it, so the range covers every
+        // name starting with the prefix and nothing else — without having to
+        // increment the prefix's last code point, which is fiddly in UTF-8.
+        //
+        // mb_strtolower mirrors citySearchKey in the CLI, which is what wrote
+        // the column; plain strtolower would not, since it leaves Ü alone.
+        $prefix = mb_strtolower($q, 'UTF-8');
         $searchStmt = $searchPdo->prepare(
             "SELECT normalized_name AS city_key, display_name
              FROM cities
-             WHERE LOWER(normalized_name) LIKE :prefix
-             ORDER BY normalized_name ASC
+             WHERE normalized_lower >= :prefix AND normalized_lower < :prefix_end
+             ORDER BY normalized_lower ASC
              LIMIT 20"
         );
-        $searchStmt->bindValue(':prefix', strtolower($q) . '%');
+        $searchStmt->bindValue(':prefix', $prefix);
+        $searchStmt->bindValue(':prefix_end', $prefix . "\u{10FFFF}");
         $searchStmt->execute();
         echo json_encode($searchStmt->fetchAll(), JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
     } catch (Throwable $e) {

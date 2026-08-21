@@ -2898,9 +2898,10 @@ func seedFixtureDB(t *testing.T) string {
 		Lng:         13.395131,
 	}
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, city.QueryName, city.Name, city.DisplayName, city.Lat, city.Lng, "2026-04-02T09:00:00Z")
+		INSERT INTO cities (name, normalized_name, normalized_lower, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, city.QueryName, city.Name, citySearchKey(city.Name), city.DisplayName, city.Lat, city.Lng,
+		"2026-04-02T09:00:00Z")
 	if err != nil {
 		t.Fatalf("insert city: %v", err)
 	}
@@ -3953,5 +3954,145 @@ func TestRunUpdateTransfersOwnershipWhenATargetShrinks(t *testing.T) {
 	})
 	if owner, rows := sharedStationOwner(t, dbPath); owner != "Berlin" || rows != 1 {
 		t.Fatalf("after shrinking Potsdam: owner = %q in %d rows, want Berlin in 1", owner, rows)
+	}
+}
+
+// TestMigrateBackfillsCitySearchKeys covers the upgrade path for the typeahead's
+// folded column: an install that predates it has to come out of `migrate` with
+// every city findable, including the ones the database engine could not have
+// folded correctly itself.
+func TestMigrateBackfillsCitySearchKeys(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "cities.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	// A cities table as it stood before normalized_lower existed.
+	if _, err := db.ExecContext(ctx, `CREATE TABLE cities (
+		name TEXT PRIMARY KEY,
+		normalized_name TEXT NOT NULL,
+		display_name TEXT NOT NULL,
+		lat REAL NOT NULL,
+		lng REAL NOT NULL,
+		created_at TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("legacy cities: %v", err)
+	}
+	for _, name := range []string{"Lübbecke", "LÜBZ", "enzberg"} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO cities
+			(name, normalized_name, display_name, lat, lng, created_at)
+			VALUES (?, ?, ?, 52.0, 13.0, '2026-04-02T09:00:00Z')`, name, name, name); err != nil {
+			t.Fatalf("insert legacy city: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run([]string{"migrate", "--db", dbPath, "--output", "json"})
+	})
+	var result migrateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal migrate output: %v\noutput=%s", err, output)
+	}
+	if !containsString(result.Applied, "cities.normalized_lower") {
+		t.Fatalf("applied = %v, want the column to be added", result.Applied)
+	}
+	if !containsString(result.Applied, "cities.idx_cities_search") {
+		t.Fatalf("applied = %v, want the index to be created", result.Applied)
+	}
+	backfilled := false
+	for _, applied := range result.Applied {
+		if strings.HasPrefix(applied, "cities.normalized_lower_backfill") {
+			backfilled = true
+		}
+	}
+	if !backfilled {
+		t.Fatalf("applied = %v, want a backfill", result.Applied)
+	}
+
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	for name, want := range map[string]string{
+		"Lübbecke": "lübbecke",
+		"LÜBZ":     "lübz",
+		"enzberg":  "enzberg",
+	} {
+		var got string
+		if err := db.QueryRowContext(ctx,
+			`SELECT normalized_lower FROM cities WHERE name = ?`, name).Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if got != want {
+			t.Errorf("normalized_lower for %q = %q, want %q", name, got, want)
+		}
+	}
+
+	// The reason the backfill is Go rather than SQL: SQLite's lower() is
+	// ASCII-only, so LÜBZ would have kept an unmatchable key.
+	var sqliteFold string
+	if err := db.QueryRowContext(ctx,
+		`SELECT lower(normalized_name) FROM cities WHERE name = 'LÜBZ'`).Scan(&sqliteFold); err != nil {
+		t.Fatalf("sqlite lower: %v", err)
+	}
+	if sqliteFold == "lübz" {
+		t.Skip("this SQLite build folds beyond ASCII, so the Go backfill is belt-and-braces here")
+	}
+	if sqliteFold != "lÜbz" {
+		t.Fatalf("SQLite lower('LÜBZ') = %q, which this test's premise did not expect", sqliteFold)
+	}
+
+	// Running it again must be a no-op, not a repeated backfill.
+	output = captureStdout(t, func() error {
+		return run([]string{"migrate", "--db", dbPath, "--output", "json"})
+	})
+	var second migrateResult
+	if err := json.Unmarshal([]byte(output), &second); err != nil {
+		t.Fatalf("unmarshal second migrate: %v", err)
+	}
+	if len(second.Applied) != 0 {
+		t.Errorf("second migrate applied %v, want nothing", second.Applied)
+	}
+}
+
+// TestCityWritePathsStoreTheSearchKey covers the two statements that write
+// cities: a city cached by an update sweep, and a bulk `import cities` row.
+// Either one forgetting the folded key would leave that city unfindable.
+func TestCityWritePathsStoreTheSearchKey(t *testing.T) {
+	ctx := context.Background()
+	db, err := openDB(filepath.Join(t.TempDir(), "writes.db"))
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, citiesInsertIgnoreSQL(dialectSQLite),
+		"Lübbecke, Germany", "Lübbecke", citySearchKey("Lübbecke"), "Lübbecke, Germany",
+		52.3, 8.6, "2026-04-02T09:00:00Z"); err != nil {
+		t.Fatalf("insert-ignore: %v", err)
+	}
+	if _, err := importCities(ctx, db, dialectSQLite, []cachedCity{
+		{Name: "Uchte", DisplayName: "Uchte, Germany", Lat: 52.5, Lng: 8.9},
+	}); err != nil {
+		t.Fatalf("importCities: %v", err)
+	}
+
+	for name, want := range map[string]string{"Lübbecke": "lübbecke", "Uchte": "uchte"} {
+		var got string
+		if err := db.QueryRowContext(ctx,
+			`SELECT normalized_lower FROM cities WHERE normalized_name = ?`, name).Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if got != want {
+			t.Errorf("%s stored normalized_lower %q, want %q", name, got, want)
+		}
 	}
 }

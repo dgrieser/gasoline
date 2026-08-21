@@ -91,7 +91,9 @@ func doctorExpectedIndexes(d dialect) map[string][]string {
 			"idx_price_snapshots_city_recorded",
 		},
 		"stations": {"idx_stations_lat_lng"},
-		"cities":   {"idx_cities_normalized"},
+		// Both cities indexes serve the dashboard: one its city filter, the
+		// other its typeahead.
+		"cities": {"idx_cities_normalized", "idx_cities_search"},
 	}
 	if d != dialectMySQL {
 		expected["price_predictions"] = append(expected["price_predictions"], "idx_price_predictions_run")
