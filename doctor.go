@@ -14,18 +14,24 @@ import (
 	"time"
 )
 
-// doctor inspects a live database instead of changing it: what the prediction
-// tables cost, which indexes exist, which stations are still in scope, and — the
-// part that matters for the admin accuracy page — what the planner actually does
-// with that page's queries and how long each one takes. Everything it runs is
+// doctor inspects a live database instead of changing it: what the tables cost,
+// which indexes exist, which stations are still in scope, and — the part that
+// answers "why is this page slow" — what the planner actually does with one
+// web page's queries and how long each one takes. Everything it runs is
 // read-only, so it is safe against production.
 //
-// The single exception is --optimize, which rebuilds tables to hand freed pages
-// back to the filesystem. It writes, it is opt-in, and it runs after every
-// measurement so the report still describes the database as it was found.
+// Which page is measured is a subcommand (resolveDoctorPages): bare `doctor`
+// measures the admin accuracy page, `doctor dashboard` the dashboard, and
+// `doctor all` both. A page's section costs about what one load of that page
+// costs, which is why it is asked for by name rather than measured every time.
+// The dashboard's half lives in doctor_dashboard.go.
+//
+// The single exception to read-only is --optimize, which rebuilds tables to hand
+// freed pages back to the filesystem. It writes, it is opt-in, and it runs after
+// every measurement so the report still describes the database as it was found.
 //
 // The queries live here rather than being read out of web/index.php because
-// the page builds them in PHP. accuracyQuerySpecs documents that duplication
+// the page builds them in PHP. accuracyQuerySpecsFor documents that duplication
 // and TestDoctorAccuracyQueriesMatchViewer guards it against drift.
 
 // datePattern matches the YYYY-MM-DD form --from/--to accept, mirroring the
@@ -57,6 +63,11 @@ var doctorTables = []string{
 	"prediction_runs",
 	"price_snapshots",
 	"stations",
+	// cities is here because the dashboard resolves its city filter against it
+	// on every load and `gasoline import cities` can grow it by five orders of
+	// magnitude, so both its row count and whether idx_cities_normalized is
+	// present belong in the report.
+	"cities",
 }
 
 // doctorExpectedIndexes lists the indexes schemaStatements installs, so doctor
@@ -80,6 +91,7 @@ func doctorExpectedIndexes(d dialect) map[string][]string {
 			"idx_price_snapshots_city_recorded",
 		},
 		"stations": {"idx_stations_lat_lng"},
+		"cities":   {"idx_cities_normalized"},
 	}
 	if d != dialectMySQL {
 		expected["price_predictions"] = append(expected["price_predictions"], "idx_price_predictions_run")
@@ -96,7 +108,11 @@ type doctorResult struct {
 	Optimize *doctorOptimize `json:"optimize,omitempty"`
 	Filters  doctorFilters   `json:"filters"`
 	Queries  []doctorQuery   `json:"queries"`
-	Findings []doctorFinding `json:"findings"`
+	// Dashboard is the dashboard page's measurements, present only when that
+	// page was selected. The accuracy page's live in Queries above; the two
+	// pages share nothing but the schema, so they are reported apart.
+	Dashboard *doctorDashboard `json:"dashboard,omitempty"`
+	Findings  []doctorFinding  `json:"findings"`
 }
 
 type doctorDatabase struct {
@@ -286,6 +302,24 @@ type doctorQuery struct {
 	// --try-index. It answers "would a different index choice actually be
 	// faster here" with a measurement rather than a guess.
 	Hinted *doctorQueryHint `json:"hinted,omitempty"`
+	// Probe is a derived measurement of part of this query's cost, used by the
+	// dashboard checks; see dashboardProbeSpec.
+	Probe *doctorQueryProbe `json:"probe,omitempty"`
+}
+
+// doctorQueryProbe is one derived, read-only measurement taken beside a query:
+// the same access path with a narrower projection, so the gap between the two
+// prices whatever the narrower one leaves out.
+type doctorQueryProbe struct {
+	Name        string   `json:"name"`
+	Purpose     string   `json:"purpose"`
+	SQL         string   `json:"sql"`
+	DurationMS  float64  `json:"duration_ms"`
+	Rows        int      `json:"rows"`
+	Plan        []string `json:"plan"`
+	UsesIndex   string   `json:"uses_index"`
+	CoveringHit bool     `json:"covering"`
+	Error       string   `json:"error,omitempty"`
 }
 
 type doctorQueryHint struct {
@@ -820,14 +854,30 @@ func indexSizes(ctx context.Context, q queryer, d dialect, table string) map[str
 // No column layout is assumed: SQLite returns four fixed columns, MySQL a
 // dozen that vary by version, and EXPLAIN ANALYZE a single text blob.
 func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args []any, analyze bool) ([]string, []map[string]string, error) {
-	prefix := "EXPLAIN QUERY PLAN "
-	if d == dialectMySQL {
-		prefix = "EXPLAIN "
-		if analyze {
-			prefix = "EXPLAIN ANALYZE "
-		}
+	if d != dialectMySQL {
+		return renderPlan(ctx, db, "EXPLAIN QUERY PLAN "+query, args)
 	}
-	rows, err := db.QueryContext(ctx, prefix+query, args...)
+	if analyze {
+		return renderPlan(ctx, db, "EXPLAIN ANALYZE "+query, args)
+	}
+	// FORMAT=TRADITIONAL pins the tabular plan whatever the server's
+	// explain_format is set to. It matters more than it looks: on a server
+	// configured for TREE (MySQL 8.3+ made that settable) a plain EXPLAIN
+	// answers with one text column, and then there is no `key`, no `Extra` and
+	// no `possible_keys` to read — so doctor reported "no index" for a table
+	// scan and never saw a covering read at all. MariaDB does not know the
+	// keyword, hence the fallback.
+	plan, cells, err := renderPlan(ctx, db, "EXPLAIN FORMAT=TRADITIONAL "+query, args)
+	if err == nil {
+		return plan, cells, nil
+	}
+	return renderPlan(ctx, db, "EXPLAIN "+query, args)
+}
+
+// renderPlan runs one already-prefixed EXPLAIN and returns it both as text and,
+// where the server answered in columns, as parsed cells.
+func renderPlan(ctx context.Context, db *sql.DB, stmt string, args []any) ([]string, []map[string]string, error) {
+	rows, err := db.QueryContext(ctx, stmt, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -848,14 +898,15 @@ func explainPlan(ctx context.Context, db *sql.DB, d dialect, query string, args 
 		if err := rows.Scan(targets...); err != nil {
 			return nil, nil, err
 		}
-		// SQLite's plan is one meaningful column; printing it bare reads far
-		// better than labelling it.
-		if d != dialectMySQL && len(columns) == 4 {
+		// SQLite's plan is four columns of which one is meaningful; printing it
+		// bare reads far better than labelling it.
+		if len(columns) == 4 && columns[0] == "id" && columns[3] == "detail" {
 			out = append(out, cells[3].String)
 			continue
 		}
-		// EXPLAIN ANALYZE returns a multi-line blob; keep its own line breaks
-		// and leave the cells empty so classification falls back to text.
+		// A tree plan (EXPLAIN ANALYZE, or a server set to explain_format=TREE)
+		// is one multi-line blob; keep its own line breaks and leave the cells
+		// empty so classification falls back to reading the text.
 		if len(columns) == 1 {
 			out = append(out, strings.Split(strings.TrimRight(cells[0].String, "\n"), "\n")...)
 			continue
@@ -887,9 +938,14 @@ func mysqlExtraHas(extra, note string) bool {
 	return false
 }
 
-// classifyPlan pulls the two facts that decide whether the accuracy page is
-// healthy out of a rendered plan: which of the table's indexes the planner
-// chose, and whether it is reading table rows anyway.
+// classifyPlan pulls the two facts that decide whether a page is healthy out of
+// a rendered plan: which of the table's indexes the planner chose, and whether
+// it is reading table rows anyway.
+//
+// It reads the parsed cells where the server answered in columns, and falls back
+// to the text otherwise. The fallback is not a rare path — EXPLAIN ANALYZE is
+// always a tree, and so is a plain EXPLAIN on a server whose explain_format
+// says so — so it has to know the tree vocabulary as well as the tabular one.
 //
 // Every judgement is scoped to the alias of the big table the query drives
 // from, because these plans also touch things whose scans are harmless — a
@@ -927,11 +983,19 @@ func classifyPlan(plan []string, cells []map[string]string, d dialect, indexName
 			}
 		}
 		if d == dialectMySQL {
-			// EXPLAIN ANALYZE fallback: no cells to read, so match the text.
-			if strings.Contains(line, "Using index") && !strings.Contains(line, "Using index condition") {
+			// No cells to read, so the verdict comes out of the text. Two
+			// vocabularies land here and both have to be understood: a rendered
+			// traditional row ("type=ALL", "Extra=Using index") and a tree plan
+			// from EXPLAIN ANALYZE or a server set to explain_format=TREE, which
+			// says none of those words. Teaching this branch only the
+			// traditional ones is what made every tree plan read as "no index".
+			switch {
+			case strings.Contains(line, "Covering index"):
+				covering = true
+			case strings.Contains(line, "Using index") && !strings.Contains(line, "Using index condition"):
 				covering = true
 			}
-			if strings.Contains(line, "type=ALL") {
+			if strings.Contains(line, "type=ALL") || strings.Contains(line, "Table scan on ") {
 				fullScan = true
 			}
 			continue
@@ -1035,13 +1099,13 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 	// Without the table there is nothing to time, and running the queries anyway
 	// would report the same missing-table error eight times over the one finding
 	// that matters.
-	if !opts.SkipQueries && !hasPredictions {
+	if opts.Pages.Accuracy && !opts.SkipQueries && !hasPredictions {
 		result.Queries = append(result.Queries, doctorQuery{
 			Name:    "accuracy_page",
 			Purpose: "skipped: price_predictions does not exist — run `gasoline migrate`",
 			Skipped: true,
 		})
-	} else if !opts.SkipQueries {
+	} else if opts.Pages.Accuracy && !opts.SkipQueries {
 		qc := accuracyQueryContext{
 			Filters:      opts.Filters,
 			Dialect:      d,
@@ -1086,12 +1150,16 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 			}
 			result.Queries = append(result.Queries, q)
 		}
-	} else {
+	} else if opts.Pages.Accuracy {
 		result.Queries = append(result.Queries, doctorQuery{
 			Name:    "accuracy_page",
 			Purpose: "skipped via --skip-queries",
 			Skipped: true,
 		})
+	}
+
+	if opts.Pages.Dashboard {
+		result.Dashboard = runDashboardChecks(ctx, db, d, opts, present, indexesByTable, result.Scope, time.Now().UTC())
 	}
 
 	// Last, and only on request: this is the one step that writes, so everything
@@ -1742,6 +1810,7 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 	}
 
 	findings = append(findings, doctorScopeFindings(r.Scope)...)
+	findings = append(findings, doctorDashboardFindings(r.Dashboard, r.Tables, opts)...)
 	findings = append(findings, doctorOptimizeFindings(r.Optimize)...)
 
 	// scanWorthWarningAbout keeps a full scan from being reported as a problem
@@ -1910,7 +1979,27 @@ func doctorScopeFindings(s doctorScope) []doctorFinding {
 	return findings
 }
 
+// doctorPages selects which page's queries a run measures. Each page costs
+// about what one of its loads costs, so this is opt-in per page rather than
+// everything every time.
+type doctorPages struct {
+	Accuracy  bool
+	Dashboard bool
+}
+
 type doctorOptions struct {
+	// Pages is which page's queries to measure.
+	Pages doctorPages
+	// Dashboard is the request a dashboard load would have carried, used only
+	// when Pages.Dashboard is set.
+	Dashboard doctorDashboardFilters
+	// DashboardNoCity reproduces the unscoped dashboard instead of letting
+	// doctor pick the busiest city.
+	DashboardNoCity bool
+	// Probe runs the derived measurements that price the row lookups and the
+	// rows an aggregate walks. Read-only, roughly one extra read per probed
+	// query, and the numbers that decide whether an index would help.
+	Probe   bool
 	Filters doctorFilters
 	// TryIndex names an index to force on price_predictions for a second,
 	// side-by-side timing of every query. Read-only: it changes nothing but
@@ -1972,15 +2061,62 @@ func resolveOptimizeTables(list string, optimize bool) ([]string, error) {
 	return tables, nil
 }
 
+// resolveDoctorPages reads the optional page subcommand. Bare `doctor` keeps
+// measuring the accuracy page, which is what it has always done; the other
+// pages have to be asked for by name.
+func resolveDoctorPages(args []string) (doctorPages, []string, error) {
+	pages := doctorPages{Accuracy: true}
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return pages, args, nil
+	}
+	switch args[0] {
+	case "accuracy":
+		return doctorPages{Accuracy: true}, args[1:], nil
+	case "dashboard":
+		return doctorPages{Dashboard: true}, args[1:], nil
+	case "all":
+		return doctorPages{Accuracy: true, Dashboard: true}, args[1:], nil
+	}
+	return doctorPages{}, nil, fmt.Errorf("unknown doctor subcommand %q: use accuracy, dashboard or all", args[0])
+}
+
 func runDoctor(args []string) error {
+	pages, args, err := resolveDoctorPages(args)
+	if err != nil {
+		return err
+	}
+
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	dbf := addDBFlags(fs)
-	fuel := fs.String("fuel", "diesel", "Fuel the accuracy-page queries filter on: diesel, e5 or e10")
+	fuelUsage := "Fuel the accuracy-page queries filter on: diesel, e5 or e10"
+	fuelDefault := "diesel"
+	if pages.Dashboard && !pages.Accuracy {
+		fuelUsage = "Fuel filter the dashboard was loaded with: all (default), diesel, e5 or e10"
+		fuelDefault = "all"
+	}
+	fuel := fs.String("fuel", fuelDefault, fuelUsage)
 	confidence := fs.String("confidence", "all", "Confidence filter: all or medium_high")
-	rangeName := fs.String("range", "", "Target-date range: 7d, 14d (default) or 30d")
-	from := fs.String("from", "", "Range start as YYYY-MM-DD (needs --to)")
-	to := fs.String("to", "", "Range end as YYYY-MM-DD (needs --from)")
-	skipQueries := fs.Bool("skip-queries", false, "Only report schema, sizes, indexes and scope; do not run the accuracy-page queries")
+	rangeUsage := "Target-date range: 7d, 14d (default) or 30d"
+	if pages.Dashboard {
+		rangeUsage = "Date range the page was loaded with: 7d, 14d or 30d (the dashboard defaults to 7d, the accuracy page to 14d)"
+	}
+	rangeName := fs.String("range", "", rangeUsage)
+	from := fs.String("from", "", "Range start as YYYY-MM-DD (the accuracy page needs --to with it)")
+	to := fs.String("to", "", "Range end as YYYY-MM-DD (the accuracy page needs --from with it)")
+	skipQueries := fs.Bool("skip-queries", false, "Only report schema, sizes, indexes and scope; do not run the page queries")
+
+	// Dashboard-only filters, registered only where they mean something so
+	// `doctor accuracy --city` fails at the flag rather than being ignored.
+	var city, station *string
+	var radius *int
+	var noCity, probe *bool
+	if pages.Dashboard {
+		city = fs.String("city", "", "City filter the dashboard was loaded with, as its normalized name; default is the city with the most stations in scope")
+		noCity = fs.Bool("no-city", false, "Reproduce the unscoped dashboard, which loads the station list and skips the snapshot and prediction queries")
+		radius = fs.Int("radius", dashboardRadiusOptions[0], "Radius in km around the city, one of the radii the dashboard offers: 5, 10 or 20")
+		station = fs.String("station", "", "Station ids the dashboard's picker had selected (comma-separated); narrows the in-scope list the same way the page does")
+		probe = fs.Bool("probe", true, "Also run the derived probe queries that price the row lookups and the rows an aggregate walks (read-only, roughly one extra read each)")
+	}
 	tryIndex := fs.String("try-index", "", "Also time every price_predictions query with this index forced, to measure what a different index choice would cost (read-only)")
 	analyze := fs.Bool("analyze", false, "Use EXPLAIN ANALYZE for real per-step timings (MySQL 8.0.18+; ignored on SQLite)")
 	explain := fs.Bool("explain", false, "Print the full query plan for each query")
@@ -2003,16 +2139,53 @@ func runDoctor(args []string) error {
 	if err != nil {
 		return err
 	}
-	if !isSuggestFuelType(*fuel) {
+	// Only the dashboard has an "all fuels" setting, and it is that page's
+	// default; the accuracy page's queries each filter one fuel.
+	dashboardOnly := pages.Dashboard && !pages.Accuracy
+	if !isSuggestFuelType(*fuel) && !(dashboardOnly && *fuel == "all") {
+		if pages.Dashboard && *fuel == "all" {
+			return errors.New("--fuel all only works for `doctor dashboard`; the accuracy page filters one fuel, so name one")
+		}
+		if pages.Dashboard {
+			return errors.New("--fuel must be one of: all, diesel, e5, e10")
+		}
 		return errors.New("--fuel must be one of: diesel, e5, e10")
 	}
 	if *confidence != "all" && *confidence != "medium_high" {
 		return errors.New("--confidence must be one of: all, medium_high")
 	}
-	fromTS, toTS, err := resolveDoctorRange(*rangeName, *from, *to, time.Now())
-	if err != nil {
-		return err
+
+	now := time.Now()
+	var fromTS, toTS string
+	if pages.Accuracy {
+		fromTS, toTS, err = resolveDoctorRange(*rangeName, *from, *to, now)
+		if err != nil {
+			return err
+		}
 	}
+	dashFilters := doctorDashboardFilters{Fuel: *fuel}
+	if pages.Dashboard {
+		dashFilters.From, dashFilters.To, err = resolveDashboardRange(*rangeName, *from, *to, now)
+		if err != nil {
+			return err
+		}
+		if *noCity && strings.TrimSpace(*city) != "" {
+			return errors.New("--no-city cannot be combined with --city")
+		}
+		dashFilters.City = strings.TrimSpace(*city)
+		dashFilters.Stations = parseStationList(*station)
+		if dashFilters.RadiusKM, err = resolveDashboardRadius(*radius); err != nil {
+			return err
+		}
+	}
+
+	// --try-index steers the accuracy page's price_predictions queries and
+	// nothing else, so accepting it where no such query runs would report a
+	// comparison that never happened.
+	if strings.TrimSpace(*tryIndex) != "" && !pages.Accuracy {
+		return errors.New("--try-index measures the accuracy page's queries, so it needs `doctor`, `doctor accuracy` or `doctor all`")
+	}
+
 	optimizeTables, err := resolveOptimizeTables(*optimizeTable, *optimize)
 	if err != nil {
 		return err
@@ -2045,9 +2218,20 @@ func runDoctor(args []string) error {
 	// Deliberately no initSchema: doctor is a read-only diagnostic, and
 	// creating or migrating the schema underneath the operator would change
 	// the very thing they are asking about.
+
+	// The scope report reads the newest stored prediction per fuel, so it needs
+	// a single one even on a dashboard run where the filter is "all fuels".
+	scopeFuel := *fuel
+	if !isSuggestFuelType(scopeFuel) {
+		scopeFuel = "diesel"
+	}
 	opts := doctorOptions{
+		Pages:           pages,
+		Dashboard:       dashFilters,
+		DashboardNoCity: noCity != nil && *noCity,
+		Probe:           probe != nil && *probe,
 		Filters: doctorFilters{
-			Fuel:       *fuel,
+			Fuel:       scopeFuel,
 			Confidence: *confidence,
 			From:       fromTS,
 			To:         toTS,
@@ -2120,25 +2304,16 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 
 	writeDoctorScopeText(r.Scope)
 
-	fmt.Fprintf(stdout, "\naccuracy page queries: fuel=%s, confidence=%s, %s .. %s\n",
-		r.Filters.Fuel, r.Filters.Confidence, r.Filters.From, r.Filters.To)
+	if opts.Pages.Accuracy {
+		fmt.Fprintf(stdout, "\naccuracy page queries: fuel=%s, confidence=%s, %s .. %s\n",
+			r.Filters.Fuel, r.Filters.Confidence, r.Filters.From, r.Filters.To)
+	}
 	for _, q := range r.Queries {
 		if q.Skipped {
 			fmt.Fprintf(stdout, "  %-16s %s\n", q.Name, q.Purpose)
 			continue
 		}
-		note := "no index"
-		switch {
-		case q.Error != "":
-			note = "failed: " + q.Error
-		case q.FullScan:
-			note = "TABLE SCAN"
-		case q.UsesIndex != "" && q.CoveringHit:
-			note = "covering " + q.UsesIndex
-		case q.UsesIndex != "":
-			note = q.UsesIndex
-		}
-		fmt.Fprintf(stdout, "  %-16s %9.1f ms %6d rows  %s\n", q.Name, q.DurationMS, q.Rows, note)
+		fmt.Fprintf(stdout, "  %-16s %9.1f ms %6d rows  %s\n", q.Name, q.DurationMS, q.Rows, queryNote(q))
 		if h := q.Hinted; h != nil {
 			hintNote := h.UsesIndex
 			switch {
@@ -2166,6 +2341,7 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 		}
 	}
 
+	writeDoctorDashboardText(r.Dashboard, opts, explain)
 	writeDoctorOptimizeText(r.Optimize)
 
 	fmt.Fprintln(stdout, "\nfindings:")

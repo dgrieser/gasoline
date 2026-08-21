@@ -10,6 +10,7 @@ build:
 
 test:
 	go test ./...
+	@if command -v php >/dev/null 2>&1; then php web_picker_test.php; else echo "skipping web_picker_test.php, php is not installed"; fi
 	bash gasoline-watch_test.sh
 	@if locale -a | grep -qx 'de_DE.utf8'; then LC_ALL=de_DE.utf8 bash gasoline-watch_test.sh; else echo "skipping de_DE.utf8 watcher test"; fi
 
