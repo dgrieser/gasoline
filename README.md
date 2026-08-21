@@ -251,6 +251,8 @@ Run `gasoline migrate` once to create the tables and seed the notification templ
 
 `migrate` also backfills the covering index the admin **Prediction accuracy** page aggregates over (`idx_price_predictions_accuracy`); `gasoline doctor` reports whether it is present, see [Diagnosing a slow database](#diagnosing-a-slow-database-gasoline-doctor). On an install that has already accrued a large `price_predictions` table this is the one migration step that takes a noticeable while — tens of seconds per few million rows — and it grows the database by roughly the size of the table's own data. MySQL builds the index in place without blocking reads or writes, so a `suggest --persist` run may overlap it.
 
+It backfills two smaller things the dashboard needs as well: `idx_cities_normalized` for its city filter, and `cities.normalized_lower` plus `idx_cities_search` for the city dropdown's typeahead. Both are quick even on a `cities` table holding a whole country — the row count is one per known place, not one per prediction. Until the typeahead's column is backfilled the dropdown finds nothing, so run `migrate` after upgrading rather than only when a schema error says to; `gasoline doctor dashboard` reports either index as missing.
+
 Send Pushover notifications to the web UI's users:
 
 ```bash
@@ -460,7 +462,7 @@ dashboard queries: city=Lübbecke (auto), radius=5 km, fuel=all (e5+e10+diesel),
     probe/keys only       52.5 ms    40290 rows  covering idx_price_predictions_station_fuel_target
 ```
 
-Those are real numbers from a production MySQL 8.4, taken **before** the fix below, and they are the reason the probes exist. One query was 99.87% of the load — and the probe beside it showed that reading its 610,978 rows took 256 ms, so the row count was *not* what cost three minutes. `predictions_latest` no longer exists; see [what this found](#what-doctor-dashboard-found-and-what-was-done-about-it).
+Those are real numbers from a production MySQL 8.4, taken **before** the fixes below, and they are the reason the probes exist. One query was 99.87% of the load — and the probe beside it showed that reading its 610,978 rows took 256 ms, so the row count was *not* what cost three minutes. The same report is now 257 ms in total: `predictions_latest` no longer exists and neither of the `cities` scans does. See [what this found](#what-doctor-dashboard-found-and-what-was-done-about-it).
 
 ##### Probes: what a query's time is actually spent on
 
@@ -477,7 +479,7 @@ Probes are read-only and cost roughly one extra read each. `--probe=false` turns
 
 - **A query paying a table lookup per index entry.** Where the probe reads the same rows through the same index far faster than the query does, the gap is the columns the index does not carry, fetched a row at a time. The finding names the index, the gap, and the per-lookup rate.
 - **`snapshots` is the standing example.** `idx_price_snapshots_station_recorded` stops at `(station_id, recorded_at)`, and the projection needs `is_open`, `e5`, `e10` and `diesel`, so every matching row costs a second lookup into the table. This scales with the date filter and the radius — and on a small scope it is single-digit milliseconds, which is why the finding needs an absolute floor and not just a share of the query.
-- **`city_search` scans whatever the schema says.** It matches on `LOWER(normalized_name)`, and a column inside a function cannot be seeked, so no index removes the scan — installing `idx_cities_normalized` just moves it from the table to the index. This one is reported from the shape of the query rather than from the plan, precisely so it does not fall silent when that happens.
+- **A missing index.** Both `cities` indexes are expected, so an install that has not run `gasoline migrate` is told which one is absent rather than left to infer it from `TABLE SCAN` on the city lookup or the typeahead.
 
 `predictions_grid` gets a note, not a finding: it returns every future window for the scope and PHP reduces them to the newest run per station afterwards, so the run filter lands after the rows have crossed the wire. It is bounded by `target_start > now`, which is what keeps it small.
 
@@ -490,6 +492,10 @@ The production run above is what this command exists to produce, so it is worth 
 Two things changed with it, both improvements. Runs are compared by `run_id` rather than by `run_at`, so two runs recorded in the same second no longer both count as newest. And a station the newest run stored no future window for — too little history to forecast it, say — now shows the most recent run that did cover it, where before it showed nothing at all. `web_picker_test.php` pins both.
 
 **`idx_cities_normalized` was added.** `resolveCity` runs on every dashboard load and matched `normalized_name`, which had no index; where `import cities` had loaded a country's populated places that was a 54,280-row scan, twice per load. `gasoline migrate` adds it — small and quick, unlike the accuracy index.
+
+**The city typeahead was made seekable.** `city_search` matched on `LOWER(normalized_name)`, and a column inside a function cannot be seeked, so no index could help it: 41.6 ms of scanning 54,280 rows on every keystroke past the third, which is interactive latency rather than page latency. Folding the column in the query is what made it unindexable, so the fold moved into storage — `cities.normalized_lower`, written by `citySearchKey`, backfilled by `gasoline migrate` and indexed by `idx_cities_search`. The query became a half-open range over it, which is a plain index seek: measured on SQLite over the same 54,280 rows, 5.139 ms → 0.024 ms.
+
+It also fixed a case-folding bug. The search term was folded in PHP with byte-based `strtolower` while the column was folded by the database, and the two disagree beyond ASCII — on SQLite, whose `lower()` is ASCII-only, a city stored as `LÜBZ` could not be found by typing its name at all. There is now one fold on both sides: `strings.ToLower` in the CLI, `mb_strtolower` in the viewer, pinned together by `TestCitySearchKeyIsMirroredByTheViewer`. That is also why the migration backfills in Go rather than with `UPDATE ... SET normalized_lower = LOWER(normalized_name)`, which would have baked the engines' disagreement into the data.
 
 **A covering index for `snapshots` was measured and deliberately not added.** The probe prices its row lookups at ~5 ms of an 8 ms query, about 2 µs each: a lot of cheap buffer-pool reads. An index carrying the four price columns would remove them, at the cost of tens of megabytes and slower `update` writes, to save five milliseconds. `doctor` reports it as information rather than a warning for exactly that reason. Re-measure with a wider radius and date range, or once the finding escalates to a warning, and reconsider then.
 

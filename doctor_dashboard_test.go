@@ -281,9 +281,7 @@ func TestDashboardFindingsNameTheStructuralCosts(t *testing.T) {
 		"fetching is_open/e5/e10/diesel from table rows",
 		"about 7 µs each",
 		"idx_price_predictions_accuracy did for the accuracy page",
-		// The typeahead scan no index can remove.
-		"city_search reads all 120,000 rows of cities on every keystroke",
-		"a column inside a function cannot be seeked",
+
 		// The grid reduced in PHP rather than in SQL.
 		"PHP then reduces them to the newest run per station and fuel",
 		// The bounding box overshooting the radius.
@@ -534,8 +532,11 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 			"WHERE normalized_name = ",
 		},
 		"city_search": {
-			"WHERE LOWER(normalized_name) LIKE ",
-			"ORDER BY normalized_name ASC",
+			// The prefix range is what idx_cities_search can answer; a
+			// function around the column, or a LIKE, would not be seekable.
+			"WHERE normalized_lower >= ",
+			"AND normalized_lower < ",
+			"ORDER BY normalized_lower ASC",
 		},
 		"scope_stations": {
 			"COALESCE(NULLIF(TRIM(s.brand), ''), '') AS brand",
@@ -777,4 +778,129 @@ func renderFindings(findings []doctorFinding) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// TestCitySearchKeyIsMirroredByTheViewer pins the pairing citySearchKey's doc
+// comment describes. The stored column and the search term are folded on
+// opposite sides of the wire, so if the two implementations disagree a city
+// stops being findable by its own name — and nothing else would notice.
+func TestCitySearchKeyIsMirroredByTheViewer(t *testing.T) {
+	viewer, err := os.ReadFile(filepath.Join("web", "index.php"))
+	if err != nil {
+		t.Fatalf("read viewer: %v", err)
+	}
+	php := string(viewer)
+
+	// mb_strtolower folds beyond ASCII the way strings.ToLower does; plain
+	// strtolower leaves Ü alone and would never match the stored key.
+	if !strings.Contains(php, "mb_strtolower($q, 'UTF-8')") {
+		t.Error("web/index.php no longer folds the search term with mb_strtolower, so it cannot match cities.normalized_lower")
+	}
+	if strings.Contains(php, "strtolower($q) . '%'") {
+		t.Error("web/index.php still builds the old byte-folded LIKE prefix")
+	}
+	// The half-open range and its upper bound are what make the index usable.
+	for _, want := range []string{
+		"normalized_lower >= :prefix",
+		"normalized_lower < :prefix_end",
+		`$prefix . "\u{10FFFF}"`,
+	} {
+		if !strings.Contains(php, want) {
+			t.Errorf("web/index.php no longer contains %q, so the typeahead is not an indexed range any more", want)
+		}
+	}
+	// The fold itself: beyond ASCII, and a no-op on an already-folded name.
+	for in, want := range map[string]string{
+		"Lübbecke":       "lübbecke",
+		"LÜBBECKE":       "lübbecke",
+		"lübbecke":       "lübbecke",
+		"Bad Oeynhausen": "bad oeynhausen",
+	} {
+		if got := citySearchKey(in); got != want {
+			t.Errorf("citySearchKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestCitySearchRangeFindsNamesRegardlessOfCase runs the typeahead's own query
+// — doctor's mirror of it, kept in step by TestDoctorDashboardQueriesMatchViewer
+// — against real rows, so the half-open range and its U+10FFFF upper bound are
+// exercised rather than reasoned about.
+func TestCitySearchRangeFindsNamesRegardlessOfCase(t *testing.T) {
+	ctx := context.Background()
+	db, err := openDB(filepath.Join(t.TempDir(), "cities.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	for _, name := range []string{"Lübbecke", "Lübbrechtsen", "Lüchow", "Marl", "Enzberg", "LÜBZ"} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO cities
+			(name, normalized_name, normalized_lower, display_name, lat, lng, created_at)
+			VALUES (?, ?, ?, ?, 52.0, 13.0, '')`,
+			name, name, citySearchKey(name), name); err != nil {
+			t.Fatalf("insert city: %v", err)
+		}
+	}
+
+	search := func(term string) []string {
+		t.Helper()
+		var spec dashboardQuerySpec
+		for _, s := range dashboardQuerySpecsFor(dashboardQueryContext{
+			Filters: doctorDashboardFilters{City: term, RadiusKM: 5, Fuel: "all"},
+			Now:     time.Now().UTC(),
+		}) {
+			if s.name == "city_search" {
+				spec = s
+			}
+		}
+		if spec.name == "" {
+			t.Fatalf("no city_search spec for %q", term)
+		}
+		rows, err := db.QueryContext(ctx, spec.sql, spec.args...)
+		if err != nil {
+			t.Fatalf("city_search: %v", err)
+		}
+		defer rows.Close()
+		var found []string
+		for rows.Next() {
+			var key, display string
+			if err := rows.Scan(&key, &display); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			found = append(found, key)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		return found
+	}
+
+	// citySearchTerm folds and takes the first three runes, like the page.
+	// "lüb" must reach every spelling of it, whatever case it is stored in.
+	if got := search("Lübbecke"); strings.Join(got, ",") != "Lübbecke,Lübbrechtsen,LÜBZ" {
+		t.Errorf(`prefix "lüb" found %v, want the three Lüb names including the upper-cased one`, got)
+	}
+	// The upper bound must not leak into the next prefix.
+	if got := search("Marl"); strings.Join(got, ",") != "Marl" {
+		t.Errorf(`prefix "mar" found %v, want only Marl`, got)
+	}
+	if got := search("Xanten"); len(got) != 0 {
+		t.Errorf("a prefix nothing starts with found %v, want nothing", got)
+	}
+
+	// And the index is what answers it, rather than a scan of the table.
+	plan, cells, err := explainPlan(ctx, db, dialectSQLite, "SELECT normalized_name FROM cities "+
+		"WHERE normalized_lower >= ? AND normalized_lower < ? ORDER BY normalized_lower ASC LIMIT 20",
+		[]any{"lüb", "lüb" + string(rune(0x10FFFF))}, false)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	uses, _, fullScan := classifyPlan(plan, cells, dialectSQLite, []string{"idx_cities_search"}, "cities")
+	if uses != "idx_cities_search" || fullScan {
+		t.Errorf("typeahead plan uses=%q fullScan=%v, want idx_cities_search and no scan:\n%s",
+			uses, fullScan, strings.Join(plan, "\n"))
+	}
 }

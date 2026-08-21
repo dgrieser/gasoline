@@ -209,8 +209,12 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 				name:    "city_search",
 				purpose: "city typeahead, first 3 letters (?action=city_search)",
 				sql: "SELECT normalized_name AS city_key, display_name FROM cities " +
-					"WHERE LOWER(normalized_name) LIKE ? ORDER BY normalized_name ASC LIMIT 20",
-				args:  []any{term + "%"},
+					"WHERE normalized_lower >= ? AND normalized_lower < ? " +
+					"ORDER BY normalized_lower ASC LIMIT 20",
+				// The page's own upper bound: the prefix with the highest code
+				// point appended, which no character following the prefix can
+				// reach. See the city_search handler in web/index.php.
+				args:  []any{term, term + string(rune(0x10FFFF))},
 				table: "cities",
 				alias: "cities",
 			})
@@ -765,12 +769,6 @@ func doctorDashboardFindings(dash *doctorDashboard, tables []doctorTable, opts d
 		if q.DurationMS >= opts.SlowMS {
 			warn("dashboard query %s took %.0f ms (%s)", q.Name, q.DurationMS, q.Purpose)
 		}
-		// city_search can never seek, whatever the schema says, so
-		// dashboardTypeaheadFinding reports it structurally rather than having
-		// the generic verdicts describe the same scan twice.
-		if q.Name == "city_search" {
-			continue
-		}
 		switch {
 		case q.FullScan && (rowsByTable[q.Table] >= scanRowsThreshold || q.DurationMS >= opts.SlowMS):
 			warn("dashboard query %s scans %s (%s rows) instead of using an index",
@@ -782,7 +780,6 @@ func doctorDashboardFindings(dash *doctorDashboard, tables []doctorTable, opts d
 		}
 	}
 
-	findings = append(findings, dashboardTypeaheadFinding(byName, rowsByTable)...)
 	findings = append(findings, dashboardSnapshotFindings(byName, opts)...)
 	findings = append(findings, dashboardPredictionFindings(byName, opts)...)
 
@@ -793,32 +790,6 @@ func doctorDashboardFindings(dash *doctorDashboard, tables []doctorTable, opts d
 		info("probes were skipped (--probe=false), so the report cannot say how much of each query's time is row lookups")
 	}
 	return findings
-}
-
-// dashboardTypeaheadFinding covers the city dropdown's search, which is the one
-// dashboard query no index can help. It matches on LOWER(normalized_name), and
-// wrapping the column in a function rules out a seek whatever indexes exist — so
-// this is reported from the shape of the query rather than from the plan, which
-// otherwise stops mentioning it the moment idx_cities_normalized is installed
-// and the scan merely moves from the table to the index.
-func dashboardTypeaheadFinding(byName map[string]doctorQuery, rowsByTable map[string]int64) []doctorFinding {
-	q, ok := byName["city_search"]
-	if !ok || q.Error != "" {
-		return nil
-	}
-	cityRows := rowsByTable["cities"]
-	// Below the threshold doctor uses everywhere else, reading the whole thing
-	// is often the cheapest plan and saying so would bury what matters.
-	severity := "info"
-	if cityRows >= 100_000 {
-		severity = "warn"
-	}
-	return []doctorFinding{{
-		Severity: severity,
-		Message: fmt.Sprintf("city_search reads all %s rows of cities on every keystroke past the third: it matches on LOWER(normalized_name), and a column inside a function cannot be seeked, "+
-			"so no index removes this scan. `gasoline import cities` grows this table, so what is cheap on a hand-fed install is not on a country-wide one",
-			formatCount(cityRows)),
-	}}
 }
 
 // dashboardSnapshotFindings prices the snapshot history read, which is the query

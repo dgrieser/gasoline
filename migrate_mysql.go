@@ -17,7 +17,10 @@ var migrationTables = []struct {
 	name    string
 	columns []string
 }{
-	{"cities", []string{"name", "normalized_name", "display_name", "lat", "lng", "created_at"}},
+	// normalized_lower travels with the row: it is derived, but leaving the
+	// target's default in place would make every city unfindable by the
+	// dashboard's typeahead until someone happened to run a migration.
+	{"cities", []string{"name", "normalized_name", "normalized_lower", "display_name", "lat", "lng", "created_at"}},
 	{"stations", []string{"id", "name", "name_override", "alias_of", "brand", "street", "house_number", "post_code", "place", "lat", "lng", "first_seen_at", "last_seen_at"}},
 	// id is copied so ties in recorded_at keep their original order
 	// (compaction and latest-snapshot queries break ties by id).

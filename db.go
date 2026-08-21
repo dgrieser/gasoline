@@ -312,10 +312,14 @@ func openMySQL(ctx context.Context, dsn string) (*sql.DB, error) {
 // (MySQL needs bounded VARCHARs for indexed columns and does not support
 // CREATE INDEX IF NOT EXISTS, so indexes are declared inline).
 //
-// idx_cities_normalized is the other index that exists for a page rather than
-// for the CLI: the dashboard resolves its city filter against normalized_name
-// on every load, and `import cities` can grow this table from a handful of rows
-// to a whole country's populated places. Without it that filter is a full scan.
+// The cities indexes exist for a page rather than for the CLI, because `import
+// cities` can grow this table from a handful of rows to a whole country's
+// populated places. idx_cities_normalized serves the dashboard's city filter,
+// which resolves normalized_name on every load. idx_cities_search serves the
+// city dropdown's typeahead, and normalized_lower exists so that it can: the
+// typeahead needs a case-insensitive prefix match, and folding the column
+// inside the query (LOWER(normalized_name)) rules out any index. See
+// citySearchKey for what writes it.
 //
 // idx_price_predictions_accuracy deserves a note: it exists solely for the
 // admin accuracy page, which runs seven aggregate passes over the same
@@ -331,11 +335,13 @@ func schemaStatements(d dialect) []string {
 			`CREATE TABLE IF NOT EXISTS cities (
 				name VARCHAR(255) PRIMARY KEY,
 				normalized_name VARCHAR(255) NOT NULL,
+				normalized_lower VARCHAR(255) NOT NULL DEFAULT '',
 				display_name TEXT NOT NULL,
 				lat DOUBLE NOT NULL,
 				lng DOUBLE NOT NULL,
 				created_at VARCHAR(64) NOT NULL,
-				INDEX idx_cities_normalized (normalized_name)
+				INDEX idx_cities_normalized (normalized_name),
+				INDEX idx_cities_search (normalized_lower)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 			`CREATE TABLE IF NOT EXISTS stations (
 				id VARCHAR(64) PRIMARY KEY,
@@ -492,6 +498,7 @@ func schemaStatements(d dialect) []string {
 		`CREATE TABLE IF NOT EXISTS cities (
 			name TEXT PRIMARY KEY,
 			normalized_name TEXT NOT NULL,
+			normalized_lower TEXT NOT NULL DEFAULT '',
 			display_name TEXT NOT NULL,
 			lat REAL NOT NULL,
 			lng REAL NOT NULL,
@@ -706,19 +713,21 @@ func stationsUpsertSQL(d dialect) string {
 func citiesUpsertSQL(d dialect) string {
 	if d == dialectMySQL {
 		return `
-			INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO cities (name, normalized_name, normalized_lower, display_name, lat, lng, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE
 				normalized_name = VALUES(normalized_name),
+				normalized_lower = VALUES(normalized_lower),
 				display_name = VALUES(display_name),
 				lat = VALUES(lat),
 				lng = VALUES(lng)`
 	}
 	return `
-		INSERT INTO cities (name, normalized_name, display_name, lat, lng, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO cities (name, normalized_name, normalized_lower, display_name, lat, lng, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			normalized_name = excluded.normalized_name,
+			normalized_lower = excluded.normalized_lower,
 			display_name = excluded.display_name,
 			lat = excluded.lat,
 			lng = excluded.lng`
@@ -727,9 +736,9 @@ func citiesUpsertSQL(d dialect) string {
 // citiesInsertIgnoreSQL inserts a city only if its name is not cached yet.
 func citiesInsertIgnoreSQL(d dialect) string {
 	if d == dialectMySQL {
-		return `INSERT IGNORE INTO cities (name, normalized_name, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?)`
+		return `INSERT IGNORE INTO cities (name, normalized_name, normalized_lower, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
 	}
-	return `INSERT OR IGNORE INTO cities (name, normalized_name, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?)`
+	return `INSERT OR IGNORE INTO cities (name, normalized_name, normalized_lower, display_name, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
 }
 
 // kvUpsertSQL upserts one name/value row into a key-value table (settings or
