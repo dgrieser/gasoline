@@ -1193,16 +1193,42 @@ func TestRunDoctorTryIndexReportsBothTimings(t *testing.T) {
 	if hintedCount == 0 {
 		t.Fatal("no query was compared")
 	}
-	var verdict bool
+	var verdict, band bool
 	for _, f := range result.Findings {
-		if strings.Contains(f.Message, "idx_price_predictions_accuracy") &&
-			(strings.Contains(f.Message, "would cut") || strings.Contains(f.Message, "little difference") ||
-				strings.Contains(f.Message, "is slower")) {
+		if !strings.Contains(f.Message, "idx_price_predictions_accuracy") {
+			continue
+		}
+		if strings.Contains(f.Message, "cuts") || strings.Contains(f.Message, "not established") ||
+			strings.Contains(f.Message, "slower on") || strings.Contains(f.Message, "nothing was actually compared") {
 			verdict = true
+		}
+		// The queries the page already hints re-ran identical SQL, so the report
+		// has to say what their repeats measured before any verdict lands.
+		if strings.Contains(f.Message, "re-ran identical SQL") {
+			band = true
 		}
 	}
 	if !verdict {
 		t.Fatalf("--try-index produced no verdict; findings=%v", result.Findings)
+	}
+	if !band {
+		t.Fatalf("--try-index did not report the repeats' noise band; findings=%v", result.Findings)
+	}
+
+	// Five of these queries already force the index, so their comparison is a
+	// repeat of the same statement and must be marked as one.
+	repeats := 0
+	for _, q := range result.Queries {
+		if q.Hinted != nil && q.Hinted.Repeat {
+			repeats++
+			if !pageHintedQueries[q.Name] {
+				t.Errorf("query %s is not one the page hints, so its comparison is not a repeat", q.Name)
+			}
+		}
+	}
+	if repeats != len(pageHintedQueries) {
+		t.Errorf("%d comparisons were marked as repeats, want the %d the page already hints",
+			repeats, len(pageHintedQueries))
 	}
 
 	// Without the flag there must be no comparison at all.
@@ -2045,5 +2071,110 @@ func TestAccuracySliceFindingIsStatedOnce(t *testing.T) {
 	// Nothing probed, nothing to say.
 	if _, ok := accuracySliceFinding([]doctorQuery{{Name: "summary"}}); ok {
 		t.Error("no probes must produce no slice finding")
+	}
+}
+
+// TestTryIndexVerdictIsJudgedAgainstItsOwnRepeats uses the production numbers
+// that exposed the flaw. Five accuracy-page queries already force
+// idx_price_predictions_accuracy, so forcing it again re-ran identical SQL and
+// still moved by up to 27%. Against that, the one query whose SQL genuinely
+// changed moved 28% — indistinguishable from the database having a different
+// afternoon, and the old verdict called the whole thing "little difference"
+// while five of its seven pairs were not comparisons at all.
+func TestTryIndexVerdictIsJudgedAgainstItsOwnRepeats(t *testing.T) {
+	pair := func(name string, base, hinted float64, repeat bool) doctorQuery {
+		return doctorQuery{Name: name, Table: "price_predictions", DurationMS: base, Rows: 1,
+			Hinted: &doctorQueryHint{Index: "idx_price_predictions_accuracy",
+				DurationMS: hinted, Rows: 1, Repeat: repeat}}
+	}
+	queries := []doctorQuery{
+		pair("summary", 2414.7, 2180.9, true),        // -10%
+		pair("summary_latest", 2941.3, 2861.9, true), //  -3%
+		pair("by_confidence", 2034.3, 2028.5, true),  //  -0%
+		pair("by_lead", 2121.2, 2150.0, true),        //  +1%
+		pair("by_hour", 2563.5, 1876.2, true),        // -27%, identical SQL
+		pair("series", 1667.9, 1629.6, false),        //  -2%, genuinely unhinted
+		pair("rows", 8024.2, 5770.6, false),          // -28%, genuinely unhinted
+	}
+
+	band, repeats := hintNoiseBand(queries)
+	if repeats != 5 {
+		t.Fatalf("repeats = %d, want the 5 pairs the page already hints", repeats)
+	}
+	if band < 26 || band > 28 {
+		t.Fatalf("noise band = %.1f%%, want by_hour's ~27%%", band)
+	}
+
+	got := renderFindings(tryIndexFindings(queries, "idx_price_predictions_accuracy"))
+	for _, want := range []string{
+		"5 queries already force idx_price_predictions_accuracy, so their second timing re-ran identical SQL",
+		"those repeats moved up to 27%",
+		// series + rows together are -24%, inside the 27% band.
+		"not established either way; repeat the run before acting on it",
+		"(rows, series)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("findings are missing %q:\n%s", want, got)
+		}
+	}
+	// The five no-op pairs must not be counted into the compared totals.
+	if strings.Contains(got, "summary") || strings.Contains(got, "by_hour") {
+		t.Errorf("a repeat must not appear among the queries actually compared:\n%s", got)
+	}
+
+	// A move clear of the band is a result, and says so.
+	clear := []doctorQuery{
+		pair("by_hour", 2000, 1990, true), // -0.5% band
+		pair("rows", 8000, 2000, false),   // -75%, unmistakable
+	}
+	got = renderFindings(tryIndexFindings(clear, "idx_price_predictions_accuracy"))
+	if !strings.Contains(got, "cuts the one query (rows) from 8000 ms to 2000 ms (75% less)") {
+		t.Errorf("a move clear of the band must be reported as a result:\n%s", got)
+	}
+	if !strings.Contains(got, "warn") {
+		t.Errorf("the optimizer picking a slower index is a warning:\n%s", got)
+	}
+
+	// Naming an index every query already forces compares nothing at all.
+	allRepeats := []doctorQuery{pair("summary", 2400, 2100, true), pair("by_hour", 2000, 2200, true)}
+	got = renderFindings(tryIndexFindings(allRepeats, "idx_price_predictions_accuracy"))
+	if !strings.Contains(got, "nothing was actually compared") {
+		t.Errorf("all-repeats must say nothing was compared:\n%s", got)
+	}
+}
+
+// TestProbeAccountingForTheWholeQueryIsStated covers the case production hit on
+// `rows`: the probe cost as much as the query, so the joins it drops are free
+// and the cost is entirely in the part the probe kept. Saying nothing there
+// leaves an 8-second query with no explanation at all.
+func TestProbeAccountingForTheWholeQueryIsStated(t *testing.T) {
+	opts := doctorOptions{Pages: doctorPages{Accuracy: true}, Probe: true, SlowMS: 1000}
+	rows := doctorQuery{
+		Name: "rows", Table: "price_predictions", DurationMS: 7503.7, Rows: 1001,
+		UsesIndex: "idx_price_predictions_due",
+		probeGap:  "joining prediction_runs and stations onto the capped page",
+		Probe: &doctorQueryProbe{Name: "page only", DurationMS: 7872.0, Rows: 1001,
+			UsesIndex: "idx_price_predictions_due", Comparable: true},
+	}
+	got := renderFindings(accuracyProbeFindings(rows, rows.probeGap, opts))
+	for _, want := range []string{
+		"query rows costs 7504 ms and its probe alone costs 7872 ms",
+		"joining prediction_runs and stations onto the capped page adds nothing measurable",
+		"what the probe itself does is the whole cost",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("findings are missing %q:\n%s", want, got)
+		}
+	}
+	// A probe that accounts for only part of the query keeps the lookup wording.
+	partial := rows
+	partial.Probe = &doctorQueryProbe{Name: "page only", DurationMS: 100, Rows: 1001,
+		UsesIndex: "idx_price_predictions_due", Comparable: true}
+	got = renderFindings(accuracyProbeFindings(partial, partial.probeGap, opts))
+	if strings.Contains(got, "adds nothing measurable") {
+		t.Errorf("a real gap must not be reported as nothing:\n%s", got)
+	}
+	if !strings.Contains(got, "spends 7404 ms of its 7504 ms") {
+		t.Errorf("a real gap must be attributed:\n%s", got)
 	}
 }

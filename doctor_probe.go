@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -188,7 +191,8 @@ func writeDoctorProbeText(p *doctorQueryProbe, opts doctorOptions, explain bool)
 	if p.Error == "" && !p.Comparable {
 		note += "  (different plan, not comparable)"
 	}
-	fmt.Fprintf(stdout, "    %-16s %9.1f ms %8d rows  %s\n",
+	// Wide enough for the longest probe name, so the timings stay in a column.
+	fmt.Fprintf(stdout, "    %-22s %9.1f ms %8d rows  %s\n",
 		"probe/"+p.Name, p.DurationMS, p.Rows, note)
 	if opts.ShowSQL {
 		fmt.Fprintf(stdout, "      probe sql: %s\n", p.SQL)
@@ -198,4 +202,103 @@ func writeDoctorProbeText(p *doctorQueryProbe, opts doctorOptions, explain bool)
 			fmt.Fprintf(stdout, "      probe | %s\n", line)
 		}
 	}
+}
+
+// ── --try-index verdicts ──────────────────────────────────────────────────────
+//
+// Two timings of the same query differ by more than the thing being measured.
+// On the production database, five accuracy-page queries already force
+// idx_price_predictions_accuracy, so `--try-index idx_price_predictions_accuracy`
+// re-ran byte-identical SQL for each of them — and those repeats moved by -10%,
+// -3%, -0%, +1% and -27%. Any verdict that treats a -28% on changed SQL as a
+// result, while a repeat of unchanged SQL moved -27%, is reading noise.
+//
+// So the repeats are not thrown away: they are the measurement of this
+// database's variance, taken under the same conditions and in the same run. The
+// verdict is drawn only from the pairs whose SQL actually differed, and it is
+// stated against that band.
+
+// hintNoiseBand is the widest absolute move an identical-SQL repeat made, in
+// percent. Anything smaller than this on a real comparison is indistinguishable
+// from the database having a different afternoon.
+func hintNoiseBand(queries []doctorQuery) (band float64, repeats int) {
+	for _, q := range queries {
+		h := q.Hinted
+		if h == nil || h.Error != "" || !h.Repeat || q.DurationMS <= 0 {
+			continue
+		}
+		repeats++
+		if move := math.Abs((h.DurationMS - q.DurationMS) / q.DurationMS * 100); move > band {
+			band = move
+		}
+	}
+	return band, repeats
+}
+
+// tryIndexFindings states what --try-index established, and what it did not.
+func tryIndexFindings(queries []doctorQuery, index string) []doctorFinding {
+	band, repeats := hintNoiseBand(queries)
+
+	var baseTotal, hintedTotal float64
+	var compared []string
+	var mismatch bool
+	for _, q := range queries {
+		h := q.Hinted
+		if h == nil || h.Error != "" {
+			continue
+		}
+		if h.Rows != q.Rows {
+			mismatch = true
+		}
+		if h.Repeat {
+			continue
+		}
+		baseTotal += q.DurationMS
+		hintedTotal += h.DurationMS
+		compared = append(compared, q.Name)
+	}
+	sort.Strings(compared)
+
+	var findings []doctorFinding
+	if repeats > 0 {
+		findings = append(findings, doctorFinding{
+			Severity: "info",
+			Message: fmt.Sprintf("%d %s already force %s, so their second timing re-ran identical SQL: those repeats moved up to %.0f%%, "+
+				"which is this database's own variance and the bar any real difference below has to clear",
+				repeats, plural(repeats, "query", "queries"), index, band),
+		})
+	}
+
+	switch {
+	case mismatch:
+		findings = append(findings, doctorFinding{Severity: "warn",
+			Message: fmt.Sprintf("forcing %s changed a query's row count — the comparison is not measuring "+
+				"the same work, so ignore its timings", index)})
+		return findings
+	case len(compared) == 0:
+		findings = append(findings, doctorFinding{Severity: "info",
+			Message: fmt.Sprintf("every query already forces %s, so nothing was actually compared; "+
+				"name a different index to measure one", index)})
+		return findings
+	}
+
+	move := (hintedTotal - baseTotal) / baseTotal * 100
+	changed := fmt.Sprintf("%s (%s)", plural(len(compared), "the one query", "the queries"), strings.Join(compared, ", "))
+	switch {
+	case math.Abs(move) <= band:
+		findings = append(findings, doctorFinding{Severity: "info",
+			Message: fmt.Sprintf("forcing %s moved %s by %+.0f%% (%.0f ms against %.0f ms), which is inside the %.0f%% a repeat of unchanged SQL moved on its own — "+
+				"not established either way; repeat the run before acting on it",
+				index, changed, move, hintedTotal, baseTotal, band)})
+	case move < 0:
+		findings = append(findings, doctorFinding{Severity: "warn",
+			Message: fmt.Sprintf("forcing %s cuts %s from %.0f ms to %.0f ms (%.0f%% less), beyond the %.0f%% repeats moved on their own — "+
+				"the optimizer is picking the slower index there",
+				index, changed, baseTotal, hintedTotal, -move, band)})
+	default:
+		findings = append(findings, doctorFinding{Severity: "info",
+			Message: fmt.Sprintf("forcing %s is %+.0f%% slower on %s (%.0f ms against %.0f ms); the optimizer's choice is the better one",
+				index, move, changed, hintedTotal, baseTotal)})
+	}
+	return findings
 }

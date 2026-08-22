@@ -445,6 +445,23 @@ gasoline doctor --try-index idx_price_predictions_accuracy
 
 It ends with a verdict — whether forcing the index would be faster, slower, or much the same. This stays read-only: the hint applies to that one run, never to the page. Because an index hint changes the plan and not the answer, `doctor` compares row counts between the two runs and tells you to disregard the timings if they ever disagree.
 
+##### Repeats, and the noise band they measure
+
+Naming an index a query **already** forces produces byte-identical SQL, so its second timing is the same statement run twice. Those pairs are labelled `repeat:` rather than `forced:`, they are kept out of the verdict, and they are put to work instead: the widest move they make is this database's own variance, measured in the same run under the same conditions.
+
+That matters more than it sounds. On a production MySQL, `--try-index idx_price_predictions_accuracy` re-ran identical SQL for the five queries the page already hints — and those repeats moved by −10%, −3%, −0%, +1% and **−27%**. The one query whose SQL genuinely changed moved −28%. Read on its own that looks like a result; read against a −27% repeat of unchanged SQL it is indistinguishable from the afternoon:
+
+```
+info 5 queries already force idx_price_predictions_accuracy, so their second timing
+     re-ran identical SQL: those repeats moved up to 27%, which is this database's own
+     variance and the bar any real difference below has to clear
+info forcing idx_price_predictions_accuracy moved the queries (rows, series) by -24%
+     (7400 ms against 9692 ms), which is inside the 27% a repeat of unchanged SQL moved
+     on its own — not established either way; repeat the run before acting on it
+```
+
+Before this, the verdict averaged all seven pairs together and reported "little difference" — a single number over five comparisons that had compared nothing. If every query already forces the index, the report now says so outright rather than producing a verdict from no comparisons at all.
+
 If forcing the covering index is much faster, the optimizer is mis-costing it. Refreshing the statistics it reasons from is worth trying first — `ANALYZE TABLE price_predictions`, or `ANALYZE TABLE price_predictions UPDATE HISTOGRAM ON target_start` when the range estimate looks wrong (a `filtered` value pinned near 10% is the tell). Where that does not change the choice, the accuracy page forces the index itself: five of its aggregate queries carry `FORCE INDEX`/`INDEXED BY`, which measured 66–73% faster per query on a live MySQL after both of those statistics commands had failed to move it. The hint is omitted when the index is absent, so an un-migrated database still renders the page. `series` and the raw-row query are deliberately left unhinted — the hint measured +1% and −2% there, so there is nothing to buy. Re-run `--try-index` after a schema or data-shape change: if forcing stops winning, the hint should go rather than be kept on faith.
 
 #### Why the dashboard is slow (`doctor dashboard`)
@@ -501,7 +518,7 @@ A verdict of `covering <index>` or a bare index name says which index was used, 
 
 A probe is only a floor for its query if it reads the same rows the same way, so each one is **pinned to the index its query actually chose** rather than to the hint the page emitted. That distinction is not academic: the two queries the accuracy page leaves unhinted are free to be costed differently once a probe narrows their projection, and before pinning, `series`'s probe picked another index and came out four times *slower* than the query it was measuring. Where the plans still differ the probe is labelled `(different plan, not comparable)`, no finding is drawn from it, and its rows stay out of the page totals.
 
-Where a query is answered from an index alone, the gap to its probe is the aggregation rather than row lookups, and the findings say so — calling it lookups would send you after an index the query is already using.
+Where a query is answered from an index alone, the gap to its probe is the aggregation rather than row lookups, and the findings say so — calling it lookups would send you after an index the query is already using. And where there is no gap at all, that is the finding: whatever the probe drops is free, so the cost is in the part it kept. That is what ruled the metadata joins out of the accuracy page's slowest query and left its index choice as the only thing still to explain.
 
 Because the accuracy page runs several independent aggregate passes over the same `(fuel, target_start)` slice, `doctor` states that slice once for the page rather than under each query:
 

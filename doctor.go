@@ -353,7 +353,15 @@ type doctorQueryHint struct {
 	Plan        []string `json:"plan"`
 	UsesIndex   string   `json:"uses_index"`
 	CoveringHit bool     `json:"covering"`
-	Error       string   `json:"error,omitempty"`
+	// Repeat marks a hint that produced byte-identical SQL to the query it is
+	// compared against, which happens whenever --try-index names the index the
+	// page already forces there. Then the second timing is the same statement
+	// run twice, so its delta measures this database's variance and nothing
+	// about the index — and folding those into the verdict is what made
+	// `--try-index idx_price_predictions_accuracy` report "little difference"
+	// across five queries it had not changed at all.
+	Repeat bool   `json:"repeat"`
+	Error  string `json:"error,omitempty"`
 }
 
 type doctorFinding struct {
@@ -1255,6 +1263,7 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 			// decisions query reads a different table.
 			if alt, ok := hinted[spec.name]; ok && spec.table == "price_predictions" {
 				q.Hinted = measureHinted(ctx, db, d, alt, opts, indexesByTable[spec.table])
+				q.Hinted.Repeat = alt.sql == spec.sql
 			}
 			if spec.probe != nil && opts.Probe {
 				q.Probe = measureProbe(ctx, db, d, spec.probe, opts, indexesByTable[spec.table], q)
@@ -1992,7 +2001,19 @@ func accuracyProbeFindings(q doctorQuery, gap string, opts doctorOptions) []doct
 		return findings
 	}
 	if finding, ok := probeLookupFinding(q, gap, opts); ok {
-		findings = append(findings, finding)
+		return append(findings, finding)
+	}
+	// No gap worth attributing, which is itself the answer: whatever the probe
+	// leaves out is free, and the cost is in what the probe already does. On
+	// production this is what ruled the metadata joins out of `rows`, leaving
+	// its index choice as the only thing left to explain 7.5 seconds.
+	if probe.DurationMS >= q.DurationMS*0.8 {
+		findings = append(findings, doctorFinding{
+			Severity: "info",
+			Message: fmt.Sprintf("query %s costs %.0f ms and its probe alone costs %.0f ms, so %s adds nothing measurable — "+
+				"what the probe itself does is the whole cost",
+				q.Name, q.DurationMS, probe.DurationMS, gap),
+		})
 	}
 	return findings
 }
@@ -2079,38 +2100,8 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 		info("probes were skipped (--probe=false), so the report cannot say how much of each query's time is the aggregation and how much is reading rows")
 	}
 
-	// --try-index only pays off if it produces a verdict, so state one.
 	if opts.TryIndex != "" {
-		var hintedTotal, comparable float64
-		var mismatch bool
-		for _, q := range r.Queries {
-			h := q.Hinted
-			if h == nil || h.Error != "" {
-				continue
-			}
-			if h.Rows != q.Rows {
-				mismatch = true
-			}
-			comparable += q.DurationMS
-			hintedTotal += h.DurationMS
-		}
-		switch {
-		case mismatch:
-			warn("forcing %s changed a query's row count — the comparison is not measuring "+
-				"the same work, so ignore its timings", opts.TryIndex)
-		case comparable == 0:
-			info("no query could be compared with %s forced", opts.TryIndex)
-		case hintedTotal < comparable*0.8:
-			warn("forcing %s would cut those queries from %.0f ms to %.0f ms (%.0f%% less) — "+
-				"the optimizer is picking the slower index on its own",
-				opts.TryIndex, comparable, hintedTotal, (comparable-hintedTotal)/comparable*100)
-		case hintedTotal > comparable*1.2:
-			info("forcing %s is slower (%.0f ms vs %.0f ms); the optimizer's choice is the better one",
-				opts.TryIndex, hintedTotal, comparable)
-		default:
-			info("forcing %s makes little difference (%.0f ms vs %.0f ms)",
-				opts.TryIndex, hintedTotal, comparable)
-		}
+		findings = append(findings, tryIndexFindings(r.Queries, opts.TryIndex)...)
 	}
 
 	for _, t := range r.Tables {
@@ -2537,11 +2528,21 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 				hintNote = "hint not taken"
 			}
 			delta := ""
-			if h.Error == "" && h.DurationMS > 0 {
+			if h.Error == "" && q.DurationMS > 0 {
 				delta = fmt.Sprintf("  (%+.0f%%)", (h.DurationMS-q.DurationMS)/q.DurationMS*100)
 			}
+			// A repeat of identical SQL is labelled as one, because its delta is
+			// this database's variance rather than anything about the index, and
+			// a line reading "forced:" invites it to be read as a result.
+			label := "  forced:"
+			if h.Repeat {
+				label = "  repeat:"
+				if h.Error == "" {
+					delta += " same SQL, already forced"
+				}
+			}
 			fmt.Fprintf(stdout, "  %-16s %9.1f ms %6d rows  %s%s\n",
-				"  forced:", h.DurationMS, h.Rows, hintNote, delta)
+				label, h.DurationMS, h.Rows, hintNote, delta)
 		}
 		if opts.ShowSQL {
 			fmt.Fprintf(stdout, "      sql: %s\n", q.SQL)
