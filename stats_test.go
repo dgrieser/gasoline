@@ -458,6 +458,102 @@ func TestCommandRunNotifyRecordsPartialWhenSomeSendsFail(t *testing.T) {
 	}
 }
 
+// TestCommandRunNotifyRecordsErrorWhenEverySendFails covers both output modes.
+// The JSON path used to return straight out of writeJSON, so the deferred
+// recorder saw no error and stored 'ok' on a run that delivered nothing — the
+// exact opposite of what happened, and a zero exit code with it.
+func TestCommandRunNotifyRecordsErrorWhenEverySendFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"json", []string{"--output", "json"}},
+		{"text", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "stats-notify-allfail.db")
+			seedStatsHistory(t, dbPath)
+			seedStatsNotifyRecipient(t, dbPath)
+			// Every Pushover call fails, so there is nothing partial about it.
+			pushes := stubPushover(t, func(string) bool { return true })
+
+			args := append([]string{"notify", "--db", dbPath}, tc.args...)
+			err := runQuiet(t, args...)
+			if err == nil {
+				t.Fatal("run returned nil, want the all-sends-failed error")
+			}
+			if !strings.Contains(err.Error(), "notification sends failed") {
+				t.Fatalf("error = %v, want the all-sends-failed error", err)
+			}
+			if len(*pushes) != 0 {
+				t.Fatalf("delivered %d notifications, want none", len(*pushes))
+			}
+
+			row, metrics := singleCommandRun(t, dbPath, "notify")
+			if row.Status != commandRunStatusError {
+				t.Fatalf("status = %q, want %q", row.Status, commandRunStatusError)
+			}
+			if !row.Error.Valid || !strings.Contains(row.Error.String, "notification sends failed") {
+				t.Fatalf("recorded error = %+v, want the all-sends-failed error", row.Error)
+			}
+			if metrics["sent"] != 0 {
+				t.Fatalf("sent = %v, want 0", metrics["sent"])
+			}
+			if metrics["failed"] != 1 {
+				t.Fatalf("failed = %v, want 1", metrics["failed"])
+			}
+		})
+	}
+}
+
+// TestCommandRunRecordsSingleCityFailure covers the one-target bail-out, which
+// returns from inside the fetch loop. It used to skip the metric block at the
+// end of runUpdate entirely, so the commonest failure on a single-target
+// install recorded an error run carrying no counters at all.
+func TestCommandRunRecordsSingleCityFailure(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "stats-onecity.db")
+	t.Setenv(envAPIKeyName, "test-key")
+
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.5","lon":"13.4"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			return nil, fmt.Errorf("simulated upstream failure")
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	err := runQuiet(t, "update", "--db", dbPath, "--city", "Berlin", "--output", "json")
+	if err == nil {
+		t.Fatal("run returned nil, want the fetch failure")
+	}
+	// A single target keeps reporting the fetch error itself, not the
+	// best-effort tally the multi-city path produces.
+	if !strings.Contains(err.Error(), "simulated upstream failure") {
+		t.Fatalf("error = %v, want the raw fetch failure", err)
+	}
+	if strings.Contains(err.Error(), "cities failed") {
+		t.Fatalf("error = %v, want the single-city shape preserved", err)
+	}
+
+	row, metrics := singleCommandRun(t, dbPath, "update")
+	if row.Status != commandRunStatusError {
+		t.Fatalf("status = %q, want %q", row.Status, commandRunStatusError)
+	}
+	wantMetrics(t, metrics, map[string]float64{
+		"cities":           1,
+		"cities_failed":    1,
+		"stations_fetched": 0,
+		"snapshots_stored": 0,
+	})
+}
+
 func TestCommandRunSurvivesStatsWriteFailure(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "stats-broken.db")

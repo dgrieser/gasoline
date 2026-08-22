@@ -820,6 +820,16 @@ func runUpdate(args []string) (err error) {
 
 	stats := beginCommandRun(ctx, db, "update")
 	defer func() { stats.finish(ctx, err) }()
+	// One place for the sweep's metric contract: a single-target run bails out
+	// of the fetch loop below without reaching the end of the function, and it
+	// has to report the same names as a full sweep or cities_failed undercounts
+	// exactly the failure a one-target install hits most.
+	recordSweep := func(cities, failed, fetched, stored int) {
+		stats.set("cities", float64(cities))
+		stats.set("cities_failed", float64(failed))
+		stats.set("stations_fetched", float64(fetched))
+		stats.set("snapshots_stored", float64(stored))
+	}
 
 	queries := buildCityQueries(events)
 	// Without any --city/--radius flags, fall back to the admin-configured
@@ -851,6 +861,7 @@ func runUpdate(args []string) (err error) {
 		if err != nil {
 			// Single city: preserve the original error shape.
 			if len(queries) == 1 {
+				recordSweep(1, 1, 0, 0)
 				return err
 			}
 			failures++
@@ -907,10 +918,7 @@ func runUpdate(args []string) (err error) {
 		})
 	}
 
-	stats.set("cities", float64(len(queries)))
-	stats.set("cities_failed", float64(failures))
-	stats.set("stations_fetched", float64(totalFetched))
-	stats.set("snapshots_stored", float64(len(observations)))
+	recordSweep(len(queries), failures, totalFetched, len(observations))
 	// A sweep that lost some cities but stored the rest is degraded, not
 	// failed; one that lost every city is a failure like any other.
 	if failures > 0 && failures < len(queries) {

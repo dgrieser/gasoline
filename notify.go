@@ -189,14 +189,23 @@ func runNotify(args []string) (err error) {
 		stats.markPartial()
 	}
 
+	// Every send failed. That is the command's result whichever way it prints,
+	// so build it before the output branch: computing it only on the text path
+	// left JSON runs exiting 0 and recorded as 'ok' on a run that delivered
+	// nothing.
+	var sendErr error
+	if len(result.Failed) > 0 && len(result.Sent) == 0 {
+		sendErr = fmt.Errorf("all %d notification sends failed", len(result.Failed))
+	}
+
 	if output == outputJSON {
-		return writeJSON(result)
+		if err := writeJSON(result); err != nil {
+			return err
+		}
+		return sendErr
 	}
 	printNotifyResultText(result)
-	if len(result.Failed) > 0 && len(result.Sent) == 0 {
-		return fmt.Errorf("all %d notification sends failed", len(result.Failed))
-	}
-	return nil
+	return sendErr
 }
 
 func printNotifyResultText(result notifyResult) {

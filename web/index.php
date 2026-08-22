@@ -377,6 +377,62 @@ function gasolineSchemaReady(PDO $pdo, string $driver): bool
     }
 }
 
+// gasolineCommandStatsSeries turns the statistics page's bucket query into the
+// chart's series, filling in the buckets the GROUP BY never produced.
+//
+// Two things depend on this. The chart lays buckets out in equal-width slots,
+// so a period with no runs at all has to be present as a zero — an absent
+// bucket takes up no width, closing the gap and hiding the very outage the page
+// exists to reveal. And a bucket whose runs are all unfinished has no average
+// duration: that stays null rather than becoming zero, so the duration line
+// breaks across it instead of plunging to "instant".
+//
+// Everything is UTC — started_at is RFC3339 Z and $now carries the UTC zone —
+// so there are no DST-length days to step over.
+function gasolineCommandStatsSeries(array $rows, DateTimeImmutable $now, int $hours, bool $daily): array
+{
+    $found = [];
+    foreach ($rows as $row) {
+        $found[(string) $row['bucket']] = [
+            't' => (string) $row['bucket'],
+            'ok' => (int) $row['ok'],
+            'partial' => (int) $row['partial'],
+            'error' => (int) $row['error_count'],
+            'running' => (int) $row['running'],
+            'avg_ms' => $row['avg_ms'] !== null ? (float) $row['avg_ms'] : null,
+        ];
+    }
+
+    // The key format has to match the SUBSTR widths the query groups by:
+    // characters 1-13 are 'YYYY-MM-DDTHH', 1-10 are 'YYYY-MM-DD'.
+    $format = $daily ? 'Y-m-d' : 'Y-m-d\TH';
+    $step = $daily ? '+1 day' : '+1 hour';
+    $floor = static fn (DateTimeImmutable $t): DateTimeImmutable => $daily
+        ? $t->setTime(0, 0)
+        : $t->setTime((int) $t->format('G'), 0);
+
+    $cursor = $floor($now->modify('-' . $hours . ' hours'));
+    $last = $floor($now);
+
+    $series = [];
+    // At most 25 hourly or 31 daily buckets; the guard only keeps a malformed
+    // window from spinning.
+    for ($guard = 0; $cursor <= $last && $guard < 800; $guard++) {
+        $key = $cursor->format($format);
+        $series[] = $found[$key] ?? [
+            't' => $key,
+            'ok' => 0,
+            'partial' => 0,
+            'error' => 0,
+            'running' => 0,
+            'avg_ms' => null,
+        ];
+        $cursor = $cursor->modify($step);
+    }
+
+    return $series;
+}
+
 // ── Auth: user helpers ────────────────────────────────────────────────────────
 
 function normalizeEmail(string $email): string
@@ -3180,7 +3236,13 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
 
             const daily = !!data.daily_buckets;
             const maxRuns = Math.max(1, ...series.map((d) => d.ok + d.partial + d.error + d.running));
-            const maxDur  = Math.max(1, ...series.map((d) => d.avg_ms || 0));
+            // A bucket with no finished run carries a null duration, not a
+            // zero. Scale off the measured ones, and drop the whole duration
+            // axis when nothing in the window finished — otherwise the
+            // Math.max floor below invents an axis reading "0 ms … 1 ms".
+            const durVals = series.map((d) => d.avg_ms).filter((v) => v !== null && v !== undefined);
+            const hasDur  = durVals.length > 0;
+            const maxDur  = Math.max(1, ...durVals);
 
             const py     = (v) => m.top + iH - (v / maxRuns) * iH;
             const pyDur  = (v) => m.top + iH - (v / maxDur) * iH;
@@ -3197,10 +3259,12 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                 mk('text', { x: m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': font, fill: label }).textContent = fmtInt(val);
             }
             // Right axis: the average duration line's own scale.
-            for (let i = 0; i <= steps; i++) {
-                const val = (maxDur / steps) * i;
-                mk('text', { x: W - m.right + 8, y: pyDur(val) + 4, 'text-anchor': 'start', 'font-size': 10, 'font-family': font, fill: C_DURATION })
-                    .textContent = fmtDuration(val);
+            if (hasDur) {
+                for (let i = 0; i <= steps; i++) {
+                    const val = (maxDur / steps) * i;
+                    mk('text', { x: W - m.right + 8, y: pyDur(val) + 4, 'text-anchor': 'start', 'font-size': 10, 'font-family': font, fill: C_DURATION })
+                        .textContent = fmtDuration(val);
+                }
             }
 
             series.forEach((d, i) => {
@@ -3216,14 +3280,33 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                 });
             });
 
-            const durPts = series.map((d, i) => ({
-                x: m.left + slot * i + slot / 2,
-                y: pyDur(d.avg_ms || 0),
-            }));
-            mk('polyline', {
-                points: durPts.map((p) => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' '),
-                fill: 'none', stroke: C_DURATION, 'stroke-width': 2,
-                'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+            // Break the line where nothing finished rather than drawing it
+            // through: a continuous line across a gap claims a duration that
+            // was never measured, and drawing the gap at zero would read as an
+            // instant run when it is really a hung or absent one.
+            const durSegments = [];
+            let durSegment = [];
+            series.forEach((d, i) => {
+                if (d.avg_ms === null || d.avg_ms === undefined) {
+                    if (durSegment.length) durSegments.push(durSegment);
+                    durSegment = [];
+                    return;
+                }
+                durSegment.push({ x: m.left + slot * i + slot / 2, y: pyDur(d.avg_ms) });
+            });
+            if (durSegment.length) durSegments.push(durSegment);
+            durSegments.forEach((seg) => {
+                if (seg.length === 1) {
+                    // A lone measured bucket between two gaps: a one-point
+                    // polyline draws nothing, so mark the point instead.
+                    mk('circle', { cx: seg[0].x, cy: seg[0].y, r: 2.5, fill: C_DURATION });
+                    return;
+                }
+                mk('polyline', {
+                    points: seg.map((p) => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' '),
+                    fill: 'none', stroke: C_DURATION, 'stroke-width': 2,
+                    'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+                });
             });
 
             mk('line', { x1: m.left, y1: m.top + iH, x2: W - m.right, y2: m.top + iH, stroke: axis, 'stroke-width': 1 });
@@ -3237,7 +3320,7 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                     .textContent = fmtBucket(series[idx].t, daily);
             }
 
-            drawLegend();
+            drawLegend(hasDur);
             if (!tooltip) return;
 
             const crossLine = mk('line', {
@@ -3282,7 +3365,7 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             attachLongPressCrosshair(overlay, showCrosshair, hideTooltip);
         }
 
-        function drawLegend() {
+        function drawLegend(hasDur) {
             legendEl.hidden = false;
             legendEl.innerHTML = '';
             const t = T();
@@ -3292,7 +3375,10 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             add(box(C_PARTIAL), t.statsStatus_partial);
             add(box(C_ERROR), t.statsStatus_error);
             add(box(C_RUNNING), t.statsStatus_running);
-            add('<span class="cs-legend-line" style="background:' + C_DURATION + '"></span>', t.statsLegendDuration);
+            // Nothing finished in this window, so there is no line to explain.
+            if (hasDur) {
+                add('<span class="cs-legend-line" style="background:' + C_DURATION + '"></span>', t.statsLegendDuration);
+            }
         }
 
         [cfg.command, cfg.range].forEach((el) => { if (el) el.addEventListener('change', load); });
@@ -4262,16 +4348,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
         );
         $bind($seriesStmt);
         $seriesStmt->execute();
-        foreach ($seriesStmt->fetchAll() as $row) {
-            $out['series'][] = [
-                't' => (string) $row['bucket'],
-                'ok' => (int) $row['ok'],
-                'partial' => (int) $row['partial'],
-                'error' => (int) $row['error_count'],
-                'running' => (int) $row['running'],
-                'avg_ms' => $row['avg_ms'] !== null ? (float) $row['avg_ms'] : 0.0,
-            ];
-        }
+        $out['series'] = gasolineCommandStatsSeries($seriesStmt->fetchAll(), $now, $hours, $daily);
 
         // 5) Metric totals. The per-run average divides by the runs that
         //    actually reported the metric, not by every run of the command:
