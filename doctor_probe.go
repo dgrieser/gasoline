@@ -33,27 +33,53 @@ type doctorProbeSpec struct {
 	sql     string
 	args    []any
 	alias   string
+	// sqlFor rebuilds this probe with one index forced, so it can be pinned to
+	// the plan its query actually took. Without it a probe is at the optimizer's
+	// mercy, and a narrower projection is enough to change its mind: measured on
+	// production, the unpinned probe for `series` chose a different index and
+	// came out four times slower than the query it was supposed to be a floor
+	// for. Nil where a probe cannot be steered, and then the comparability check
+	// below is the only guard.
+	sqlFor func(index string) string
 }
 
-// measureProbe explains, times and classifies one probe.
+// measureProbe explains, times and classifies one probe, pinned where it can be
+// to the plan its query took.
+//
+// A probe only means something if it reads the same rows by the same path as its
+// query — the gap between the two is then the work the probe leaves out. If the
+// plans differ, the gap is the difference between two unrelated plans and says
+// nothing, so the probe is marked not comparable and no finding is drawn from
+// it.
 func measureProbe(ctx context.Context, db *sql.DB, d dialect, spec *doctorProbeSpec,
-	opts doctorOptions, indexNames []string) *doctorQueryProbe {
-	out := &doctorQueryProbe{Name: spec.name, Purpose: spec.purpose, SQL: spec.sql}
-	plan, cells, err := explainPlan(ctx, db, d, spec.sql, spec.args, opts.Analyze)
+	opts doctorOptions, indexNames []string, parent doctorQuery) *doctorQueryProbe {
+	query, args := spec.sql, spec.args
+	if spec.sqlFor != nil && parent.UsesIndex != "" {
+		pinned := spec.sqlFor(parent.UsesIndex)
+		// A forced index the server will not accept here (SQLite cannot be told
+		// to use a rowid, for one) leaves the unpinned probe as the fallback.
+		if _, _, err := explainPlan(ctx, db, d, pinned, args, false); err == nil {
+			query = pinned
+		}
+	}
+
+	out := &doctorQueryProbe{Name: spec.name, Purpose: spec.purpose, SQL: query}
+	plan, cells, err := explainPlan(ctx, db, d, query, args, opts.Analyze)
 	if err != nil {
 		out.Error = err.Error()
 		return out
 	}
 	out.Plan = plan
-	out.UsesIndex, out.CoveringHit, _ = classifyPlan(plan, cells, d, indexNames, spec.alias)
+	out.UsesIndex, out.CoveringHit, out.FullScan = classifyPlan(plan, cells, d, indexNames, spec.alias)
 
 	started := time.Now()
-	count, err := countQueryRows(ctx, db, spec.sql, spec.args)
+	count, err := countQueryRows(ctx, db, query, args)
 	out.DurationMS = float64(time.Since(started).Microseconds()) / 1000
 	if err != nil {
 		out.Error = err.Error()
 	}
 	out.Rows = count
+	out.Comparable = out.Error == "" && out.UsesIndex == parent.UsesIndex
 	return out
 }
 
@@ -119,7 +145,7 @@ func indexOrPlan(q doctorQuery) string {
 // row, with `detail` naming what that work actually was.
 func probeLookupFinding(q doctorQuery, detail string, opts doctorOptions) (doctorFinding, bool) {
 	probe := q.Probe
-	if probe == nil || probe.Error != "" || q.Error != "" {
+	if probe == nil || probe.Error != "" || q.Error != "" || !probe.Comparable {
 		return doctorFinding{}, false
 	}
 	lookups := q.DurationMS - probe.DurationMS
@@ -150,10 +176,17 @@ func writeDoctorProbeText(p *doctorQueryProbe, opts doctorOptions, explain bool)
 	switch {
 	case p.Error != "":
 		note = "failed: " + p.Error
+	case p.FullScan:
+		note = "TABLE SCAN"
 	case p.UsesIndex != "" && p.CoveringHit:
 		note = "covering " + p.UsesIndex
 	case p.UsesIndex != "":
 		note = p.UsesIndex
+	}
+	// A probe on a different plan is not a floor for anything, and saying so on
+	// the line is what keeps its timing from being read as one.
+	if p.Error == "" && !p.Comparable {
+		note += "  (different plan, not comparable)"
 	}
 	fmt.Fprintf(stdout, "    %-16s %9.1f ms %8d rows  %s\n",
 		"probe/"+p.Name, p.DurationMS, p.Rows, note)

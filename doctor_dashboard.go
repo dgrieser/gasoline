@@ -665,7 +665,7 @@ func runDashboardSpecs(ctx context.Context, db *sql.DB, d dialect, opts doctorOp
 		q.Rows = count
 
 		if spec.probe != nil && opts.Probe {
-			q.Probe = measureProbe(ctx, db, d, spec.probe, opts, indexesByTable[spec.table])
+			q.Probe = measureProbe(ctx, db, d, spec.probe, opts, indexesByTable[spec.table], q)
 		}
 		out = append(out, q)
 	}

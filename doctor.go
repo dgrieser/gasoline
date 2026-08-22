@@ -337,7 +337,13 @@ type doctorQueryProbe struct {
 	Plan        []string `json:"plan"`
 	UsesIndex   string   `json:"uses_index"`
 	CoveringHit bool     `json:"covering"`
-	Error       string   `json:"error,omitempty"`
+	FullScan    bool     `json:"full_scan"`
+	// Comparable reports whether the probe took the same plan as its query. Only
+	// then is the difference between their timings the work the probe leaves
+	// out; otherwise it is the difference between two unrelated plans, and no
+	// finding may be drawn from it.
+	Comparable bool   `json:"comparable"`
+	Error      string `json:"error,omitempty"`
 }
 
 type doctorQueryHint struct {
@@ -441,19 +447,48 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 		return out
 	}
 
+	// predictionsWith is the table reference with one index forced, which is how
+	// a probe is pinned to the plan its query turned out to take. The page's own
+	// hint is not enough for that: two of its queries are deliberately unhinted,
+	// and there the optimizer is free to cost a probe's narrower projection
+	// differently from the query it belongs to.
+	predictionsWith := func(index string) string {
+		if index == "" {
+			return plain
+		}
+		return plain + indexHintSyntax(qc.Dialect, index) + " "
+	}
+
 	// walkedProbe counts the index entries one query's filter matches, and times
 	// the walk alone. For the aggregates that is the slice --range selects, and
 	// the gap to the parent is whatever the aggregation costs on top of it —
 	// unless the parent is not covering, in which case the gap is row lookups.
-	// Same reference and hint as the parent, so the access path is the same one.
 	walkedProbe := func(name string) *doctorProbeSpec {
+		build := func(ref string) string {
+			return "SELECT 1 FROM " + ref + joinRuns + "WHERE " + where
+		}
 		return &doctorProbeSpec{
 			name:    "rows walked",
 			purpose: "index entries the filter matches, and what walking them alone costs",
-			sql:     "SELECT 1 FROM " + predictionsFor(name) + joinRuns + "WHERE " + where,
+			sql:     build(predictionsFor(name)),
 			args:    argsFor(1),
 			alias:   "pp",
+			sqlFor:  func(index string) string { return build(predictionsWith(index)) },
 		}
+	}
+
+	// The two inner selects below are each built once and used twice: the query
+	// nests them, the probe runs them alone.
+	innerLatestGroup := func(ref string) string {
+		return "SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id " +
+			"FROM " + ref + joinRuns + "WHERE " + where +
+			" GROUP BY pp.station_id, pp.target_start"
+	}
+	innerRowsPage := func(ref string) string {
+		return "SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, " +
+			"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion " +
+			"FROM " + ref + joinRuns + "WHERE " + where +
+			" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001"
 	}
 
 	leadBucket := "CASE" +
@@ -488,9 +523,7 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			sql: "SELECT COUNT(*) AS n, AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, " +
 				"SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 " +
 				"FROM " + predictionsFor("summary_latest") + "JOIN (" +
-				"SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id " +
-				"FROM " + predictionsFor("summary_latest") + joinRuns + "WHERE " + where +
-				" GROUP BY pp.station_id, pp.target_start" +
+				innerLatestGroup(predictionsFor("summary_latest")) +
 				") latest ON latest.station_id = pp.station_id" +
 				" AND latest.target_start = pp.target_start" +
 				" AND latest.run_id = pp.run_id" +
@@ -506,11 +539,10 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			probe: &doctorProbeSpec{
 				name:    "inner group only",
 				purpose: "the latest-run-per-window group-by without the join back to it",
-				sql: "SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id " +
-					"FROM " + predictionsFor("summary_latest") + joinRuns + "WHERE " + where +
-					" GROUP BY pp.station_id, pp.target_start",
-				args:  argsFor(1),
-				alias: "pp",
+				sql:     innerLatestGroup(predictionsFor("summary_latest")),
+				args:    argsFor(1),
+				alias:   "pp",
+				sqlFor:  func(index string) string { return innerLatestGroup(predictionsWith(index)) },
 			},
 			probeGap: "joining that group-by back into price_predictions",
 		},
@@ -569,12 +601,7 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			sql: "SELECT page.station_id, page.fuel, pr.run_at, page.target_start, page.target_end, " +
 				"page.predicted_price, page.actual_price, page.error, page.confidence, page.lead_minutes, page.is_suggestion, " +
 				"COALESCE(s.name_override, s.name) AS name, s.brand, s.street, s.house_number, s.post_code, s.place " +
-				"FROM (" +
-				"SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, " +
-				"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion " +
-				"FROM " + predictionsFor("rows") + joinRuns + "WHERE " + where +
-				" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001" +
-				") page " +
+				"FROM (" + innerRowsPage(predictionsFor("rows")) + ") page " +
 				"JOIN prediction_runs pr ON pr.id = page.run_id " +
 				"JOIN stations s ON s.id = page.station_id " +
 				" ORDER BY page.target_start DESC, page.station_id ASC",
@@ -587,12 +614,10 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			probe: &doctorProbeSpec{
 				name:    "page only",
 				purpose: "the capped inner select without the run and station joins",
-				sql: "SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, " +
-					"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion " +
-					"FROM " + predictionsFor("rows") + joinRuns + "WHERE " + where +
-					" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001",
-				args:  argsFor(1),
-				alias: "pp",
+				sql:     innerRowsPage(predictionsFor("rows")),
+				args:    argsFor(1),
+				alias:   "pp",
+				sqlFor:  func(index string) string { return innerRowsPage(predictionsWith(index)) },
 			},
 			probeGap: "joining prediction_runs and stations onto the capped page",
 		},
@@ -1232,7 +1257,7 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 				q.Hinted = measureHinted(ctx, db, d, alt, opts, indexesByTable[spec.table])
 			}
 			if spec.probe != nil && opts.Probe {
-				q.Probe = measureProbe(ctx, db, d, spec.probe, opts, indexesByTable[spec.table])
+				q.Probe = measureProbe(ctx, db, d, spec.probe, opts, indexesByTable[spec.table], q)
 				q.probeGap = spec.probeGap
 			}
 			result.Queries = append(result.Queries, q)
@@ -1896,7 +1921,9 @@ func accuracySliceFinding(queries []doctorQuery) (doctorFinding, bool) {
 		if q.Skipped || probe == nil || probe.Error != "" || probe.Rows == 0 {
 			continue
 		}
-		if probe.Name != "rows walked" {
+		// A probe on a different plan read its rows another way, so neither its
+		// count nor its timing belongs in a total about this one.
+		if probe.Name != "rows walked" || !probe.Comparable {
 			continue
 		}
 		bySlice[probe.Rows] = append(bySlice[probe.Rows], q.Name)
@@ -1928,6 +1955,17 @@ func accuracySliceFinding(queries []doctorQuery) (doctorFinding, bool) {
 	}, true
 }
 
+// planName describes a chosen plan in the few words a finding needs.
+func planName(index string, fullScan bool) string {
+	switch {
+	case fullScan:
+		return "a table scan"
+	case index == "":
+		return "no index"
+	}
+	return index
+}
+
 // accuracyProbeFindings turns one query's probe into findings: how big the slice
 // it reads is, and — where the query is not answered from an index alone — what
 // the row lookups on top of it cost.
@@ -1935,6 +1973,14 @@ func accuracyProbeFindings(q doctorQuery, gap string, opts doctorOptions) []doct
 	probe := q.Probe
 	if probe == nil || probe.Error != "" {
 		return nil
+	}
+	if !probe.Comparable {
+		return []doctorFinding{{
+			Severity: "info",
+			Message: fmt.Sprintf("query %s took %s while its probe took %s, so the two are not measuring the same work "+
+				"and the probe's timing says nothing about where this query's time goes",
+				q.Name, planName(q.UsesIndex, q.FullScan), planName(probe.UsesIndex, probe.FullScan)),
+		}}
 	}
 	var findings []doctorFinding
 	// A covering read's remaining time is aggregation, not lookups; saying

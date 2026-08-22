@@ -1813,6 +1813,18 @@ func TestAccuracyQueriesCarryProbes(t *testing.T) {
 		if spec.probe.alias != spec.alias {
 			t.Errorf("query %s probes alias %q but drives from %q", name, spec.probe.alias, spec.alias)
 		}
+		// Carrying the same hint is not enough: two of these queries are
+		// unhinted, and there only pinning the plan the query actually took
+		// keeps the probe comparable.
+		if spec.table == "price_predictions" && spec.probe.sqlFor == nil {
+			t.Errorf("query %s has a probe that cannot be pinned to its plan", name)
+		}
+		if spec.probe.sqlFor != nil {
+			pinned := spec.probe.sqlFor("idx_price_predictions_due")
+			if !strings.Contains(pinned, "idx_price_predictions_due") {
+				t.Errorf("query %s probe ignores the index it is pinned to:\n%s", name, pinned)
+			}
+		}
 		// A probe that carried a different hint would take a different plan and
 		// its timing would not be comparable.
 		if strings.Contains(spec.sql, "idx_price_predictions_accuracy") !=
@@ -1882,7 +1894,7 @@ func TestAccuracyProbeFindingsDistinguishAggregationFromLookups(t *testing.T) {
 		Name: "summary", Table: "price_predictions", DurationMS: 3600, Rows: 1,
 		UsesIndex: "idx_price_predictions_accuracy", CoveringHit: true,
 		Probe: &doctorQueryProbe{Name: "rows walked", DurationMS: 900, Rows: 2_400_000,
-			UsesIndex: "idx_price_predictions_accuracy", CoveringHit: true},
+			UsesIndex: "idx_price_predictions_accuracy", CoveringHit: true, Comparable: true},
 	}
 	// A covering read's remaining time is the aggregation, so there is nothing
 	// here to attribute to lookups. Its slice is reported once for the page
@@ -1896,7 +1908,7 @@ func TestAccuracyProbeFindingsDistinguishAggregationFromLookups(t *testing.T) {
 		UsesIndex: "idx_price_predictions_station_fuel_target",
 		probeGap:  "joining prediction_runs and stations onto the capped page",
 		Probe: &doctorQueryProbe{Name: "page only", DurationMS: 100, Rows: 1001,
-			UsesIndex: "idx_price_predictions_station_fuel_target"},
+			UsesIndex: "idx_price_predictions_station_fuel_target", Comparable: true},
 	}
 	got := renderFindings(accuracyProbeFindings(lookupBound, lookupBound.probeGap, opts))
 	for _, want := range []string{
@@ -1907,6 +1919,55 @@ func TestAccuracyProbeFindingsDistinguishAggregationFromLookups(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("findings are missing %q:\n%s", want, got)
 		}
+	}
+}
+
+// TestProbeOnADifferentPlanIsRefused pins the guard the production run needed:
+// `series` is one of the two queries the page leaves unhinted, its probe's
+// narrower projection led the optimizer to a different index, and the probe came
+// out four times slower than the query it was meant to be a floor for. A gap
+// between two unrelated plans is not a measurement of anything.
+func TestProbeOnADifferentPlanIsRefused(t *testing.T) {
+	opts := doctorOptions{Pages: doctorPages{Accuracy: true}, Probe: true, SlowMS: 1000}
+	series := doctorQuery{
+		Name: "series", Table: "price_predictions", DurationMS: 1627, Rows: 575,
+		UsesIndex: "idx_price_predictions_accuracy", CoveringHit: true,
+		probeGap: "grouping and ordering those rows",
+		Probe: &doctorQueryProbe{Name: "rows walked", DurationMS: 6508, Rows: 1_363_186,
+			UsesIndex: "idx_price_predictions_due", Comparable: false},
+	}
+	got := renderFindings(accuracyProbeFindings(series, series.probeGap, opts))
+	for _, want := range []string{
+		"query series took idx_price_predictions_accuracy while its probe took idx_price_predictions_due",
+		"not measuring the same work",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("findings are missing %q:\n%s", want, got)
+		}
+	}
+	// Above all it must not be reported as a cost of the query.
+	if strings.Contains(got, "spends") {
+		t.Errorf("an incomparable probe must not be attributed to the query:\n%s", got)
+	}
+
+	// The line itself has to carry the caveat, or its timing reads as a floor.
+	line := captureStdout(t, func() error {
+		writeDoctorProbeText(series.Probe, doctorOptions{}, false)
+		return nil
+	})
+	if !strings.Contains(line, "different plan, not comparable") {
+		t.Errorf("the probe line must say it is not comparable:\n%s", line)
+	}
+
+	// Nor may its rows or its time reach the page-level slice total.
+	comparable := doctorQuery{Name: "summary", Table: "price_predictions", CoveringHit: true,
+		Probe: &doctorQueryProbe{Name: "rows walked", Rows: 1_363_186, DurationMS: 1686, Comparable: true}}
+	finding, ok := accuracySliceFinding([]doctorQuery{comparable, series})
+	if !ok {
+		t.Fatal("the comparable probe still reports its slice")
+	}
+	if strings.Contains(finding.Message, "series") || strings.Contains(finding.Message, "2 of") {
+		t.Errorf("an incomparable probe must not be counted into the slice total:\n%s", finding.Message)
 	}
 }
 
@@ -1946,7 +2007,7 @@ func TestRunDoctorProbesAreOptIntoOut(t *testing.T) {
 func TestAccuracySliceFindingIsStatedOnce(t *testing.T) {
 	walked := func(name string, rows int, ms float64) doctorQuery {
 		return doctorQuery{Name: name, Table: "price_predictions", CoveringHit: true,
-			Probe: &doctorQueryProbe{Name: "rows walked", Rows: rows, DurationMS: ms}}
+			Probe: &doctorQueryProbe{Name: "rows walked", Rows: rows, DurationMS: ms, Comparable: true}}
 	}
 	queries := []doctorQuery{
 		walked("summary", 1_476_360, 371),
@@ -1954,7 +2015,7 @@ func TestAccuracySliceFindingIsStatedOnce(t *testing.T) {
 		walked("by_lead", 1_476_360, 383),
 		// A different slice and a differently-named probe must not be folded in.
 		{Name: "summary_latest", Table: "price_predictions", CoveringHit: true,
-			Probe: &doctorQueryProbe{Name: "inner group only", Rows: 21_570, DurationMS: 414}},
+			Probe: &doctorQueryProbe{Name: "inner group only", Rows: 21_570, DurationMS: 414, Comparable: true}},
 		{Name: "skipped", Skipped: true},
 	}
 	finding, ok := accuracySliceFinding(queries)
