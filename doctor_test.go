@@ -1791,3 +1791,198 @@ func TestFormatDurationMS(t *testing.T) {
 		}
 	}
 }
+
+// TestAccuracyQueriesCarryProbes pins that every accuracy-page query has a probe
+// and that each probe reads the same rows through the same access path as its
+// query — a probe on a different plan would price the wrong thing.
+func TestAccuracyQueriesCarryProbes(t *testing.T) {
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	specs := map[string]accuracyQuerySpec{}
+	for _, spec := range pageSpecs(filters, true) {
+		specs[spec.name] = spec
+	}
+	for name, spec := range specs {
+		if spec.probe == nil {
+			t.Errorf("query %s has no probe, so nothing can say where its time goes", name)
+			continue
+		}
+		if spec.probeGap == "" {
+			t.Errorf("query %s has a probe but does not say what the gap to it is", name)
+		}
+		if spec.probe.alias != spec.alias {
+			t.Errorf("query %s probes alias %q but drives from %q", name, spec.probe.alias, spec.alias)
+		}
+		// A probe that carried a different hint would take a different plan and
+		// its timing would not be comparable.
+		if strings.Contains(spec.sql, "idx_price_predictions_accuracy") !=
+			strings.Contains(spec.probe.sql, "idx_price_predictions_accuracy") {
+			t.Errorf("query %s and its probe disagree about the index hint:\n%s\n%s",
+				name, spec.sql, spec.probe.sql)
+		}
+	}
+
+	// The two structural probes isolate a join rather than a projection, which
+	// is the whole reason they are spelled out separately.
+	if got := specs["summary_latest"].probe.sql; strings.Contains(got, "JOIN (") {
+		t.Errorf("the summary_latest probe must drop the self-join, got:\n%s", got)
+	}
+	if got := specs["rows"].probe.sql; strings.Contains(got, "JOIN prediction_runs") ||
+		strings.Contains(got, "JOIN stations") {
+		t.Errorf("the rows probe must drop the metadata joins, got:\n%s", got)
+	}
+	// ...but must keep the cap, or it would read the whole range instead.
+	if !strings.Contains(specs["rows"].probe.sql, "LIMIT 1001") {
+		t.Errorf("the rows probe lost the page cap:\n%s", specs["rows"].probe.sql)
+	}
+}
+
+// TestAccuracyProbesReadTheSameRows runs each query and its probe for real and
+// checks the probe is not measuring a smaller slice than the query aggregates
+// over, which is what makes the difference between them meaningful.
+func TestAccuracyProbesReadTheSameRows(t *testing.T) {
+	_, db := seedDoctorDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	for _, spec := range pageSpecs(filters, true) {
+		if spec.probe == nil {
+			continue
+		}
+		queryRows, err := countQueryRows(ctx, db, spec.sql, spec.args)
+		if err != nil {
+			t.Fatalf("%s: %v", spec.name, err)
+		}
+		probeRows, err := countQueryRows(ctx, db, spec.probe.sql, spec.probe.args)
+		if err != nil {
+			t.Fatalf("%s probe: %v", spec.name, err)
+		}
+		if probeRows == 0 {
+			t.Errorf("%s probe read nothing while the query returned %d rows", spec.name, queryRows)
+		}
+		// The aggregates reduce, so the probe reads at least as much as the
+		// query returns; rows and its probe both stop at the cap.
+		if probeRows < queryRows {
+			t.Errorf("%s probe read %d rows, fewer than the query's %d — it is not the same slice",
+				spec.name, probeRows, queryRows)
+		}
+	}
+}
+
+// TestAccuracyProbeFindingsDistinguishAggregationFromLookups pins the
+// distinction the wording turns on: a covering read's remaining time is the
+// aggregation, and calling it row lookups would send an operator after an index
+// the query is already using.
+func TestAccuracyProbeFindingsDistinguishAggregationFromLookups(t *testing.T) {
+	opts := doctorOptions{Pages: doctorPages{Accuracy: true}, Probe: true, SlowMS: 1000}
+
+	covering := doctorQuery{
+		Name: "summary", Table: "price_predictions", DurationMS: 3600, Rows: 1,
+		UsesIndex: "idx_price_predictions_accuracy", CoveringHit: true,
+		Probe: &doctorQueryProbe{Name: "rows walked", DurationMS: 900, Rows: 2_400_000,
+			UsesIndex: "idx_price_predictions_accuracy", CoveringHit: true},
+	}
+	// A covering read's remaining time is the aggregation, so there is nothing
+	// here to attribute to lookups. Its slice is reported once for the page
+	// instead; see TestAccuracySliceFindingIsStatedOnce.
+	if got := accuracyProbeFindings(covering, "aggregating those rows", opts); len(got) != 0 {
+		t.Errorf("a covering read must not be reported as paying for lookups:\n%s", renderFindings(got))
+	}
+
+	lookupBound := doctorQuery{
+		Name: "rows", Table: "price_predictions", DurationMS: 4100, Rows: 1001,
+		UsesIndex: "idx_price_predictions_station_fuel_target",
+		probeGap:  "joining prediction_runs and stations onto the capped page",
+		Probe: &doctorQueryProbe{Name: "page only", DurationMS: 100, Rows: 1001,
+			UsesIndex: "idx_price_predictions_station_fuel_target"},
+	}
+	got := renderFindings(accuracyProbeFindings(lookupBound, lookupBound.probeGap, opts))
+	for _, want := range []string{
+		"query rows spends 4000 ms of its 4100 ms joining prediction_runs and stations onto the capped page",
+		"about 3996 µs each",
+		"That is seek latency rather than a cache hit",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("findings are missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunDoctorProbesAreOptIntoOut covers the flag on the accuracy page, which
+// did not have one until the probes reached it.
+func TestRunDoctorProbesAreOptIntoOut(t *testing.T) {
+	dbPath, db := seedDoctorDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	out := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath})
+	})
+	if !strings.Contains(out, "probe/rows walked") {
+		t.Errorf("the accuracy page must probe by default:\n%s", out)
+	}
+	if !strings.Contains(out, "probe/page only") || !strings.Contains(out, "probe/inner group only") {
+		t.Errorf("the two structural probes must appear:\n%s", out)
+	}
+
+	out = captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--probe=false"})
+	})
+	if strings.Contains(out, "probe/") {
+		t.Errorf("--probe=false must run no probes:\n%s", out)
+	}
+	if !strings.Contains(out, "probes were skipped") {
+		t.Errorf("--probe=false must say the report is missing those numbers:\n%s", out)
+	}
+}
+
+// TestAccuracySliceFindingIsStatedOnce pins the shape of the page-level slice
+// finding. The page runs several independent aggregate passes over the same
+// range, so the row count belongs to the page rather than to any one query —
+// repeating it under each of them said the same number five times.
+func TestAccuracySliceFindingIsStatedOnce(t *testing.T) {
+	walked := func(name string, rows int, ms float64) doctorQuery {
+		return doctorQuery{Name: name, Table: "price_predictions", CoveringHit: true,
+			Probe: &doctorQueryProbe{Name: "rows walked", Rows: rows, DurationMS: ms}}
+	}
+	queries := []doctorQuery{
+		walked("summary", 1_476_360, 371),
+		walked("by_confidence", 1_476_360, 457),
+		walked("by_lead", 1_476_360, 383),
+		// A different slice and a differently-named probe must not be folded in.
+		{Name: "summary_latest", Table: "price_predictions", CoveringHit: true,
+			Probe: &doctorQueryProbe{Name: "inner group only", Rows: 21_570, DurationMS: 414}},
+		{Name: "skipped", Skipped: true},
+	}
+	finding, ok := accuracySliceFinding(queries)
+	if !ok {
+		t.Fatal("three queries over one slice must produce a finding")
+	}
+	for _, want := range []string{
+		"3 of the page's queries each walk the same 1,476,360 rows",
+		"(by_confidence, by_lead, summary)",
+		"1211 ms of the total spent walking them over again",
+		"a narrower --range is what shrinks that slice",
+	} {
+		if !strings.Contains(finding.Message, want) {
+			t.Errorf("finding is missing %q:\n%s", want, finding.Message)
+		}
+	}
+
+	// One query over a slice is not "over again", so it reads differently.
+	single, ok := accuracySliceFinding([]doctorQuery{walked("summary", 900, 12)})
+	if !ok {
+		t.Fatal("a single probed query still reports its slice")
+	}
+	if !strings.Contains(single.Message, "query summary reads 900 rows for this filter, walked in 12 ms") {
+		t.Errorf("single-query wording is wrong:\n%s", single.Message)
+	}
+
+	// Nothing probed, nothing to say.
+	if _, ok := accuracySliceFinding([]doctorQuery{{Name: "summary"}}); ok {
+		t.Error("no probes must produce no slice finding")
+	}
+}

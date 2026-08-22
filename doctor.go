@@ -316,9 +316,13 @@ type doctorQuery struct {
 	// --try-index. It answers "would a different index choice actually be
 	// faster here" with a measurement rather than a guess.
 	Hinted *doctorQueryHint `json:"hinted,omitempty"`
-	// Probe is a derived measurement of part of this query's cost, used by the
-	// dashboard checks; see dashboardProbeSpec.
+	// Probe is a derived measurement of part of this query's cost; see
+	// doctorProbeSpec.
 	Probe *doctorQueryProbe `json:"probe,omitempty"`
+	// probeGap is the wording for what the probe leaves out, carried from the
+	// spec so a finding can name the work rather than assume it. Unexported
+	// because it is phrasing, not a measurement, so it stays out of the JSON.
+	probeGap string
 }
 
 // doctorQueryProbe is one derived, read-only measurement taken beside a query:
@@ -361,6 +365,11 @@ type accuracyQuerySpec struct {
 	// classification can be scoped to it (see classifyPlan).
 	table string
 	alias string
+	// probe is the derived measurement that runs beside this query, and
+	// probeGap names in words what the difference between the two actually is,
+	// so a finding can state it rather than assume every gap is row lookups.
+	probe    *doctorProbeSpec
+	probeGap string
 }
 
 // accuracyQuerySpecs mirrors the queries in web/index.php's
@@ -432,6 +441,21 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 		return out
 	}
 
+	// walkedProbe counts the index entries one query's filter matches, and times
+	// the walk alone. For the aggregates that is the slice --range selects, and
+	// the gap to the parent is whatever the aggregation costs on top of it —
+	// unless the parent is not covering, in which case the gap is row lookups.
+	// Same reference and hint as the parent, so the access path is the same one.
+	walkedProbe := func(name string) *doctorProbeSpec {
+		return &doctorProbeSpec{
+			name:    "rows walked",
+			purpose: "index entries the filter matches, and what walking them alone costs",
+			sql:     "SELECT 1 FROM " + predictionsFor(name) + joinRuns + "WHERE " + where,
+			args:    argsFor(1),
+			alias:   "pp",
+		}
+	}
+
 	leadBucket := "CASE" +
 		" WHEN pp.lead_minutes < 60 THEN '0-1h'" +
 		" WHEN pp.lead_minutes < 180 THEN '1-3h'" +
@@ -452,9 +476,11 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 				"SUM(CASE WHEN ABS(pp.error) <= 0.01 THEN 1 ELSE 0 END) AS within1, " +
 				"SUM(CASE WHEN ABS(pp.error) <= 0.02 THEN 1 ELSE 0 END) AS within2 " +
 				"FROM " + predictionsFor("summary") + joinRuns + "WHERE " + where,
-			args:  argsFor(1),
-			table: "price_predictions",
-			alias: "pp",
+			args:     argsFor(1),
+			table:    "price_predictions",
+			alias:    "pp",
+			probe:    walkedProbe("summary"),
+			probeGap: "aggregating those rows",
 		},
 		{
 			name:    "summary_latest",
@@ -474,6 +500,19 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			args:  append(argsFor(1), f.Fuel),
 			table: "price_predictions",
 			alias: "pp",
+			// The inner group-by on its own. The gap to the parent is the
+			// self-join back into price_predictions, which is the part of this
+			// query the covering index has to satisfy twice.
+			probe: &doctorProbeSpec{
+				name:    "inner group only",
+				purpose: "the latest-run-per-window group-by without the join back to it",
+				sql: "SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id " +
+					"FROM " + predictionsFor("summary_latest") + joinRuns + "WHERE " + where +
+					" GROUP BY pp.station_id, pp.target_start",
+				args:  argsFor(1),
+				alias: "pp",
+			},
+			probeGap: "joining that group-by back into price_predictions",
 		},
 		{
 			name:    "by_confidence",
@@ -481,9 +520,11 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			sql: "SELECT pp.confidence AS confidence, COUNT(*) AS n, " +
 				"AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias " +
 				"FROM " + predictionsFor("by_confidence") + joinRuns + "WHERE " + where + " GROUP BY pp.confidence",
-			args:  argsFor(1),
-			table: "price_predictions",
-			alias: "pp",
+			args:     argsFor(1),
+			table:    "price_predictions",
+			alias:    "pp",
+			probe:    walkedProbe("by_confidence"),
+			probeGap: "aggregating and grouping those rows",
 		},
 		{
 			name:    "by_lead",
@@ -491,9 +532,11 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			sql: "SELECT " + leadBucket + " AS bucket, COUNT(*) AS n, " +
 				"AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias, MIN(pp.lead_minutes) AS lead_floor " +
 				"FROM " + predictionsFor("by_lead") + joinRuns + "WHERE " + where + " GROUP BY " + leadBucket,
-			args:  argsFor(1),
-			table: "price_predictions",
-			alias: "pp",
+			args:     argsFor(1),
+			table:    "price_predictions",
+			alias:    "pp",
+			probe:    walkedProbe("by_lead"),
+			probeGap: "aggregating and grouping those rows",
 		},
 		{
 			name:    "by_hour",
@@ -502,9 +545,11 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 				"AVG(ABS(pp.error)) AS mae, AVG(pp.error) AS bias " +
 				"FROM " + predictionsFor("by_hour") + joinRuns + "WHERE " + where +
 				" GROUP BY " + hourExpr + " ORDER BY hour ASC",
-			args:  argsFor(1),
-			table: "price_predictions",
-			alias: "pp",
+			args:     argsFor(1),
+			table:    "price_predictions",
+			alias:    "pp",
+			probe:    walkedProbe("by_hour"),
+			probeGap: "aggregating and grouping those rows",
 		},
 		{
 			name:    "series",
@@ -512,9 +557,11 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			sql: "SELECT pp.target_start AS t, AVG(pp.predicted_price) AS p, AVG(pp.actual_price) AS a, COUNT(*) AS n " +
 				"FROM " + predictionsFor("series") + joinRuns + "WHERE " + where +
 				" GROUP BY pp.target_start ORDER BY pp.target_start ASC",
-			args:  argsFor(1),
-			table: "price_predictions",
-			alias: "pp",
+			args:     argsFor(1),
+			table:    "price_predictions",
+			alias:    "pp",
+			probe:    walkedProbe("series"),
+			probeGap: "grouping and ordering those rows",
 		},
 		{
 			name:    "rows",
@@ -534,6 +581,20 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			args:  argsFor(1),
 			table: "price_predictions",
 			alias: "pp",
+			// The capped inner page on its own. The gap to the parent is the two
+			// metadata joins, which is the one part of this query that scales
+			// with the cap rather than with the range.
+			probe: &doctorProbeSpec{
+				name:    "page only",
+				purpose: "the capped inner select without the run and station joins",
+				sql: "SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, " +
+					"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion " +
+					"FROM " + predictionsFor("rows") + joinRuns + "WHERE " + where +
+					" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001",
+				args:  argsFor(1),
+				alias: "pp",
+			},
+			probeGap: "joining prediction_runs and stations onto the capped page",
 		},
 	}
 
@@ -557,6 +618,14 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 			args:  decArgs,
 			table: "price_check_decisions",
 			alias: "d",
+			probe: &doctorProbeSpec{
+				name:    "rows walked",
+				purpose: "decision rows the filter matches, and what walking them alone costs",
+				sql:     "SELECT 1 FROM price_check_decisions d " + decJoin + "WHERE " + decWhere,
+				args:    decArgs,
+				alias:   "d",
+			},
+			probeGap: "reading the regret and recommendation columns off those rows",
 		})
 	}
 	return specs
@@ -1161,6 +1230,10 @@ func runDoctorChecks(ctx context.Context, db *sql.DB, d dialect, target string, 
 			// decisions query reads a different table.
 			if alt, ok := hinted[spec.name]; ok && spec.table == "price_predictions" {
 				q.Hinted = measureHinted(ctx, db, d, alt, opts, indexesByTable[spec.table])
+			}
+			if spec.probe != nil && opts.Probe {
+				q.Probe = measureProbe(ctx, db, d, spec.probe, opts, indexesByTable[spec.table])
+				q.probeGap = spec.probeGap
 			}
 			result.Queries = append(result.Queries, q)
 		}
@@ -1808,6 +1881,76 @@ func countQueryRows(ctx context.Context, db *sql.DB, query string, args []any) (
 
 // doctorFindings turns the raw report into the short actionable list an
 // operator actually reads first.
+// accuracySliceFinding reports the row slice the page reads, once, along with
+// how many of its queries read it and what the walking alone adds up to.
+//
+// The page issues several independent aggregate passes over the same
+// (fuel, target_start) range, so on a wide --range the same rows are walked
+// several times over. That is the fact worth stating; repeating the row count
+// under every query says it five times and lands as noise.
+func accuracySliceFinding(queries []doctorQuery) (doctorFinding, bool) {
+	bySlice := map[int][]string{}
+	walkMS := map[int]float64{}
+	for _, q := range queries {
+		probe := q.Probe
+		if q.Skipped || probe == nil || probe.Error != "" || probe.Rows == 0 {
+			continue
+		}
+		if probe.Name != "rows walked" {
+			continue
+		}
+		bySlice[probe.Rows] = append(bySlice[probe.Rows], q.Name)
+		walkMS[probe.Rows] += probe.DurationMS
+	}
+	widest, passes := 0, 0
+	for rows, names := range bySlice {
+		if len(names) > passes || (len(names) == passes && rows > widest) {
+			widest, passes = rows, len(names)
+		}
+	}
+	if widest == 0 {
+		return doctorFinding{}, false
+	}
+	names := bySlice[widest]
+	sort.Strings(names)
+	if passes == 1 {
+		return doctorFinding{
+			Severity: "info",
+			Message: fmt.Sprintf("query %s reads %s rows for this filter, walked in %.0f ms",
+				names[0], formatCount(int64(widest)), walkMS[widest]),
+		}, true
+	}
+	return doctorFinding{
+		Severity: "info",
+		Message: fmt.Sprintf("%d of the page's queries each walk the same %s rows this filter selects (%s), "+
+			"%.0f ms of the total spent walking them over again; a narrower --range is what shrinks that slice",
+			passes, formatCount(int64(widest)), strings.Join(names, ", "), walkMS[widest]),
+	}, true
+}
+
+// accuracyProbeFindings turns one query's probe into findings: how big the slice
+// it reads is, and — where the query is not answered from an index alone — what
+// the row lookups on top of it cost.
+func accuracyProbeFindings(q doctorQuery, gap string, opts doctorOptions) []doctorFinding {
+	probe := q.Probe
+	if probe == nil || probe.Error != "" {
+		return nil
+	}
+	var findings []doctorFinding
+	// A covering read's remaining time is aggregation, not lookups; saying
+	// "lookups" there would send an operator after an index it already has.
+	// The slice size those rows come from is reported once for the page as a
+	// whole (accuracySliceFinding), because most of these queries read the
+	// same one and repeating the number per query buries it.
+	if q.CoveringHit || gap == "" {
+		return findings
+	}
+	if finding, ok := probeLookupFinding(q, gap, opts); ok {
+		findings = append(findings, finding)
+	}
+	return findings
+}
+
 func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFinding {
 	var findings []doctorFinding
 	warn := func(format string, a ...any) {
@@ -1865,6 +2008,7 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 		case !q.CoveringHit:
 			info("query %s uses %s but still reads table rows", q.Name, q.UsesIndex)
 		}
+		findings = append(findings, accuracyProbeFindings(q, q.probeGap, opts)...)
 		// An index the planner weighed and passed over, on a query that is not
 		// covering, is worth naming — but only as something to measure. On the
 		// live database this pattern survived both ANALYZE TABLE and a
@@ -1879,8 +2023,14 @@ func doctorFindings(r doctorResult, d dialect, opts doctorOptions) []doctorFindi
 			}
 		}
 	}
+	if finding, ok := accuracySliceFinding(r.Queries); ok {
+		findings = append(findings, finding)
+	}
 	if total > 0 {
 		info("accuracy page SQL total %.0f ms; slowest %s at %.0f ms", total, slowest.Name, slowest.DurationMS)
+	}
+	if opts.Pages.Accuracy && !opts.Probe {
+		info("probes were skipped (--probe=false), so the report cannot say how much of each query's time is the aggregation and how much is reading rows")
 	}
 
 	// --try-index only pays off if it produces a verdict, so state one.
@@ -2119,17 +2269,18 @@ func runDoctor(args []string) error {
 	to := fs.String("to", "", "Range end as YYYY-MM-DD (the accuracy page needs --from with it)")
 	skipQueries := fs.Bool("skip-queries", false, "Only report schema, sizes, indexes and scope; do not run the page queries")
 
+	probe := fs.Bool("probe", true, "Also run the derived probe queries that price the row lookups and the rows an aggregate walks (read-only, roughly one extra read each)")
+
 	// Dashboard-only filters, registered only where they mean something so
 	// `doctor accuracy --city` fails at the flag rather than being ignored.
 	var city, station *string
 	var radius *int
-	var noCity, probe *bool
+	var noCity *bool
 	if pages.Dashboard {
 		city = fs.String("city", "", "City filter the dashboard was loaded with, as its normalized name; default is the city with the most stations in scope")
 		noCity = fs.Bool("no-city", false, "Reproduce the unscoped dashboard, which loads the station list and skips the snapshot and prediction queries")
 		radius = fs.Int("radius", dashboardRadiusOptions[0], "Radius in km around the city, one of the radii the dashboard offers: 5, 10 or 20")
 		station = fs.String("station", "", "Station ids the dashboard's picker had selected (comma-separated); narrows the in-scope list the same way the page does")
-		probe = fs.Bool("probe", true, "Also run the derived probe queries that price the row lookups and the rows an aggregate walks (read-only, roughly one extra read each)")
 	}
 	tryIndex := fs.String("try-index", "", "Also time every price_predictions query with this index forced, to measure what a different index choice would cost (read-only)")
 	analyze := fs.Bool("analyze", false, "Use EXPLAIN ANALYZE for real per-step timings (MySQL 8.0.18+; ignored on SQLite)")
@@ -2243,7 +2394,7 @@ func runDoctor(args []string) error {
 		Pages:           pages,
 		Dashboard:       dashFilters,
 		DashboardNoCity: noCity != nil && *noCity,
-		Probe:           probe != nil && *probe,
+		Probe:           *probe,
 		Filters: doctorFilters{
 			Fuel:       scopeFuel,
 			Confidence: *confidence,
@@ -2328,6 +2479,7 @@ func writeDoctorText(r doctorResult, opts doctorOptions, explain bool) {
 			continue
 		}
 		fmt.Fprintf(stdout, "  %-16s %9.1f ms %6d rows  %s\n", q.Name, q.DurationMS, q.Rows, queryNote(q))
+		writeDoctorProbeText(q.Probe, opts, explain)
 		if h := q.Hinted; h != nil {
 			hintNote := h.UsesIndex
 			switch {

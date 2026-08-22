@@ -98,22 +98,7 @@ type dashboardQuerySpec struct {
 	// classification can be scoped to it (see classifyPlan).
 	table string
 	alias string
-	probe *dashboardProbeSpec
-}
-
-// dashboardProbeSpec is a derived, read-only measurement that runs beside its
-// query: the same access path with a narrower projection. The difference between
-// the two is what fetching the table rows costs, and that is the number which
-// decides whether a covering index would pay for itself — the same question
-// idx_price_predictions_accuracy answered for the accuracy page. A probe is
-// never a query the page runs, so it is reported as a sub-line and never
-// counted into the page's total.
-type dashboardProbeSpec struct {
-	name    string
-	purpose string
-	sql     string
-	args    []any
-	alias   string
+	probe *doctorProbeSpec
 }
 
 // dashboardQueryContext is everything that shapes a dashboard load's SQL.
@@ -285,7 +270,7 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 		args:  snapArgs,
 		table: "price_snapshots",
 		alias: "ps",
-		probe: &dashboardProbeSpec{
+		probe: &doctorProbeSpec{
 			name:    "keys only",
 			purpose: "the same rows without the price columns, so the difference is the row lookups",
 			sql: "SELECT ps.station_id, ps.recorded_at FROM price_snapshots ps " +
@@ -327,7 +312,7 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 		args:  gridArgs,
 		table: "price_predictions",
 		alias: "pp",
-		probe: &dashboardProbeSpec{
+		probe: &doctorProbeSpec{
 			name:    "keys only",
 			purpose: "the same rows without the payload columns or the run join",
 			sql: "SELECT pp.station_id, pp.fuel, pp.target_start FROM price_predictions pp " +
@@ -687,28 +672,6 @@ func runDashboardSpecs(ctx context.Context, db *sql.DB, d dialect, opts doctorOp
 	return out
 }
 
-// measureProbe runs one derived measurement beside its query.
-func measureProbe(ctx context.Context, db *sql.DB, d dialect, spec *dashboardProbeSpec,
-	opts doctorOptions, indexNames []string) *doctorQueryProbe {
-	out := &doctorQueryProbe{Name: spec.name, Purpose: spec.purpose, SQL: spec.sql}
-	plan, cells, err := explainPlan(ctx, db, d, spec.sql, spec.args, opts.Analyze)
-	if err != nil {
-		out.Error = err.Error()
-		return out
-	}
-	out.Plan = plan
-	out.UsesIndex, out.CoveringHit, _ = classifyPlan(plan, cells, d, indexNames, spec.alias)
-
-	started := time.Now()
-	count, err := countQueryRows(ctx, db, spec.sql, spec.args)
-	out.DurationMS = float64(time.Since(started).Microseconds()) / 1000
-	if err != nil {
-		out.Error = err.Error()
-	}
-	out.Rows = count
-	return out
-}
-
 // doctorDashboardFindings turns the dashboard measurements into the short list
 // an operator acts on. The generic verdicts (a failed query, a slow one, a table
 // scan) mirror the accuracy page's; the rest are specific to how this page is
@@ -855,63 +818,6 @@ func dashboardPredictionFindings(byName map[string]doctorQuery, opts doctorOptio
 	return findings
 }
 
-// A share of a query's time is not on its own a reason to warn: 4 ms out of
-// 7 ms is half the query and still nobody's problem. Both an absolute floor and
-// a share have to be crossed, and below the note floor there is nothing worth
-// saying at all.
-const (
-	dashboardLookupNoteMS = 5
-	dashboardLookupWarnMS = 100
-)
-
-// lookupSeverity rates the time a query spends on work its index could have
-// carried instead. The second return says whether it is worth reporting.
-func lookupSeverity(lookupsMS, totalMS, slowMS float64) (string, bool) {
-	if lookupsMS < dashboardLookupNoteMS {
-		return "", false
-	}
-	if lookupsMS >= slowMS || (lookupsMS >= dashboardLookupWarnMS && lookupsMS >= totalMS/2) {
-		return "warn", true
-	}
-	return "info", true
-}
-
-// perLookupMicros is what one row lookup cost. It is the number that separates a
-// query reading a lot of rows from a cache (a few microseconds each) from one
-// seeking to disk for every one of them, and those need different fixes.
-func perLookupMicros(lookupsMS float64, rows int) float64 {
-	if rows <= 0 {
-		return 0
-	}
-	return lookupsMS * 1000 / float64(rows)
-}
-
-// dashboardSeekMicros is where a per-lookup cost stops looking like a cache hit.
-// Above it the table is being read from disk a row at a time, and then reducing
-// the row count is treating a symptom.
-const dashboardSeekMicros = 50
-
-// lookupRate renders the per-lookup cost, and says so when it is seek latency
-// rather than a cache hit — the two want different fixes, so the distinction is
-// worth a sentence wherever a finding reports lookups at all.
-func lookupRate(lookupsMS float64, rows int) string {
-	perLookup := perLookupMicros(lookupsMS, rows)
-	out := fmt.Sprintf("about %.0f µs each", perLookup)
-	if perLookup >= dashboardSeekMicros {
-		out += ". That is seek latency rather than a cache hit, so the table is not staying in the buffer pool"
-	}
-	return out
-}
-
-// indexOrPlan names the index a query took, or says there was none, so a
-// finding reads the same either way.
-func indexOrPlan(q doctorQuery) string {
-	if q.UsesIndex == "" {
-		return "the plan it chose"
-	}
-	return q.UsesIndex
-}
-
 // writeDoctorDashboardText prints the dashboard section: the filters that were
 // reproduced, how the scope narrowed, then one line per query with its probe
 // indented beneath it.
@@ -957,33 +863,13 @@ func writeDoctorDashboardText(dash *doctorDashboard, opts doctorOptions, explain
 			continue
 		}
 		fmt.Fprintf(stdout, "  %-18s %9.1f ms %8d rows  %s\n", q.Name, q.DurationMS, q.Rows, queryNote(q))
-		if p := q.Probe; p != nil {
-			note := "no index"
-			switch {
-			case p.Error != "":
-				note = "failed: " + p.Error
-			case p.UsesIndex != "" && p.CoveringHit:
-				note = "covering " + p.UsesIndex
-			case p.UsesIndex != "":
-				note = p.UsesIndex
-			}
-			fmt.Fprintf(stdout, "    %-16s %9.1f ms %8d rows  %s\n",
-				"probe/"+p.Name, p.DurationMS, p.Rows, note)
-		}
+		writeDoctorProbeText(q.Probe, opts, explain)
 		if opts.ShowSQL {
 			fmt.Fprintf(stdout, "      sql: %s\n", q.SQL)
-			if p := q.Probe; p != nil {
-				fmt.Fprintf(stdout, "      probe sql: %s\n", p.SQL)
-			}
 		}
 		if explain {
 			for _, line := range q.Plan {
 				fmt.Fprintf(stdout, "      | %s\n", line)
-			}
-			if p := q.Probe; p != nil {
-				for _, line := range p.Plan {
-					fmt.Fprintf(stdout, "      probe | %s\n", line)
-				}
 			}
 		}
 	}

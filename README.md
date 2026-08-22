@@ -426,6 +426,8 @@ A configured target with no stations in scope is the inverse failure — the swe
 
 The section is built from indexed lookups only — one seek per station, plus one pass over the newest run's predictions — so it runs even under `--skip-queries` and costs nothing next to the page timings. Stored predictions are looked up only for stations that have *left* scope, newest first and capped at 500 stations.
 
+Every query carries a probe as well — the same measurement the dashboard checks use, see [Probes](#probes-what-a-querys-time-is-actually-spent-on). For the aggregates it is `probe/rows walked`: the index entries the filter matches and what walking them alone costs, so a slow pass can be told apart from a wide `--range`. `summary_latest` and `rows` get structural probes instead, dropping the self-join and the metadata joins respectively, because for those two the join is the part worth pricing. `--probe=false` skips them.
+
 Its filter flags (`--fuel`, `--confidence`, `--range`, or `--from`/`--to`) mirror the page's own controls, so you can reproduce exactly the filter that felt slow in the browser. Each query line ends in a verdict: `covering <index>` means the query was answered from an index alone, a bare index name means it used that index but still fetched table rows, and `TABLE SCAN` means it read the whole table. The `findings` section collects the actionable parts — a missing index, a query over `--slow-ms` (default 1000), a table scan.
 
 When a query is slow but the index it needs exists, the usual cause is the optimizer passing that index over. `doctor` reports the index MySQL actually committed to (its `key`), not the ones it merely weighed, and warns when it chose a non-covering index while the covering one was among the candidates.
@@ -495,6 +497,17 @@ A verdict of `covering <index>` or a bare index name says which index was used, 
 
 - **`probe/keys only`** projects just the indexed columns. The query and the probe read exactly the same rows via exactly the same index, so the difference between their timings is what fetching the *unindexed* columns from table rows costs. When that difference is most of the query's time, an index carrying those columns would make the read index-only — which is precisely what `idx_price_predictions_accuracy` did for the accuracy page.
 - **`probe/rows walked`** counts the rows an aggregate reduces, and how long walking them takes — so an aggregate returning a handful of rows off millions can be told apart from one that is genuinely cheap.
+- **Structural probes** drop a join rather than a projection, where that is the part worth pricing: `probe/inner group only` runs the accuracy page's latest-run group-by without the self-join back into `price_predictions`, and `probe/page only` runs its capped row page without the `prediction_runs` and `stations` joins.
+
+Where a query is answered from an index alone, the gap to its probe is the aggregation rather than row lookups, and the findings say so — calling it lookups would send you after an index the query is already using.
+
+Because the accuracy page runs several independent aggregate passes over the same `(fuel, target_start)` slice, `doctor` states that slice once for the page rather than under each query:
+
+```
+info 5 of the page's queries each walk the same 1,476,360 rows this filter selects
+     (by_confidence, by_hour, by_lead, series, summary), 2022 ms of the total spent
+     walking them over again; a narrower --range is what shrinks that slice
+```
 
 Where a probe shows the query paying for something its index could have carried, the finding also reports the cost **per row** in microseconds. That is the number that decides the fix: a few microseconds per lookup is a buffer-pool hit and the row count is the thing to reduce; hundreds of microseconds is a disk seek, and then the table has outgrown the cache and rewriting one query will not hide it.
 
