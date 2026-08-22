@@ -128,7 +128,7 @@ type notifyResult struct {
 	DBPath        string             `json:"db_path"`
 }
 
-func runNotify(args []string) error {
+func runNotify(args []string) (err error) {
 	fs := flag.NewFlagSet("notify", flag.ContinueOnError)
 	dbf := addDBFlags(fs)
 	dryRun := fs.Bool("dry-run", false, "Render notifications and report recipients without sending or writing state")
@@ -156,6 +156,15 @@ func runNotify(args []string) error {
 		return err
 	}
 
+	// A dry run writes nothing and sends nothing, so it is not a delivery and
+	// does not belong in the delivery statistics: recording it would mix
+	// operator rehearsals into the counts the Statistics page reports.
+	var stats *commandRun
+	if !*dryRun {
+		stats = beginCommandRun(ctx, db, "notify")
+		defer func() { stats.finish(ctx, err) }()
+	}
+
 	result, err := notifyOnce(ctx, db, dbCfg.Driver, notifyOptions{
 		Now:      time.Now().UTC(),
 		Location: time.Local,
@@ -167,14 +176,36 @@ func runNotify(args []string) error {
 	}
 	result.DBPath = dbCfg.Description()
 
+	stats.set("stations", float64(result.Stations))
+	stats.set("users", float64(result.Users))
+	stats.set("check_rows", float64(result.CheckRows))
+	stats.set("suggest_rows", float64(result.SuggestRows))
+	stats.set("sent", float64(len(result.Sent)))
+	stats.set("failed", float64(len(result.Failed)))
+	stats.setBool("baseline_reset", result.BaselineReset)
+	// Some recipients got their notification and some did not: the command
+	// only returns an error when every send failed.
+	if len(result.Failed) > 0 && len(result.Sent) > 0 {
+		stats.markPartial()
+	}
+
+	// Every send failed. That is the command's result whichever way it prints,
+	// so build it before the output branch: computing it only on the text path
+	// left JSON runs exiting 0 and recorded as 'ok' on a run that delivered
+	// nothing.
+	var sendErr error
+	if len(result.Failed) > 0 && len(result.Sent) == 0 {
+		sendErr = fmt.Errorf("all %d notification sends failed", len(result.Failed))
+	}
+
 	if output == outputJSON {
-		return writeJSON(result)
+		if err := writeJSON(result); err != nil {
+			return err
+		}
+		return sendErr
 	}
 	printNotifyResultText(result)
-	if len(result.Failed) > 0 && len(result.Sent) == 0 {
-		return fmt.Errorf("all %d notification sends failed", len(result.Failed))
-	}
-	return nil
+	return sendErr
 }
 
 func printNotifyResultText(result notifyResult) {

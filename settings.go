@@ -65,6 +65,11 @@ const (
 	// stations that stopped being fed when an update target was removed or
 	// its radius shrank, without needing a radius at computation time.
 	stationFreshness = 48 * time.Hour
+	// commandRunRetentionDays is how long recorded command runs are kept.
+	// `gasoline compact` does the pruning: the recording commands run on
+	// minute-scale timers and should not each pay for a sweep, and compact is
+	// already the housekeeping pass.
+	commandRunRetentionDays = 30
 )
 
 const (

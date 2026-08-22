@@ -68,6 +68,11 @@ var doctorTables = []string{
 	// magnitude, so both its row count and whether idx_cities_normalized is
 	// present belong in the report.
 	"cities",
+	// The command-run tables are small by design (30 days of timer runs), but
+	// they back the admin Statistics page, so a missing index there is worth
+	// naming before it turns into a slow page.
+	"command_run_metrics",
+	"command_runs",
 }
 
 // doctorExpectedIndexes lists the indexes schemaStatements installs, so doctor
@@ -94,6 +99,13 @@ func doctorExpectedIndexes(d dialect) map[string][]string {
 		// Both cities indexes serve the dashboard: one its city filter, the
 		// other its typeahead.
 		"cities": {"idx_cities_normalized", "idx_cities_search"},
+		"command_runs": {
+			"idx_command_runs_command_started",
+			"idx_command_runs_started",
+		},
+		// Unlike the run_id indexes above, this one is not the foreign key's:
+		// it is (run_id, name), so MySQL declares it explicitly too.
+		"command_run_metrics": {"idx_command_run_metrics_run"},
 	}
 	if d != dialectMySQL {
 		expected["price_predictions"] = append(expected["price_predictions"], "idx_price_predictions_run")

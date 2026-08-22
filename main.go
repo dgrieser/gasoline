@@ -128,11 +128,15 @@ type multiUpdateResult struct {
 }
 
 type compactResult struct {
-	StationsProcessed int    `json:"stations_processed"`
-	BeforeCount       int    `json:"before_count"`
-	AfterCount        int    `json:"after_count"`
-	DeletedCount      int    `json:"deleted_count"`
-	UpdatedCount      int    `json:"updated_count"`
+	StationsProcessed int `json:"stations_processed"`
+	BeforeCount       int `json:"before_count"`
+	AfterCount        int `json:"after_count"`
+	DeletedCount      int `json:"deleted_count"`
+	UpdatedCount      int `json:"updated_count"`
+	// PrunedCommandRuns is the recorded command runs dropped by retention.
+	// Compact is where they go: the commands that record them run on
+	// minute-scale timers, and this is already the housekeeping pass.
+	PrunedCommandRuns int    `json:"pruned_command_runs"`
 	DBPath            string `json:"db_path"`
 }
 
@@ -767,7 +771,7 @@ func validateCityQueries(queries []cityQuery) error {
 	return nil
 }
 
-func runUpdate(args []string) error {
+func runUpdate(args []string) (err error) {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	dbf := addDBFlags(fs)
 	var events []updateArg
@@ -814,6 +818,19 @@ func runUpdate(args []string) error {
 		return err
 	}
 
+	stats := beginCommandRun(ctx, db, "update")
+	defer func() { stats.finish(ctx, err) }()
+	// One place for the sweep's metric contract: a single-target run bails out
+	// of the fetch loop below without reaching the end of the function, and it
+	// has to report the same names as a full sweep or cities_failed undercounts
+	// exactly the failure a one-target install hits most.
+	recordSweep := func(cities, failed, fetched, stored int) {
+		stats.set("cities", float64(cities))
+		stats.set("cities_failed", float64(failed))
+		stats.set("stations_fetched", float64(fetched))
+		stats.set("snapshots_stored", float64(stored))
+	}
+
 	queries := buildCityQueries(events)
 	// Without any --city/--radius flags, fall back to the admin-configured
 	// update targets. Explicit flags never mix with DB targets.
@@ -844,6 +861,7 @@ func runUpdate(args []string) error {
 		if err != nil {
 			// Single city: preserve the original error shape.
 			if len(queries) == 1 {
+				recordSweep(1, 1, 0, 0)
 				return err
 			}
 			failures++
@@ -898,6 +916,13 @@ func runUpdate(args []string) error {
 			StoredCount:  stored[i],
 			RecordedAt:   f.RecordedAt.Format(time.RFC3339),
 		})
+	}
+
+	recordSweep(len(queries), failures, totalFetched, len(observations))
+	// A sweep that lost some cities but stored the rest is degraded, not
+	// failed; one that lost every city is a failure like any other.
+	if failures > 0 && failures < len(queries) {
+		stats.markPartial()
 	}
 
 	// Single city: preserve the original behavior and output shape.
@@ -1179,6 +1204,11 @@ func runCompact(args []string) error {
 	if err != nil {
 		return err
 	}
+	prunedRuns, err := pruneCommandRuns(ctx, db, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	result.PrunedCommandRuns = prunedRuns
 	result.DBPath = dbCfg.Description()
 
 	if output == outputJSON {
@@ -1187,6 +1217,7 @@ func runCompact(args []string) error {
 
 	fmt.Fprintf(stdout, "compacted %d stations in %s\n", result.StationsProcessed, dbCfg.Description())
 	fmt.Fprintf(stdout, "snapshots: %d -> %d (deleted=%d, updated=%d)\n", result.BeforeCount, result.AfterCount, result.DeletedCount, result.UpdatedCount)
+	fmt.Fprintf(stdout, "pruned %d command run records older than %d days\n", result.PrunedCommandRuns, commandRunRetentionDays)
 	return nil
 }
 
@@ -1651,7 +1682,7 @@ func runHistory(args []string) error {
 	return nil
 }
 
-func runSuggest(args []string) error {
+func runSuggest(args []string) (err error) {
 	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
 	dbf := addDBFlags(fs)
 	persist := fs.Bool("persist", false, "Store the full prediction grid in the database, evaluate past predictions against actual prices, and learn from the errors")
@@ -1693,6 +1724,10 @@ func runSuggest(args []string) error {
 		return err
 	}
 
+	stats := beginCommandRun(ctx, db, "suggest")
+	defer func() { stats.finish(ctx, err) }()
+	stats.setBool("persist", *persist)
+
 	// One pass over the history serves every fuel.
 	scan, err := loadSnapshotScan(ctx, db, opts.Now.AddDate(0, 0, -opts.HistoryDays), opts.Now)
 	if err != nil {
@@ -1701,6 +1736,10 @@ func runSuggest(args []string) error {
 	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
 		return err
 	}
+	// The scan is the same input every fuel is computed from, so its size is
+	// what explains this run's duration.
+	stats.set("stations", float64(len(scan.Stations)))
+	stats.set("snapshots_scanned", float64(len(scan.Rows)))
 
 	// Best-effort across fuels like `update` is across cities: compute and
 	// persist each fuel independently, report failures at the end.
@@ -1769,6 +1808,23 @@ func runSuggest(args []string) error {
 				"pruned %d/%d by retention, %d/%d for %d stations that left scope\n",
 			totals.Predictions, totals.Decisions, evaluated, outcomes, totals.BiasedStations,
 			pruned, prunedDecisions, unfedPredictions, unfedDecisions, unfedStations)
+
+		stats.set("predictions_stored", float64(totals.Predictions))
+		stats.set("decisions_stored", float64(totals.Decisions))
+		stats.set("predictions_evaluated", float64(evaluated))
+		stats.set("outcomes_scored", float64(outcomes))
+		stats.set("stations_bias_corrected", float64(totals.BiasedStations))
+		stats.set("pruned_predictions", float64(pruned))
+		stats.set("pruned_decisions", float64(prunedDecisions))
+		stats.set("unfed_stations", float64(unfedStations))
+		stats.set("unfed_predictions", float64(unfedPredictions))
+		stats.set("unfed_decisions", float64(unfedDecisions))
+	}
+
+	stats.set("fuels", float64(len(suggestFuels)))
+	stats.set("fuels_failed", float64(failures))
+	if failures > 0 && failures < len(suggestFuels) {
+		stats.markPartial()
 	}
 
 	if !quiet {
@@ -1792,7 +1848,7 @@ func runSuggest(args []string) error {
 	return nil
 }
 
-func runCheck(args []string) error {
+func runCheck(args []string) (err error) {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	dbf := addDBFlags(fs)
 	outputLong, outputShort := addOutputFlags(fs)
@@ -1827,6 +1883,9 @@ func runCheck(args []string) error {
 		return err
 	}
 
+	stats := beginCommandRun(ctx, db, "check")
+	defer func() { stats.finish(ctx, err) }()
+
 	// One pass over the history serves every fuel.
 	scan, err := loadSnapshotScan(ctx, db, opts.Now.AddDate(0, 0, -opts.HistoryDays), opts.Now)
 	if err != nil {
@@ -1835,6 +1894,8 @@ func runCheck(args []string) error {
 	if err := scan.fillOwningCityDistances(ctx, db); err != nil {
 		return err
 	}
+	stats.set("stations", float64(len(scan.Stations)))
+	stats.set("snapshots_scanned", float64(len(scan.Rows)))
 
 	// Best-effort across fuels: check all, report failures at the end.
 	results := make([]fuelCheckResult, 0, len(suggestFuels))
@@ -1853,6 +1914,17 @@ func runCheck(args []string) error {
 			checks = []priceCheckRow{}
 		}
 		results = append(results, fuelCheckResult{Fuel: fuel, Checks: checks})
+	}
+
+	checkRows := 0
+	for _, res := range results {
+		checkRows += len(res.Checks)
+	}
+	stats.set("fuels", float64(len(suggestFuels)))
+	stats.set("fuels_failed", float64(failures))
+	stats.set("check_rows", float64(checkRows))
+	if failures > 0 && failures < len(suggestFuels) {
+		stats.markPartial()
 	}
 
 	if output == outputJSON {

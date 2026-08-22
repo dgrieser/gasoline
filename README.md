@@ -143,6 +143,8 @@ gasoline compact
 
 Run this once after upgrading if you have been updating cities with overlapping radii: earlier versions stored a row per city for every shared station on every run, and `compact` collapses those into the single row the current `update` maintains.
 
+`compact` is also the housekeeping pass for [command run statistics](#command-run-statistics): it drops recorded runs older than 30 days and reports how many went. The commands that record them fire every few minutes and should not each pay for a retention sweep.
+
 List cached cities:
 
 ```bash
@@ -336,6 +338,29 @@ crontab -e                                    # paste the line from examples/cro
 ```
 
 Edit the fuel and the `--check-command` / `--suggest-command` templates to taste, and confirm the paths to `gasoline`, `gasoline-watch`, and `/etc/gasoline/gasoline.env` match your install.
+
+### Command run statistics
+
+`update`, `suggest`, `check` and `notify` each record what they did, so a timer that quietly stopped firing — or started failing — is visible without shell access to the server. Every invocation writes one row to `command_runs` with its start and end time, duration, status and error, plus the counters it already computes as name/value pairs in `command_run_metrics`. Both tables are created automatically; run `gasoline migrate` once on an existing database to get them before the next scheduled run.
+
+The row is written **before** the work starts and completed afterwards, so a run that is killed, runs out of memory, or hangs still leaves a trace. Such a run keeps `status = 'running'` forever — nothing sweeps it up later — and the web UI counts one older than six hours as *interrupted*. The status of a finished run is `ok`, `error`, or `partial`: the last is the best-effort case where some units of work failed and the rest succeeded ("2 of 5 cities failed"), which the command still reports as an error on the command line.
+
+Two things are deliberately not recorded. A failure **before the database is open** — an unparseable flag, a wrong DSN, an unreachable MySQL server — leaves no row, because no work ran and there is nowhere to write it; those still go to stderr and the journal as they always did. And `notify --dry-run` records nothing at all: it sends nothing and writes nothing, so counting it would mix rehearsals into the delivery numbers.
+
+Recording never fails a command. If the statistics write cannot happen, the command prints one `command stats:` line to stderr and carries on with its real work unchanged.
+
+The metric names per command, which are what the web UI renders:
+
+| Command | Metrics |
+| --- | --- |
+| `update` | `cities`, `cities_failed`, `stations_fetched`, `snapshots_stored` |
+| `suggest` | `persist` (0/1), `fuels`, `fuels_failed`, `stations`, `snapshots_scanned`; with `--persist` also `predictions_stored`, `decisions_stored`, `predictions_evaluated`, `outcomes_scored`, `stations_bias_corrected`, `pruned_predictions`, `pruned_decisions`, `unfed_stations`, `unfed_predictions`, `unfed_decisions` |
+| `check` | `fuels`, `fuels_failed`, `stations`, `snapshots_scanned`, `check_rows` |
+| `notify` | `stations`, `users`, `check_rows`, `suggest_rows`, `sent`, `failed`, `baseline_reset` (0/1) |
+
+They are the same numbers the commands print when you run them by hand; `stations` and `snapshots_scanned` are the size of the shared history scan, which is what explains a `suggest` or `check` run's duration.
+
+Runs are kept for 30 days and pruned by `gasoline compact`. The web UI reads them on the admin **Statistics** page (hamburger menu → Statistics).
 
 ### Continuous updates with a timer
 
@@ -577,6 +602,7 @@ The hamburger menu in the header opens:
 - **Stations** (admins) — set the same persistent display-name overrides as `gasoline rename`: search a station by name or address, enter a new name, and apply. All existing renames are listed with their original name and address, editable inline or removable to restore the Tankerkönig name.
 - **Settings** (admins) — manage the update targets (cities + radii updated automatically by the CLI), the suggestion/check parameters, the notification templates, and the schedule defaults. These are the values the CLI picks up as described in [Server-stored configuration](#server-stored-configuration-admin-settings); notification templates are admin-only and never editable by regular users.
 - **Prediction accuracy** (admins) — compare past predicted prices with the actual prices recorded for those windows, from the evaluated `price_predictions` data (see [Persistent predictions and learning](#persistent-predictions-and-learning-suggest---persist)). Filter by fuel, city, target date range, and confidence; view accuracy statistics (count, MAE, bias, RMSE, share within ±1/±2 ct, and a per-confidence breakdown), a predicted-vs-actual graph (timeline with an error band, or a predicted-vs-actual scatter), and the raw evaluated rows.
+- **Statistics** (admins) — what the scheduled commands actually did, from the recorded `command_runs` data (see [Command run statistics](#command-run-statistics)). Filter by command and time range; view run counts and success rate, median and p95 duration, how long ago each command last ran, a stacked runs-over-time chart with the average duration, a per-command summary, the summed counters, and the most recent runs with their metrics and error text.
 
 Signing in lasts: alongside the PHP session the viewer sets a second, long-lived cookie (`gasoline_remember`, 30 days by default — see `GASOLINE_SESSION_DAYS`) whose token is stored hashed in the `user_sessions` table. Closing the browser, an idle afternoon, or the host clearing out PHP's session files no longer means retyping the password — the token restores the login and its expiry slides forward with use. Signing out drops the token for that browser only; changing the password drops it everywhere else and keeps the browser you changed it in. Run `gasoline migrate` once to create `user_sessions`; until then the viewer simply keeps using plain sessions.
 

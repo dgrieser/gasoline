@@ -1,11 +1,13 @@
 <?php
 /**
- * Executes the dashboard's prediction picker against seeded SQLite databases.
+ * Exercises the viewer's decision functions: the dashboard's prediction picker
+ * against seeded SQLite databases, and the statistics page's chart bucketing.
  *
  * web/index.php is a monolith that runs a page when included, so the functions
  * under test are lifted out of it by name and evaluated on their own. That is
- * worth the small amount of machinery: the picker decides what the dashboard's
- * fill-up card shows, and the Go side can only assert about its source text.
+ * worth the small amount of machinery: these decide what the dashboard's
+ * fill-up card and the statistics chart show, and the Go side can only assert
+ * about their source text.
  *
  * Run directly (`php web_picker_test.php`) or via `make test`.
  */
@@ -42,7 +44,7 @@ function extractFunction(string $source, string $name): string
 }
 
 $viewer = file_get_contents(__DIR__ . '/web/index.php');
-foreach (['raisedNinePrice', 'loadFilteredPredictions'] as $name) {
+foreach (['raisedNinePrice', 'loadFilteredPredictions', 'gasolineCommandStatsSeries'] as $name) {
     eval(extractFunction($viewer, $name));
 }
 
@@ -199,6 +201,90 @@ $counting->exec("INSERT INTO price_predictions (run_id, station_id, fuel, target
     predicted_price, confidence) VALUES (1, 'a', 'diesel', '2026-08-21T15:00:00Z', '2026-08-21T16:00:00Z', 1.7, 'high')");
 loadFilteredPredictions($counting, ['a'], ['a' => 1.0], 'diesel', NOW);
 check('the picker issues one query, not two', $counting->prepared, 1);
+
+// ── Statistics page: chart bucketing ─────────────────────────────────────────
+//
+// The chart lays every returned bucket out in one equal-width slot, so a period
+// with no runs has to come back as a zero. Left out, an outage takes up no
+// width at all and the runs on either side render adjacent — hiding exactly the
+// stopped timer the page exists to surface.
+
+echo "web_picker_test: gasolineCommandStatsSeries\n";
+
+$statsNow = new DateTimeImmutable('2026-08-21T12:30:00Z', new DateTimeZone('UTC'));
+
+/** One row in the shape the bucket query returns. */
+function bucketRow(string $bucket, int $ok, int $partial, int $error, int $running, ?float $avg): array
+{
+    return ['bucket' => $bucket, 'ok' => $ok, 'partial' => $partial,
+        'error_count' => $error, 'running' => $running, 'avg_ms' => $avg];
+}
+
+/** The bucket keys of a series, which is what the equal-width layout consumes. */
+function bucketKeys(array $series): array
+{
+    return array_map(static fn (array $b): string => $b['t'], $series);
+}
+
+// A four-hour outage in the middle of a six-hour window.
+$series = gasolineCommandStatsSeries([
+    bucketRow('2026-08-21T07', 3, 0, 0, 0, 500.0),
+    bucketRow('2026-08-21T12', 2, 0, 0, 0, 700.0),
+], $statsNow, 6, false);
+check('an hourly window emits every bucket, gap included', bucketKeys($series), [
+    '2026-08-21T06', '2026-08-21T07', '2026-08-21T08', '2026-08-21T09',
+    '2026-08-21T10', '2026-08-21T11', '2026-08-21T12',
+]);
+check('the buckets inside a gap are zeroed', array_slice($series, 2, 3), [
+    ['t' => '2026-08-21T08', 'ok' => 0, 'partial' => 0, 'error' => 0, 'running' => 0, 'avg_ms' => null],
+    ['t' => '2026-08-21T09', 'ok' => 0, 'partial' => 0, 'error' => 0, 'running' => 0, 'avg_ms' => null],
+    ['t' => '2026-08-21T10', 'ok' => 0, 'partial' => 0, 'error' => 0, 'running' => 0, 'avg_ms' => null],
+]);
+check('a bucket that has runs keeps its counts', $series[1], [
+    't' => '2026-08-21T07', 'ok' => 3, 'partial' => 0, 'error' => 0, 'running' => 0, 'avg_ms' => 500.0,
+]);
+
+// Daily buckets use the shorter key, matching SUBSTR(started_at, 1, 10).
+$series = gasolineCommandStatsSeries([
+    bucketRow('2026-08-19', 10, 1, 0, 0, 900.0),
+], $statsNow, 72, true);
+check('a daily window emits one bucket per day', bucketKeys($series), [
+    '2026-08-18', '2026-08-19', '2026-08-20', '2026-08-21',
+]);
+check('an empty day is zeroed, not dropped', $series[3], [
+    't' => '2026-08-21', 'ok' => 0, 'partial' => 0, 'error' => 0, 'running' => 0, 'avg_ms' => null,
+]);
+
+// AVG(duration_ms) is NULL when nothing in the bucket finished. Coercing that
+// to zero drew the duration line down to "instant" over the hung runs it is
+// supposed to be flagging.
+$series = gasolineCommandStatsSeries([
+    bucketRow('2026-08-21T11', 0, 0, 0, 2, null),
+    bucketRow('2026-08-21T12', 1, 0, 0, 1, 1500.0),
+], $statsNow, 2, false);
+check('an all-unfinished bucket keeps a null duration', $series[1], [
+    't' => '2026-08-21T11', 'ok' => 0, 'partial' => 0, 'error' => 0, 'running' => 2, 'avg_ms' => null,
+]);
+check('a bucket with one finished run reports its duration', $series[2]['avg_ms'], 1500.0);
+
+// Nothing recorded at all still yields a full window, so the chart shows the
+// silence rather than nothing.
+$series = gasolineCommandStatsSeries([], $statsNow, 3, false);
+check('an empty result still spans the window', count($series), 4);
+check('every bucket of an empty window is zeroed', array_sum(array_map(
+    static fn (array $b): int => $b['ok'] + $b['partial'] + $b['error'] + $b['running'],
+    $series
+)), 0);
+
+// Buckets the query returns but the window no longer covers are not invented
+// back in: the series is the window, in order.
+$series = gasolineCommandStatsSeries([
+    bucketRow('2026-08-01T05', 9, 0, 0, 0, 100.0),
+    bucketRow('2026-08-21T12', 1, 0, 0, 0, 200.0),
+], $statsNow, 1, false);
+check('the series covers the window and nothing else', bucketKeys($series), [
+    '2026-08-21T11', '2026-08-21T12',
+]);
 
 if ($failures > 0) {
     printf("web_picker_test: %d failed\n", $failures);

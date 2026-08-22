@@ -377,6 +377,62 @@ function gasolineSchemaReady(PDO $pdo, string $driver): bool
     }
 }
 
+// gasolineCommandStatsSeries turns the statistics page's bucket query into the
+// chart's series, filling in the buckets the GROUP BY never produced.
+//
+// Two things depend on this. The chart lays buckets out in equal-width slots,
+// so a period with no runs at all has to be present as a zero — an absent
+// bucket takes up no width, closing the gap and hiding the very outage the page
+// exists to reveal. And a bucket whose runs are all unfinished has no average
+// duration: that stays null rather than becoming zero, so the duration line
+// breaks across it instead of plunging to "instant".
+//
+// Everything is UTC — started_at is RFC3339 Z and $now carries the UTC zone —
+// so there are no DST-length days to step over.
+function gasolineCommandStatsSeries(array $rows, DateTimeImmutable $now, int $hours, bool $daily): array
+{
+    $found = [];
+    foreach ($rows as $row) {
+        $found[(string) $row['bucket']] = [
+            't' => (string) $row['bucket'],
+            'ok' => (int) $row['ok'],
+            'partial' => (int) $row['partial'],
+            'error' => (int) $row['error_count'],
+            'running' => (int) $row['running'],
+            'avg_ms' => $row['avg_ms'] !== null ? (float) $row['avg_ms'] : null,
+        ];
+    }
+
+    // The key format has to match the SUBSTR widths the query groups by:
+    // characters 1-13 are 'YYYY-MM-DDTHH', 1-10 are 'YYYY-MM-DD'.
+    $format = $daily ? 'Y-m-d' : 'Y-m-d\TH';
+    $step = $daily ? '+1 day' : '+1 hour';
+    $floor = static fn (DateTimeImmutable $t): DateTimeImmutable => $daily
+        ? $t->setTime(0, 0)
+        : $t->setTime((int) $t->format('G'), 0);
+
+    $cursor = $floor($now->modify('-' . $hours . ' hours'));
+    $last = $floor($now);
+
+    $series = [];
+    // At most 25 hourly or 31 daily buckets; the guard only keeps a malformed
+    // window from spinning.
+    for ($guard = 0; $cursor <= $last && $guard < 800; $guard++) {
+        $key = $cursor->format($format);
+        $series[] = $found[$key] ?? [
+            't' => $key,
+            'ok' => 0,
+            'partial' => 0,
+            'error' => 0,
+            'running' => 0,
+            'avg_ms' => null,
+        ];
+        $cursor = $cursor->modify($step);
+    }
+
+    return $series;
+}
+
 // ── Auth: user helpers ────────────────────────────────────────────────────────
 
 function normalizeEmail(string $email): string
@@ -2726,6 +2782,620 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
     renderPageEnd();
 }
 
+// renderAdminStatsPage shows what the scheduled commands actually did: one row
+// per recorded run of update/suggest/check/notify, with the counters each of
+// them already computes. Like the accuracy page it renders an empty shell and
+// fills it from ?action=command_stats, so the page paints before the
+// aggregates come back.
+function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
+{
+    $hasTable = gasolineTableExists($pdo, $driver, 'command_runs');
+
+    $commandLabels = [
+        'all'     => 'All commands',
+        'update'  => 'update',
+        'suggest' => 'suggest',
+        'check'   => 'check',
+        'notify'  => 'notify',
+    ];
+
+    renderPageStart('Statistics', $user, 'admin_stats');
+    ?>
+    <style>
+        .cs-layout { max-width: 1180px; }
+        .cs-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0 1.1rem; }
+        .cs-filters .field { margin-bottom: 0.6rem; }
+        #cs-chart { width: 100%; display: block; height: auto; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+        .cs-ok      { color: var(--e10); }
+        .cs-partial { color: var(--amber); }
+        .cs-error   { color: var(--red); }
+        .cs-running { color: var(--muted); }
+        /* The metric list inside a run row: name=value pairs, wrapping. */
+        .cs-metrics { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
+        .cs-err { font-family: var(--mono); font-size: 0.72rem; color: var(--red); word-break: break-word; }
+        .cs-legend-swatch { width: 16px; height: 10px; border-radius: 2px; display: inline-block; }
+        .cs-legend-line { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
+        .stat-value.cs-small { font-size: 1.15rem; }
+    </style>
+    <div id="price-tooltip" role="tooltip" aria-hidden="true"></div>
+    <div class="settings-layout wide cs-layout">
+        <?php renderFlash(); ?>
+
+        <div class="settings-card">
+            <h2 data-i18n="statsTitle">Command statistics</h2>
+            <p class="auth-note" data-i18n="statsHint">Every run of the scheduled commands, with what it did and how long it took. A run is recorded once its database is open, so a failure before that — a bad flag, an unreachable server — leaves no row. `notify --dry-run` is not recorded: it delivers nothing.</p>
+            <?php if (!$hasTable) { ?>
+            <p class="auth-note" data-i18n="statsNoTable">No runs have been recorded yet. Run `gasoline migrate` on the server to create the tables, then wait for the next scheduled command.</p>
+            <?php } else { ?>
+            <div class="cs-filters">
+                <div class="field">
+                    <label for="cs-command" data-i18n="statsCommand">Command</label>
+                    <select id="cs-command">
+                        <?php foreach ($commandLabels as $value => $label) { ?>
+                        <option value="<?= h($value) ?>"<?= $value === 'all' ? ' data-i18n="statsAllCommands"' : '' ?>><?= h($label) ?></option>
+                        <?php } ?>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="cs-range" data-i18n="statsRange">Range</label>
+                    <select id="cs-range">
+                        <option value="24h" data-i18n="range24h">24h</option>
+                        <option value="7d" selected data-i18n="range7d">7d</option>
+                        <option value="30d" data-i18n="range30d">30d</option>
+                    </select>
+                </div>
+            </div>
+            <?php } ?>
+        </div>
+
+        <?php if ($hasTable) { ?>
+        <div class="stats" aria-live="polite">
+            <div class="stat"><div class="stat-label" data-i18n="statsTileRuns">Runs</div><div class="stat-value skeleton" id="cs-runs" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="statsTileSuccess">Success rate</div><div class="stat-value skeleton cs-small" id="cs-success" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="statsTilePartial">Partial</div><div class="stat-value skeleton" id="cs-partial" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="statsTileFailed">Failed</div><div class="stat-value skeleton" id="cs-failed" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="statsTileInterrupted">Interrupted</div><div class="stat-value skeleton" id="cs-interrupted" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="statsTileMedian">Median duration</div><div class="stat-value skeleton cs-small" id="cs-p50" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="statsTileP95">p95 duration</div><div class="stat-value skeleton cs-small" id="cs-p95" aria-busy="true">&nbsp;</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="statsTileLastRun">Last run</div><div class="stat-value skeleton cs-small" id="cs-last" aria-busy="true">&nbsp;</div></div>
+        </div>
+        <p class="auth-note" data-i18n="statsInterruptedHint">"Interrupted" counts runs that recorded a start and never a finish — killed, out of memory, or still going. Nothing clears them later, so a run that takes longer than six hours stays counted.</p>
+
+        <div class="chart-card">
+            <div class="chart-header">
+                <span class="chart-title" data-i18n="statsChartTitle">Runs over time</span>
+            </div>
+            <div class="chart-body">
+                <div class="chart-loading" id="cs-chart-loading" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div>
+                <svg id="cs-chart" viewBox="0 0 960 340" role="img" hidden></svg>
+            </div>
+            <div class="chart-legend" id="cs-legend" hidden></div>
+            <div class="chart-empty" id="cs-chart-empty" data-i18n="statsNoData" role="status" hidden>No recorded runs match the current filters.</div>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="statsByCommand">By command</h2>
+            <div class="table-scroll">
+                <table class="stack-table">
+                    <thead>
+                        <tr>
+                            <th data-i18n="statsColCommand">Command</th>
+                            <th data-i18n="statsColRuns">Runs</th>
+                            <th data-i18n="statsColOk">OK</th>
+                            <th data-i18n="statsColPartial">Partial</th>
+                            <th data-i18n="statsColError">Failed</th>
+                            <th data-i18n="statsColAvg">Avg duration</th>
+                            <th data-i18n="statsColMax">Max duration</th>
+                            <th data-i18n="statsColLast">Last run</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cs-cmd-tbody"><tr><td colspan="8" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="statsWork">Work done</h2>
+            <p class="auth-note" data-i18n="statsWorkHint">The counters the commands report, summed over the filtered runs. Per run averages only over the runs that reported the metric, so suggest’s persist counters are not diluted by runs without --persist.</p>
+            <div class="table-scroll">
+                <table class="stack-table">
+                    <thead>
+                        <tr>
+                            <th data-i18n="statsColCommand">Command</th>
+                            <th data-i18n="statsColMetric">Metric</th>
+                            <th data-i18n="statsColTotal">Total</th>
+                            <th data-i18n="statsColPerRun">Per run</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cs-metric-tbody"><tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="statsRecent">Recent runs</h2>
+            <div class="pred-note" id="cs-truncated" data-i18n="statsTruncated" hidden>Showing the most recent 200 runs; the statistics above cover the full filtered set.</div>
+            <div class="table-scroll">
+                <table class="stack-table">
+                    <thead>
+                        <tr>
+                            <th data-i18n="statsColStarted">Started</th>
+                            <th data-i18n="statsColCommand">Command</th>
+                            <th data-i18n="statsColStatus">Status</th>
+                            <th data-i18n="statsColDuration">Duration</th>
+                            <th data-i18n="statsColHost">Host</th>
+                            <th data-i18n="statsColDetail">Detail</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cs-run-tbody"><tr><td colspan="6" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                </table>
+            </div>
+            <div class="table-more" id="cs-more" hidden>
+                <button type="button" class="btn-reset" id="cs-more-btn"></button>
+            </div>
+        </div>
+        <?php } ?>
+    </div>
+
+    <?php if ($hasTable) { ?>
+    <script>
+    (function () {
+        const cfg = {
+            command: document.getElementById('cs-command'),
+            range:   document.getElementById('cs-range'),
+        };
+        const loadingEl   = document.getElementById('cs-chart-loading');
+        const chartEl     = document.getElementById('cs-chart');
+        const legendEl    = document.getElementById('cs-legend');
+        const emptyEl     = document.getElementById('cs-chart-empty');
+        const cmdTbody    = document.getElementById('cs-cmd-tbody');
+        const metricTbody = document.getElementById('cs-metric-tbody');
+        const runTbody    = document.getElementById('cs-run-tbody');
+        const moreWrap    = document.getElementById('cs-more');
+        const moreBtn     = document.getElementById('cs-more-btn');
+        const truncEl     = document.getElementById('cs-truncated');
+        const statIds     = ['cs-runs','cs-success','cs-partial','cs-failed','cs-interrupted','cs-p50','cs-p95','cs-last'];
+
+        const NS = 'http://www.w3.org/2000/svg';
+        // Status colours reused from the theme tokens the rest of the UI uses:
+        // green for ok, amber for degraded, red for failed, grey for unfinished.
+        const C_OK = '#34d399', C_PARTIAL = '#f5a623', C_ERROR = '#ef4444', C_RUNNING = '#6b7280';
+        const C_DURATION = '#60a5fa';
+
+        let data = null;
+        let rowsRendered = 0;
+        const PAGE = 100;
+
+        const T   = () => translations[currentLang];
+        const loc = () => currentLang === 'de' ? 'de-DE' : 'en-GB';
+        const tz  = () => currentLang === 'de' ? 'Europe/Berlin' : 'UTC';
+
+        function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+        function fmtInt(v) { return Number(v || 0).toLocaleString(loc()); }
+        function fmtPct(v) { const s = fmtDecimal(v, 1); return s === null ? '—' : s + '%'; }
+        // Durations span three orders of magnitude here — a notify run that
+        // sends nothing is milliseconds, a suggest --persist sweep is minutes —
+        // so the unit follows the value instead of being fixed.
+        function fmtDuration(ms) {
+            if (ms === null || ms === undefined) return '—';
+            const v = Number(ms);
+            if (v < 1000) return fmtInt(Math.round(v)) + ' ms';
+            if (v < 60000) return (fmtDecimal(v / 1000, 1) ?? '—') + ' s';
+            const mins = Math.floor(v / 60000);
+            const secs = Math.round((v % 60000) / 1000);
+            return mins + ' min ' + String(secs).padStart(2, '0') + ' s';
+        }
+        function fmtNumber(v) {
+            // Counters are whole numbers and reach seven digits over a month —
+            // grouped, or nobody can read them. Only a per-run average needs
+            // decimals, and never more than the two the server rounded to.
+            if (v === null || v === undefined) return '—';
+            const n = Number(v);
+            return n.toLocaleString(loc(), { maximumFractionDigits: Number.isInteger(n) ? 0 : 2 });
+        }
+        function fmtDateTime(iso) { if (!iso) return '—'; return new Date(iso).toLocaleString(loc(), { timeZone: tz(), year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }); }
+        function fmtBucket(t, daily) {
+            const d = new Date(daily ? t + 'T00:00:00Z' : t + ':00:00Z');
+            return daily
+                ? d.toLocaleDateString(loc(), { timeZone: tz(), month: 'short', day: '2-digit' })
+                : d.toLocaleTimeString(loc(), { timeZone: tz(), hour: '2-digit', minute: '2-digit' });
+        }
+        // How long ago, so "is the timer still firing?" is answerable at a glance.
+        function fmtAgo(iso) {
+            if (!iso) return '—';
+            const t = T();
+            const mins = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60000));
+            if (mins < 1) return t.statsJustNow;
+            if (mins < 60) return mins + ' ' + t.statsMinutesAgo;
+            const hours = Math.floor(mins / 60);
+            if (hours < 48) return hours + ' ' + t.statsHoursAgo;
+            return Math.floor(hours / 24) + ' ' + t.statsDaysAgo;
+        }
+        function statusLabel(s) { return T()['statsStatus_' + s] || s; }
+        function statusClass(s) { return 'cs-' + s; }
+
+        function setStat(id, val) { const el = document.getElementById(id); if (!el) return; el.textContent = val; el.classList.remove('skeleton'); el.removeAttribute('aria-busy'); }
+
+        function buildUrl() {
+            const u = new URL(location.origin + location.pathname);
+            u.searchParams.set('action', 'command_stats');
+            u.searchParams.set('command', cfg.command.value);
+            u.searchParams.set('range', cfg.range.value);
+            return u.toString();
+        }
+
+        function loadingRow(span) {
+            return '<tr><td colspan="' + span + '" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
+        }
+        function emptyRow(span) {
+            return '<tr><td colspan="' + span + '" style="text-align:center;color:var(--muted);padding:1rem;font-family:var(--mono);font-size:.8rem">'
+                + esc(T().statsNoData) + '</td></tr>';
+        }
+
+        function resetLoading() {
+            if (loadingEl) loadingEl.hidden = false;
+            if (chartEl) chartEl.setAttribute('hidden', '');
+            if (legendEl) legendEl.hidden = true;
+            if (emptyEl) { emptyEl.hidden = true; emptyEl.dataset.i18n = 'statsNoData'; }
+            statIds.forEach((id) => { const el = document.getElementById(id); if (el) { el.textContent = ' '; el.classList.add('skeleton'); el.setAttribute('aria-busy', 'true'); } });
+            if (cmdTbody) cmdTbody.innerHTML = loadingRow(8);
+            if (metricTbody) metricTbody.innerHTML = loadingRow(4);
+            if (runTbody) runTbody.innerHTML = loadingRow(6);
+            if (moreWrap) moreWrap.hidden = true;
+            if (truncEl) truncEl.hidden = true;
+        }
+
+        function showError(err) {
+            if (loadingEl) loadingEl.hidden = true;
+            const t = T();
+            const key = (err && err.key && t[err.key]) ? err.key : 'loadError';
+            const msg = (err && err.key && t[err.key]) ? t[err.key] : t.loadError;
+            if (emptyEl) { emptyEl.hidden = false; emptyEl.dataset.i18n = key; emptyEl.textContent = msg; }
+            if (chartEl) chartEl.setAttribute('hidden', '');
+            if (legendEl) legendEl.hidden = true;
+            statIds.forEach((id) => setStat(id, '—'));
+            if (runTbody) runTbody.innerHTML = '<tr><td colspan="6" role="alert" style="text-align:center;color:var(--red);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="' + key + '">' + esc(msg) + '</td></tr>';
+            if (cmdTbody) cmdTbody.innerHTML = '';
+            if (metricTbody) metricTbody.innerHTML = '';
+            if (moreWrap) moreWrap.hidden = true;
+        }
+
+        async function load() {
+            resetLoading();
+            try {
+                const res = await fetch(buildUrl(), { headers: { Accept: 'application/json' } });
+                if (res.status === 401) { location.href = '?page=login'; return; }
+                if (res.status === 403) { location.href = '?'; return; }
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const payload = await res.json();
+                if (payload.errors && payload.errors.length) { showError(payload.errors[0]); return; }
+                data = payload;
+                render();
+            } catch (e) {
+                showError();
+            }
+        }
+
+        function render() {
+            if (!data) return;
+            renderStats();
+            renderByCommand();
+            renderMetrics();
+            renderChart();
+            renderRuns();
+        }
+
+        function renderStats() {
+            if (loadingEl) loadingEl.hidden = true;
+            const s = data.summary;
+            if (!s || !s.runs) { statIds.forEach((id) => setStat(id, '—')); setStat('cs-runs', '0'); return; }
+            setStat('cs-runs', fmtInt(s.runs));
+            setStat('cs-success', fmtPct(s.success_pct));
+            setStat('cs-partial', fmtInt(s.partial));
+            setStat('cs-failed', fmtInt(s.error));
+            setStat('cs-interrupted', fmtInt(s.interrupted));
+            setStat('cs-p50', fmtDuration(s.p50_ms));
+            setStat('cs-p95', fmtDuration(s.p95_ms));
+            setStat('cs-last', fmtAgo(s.last_started_at));
+        }
+
+        function renderByCommand() {
+            if (!cmdTbody) return;
+            const rows = (data && data.by_command) || [];
+            const t = T();
+            if (rows.length === 0) { cmdTbody.innerHTML = emptyRow(8); return; }
+            cmdTbody.innerHTML = rows.map((r) =>
+                '<tr>'
+                + '<td class="stack-primary" data-label="' + esc(t.statsColCommand) + '" data-i18n-label="statsColCommand">' + esc(r.command) + '</td>'
+                + '<td data-label="' + esc(t.statsColRuns) + '" data-i18n-label="statsColRuns">' + fmtInt(r.runs) + '</td>'
+                + '<td class="cs-ok" data-label="' + esc(t.statsColOk) + '" data-i18n-label="statsColOk">' + fmtInt(r.ok) + '</td>'
+                + '<td class="cs-partial" data-label="' + esc(t.statsColPartial) + '" data-i18n-label="statsColPartial">' + fmtInt(r.partial) + '</td>'
+                + '<td class="cs-error" data-label="' + esc(t.statsColError) + '" data-i18n-label="statsColError">' + fmtInt(r.error) + '</td>'
+                + '<td data-label="' + esc(t.statsColAvg) + '" data-i18n-label="statsColAvg">' + esc(fmtDuration(r.avg_ms)) + '</td>'
+                + '<td data-label="' + esc(t.statsColMax) + '" data-i18n-label="statsColMax">' + esc(fmtDuration(r.max_ms)) + '</td>'
+                + '<td class="td-muted" data-label="' + esc(t.statsColLast) + '" data-i18n-label="statsColLast">' + esc(fmtAgo(r.last_started_at)) + '</td>'
+                + '</tr>'
+            ).join('');
+        }
+
+        function renderMetrics() {
+            if (!metricTbody) return;
+            const rows = (data && data.metric_totals) || [];
+            const t = T();
+            if (rows.length === 0) { metricTbody.innerHTML = emptyRow(4); return; }
+            metricTbody.innerHTML = rows.map((r) =>
+                '<tr>'
+                + '<td class="stack-primary" data-label="' + esc(t.statsColCommand) + '" data-i18n-label="statsColCommand">' + esc(r.command) + '</td>'
+                + '<td data-label="' + esc(t.statsColMetric) + '" data-i18n-label="statsColMetric"><span class="cs-metrics">' + esc(r.name) + '</span></td>'
+                + '<td data-label="' + esc(t.statsColTotal) + '" data-i18n-label="statsColTotal">' + esc(fmtNumber(r.total)) + '</td>'
+                + '<td class="td-muted" data-label="' + esc(t.statsColPerRun) + '" data-i18n-label="statsColPerRun">' + esc(fmtNumber(r.per_run)) + '</td>'
+                + '</tr>'
+            ).join('');
+        }
+
+        function metricsHtml(metrics) {
+            const names = Object.keys(metrics || {}).sort();
+            if (names.length === 0) return '';
+            return '<span class="cs-metrics">' + names.map((n) => esc(n) + '=' + esc(fmtNumber(metrics[n]))).join('  ') + '</span>';
+        }
+
+        function runRowHtml(r) {
+            const t = T();
+            const detail = r.error
+                ? '<span class="cs-err">' + esc(r.error) + '</span>'
+                : metricsHtml(r.metrics);
+            return '<tr>'
+                + '<td class="stack-primary" data-label="' + esc(t.statsColStarted) + '" data-i18n-label="statsColStarted">' + esc(fmtDateTime(r.started_at)) + '</td>'
+                + '<td data-label="' + esc(t.statsColCommand) + '" data-i18n-label="statsColCommand">' + esc(r.command) + '</td>'
+                + '<td class="' + statusClass(r.status) + '" data-label="' + esc(t.statsColStatus) + '" data-i18n-label="statsColStatus">' + esc(statusLabel(r.status)) + '</td>'
+                + '<td data-label="' + esc(t.statsColDuration) + '" data-i18n-label="statsColDuration">' + esc(fmtDuration(r.duration_ms)) + '</td>'
+                + '<td class="td-muted" data-label="' + esc(t.statsColHost) + '" data-i18n-label="statsColHost">' + esc(r.host || '—') + '</td>'
+                + '<td data-label="' + esc(t.statsColDetail) + '" data-i18n-label="statsColDetail">' + detail + '</td>'
+                + '</tr>';
+        }
+
+        function renderMore() {
+            const rows = data.rows || [];
+            const slice = rows.slice(rowsRendered, rowsRendered + PAGE);
+            runTbody.insertAdjacentHTML('beforeend', slice.map(runRowHtml).join(''));
+            rowsRendered += slice.length;
+            const remaining = rows.length - rowsRendered;
+            if (remaining <= 0) { moreWrap.hidden = true; }
+            else { moreWrap.hidden = false; moreBtn.textContent = T().showMore + ' (' + remaining + ')'; }
+        }
+
+        function renderRuns() {
+            rowsRendered = 0;
+            runTbody.innerHTML = '';
+            const rows = data.rows || [];
+            if (truncEl) truncEl.hidden = !data.truncated;
+            if (rows.length === 0) { runTbody.innerHTML = emptyRow(6); moreWrap.hidden = true; return; }
+            renderMore();
+        }
+
+        /* ── Chart ─────────────────────────────────────────────── */
+
+        const mk = (tag, attrs, parent) => {
+            const el = document.createElementNS(NS, tag);
+            for (const k in attrs) el.setAttribute(k, String(attrs[k]));
+            (parent || chartEl).appendChild(el);
+            return el;
+        };
+
+        const tooltip = document.getElementById('price-tooltip');
+        let hideCrosshair = () => {};
+
+        function hideTooltip() {
+            if (tooltip) tooltip.style.display = 'none';
+            hideCrosshair();
+        }
+
+        document.addEventListener('touchend', (e) => {
+            if (e.target instanceof Element && e.target.closest('#cs-chart')) return;
+            hideTooltip();
+        });
+
+        const ttRow = (color, name, value) =>
+            '<div class="tt-row">'
+            + (color ? '<span class="legend-dot" style="background:' + color + '"></span>' : '')
+            + '<span class="tt-name">' + esc(name) + '</span>'
+            + '<span class="tt-val"' + (color ? ' style="color:' + color + '"' : '') + '>' + esc(value) + '</span>'
+            + '</div>';
+
+        function renderChart() {
+            hideTooltip();
+            hideCrosshair = () => {};
+            chartEl.innerHTML = '';
+            legendEl.innerHTML = '';
+            const series = (data && data.series) || [];
+            if (series.length === 0) {
+                chartEl.setAttribute('hidden', '');
+                legendEl.hidden = true;
+                if (emptyEl) emptyEl.hidden = false;
+                return;
+            }
+            if (emptyEl) emptyEl.hidden = true;
+            chartEl.removeAttribute('hidden');
+
+            const light = document.documentElement.getAttribute('data-theme') === 'light';
+            const bg    = light ? '#ffffff' : '#13151a';
+            const grid  = light ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.05)';
+            const axis  = light ? 'rgba(0,0,0,0.15)' : 'rgba(255,255,255,0.12)';
+            const tick  = light ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.4)';
+            const label = '#6b7280';
+            const font  = "'DM Mono', monospace";
+
+            const W = Math.max(280, Math.round(chartEl.getBoundingClientRect().width) || 960);
+            const compact = W < 560;
+            const H = compact ? 280 : 340;
+            const m = compact ? { top: 18, right: 54, bottom: 46, left: 42 } : { top: 24, right: 62, bottom: 54, left: 56 };
+            const iW = W - m.left - m.right;
+            const iH = H - m.top - m.bottom;
+            chartEl.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+            mk('rect', { x: 0, y: 0, width: W, height: H, fill: bg });
+
+            const daily = !!data.daily_buckets;
+            const maxRuns = Math.max(1, ...series.map((d) => d.ok + d.partial + d.error + d.running));
+            // A bucket with no finished run carries a null duration, not a
+            // zero. Scale off the measured ones, and drop the whole duration
+            // axis when nothing in the window finished — otherwise the
+            // Math.max floor below invents an axis reading "0 ms … 1 ms".
+            const durVals = series.map((d) => d.avg_ms).filter((v) => v !== null && v !== undefined);
+            const hasDur  = durVals.length > 0;
+            const maxDur  = Math.max(1, ...durVals);
+
+            const py     = (v) => m.top + iH - (v / maxRuns) * iH;
+            const pyDur  = (v) => m.top + iH - (v / maxDur) * iH;
+            const slot   = iW / series.length;
+            const barW   = Math.max(1, Math.min(28, slot * 0.7));
+
+            // Left axis: run counts. Whole numbers only — half a run is not a
+            // thing — so the gridline count follows the maximum when it is small.
+            const steps = Math.min(5, maxRuns);
+            for (let i = 0; i <= steps; i++) {
+                const val = Math.round((maxRuns / steps) * i);
+                const yp = py(val);
+                mk('line', { x1: m.left, y1: yp, x2: W - m.right, y2: yp, stroke: grid, 'stroke-width': 1 });
+                mk('text', { x: m.left - 8, y: yp + 4, 'text-anchor': 'end', 'font-size': 11, 'font-family': font, fill: label }).textContent = fmtInt(val);
+            }
+            // Right axis: the average duration line's own scale.
+            if (hasDur) {
+                for (let i = 0; i <= steps; i++) {
+                    const val = (maxDur / steps) * i;
+                    mk('text', { x: W - m.right + 8, y: pyDur(val) + 4, 'text-anchor': 'start', 'font-size': 10, 'font-family': font, fill: C_DURATION })
+                        .textContent = fmtDuration(val);
+                }
+            }
+
+            series.forEach((d, i) => {
+                const x = m.left + slot * i + (slot - barW) / 2;
+                let bottom = m.top + iH;
+                // Stacked worst-last, so a red cap is the eye-catching part.
+                [['ok', C_OK], ['partial', C_PARTIAL], ['running', C_RUNNING], ['error', C_ERROR]].forEach(([key, color]) => {
+                    const n = d[key] || 0;
+                    if (n <= 0) return;
+                    const hgt = (n / maxRuns) * iH;
+                    mk('rect', { x: x, y: bottom - hgt, width: barW, height: hgt, fill: color, rx: 1 });
+                    bottom -= hgt;
+                });
+            });
+
+            // Break the line where nothing finished rather than drawing it
+            // through: a continuous line across a gap claims a duration that
+            // was never measured, and drawing the gap at zero would read as an
+            // instant run when it is really a hung or absent one.
+            const durSegments = [];
+            let durSegment = [];
+            series.forEach((d, i) => {
+                if (d.avg_ms === null || d.avg_ms === undefined) {
+                    if (durSegment.length) durSegments.push(durSegment);
+                    durSegment = [];
+                    return;
+                }
+                durSegment.push({ x: m.left + slot * i + slot / 2, y: pyDur(d.avg_ms) });
+            });
+            if (durSegment.length) durSegments.push(durSegment);
+            durSegments.forEach((seg) => {
+                if (seg.length === 1) {
+                    // A lone measured bucket between two gaps: a one-point
+                    // polyline draws nothing, so mark the point instead.
+                    mk('circle', { cx: seg[0].x, cy: seg[0].y, r: 2.5, fill: C_DURATION });
+                    return;
+                }
+                mk('polyline', {
+                    points: seg.map((p) => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' '),
+                    fill: 'none', stroke: C_DURATION, 'stroke-width': 2,
+                    'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+                });
+            });
+
+            mk('line', { x1: m.left, y1: m.top + iH, x2: W - m.right, y2: m.top + iH, stroke: axis, 'stroke-width': 1 });
+            mk('line', { x1: m.left, y1: m.top, x2: m.left, y2: m.top + iH, stroke: axis, 'stroke-width': 1 });
+
+            const tickCount = Math.min(compact ? 4 : 8, series.length);
+            for (let i = 0; i < tickCount; i++) {
+                const idx = tickCount === 1 ? 0 : Math.round((series.length - 1) * (i / (tickCount - 1)));
+                const xp = Math.min(Math.max(m.left + slot * idx + slot / 2, 22), W - 22);
+                mk('text', { x: xp, y: H - m.bottom + 16, 'text-anchor': 'middle', 'font-size': 10, 'font-family': font, fill: tick })
+                    .textContent = fmtBucket(series[idx].t, daily);
+            }
+
+            drawLegend(hasDur);
+            if (!tooltip) return;
+
+            const crossLine = mk('line', {
+                x1: 0, x2: 0, y1: m.top, y2: m.top + iH,
+                stroke: light ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.5)',
+                'stroke-width': 1, 'stroke-dasharray': '4 3',
+                opacity: 0, 'pointer-events': 'none',
+            });
+
+            const overlay = mk('rect', {
+                x: m.left, y: m.top, width: iW, height: iH,
+                fill: 'transparent', style: 'cursor:crosshair',
+            });
+
+            const showCrosshair = (clientX, clientY) => {
+                const rect = chartEl.getBoundingClientRect();
+                const scale = rect.width ? W / rect.width : 1;
+                const sx = Math.max(m.left, Math.min(W - m.right, (clientX - rect.left) * scale));
+                const idx = Math.max(0, Math.min(series.length - 1, Math.floor((sx - m.left) / slot)));
+                const d = series[idx];
+                const xp = m.left + slot * idx + slot / 2;
+                crossLine.setAttribute('x1', xp);
+                crossLine.setAttribute('x2', xp);
+                crossLine.setAttribute('opacity', 1);
+
+                const t = T();
+                let html = '<div class="tt-meta">' + esc(fmtBucket(d.t, daily)) + '</div>';
+                if (d.ok)      html += ttRow(C_OK, t.statsStatus_ok, fmtInt(d.ok));
+                if (d.partial) html += ttRow(C_PARTIAL, t.statsStatus_partial, fmtInt(d.partial));
+                if (d.error)   html += ttRow(C_ERROR, t.statsStatus_error, fmtInt(d.error));
+                if (d.running) html += ttRow(C_RUNNING, t.statsStatus_running, fmtInt(d.running));
+                html += ttRow(C_DURATION, t.statsLegendDuration, fmtDuration(d.avg_ms));
+                tooltip.innerHTML = html;
+                tooltip.style.display = 'block';
+                positionChartTooltip(chartEl, clientX, clientY);
+            };
+
+            hideCrosshair = () => { crossLine.setAttribute('opacity', 0); };
+
+            overlay.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse') showCrosshair(e.clientX, e.clientY); });
+            overlay.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') hideTooltip(); });
+            attachLongPressCrosshair(overlay, showCrosshair, hideTooltip);
+        }
+
+        function drawLegend(hasDur) {
+            legendEl.hidden = false;
+            legendEl.innerHTML = '';
+            const t = T();
+            const add = (swatch, text) => { const it = document.createElement('div'); it.className = 'legend-item'; it.innerHTML = swatch + '<span>' + esc(text) + '</span>'; legendEl.appendChild(it); };
+            const box = (color) => '<span class="cs-legend-swatch" style="background:' + color + '"></span>';
+            add(box(C_OK), t.statsStatus_ok);
+            add(box(C_PARTIAL), t.statsStatus_partial);
+            add(box(C_ERROR), t.statsStatus_error);
+            add(box(C_RUNNING), t.statsStatus_running);
+            // Nothing finished in this window, so there is no line to explain.
+            if (hasDur) {
+                add('<span class="cs-legend-line" style="background:' + C_DURATION + '"></span>', t.statsLegendDuration);
+            }
+        }
+
+        [cfg.command, cfg.range].forEach((el) => { if (el) el.addEventListener('change', load); });
+        if (moreBtn) moreBtn.addEventListener('click', renderMore);
+
+        window.onLangChange = () => { if (data) render(); };
+        window.onThemeChange = () => { if (data) renderChart(); };
+
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', load);
+        else load();
+    })();
+    </script>
+    <?php } ?>
+    <?php
+    renderPageEnd();
+}
+
 function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
 {
     $settings = settingsAll($pdo);
@@ -2806,7 +3476,7 @@ gasolineStartSession();
 
 $requestedAction = (string) ($_GET['action'] ?? '');
 $requestedPage = (string) ($_GET['page'] ?? '');
-$isJSONRequest = in_array($requestedAction, ['city_search', 'station_search', 'data', 'prediction_accuracy'], true);
+$isJSONRequest = in_array($requestedAction, ['city_search', 'station_search', 'data', 'prediction_accuracy', 'command_stats'], true);
 
 $authPdo = null;
 $schemaGuardReason = null;
@@ -2889,6 +3559,12 @@ switch ($requestedPage) {
             redirectTo('');
         }
         renderAdminPredictionsPage($authPdo, $dbDriver, $currentUser);
+        // no break
+    case 'admin_stats':
+        if ((int) $currentUser['is_admin'] !== 1) {
+            redirectTo('');
+        }
+        renderAdminStatsPage($authPdo, $dbDriver, $currentUser);
         // no break
 }
 
@@ -3494,6 +4170,269 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         error_log('gasoline prediction_accuracy error: ' . $e->getMessage());
         http_response_code(500);
         echo json_encode(['errors' => [['key' => 'loadError', 'params' => [], 'message' => 'Could not load prediction data.']]], $jsonFlags);
+    }
+    exit;
+}
+
+// ── AJAX: command run statistics ──────────────────────────────────────────────
+if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
+    header('Content-Type: application/json; charset=utf-8');
+    $jsonFlags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR;
+    if ((int) $currentUser['is_admin'] !== 1) {
+        http_response_code(403);
+        echo json_encode(['errors' => [['key' => 'notFound', 'params' => [], 'message' => 'Administrator access required.']]], $jsonFlags);
+        exit;
+    }
+
+    // The recent-runs table is a sample, not the statistics: the aggregates
+    // below run over the whole filtered set regardless of this cap.
+    $csRowLimit = 200;
+    // A run still marked 'running' after this long never finished. Nothing
+    // clears the row later — there is no daemon — so the reader decides, and
+    // the window is generous enough to cover a slow `suggest --persist`.
+    $csStaleHours = 6;
+
+    $csCommand = trim((string) ($_GET['command'] ?? 'all'));
+    if (!in_array($csCommand, ['all', 'update', 'suggest', 'check', 'notify'], true)) {
+        $csCommand = 'all';
+    }
+    $csRange = trim((string) ($_GET['range'] ?? '7d'));
+    $rangeHours = ['24h' => 24, '7d' => 24 * 7, '30d' => 24 * 30];
+    if (!isset($rangeHours[$csRange])) {
+        $csRange = '7d';
+    }
+    $hours = $rangeHours[$csRange];
+    // Hourly buckets read as noise over a month, and daily ones hide a gap
+    // within a day, so the bucket follows the range.
+    $daily = $hours > 24;
+
+    $utc = new DateTimeZone('UTC');
+    $now = new DateTimeImmutable('now', $utc);
+    // started_at is an RFC3339 UTC string, so lexicographic comparison against
+    // another one is a correct chronological comparison.
+    $fromTs = $now->modify('-' . $hours . ' hours')->format('Y-m-d\TH:i:s\Z');
+    $staleTs = $now->modify('-' . $csStaleHours . ' hours')->format('Y-m-d\TH:i:s\Z');
+
+    $out = [
+        'summary' => null,
+        'by_command' => [],
+        'series' => [],
+        'metric_totals' => [],
+        'rows' => [],
+        'daily_buckets' => $daily,
+        'filters' => ['command' => $csCommand, 'range' => $csRange, 'from' => $fromTs],
+        'truncated' => false,
+        'errors' => [],
+    ];
+
+    try {
+        $pdo = $authPdo;
+
+        // One shared WHERE reused by every panel, so all of them describe the
+        // same set of runs.
+        $where = 'cr.started_at >= :from';
+        $params = [':from' => $fromTs];
+        if ($csCommand !== 'all') {
+            $where .= ' AND cr.command = :command';
+            $params[':command'] = $csCommand;
+        }
+        $bind = static function (PDOStatement $stmt) use ($params): void {
+            foreach ($params as $k => $v) {
+                $stmt->bindValue($k, $v);
+            }
+        };
+
+        // 1) Overall counts. duration_ms is NULL for a run that never
+        //    finished, so the averages below already exclude those.
+        $aggStmt = $pdo->prepare(
+            "SELECT COUNT(*) AS runs,
+                    SUM(CASE WHEN cr.status = 'ok' THEN 1 ELSE 0 END) AS ok,
+                    SUM(CASE WHEN cr.status = 'partial' THEN 1 ELSE 0 END) AS partial,
+                    SUM(CASE WHEN cr.status = 'error' THEN 1 ELSE 0 END) AS error_count,
+                    SUM(CASE WHEN cr.status = 'running' AND cr.started_at < :stale THEN 1 ELSE 0 END) AS interrupted,
+                    MAX(cr.started_at) AS last_started_at
+             FROM command_runs cr
+             WHERE $where"
+        );
+        $bind($aggStmt);
+        $aggStmt->bindValue(':stale', $staleTs);
+        $aggStmt->execute();
+        $agg = $aggStmt->fetch();
+
+        $runs = (int) ($agg['runs'] ?? 0);
+        if ($runs === 0) {
+            $out['summary'] = ['runs' => 0];
+            echo json_encode($out, $jsonFlags);
+            exit;
+        }
+
+        // 2) Percentiles in PHP, not SQL: SQLite has no percentile function and
+        //    the supported MySQL/MariaDB floor rules out window functions. Only
+        //    the duration column is read, so this stays a narrow scan.
+        $durStmt = $pdo->prepare(
+            "SELECT cr.duration_ms FROM command_runs cr
+             WHERE $where AND cr.duration_ms IS NOT NULL
+             ORDER BY cr.duration_ms ASC"
+        );
+        $bind($durStmt);
+        $durStmt->execute();
+        $durations = array_map('intval', $durStmt->fetchAll(PDO::FETCH_COLUMN, 0));
+        $percentile = static function (array $sorted, float $p): ?int {
+            if (count($sorted) === 0) {
+                return null;
+            }
+            $idx = (int) floor($p * (count($sorted) - 1));
+            return $sorted[$idx];
+        };
+
+        $okish = (int) ($agg['ok'] ?? 0) + (int) ($agg['partial'] ?? 0);
+        $out['summary'] = [
+            'runs' => $runs,
+            'ok' => (int) ($agg['ok'] ?? 0),
+            'partial' => (int) ($agg['partial'] ?? 0),
+            'error' => (int) ($agg['error_count'] ?? 0),
+            'interrupted' => (int) ($agg['interrupted'] ?? 0),
+            // A degraded run still did most of its work, so it counts as a
+            // success here; the Failed tile is what separates them.
+            'success_pct' => $runs > 0 ? round(($okish / $runs) * 100, 1) : null,
+            'p50_ms' => $percentile($durations, 0.5),
+            'p95_ms' => $percentile($durations, 0.95),
+            'last_started_at' => $agg['last_started_at'] !== null ? (string) $agg['last_started_at'] : null,
+        ];
+
+        // 3) Per command.
+        $cmdStmt = $pdo->prepare(
+            "SELECT cr.command,
+                    COUNT(*) AS runs,
+                    SUM(CASE WHEN cr.status = 'ok' THEN 1 ELSE 0 END) AS ok,
+                    SUM(CASE WHEN cr.status = 'partial' THEN 1 ELSE 0 END) AS partial,
+                    SUM(CASE WHEN cr.status = 'error' THEN 1 ELSE 0 END) AS error_count,
+                    AVG(cr.duration_ms) AS avg_ms,
+                    MAX(cr.duration_ms) AS max_ms,
+                    MAX(cr.started_at) AS last_started_at
+             FROM command_runs cr
+             WHERE $where
+             GROUP BY cr.command
+             ORDER BY cr.command ASC"
+        );
+        $bind($cmdStmt);
+        $cmdStmt->execute();
+        foreach ($cmdStmt->fetchAll() as $row) {
+            $out['by_command'][] = [
+                'command' => (string) $row['command'],
+                'runs' => (int) $row['runs'],
+                'ok' => (int) $row['ok'],
+                'partial' => (int) $row['partial'],
+                'error' => (int) $row['error_count'],
+                'avg_ms' => $row['avg_ms'] !== null ? (float) $row['avg_ms'] : null,
+                'max_ms' => $row['max_ms'] !== null ? (int) $row['max_ms'] : null,
+                'last_started_at' => $row['last_started_at'] !== null ? (string) $row['last_started_at'] : null,
+            ];
+        }
+
+        // 4) Time buckets for the chart. Slicing the RFC3339 string is the one
+        //    bucketing both engines agree on without date parsing: characters
+        //    1-13 are 'YYYY-MM-DDTHH', 1-10 are 'YYYY-MM-DD'.
+        $bucketLen = $daily ? 10 : 13;
+        $seriesStmt = $pdo->prepare(
+            "SELECT SUBSTR(cr.started_at, 1, $bucketLen) AS bucket,
+                    SUM(CASE WHEN cr.status = 'ok' THEN 1 ELSE 0 END) AS ok,
+                    SUM(CASE WHEN cr.status = 'partial' THEN 1 ELSE 0 END) AS partial,
+                    SUM(CASE WHEN cr.status = 'error' THEN 1 ELSE 0 END) AS error_count,
+                    SUM(CASE WHEN cr.status = 'running' THEN 1 ELSE 0 END) AS running,
+                    AVG(cr.duration_ms) AS avg_ms
+             FROM command_runs cr
+             WHERE $where
+             GROUP BY SUBSTR(cr.started_at, 1, $bucketLen)
+             ORDER BY bucket ASC"
+        );
+        $bind($seriesStmt);
+        $seriesStmt->execute();
+        $out['series'] = gasolineCommandStatsSeries($seriesStmt->fetchAll(), $now, $hours, $daily);
+
+        // 5) Metric totals. The per-run average divides by the runs that
+        //    actually reported the metric, not by every run of the command:
+        //    `suggest` only records its persist counters with --persist, and
+        //    averaging those over plain runs too would understate them.
+        $metricStmt = $pdo->prepare(
+            "SELECT cr.command, m.name,
+                    SUM(m.value) AS total,
+                    COUNT(*) AS samples
+             FROM command_run_metrics m
+             JOIN command_runs cr ON cr.id = m.run_id
+             WHERE $where
+             GROUP BY cr.command, m.name
+             ORDER BY cr.command ASC, m.name ASC"
+        );
+        $bind($metricStmt);
+        $metricStmt->execute();
+        foreach ($metricStmt->fetchAll() as $row) {
+            $samples = (int) $row['samples'];
+            $total = (float) $row['total'];
+            $out['metric_totals'][] = [
+                'command' => (string) $row['command'],
+                'name' => (string) $row['name'],
+                'total' => $total,
+                'per_run' => $samples > 0 ? round($total / $samples, 2) : null,
+            ];
+        }
+
+        // 6) The recent runs themselves, newest first, with their metrics.
+        $rowStmt = $pdo->prepare(
+            "SELECT cr.id, cr.command, cr.started_at, cr.finished_at, cr.duration_ms,
+                    cr.status, cr.error, cr.host, cr.version
+             FROM command_runs cr
+             WHERE $where
+             ORDER BY cr.started_at DESC, cr.id DESC
+             LIMIT " . ($csRowLimit + 1)
+        );
+        $bind($rowStmt);
+        $rowStmt->execute();
+        $runRows = $rowStmt->fetchAll();
+        if (count($runRows) > $csRowLimit) {
+            $out['truncated'] = true;
+            $runRows = array_slice($runRows, 0, $csRowLimit);
+        }
+
+        $byID = [];
+        foreach ($runRows as $row) {
+            $id = (int) $row['id'];
+            $byID[$id] = [
+                'id' => $id,
+                'command' => (string) $row['command'],
+                'started_at' => (string) $row['started_at'],
+                'finished_at' => $row['finished_at'] !== null ? (string) $row['finished_at'] : null,
+                'duration_ms' => $row['duration_ms'] !== null ? (int) $row['duration_ms'] : null,
+                'status' => (string) $row['status'],
+                'error' => $row['error'] !== null && $row['error'] !== '' ? (string) $row['error'] : null,
+                'host' => (string) $row['host'],
+                'version' => (string) $row['version'],
+                'metrics' => [],
+            ];
+        }
+        if (count($byID) > 0) {
+            // One query for every displayed run's metrics, pivoted in PHP:
+            // a row per metric would make the table N+1 queries deep.
+            $ids = array_keys($byID);
+            $placeholders = implode(', ', array_fill(0, count($ids), '?'));
+            $mStmt = $pdo->prepare(
+                "SELECT run_id, name, value FROM command_run_metrics WHERE run_id IN ($placeholders)"
+            );
+            $mStmt->execute($ids);
+            foreach ($mStmt->fetchAll() as $row) {
+                $rid = (int) $row['run_id'];
+                if (isset($byID[$rid])) {
+                    $byID[$rid]['metrics'][(string) $row['name']] = (float) $row['value'];
+                }
+            }
+        }
+        $out['rows'] = array_values($byID);
+
+        echo json_encode($out, $jsonFlags);
+    } catch (Throwable $e) {
+        error_log('gasoline command_stats error: ' . $e->getMessage());
+        http_response_code(500);
+        echo json_encode(['errors' => [['key' => 'loadError', 'params' => [], 'message' => 'Could not load command statistics.']]], $jsonFlags);
     }
     exit;
 }
@@ -6259,6 +7198,7 @@ function renderHeader(?array $user, string $activePage): void
                 <a class="menu-item<?= $activePage === 'admin_stations' ? ' active' : '' ?>" href="?page=admin_stations" data-i18n="menuStations">Stations</a>
                 <a class="menu-item<?= $activePage === 'admin_settings' ? ' active' : '' ?>" href="?page=admin_settings" data-i18n="menuSettings">Settings</a>
                 <a class="menu-item<?= $activePage === 'admin_predictions' ? ' active' : '' ?>" href="?page=admin_predictions" data-i18n="menuPredictions">Prediction accuracy</a>
+                <a class="menu-item<?= $activePage === 'admin_stats' ? ' active' : '' ?>" href="?page=admin_stats" data-i18n="menuStats">Statistics</a>
                 <?php } ?>
                 <div class="menu-sep"></div>
                 <form method="post" action="" class="menu-logout"><?= csrfField() ?><input type="hidden" name="action" value="logout"><button type="submit" class="menu-item" data-i18n="menuLogout">Sign out</button></form>
@@ -6338,6 +7278,7 @@ const translations = {
         sdNavigate: 'Navigate with Google Maps',
         sdClose: 'Close',
         rangeAll: 'All',
+        range24h: '24h',
         range30d: '30d',
         range14d: '14d',
         range7d: '7d',
@@ -6479,6 +7420,54 @@ const translations = {
         schemaOutdatedBody: 'The database schema is missing the required tables. Run the following command on the server, then reload this page:',
         schemaDbNotFound: 'The database was not found.',
         menuPredictions: 'Prediction accuracy',
+        menuStats: 'Statistics',
+        statsTitle: 'Command statistics',
+        statsHint: 'Every run of the scheduled commands, with what it did and how long it took. A run is recorded once its database is open, so a failure before that — a bad flag, an unreachable server — leaves no row. `notify --dry-run` is not recorded: it delivers nothing.',
+        statsNoTable: 'No runs have been recorded yet. Run `gasoline migrate` on the server to create the tables, then wait for the next scheduled command.',
+        statsCommand: 'Command',
+        statsAllCommands: 'All commands',
+        statsRange: 'Range',
+        statsTileRuns: 'Runs',
+        statsTileSuccess: 'Success rate',
+        statsTilePartial: 'Partial',
+        statsTileFailed: 'Failed',
+        statsTileInterrupted: 'Interrupted',
+        statsTileMedian: 'Median duration',
+        statsTileP95: 'p95 duration',
+        statsTileLastRun: 'Last run',
+        statsInterruptedHint: '"Interrupted" counts runs that recorded a start and never a finish — killed, out of memory, or still going. Nothing clears them later, so a run that takes longer than six hours stays counted.',
+        statsChartTitle: 'Runs over time',
+        statsNoData: 'No recorded runs match the current filters.',
+        statsByCommand: 'By command',
+        statsWork: 'Work done',
+        statsWorkHint: 'The counters the commands report, summed over the filtered runs. Per run averages only over the runs that reported the metric, so suggest\u2019s persist counters are not diluted by runs without --persist.',
+        statsRecent: 'Recent runs',
+        statsTruncated: 'Showing the most recent 200 runs; the statistics above cover the full filtered set.',
+        statsColCommand: 'Command',
+        statsColRuns: 'Runs',
+        statsColOk: 'OK',
+        statsColPartial: 'Partial',
+        statsColError: 'Failed',
+        statsColAvg: 'Avg duration',
+        statsColMax: 'Max duration',
+        statsColLast: 'Last run',
+        statsColMetric: 'Metric',
+        statsColTotal: 'Total',
+        statsColPerRun: 'Per run',
+        statsColStarted: 'Started',
+        statsColStatus: 'Status',
+        statsColDuration: 'Duration',
+        statsColHost: 'Host',
+        statsColDetail: 'Detail',
+        statsStatus_ok: 'OK',
+        statsStatus_partial: 'Partial',
+        statsStatus_error: 'Failed',
+        statsStatus_running: 'Unfinished',
+        statsLegendDuration: 'Avg duration',
+        statsJustNow: 'just now',
+        statsMinutesAgo: 'min ago',
+        statsHoursAgo: 'h ago',
+        statsDaysAgo: 'd ago',
         predAccuracyTitle: 'Prediction accuracy',
         predAccuracyHint: 'Compares each past prediction with the actual price recorded for that target window. Only evaluated predictions — whose target hour has passed and had a recorded price — are included. Errors are shown in cents (ct); bias is the mean signed error (actual − predicted), so a positive bias means predictions ran low.',
         predRange: 'Target range',
@@ -6599,6 +7588,7 @@ const translations = {
         sdNavigate: 'Mit Google Maps navigieren',
         sdClose: 'Schließen',
         rangeAll: 'Alle',
+        range24h: '24h',
         range30d: '30d',
         range14d: '14d',
         range7d: '7d',
@@ -6740,6 +7730,54 @@ const translations = {
         schemaOutdatedBody: 'Im Datenbankschema fehlen die benötigten Tabellen. Führe folgenden Befehl auf dem Server aus und lade die Seite neu:',
         schemaDbNotFound: 'Die Datenbank wurde nicht gefunden.',
         menuPredictions: 'Vorhersagegenauigkeit',
+        menuStats: 'Statistiken',
+        statsTitle: 'Befehlsstatistiken',
+        statsHint: 'Jeder Lauf der geplanten Befehle, mit dem, was er getan hat, und wie lange er gedauert hat. Ein Lauf wird erst aufgezeichnet, wenn seine Datenbank offen ist — ein Fehler davor, etwa ein falsches Flag oder ein nicht erreichbarer Server, hinterlässt keine Zeile. `notify --dry-run` wird nicht aufgezeichnet: dabei wird nichts zugestellt.',
+        statsNoTable: 'Es wurden noch keine Läufe aufgezeichnet. Führe `gasoline migrate` auf dem Server aus, um die Tabellen anzulegen, und warte auf den nächsten geplanten Befehl.',
+        statsCommand: 'Befehl',
+        statsAllCommands: 'Alle Befehle',
+        statsRange: 'Zeitraum',
+        statsTileRuns: 'Läufe',
+        statsTileSuccess: 'Erfolgsquote',
+        statsTilePartial: 'Teilweise',
+        statsTileFailed: 'Fehlgeschlagen',
+        statsTileInterrupted: 'Abgebrochen',
+        statsTileMedian: 'Median-Dauer',
+        statsTileP95: 'p95-Dauer',
+        statsTileLastRun: 'Letzter Lauf',
+        statsInterruptedHint: '„Abgebrochen“ zählt Läufe, die einen Start, aber nie ein Ende aufgezeichnet haben — beendet, ohne Speicher oder noch laufend. Nichts räumt sie später auf, ein Lauf über sechs Stunden bleibt also gezählt.',
+        statsChartTitle: 'Läufe im Zeitverlauf',
+        statsNoData: 'Keine aufgezeichneten Läufe passen zu den aktuellen Filtern.',
+        statsByCommand: 'Nach Befehl',
+        statsWork: 'Geleistete Arbeit',
+        statsWorkHint: 'Die Zähler, die die Befehle melden, summiert über die gefilterten Läufe. „Pro Lauf“ mittelt nur über die Läufe, die den Zähler gemeldet haben — die Persist-Zähler von suggest werden also nicht durch Läufe ohne --persist verwässert.',
+        statsRecent: 'Letzte Läufe',
+        statsTruncated: 'Es werden die letzten 200 Läufe angezeigt; die Statistiken oben umfassen die gesamte gefilterte Menge.',
+        statsColCommand: 'Befehl',
+        statsColRuns: 'Läufe',
+        statsColOk: 'OK',
+        statsColPartial: 'Teilweise',
+        statsColError: 'Fehlgeschlagen',
+        statsColAvg: 'Ø Dauer',
+        statsColMax: 'Max. Dauer',
+        statsColLast: 'Letzter Lauf',
+        statsColMetric: 'Kennzahl',
+        statsColTotal: 'Summe',
+        statsColPerRun: 'Pro Lauf',
+        statsColStarted: 'Gestartet',
+        statsColStatus: 'Status',
+        statsColDuration: 'Dauer',
+        statsColHost: 'Host',
+        statsColDetail: 'Detail',
+        statsStatus_ok: 'OK',
+        statsStatus_partial: 'Teilweise',
+        statsStatus_error: 'Fehlgeschlagen',
+        statsStatus_running: 'Unbeendet',
+        statsLegendDuration: 'Ø Dauer',
+        statsJustNow: 'gerade eben',
+        statsMinutesAgo: 'Min. her',
+        statsHoursAgo: 'Std. her',
+        statsDaysAgo: 'Tage her',
         predAccuracyTitle: 'Vorhersagegenauigkeit',
         predAccuracyHint: 'Vergleicht jede vergangene Vorhersage mit dem tatsächlich aufgezeichneten Preis im jeweiligen Zielfenster. Nur ausgewertete Vorhersagen — deren Zielstunde vorbei ist und für die ein Preis vorlag — werden berücksichtigt. Fehler werden in Cent (ct) angezeigt; der Bias ist der mittlere vorzeichenbehaftete Fehler (Ist − Vorhersage), ein positiver Bias bedeutet also zu niedrige Vorhersagen.',
         predRange: 'Zeitraum (Ziel)',
