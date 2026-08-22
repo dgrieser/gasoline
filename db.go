@@ -492,6 +492,27 @@ func schemaStatements(d dialect) []string {
 				FOREIGN KEY (run_id) REFERENCES prediction_runs(id),
 				FOREIGN KEY (station_id) REFERENCES stations(id)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS command_runs (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				command VARCHAR(32) NOT NULL,
+				started_at VARCHAR(64) NOT NULL,
+				finished_at VARCHAR(64),
+				duration_ms BIGINT,
+				status VARCHAR(16) NOT NULL DEFAULT 'running',
+				error TEXT,
+				host VARCHAR(255) NOT NULL DEFAULT '',
+				version VARCHAR(64) NOT NULL DEFAULT '',
+				INDEX idx_command_runs_command_started (command, started_at DESC),
+				INDEX idx_command_runs_started (started_at DESC)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS command_run_metrics (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				run_id BIGINT NOT NULL,
+				name VARCHAR(48) NOT NULL,
+				value DOUBLE NOT NULL,
+				INDEX idx_command_run_metrics_run (run_id, name),
+				FOREIGN KEY (run_id) REFERENCES command_runs(id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 		}
 	}
 	return []string{
@@ -672,6 +693,30 @@ func schemaStatements(d dialect) []string {
 			ON price_check_decisions(fuel, outcome_evaluated_at, target_end)`,
 		`CREATE INDEX IF NOT EXISTS idx_price_check_decisions_run
 			ON price_check_decisions(run_id)`,
+		`CREATE TABLE IF NOT EXISTS command_runs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			command TEXT NOT NULL,
+			started_at TEXT NOT NULL,
+			finished_at TEXT,
+			duration_ms INTEGER,
+			status TEXT NOT NULL DEFAULT 'running',
+			error TEXT,
+			host TEXT NOT NULL DEFAULT '',
+			version TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_command_runs_command_started
+			ON command_runs(command, started_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_command_runs_started
+			ON command_runs(started_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS command_run_metrics (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			value REAL NOT NULL,
+			FOREIGN KEY (run_id) REFERENCES command_runs(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_command_run_metrics_run
+			ON command_run_metrics(run_id, name)`,
 	}
 }
 
