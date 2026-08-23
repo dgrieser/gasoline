@@ -3868,10 +3868,12 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         // raw-row queries so every panel reflects exactly the same filtered set.
         // Aggregate queries below read `$ppHinted` instead of naming the table
         // directly; see gasolineAccuracyIndexHint for why they carry a hint and
-        // how to re-check that it still earns its place. `series` and the raw-row
-        // query keep the plain reference: measured on the live database the hint
-        // changed them by +1% and -2%, so there is nothing to buy there and the
-        // optimizer is left free.
+        // how to re-check that it still earns its place. The raw-row query
+        // carries it too, since the table grew past where its old measurement
+        // held. `series` is the one query left on the plain reference: forcing
+        // the index there moved it by -13%, +4%, -1% and +5% over four runs,
+        // which straddles zero, so there is nothing to buy and the optimizer is
+        // left free.
         $ppHint = gasolineAccuracyIndexHint($pdo, $driver);
         $ppTable = 'price_predictions pp ';
         $ppHinted = $ppHint === '' ? $ppTable : $ppTable . $ppHint . ' ';
@@ -4117,6 +4119,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         //    keys, so neither can drop or duplicate a row, and the outer ORDER
         //    BY repeats the inner one because a derived table's order is not
         //    guaranteed to survive a join.
+        //
+        //    The inner select carries the index hint. It used not to: when this
+        //    query was last measured the hint moved it by -2%. At 8M rows the
+        //    optimizer instead drives it from idx_price_predictions_due, which
+        //    leads with fuel and then has nothing for the target_start range or
+        //    the sort, and it became the slowest query on the page — 8.3-8.8 s
+        //    against 6.0-6.5 s forced, measured four times with the ranges never
+        //    overlapping. `gasoline doctor --try-index
+        //    idx_price_predictions_accuracy` is what re-checks this.
         $rowsStmt = $pdo->prepare(
             'SELECT page.station_id, page.fuel, pr.run_at, page.target_start, page.target_end, '
             . 'page.predicted_price, page.actual_price, page.error, page.confidence, page.lead_minutes, page.is_suggestion, '
@@ -4124,7 +4135,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
             . 'FROM ('
             . 'SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, '
             . 'pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion '
-            . 'FROM price_predictions pp ' . $joinRuns
+            . 'FROM ' . $ppHinted . $joinRuns
             . 'WHERE ' . $where
             . ' ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT ' . ($rawTableLimit + 1)
             . ') page '

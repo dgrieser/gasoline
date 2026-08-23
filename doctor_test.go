@@ -1005,15 +1005,19 @@ func TestIndexHintSyntax(t *testing.T) {
 // TestPageHintsExactlyTheMeasuredQueries pins the hint policy. Hinting is a
 // last resort justified by measurement, so the set of queries carrying one is
 // part of the decision, not an implementation detail: series and rows measured
-// +1% and -2% on the live database and must stay unhinted.
+// zero across four runs on the live database and must stay unhinted.
 func TestPageHintsExactlyTheMeasuredQueries(t *testing.T) {
 	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
 		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
 	hint := indexHintSyntax(dialectSQLite, "idx_price_predictions_accuracy")
 
+	// rows joined this set once the table passed 8M rows: the optimizer began
+	// driving it from idx_price_predictions_due, and forcing the covering index
+	// measured 8.3-8.8 s against 6.0-6.5 s over four runs with the ranges never
+	// overlapping. series stays out — there the same four runs straddled zero.
 	wantHinted := map[string]bool{
 		"summary": true, "summary_latest": true,
-		"by_confidence": true, "by_lead": true, "by_hour": true,
+		"by_confidence": true, "by_lead": true, "by_hour": true, "rows": true,
 	}
 	seen := map[string]bool{}
 	for _, spec := range pageSpecs(filters, true) {
@@ -1141,14 +1145,16 @@ func TestViewerHintMatchesDoctor(t *testing.T) {
 	if !strings.Contains(php, "gasolineIndexExists") {
 		t.Error("web/index.php hints without checking the index exists")
 	}
-	// And it must apply it to exactly the queries doctor thinks it does. Six
-	// SQL references, because summary_latest reads price_predictions twice; the
-	// two unhinted queries keep naming the table directly.
-	if got := strings.Count(php, "$ppHinted ."); got != 6 {
-		t.Errorf("web/index.php splices $ppHinted into %d queries, want 6", got)
+	// And it must apply it to exactly the queries doctor thinks it does. Seven
+	// SQL references for six hinted queries, because summary_latest reads
+	// price_predictions twice; series is the one query still naming the table
+	// directly.
+	wantRefs := len(pageHintedQueries) + 1
+	if got := strings.Count(php, "$ppHinted ."); got != wantRefs {
+		t.Errorf("web/index.php splices $ppHinted into %d references, want %d", got, wantRefs)
 	}
-	if got := strings.Count(php, "'FROM price_predictions pp ' . $joinRuns"); got != 2 {
-		t.Errorf("web/index.php has %d unhinted accuracy queries, want 2 (series and rows)", got)
+	if got := strings.Count(php, "'FROM price_predictions pp ' . $joinRuns"); got != 1 {
+		t.Errorf("web/index.php has %d unhinted accuracy queries, want 1 (series)", got)
 	}
 }
 

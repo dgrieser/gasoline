@@ -407,15 +407,26 @@ type accuracyQueryContext struct {
 
 // pageHintedQueries are the queries the accuracy page forces
 // idx_price_predictions_accuracy on (see gasolineAccuracyIndexHint in
-// web/index.php). series and rows are deliberately absent: measured on the live
-// database the hint moved them by +1% and -2%, so they keep the plain reference
-// and leave the optimizer free.
+// web/index.php).
+//
+// series is the only one deliberately absent: forcing the index there moved it
+// by -13%, +4%, -1% and +5% over four runs, which straddles zero, so it keeps
+// the plain reference and leaves the optimizer free.
+//
+// rows was absent too until the table passed 8M rows and the measurement that
+// justified it (-2%) stopped holding. The optimizer now drives it from
+// idx_price_predictions_due, which leads with fuel and then serves neither the
+// target_start range nor the sort: 8.3-8.8 s against 6.0-6.5 s forced, measured
+// four times with the two ranges never overlapping. Re-check with
+// `doctor --try-index idx_price_predictions_accuracy`, and read the verdict
+// against the noise band the same run reports.
 var pageHintedQueries = map[string]bool{
 	"summary":        true,
 	"summary_latest": true,
 	"by_confidence":  true,
 	"by_lead":        true,
 	"by_hour":        true,
+	"rows":           true,
 }
 
 // accuracyQuerySpecsHinted builds the page's queries, optionally overriding
