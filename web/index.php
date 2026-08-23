@@ -7399,6 +7399,7 @@ const translations = {
         trend: 'Trend',
         trendPerDay: 'ct/day',
         trendHint: 'Linear trend across the shown stations. Click to hide.',
+        trendLatest: 'Trend at the latest reading',
         station: 'Station',
         brand: 'Brand',
         openYes: 'open',
@@ -7712,6 +7713,7 @@ const translations = {
         trend: 'Trend',
         trendPerDay: 'ct/Tag',
         trendHint: 'Linearer Trend über die gezeigten Tankstellen. Klicken zum Ausblenden.',
+        trendLatest: 'Trend zum letzten Stand',
         station: 'Tankstelle',
         brand: 'Marke',
         openYes: 'offen',
@@ -9151,6 +9153,22 @@ if (!chartEl) {
             }
         }
 
+        // A trend has to be unmistakable among a dozen station lines, and it
+        // cannot win that on hue: station colours are spread right around the
+        // wheel, so any colour a trend picks is some station's too. It is drawn
+        // in the page's own foreground instead — a value no station line takes
+        // — over a soft halo in the fuel's colour. The halo, the dash pattern
+        // and the legend swatch carry which fuel it belongs to.
+        const trendInk = light ? '#1c1c1e' : '#e8eaed';
+        const trendSwatch = (fuel, w = 20) =>
+            `<svg class="legend-line" width="${w}" height="8" aria-hidden="true">`
+            + [[fuelConfig[fuel].color, 7, 0.18], [fuelConfig[fuel].color, 4, 0.35],
+                [trendInk, 2, 0.9]].map(([stroke, width, opacity]) =>
+                `<line x1="1" y1="4" x2="${w - 1}" y2="4" stroke="${stroke}" stroke-width="${width}"`
+                + ` stroke-opacity="${opacity}" stroke-dasharray="${fuelConfig[fuel].dash}"`
+                + ` stroke-linecap="round"/>`).join('')
+            + `</svg>`;
+
         // Clip a fitted segment to the plot band: a trend can leave the padded
         // y-range (a steep fit through lopsided data), and an unclipped line
         // would paint over the axis labels.
@@ -9170,8 +9188,10 @@ if (!chartEl) {
         // summary rather than as one more station's price line. The fits follow
         // the isolate filter, so isolating a station trends that station alone.
         // trendLegend is collected while fitting, so the legend lists only the
-        // fuels that actually produced a line.
+        // fuels that actually produced a line; trendFits keeps each fit so the
+        // crosshair can report where the trend stands at the hovered moment.
         const trendLegend = [];
+        const trendFits = [];
         for (const fuel of activeFuels) {
             // Fit the step function the chart actually draws, not the rows
             // that encode it: a price holds until the station reprices, so
@@ -9225,18 +9245,23 @@ if (!chartEl) {
             const intercept = (sumY - slope * sumX) / sumW;
             const fitAt = (ts) => intercept + slope * ((ts - minX) / 3_600_000);
 
-            trendLegend.push({ fuel, slope });
+            trendLegend.push({ fuel, slope, fitAt });
             if (hiddenTrends.has(fuel)) continue;
+            trendFits.push({ fuel, fitAt });
 
             const seg = clipToPlot(px(firstTs), py(fitAt(firstTs)), px(maxX), py(fitAt(maxX)));
             if (!seg) continue;
-            mk('line', {
+            const line = {
                 x1: seg.x1.toFixed(2), y1: seg.y1.toFixed(2),
                 x2: seg.x2.toFixed(2), y2: seg.y2.toFixed(2),
-                stroke: fuelConfig[fuel].color, 'stroke-width': 2.5,
                 'stroke-dasharray': fuelConfig[fuel].dash, 'stroke-linecap': 'round',
-                opacity: 0.95, 'pointer-events': 'none',
-            });
+                'pointer-events': 'none',
+            };
+            // Two halo passes give the glow a falloff a single wide stroke
+            // cannot, then the line goes over them.
+            mk('line', { ...line, stroke: fuelConfig[fuel].color, 'stroke-width': 9, opacity: 0.18 });
+            mk('line', { ...line, stroke: fuelConfig[fuel].color, 'stroke-width': 5, opacity: 0.35 });
+            mk('line', { ...line, stroke: trendInk, 'stroke-width': 2, opacity: 0.9 });
         }
 
         // Trend legend — the same dash the chart drew, plus the fit's slope in
@@ -9244,19 +9269,18 @@ if (!chartEl) {
         // Clicking one hides or shows that fuel's trendline.
         const drawTrendLegend = () => {
             const t = translations[currentLang];
-            for (const { fuel, slope } of trendLegend) {
-                const color = fuelConfig[fuel].color;
+            for (const { fuel, slope, fitAt } of trendLegend) {
                 const off = hiddenTrends.has(fuel);
                 const perDay = slope * 24 * 100;   // €/h → ct/day
                 const rate = (perDay < 0 ? '\u2212' : '+')
                     + Math.abs(perDay).toLocaleString(_loc(), { minimumFractionDigits: 2, maximumFractionDigits: 2 });
                 const item = document.createElement('div');
                 item.className = 'legend-item' + (off ? ' off' : '');
-                item.title = t.trendHint;
+                // Where the trend stands at the right edge — the reading the
+                // rate is heading towards, for anyone not hovering the chart.
+                item.title = `${t.trendHint}\n${t.trendLatest}: ${fmtPriceText(fitAt(maxX))} €`;
                 item.innerHTML =
-                    `<svg class="legend-line" width="20" height="8" aria-hidden="true">`
-                    + `<line x1="0" y1="4" x2="20" y2="4" stroke="${color}" stroke-width="2"`
-                    + ` stroke-dasharray="${fuelConfig[fuel].dash}" stroke-linecap="round"/></svg>`
+                    trendSwatch(fuel)
                     + `${h(t.trend)} ${h(fuelConfig[fuel].label)}`
                     + `<span class="legend-trend-rate">${h(rate)} ${h(t.trendPerDay)}</span>`;
                 item.addEventListener('click', () => {
@@ -9330,6 +9354,7 @@ if (!chartEl) {
             entries.sort((a, b) => a.price - b.price);
 
             const showFuel = activeFuels.size > 1;
+            const labels = translations[currentLang];   // `t` is the timestamp here
             tooltip.innerHTML =
                 `<div class="tt-meta">${h(formatDateTime(new Date(ts).toISOString()))}</div>` +
                 entries.map((en) => {
@@ -9340,7 +9365,18 @@ if (!chartEl) {
                         (showFuel ? `<span class="tt-fuel">${fuelConfig[en.fuel].label}</span>` : '') +
                         `<span class="tt-val" style="color:${color}">${fmtPriceHtml(en.price)} €</span>` +
                     `</div>`;
-                }).join('');
+                }).join('') +
+                // What the trend reads at this moment, so a station's price can
+                // be seen for what it is: above the trend or below it. Last in
+                // the list, since the prices above are sorted and these are not
+                // one of them.
+                trendFits.map(({ fuel, fitAt }) =>
+                    `<div class="tt-row">` +
+                        trendSwatch(fuel, 14) +
+                        `<span class="tt-name">${h(labels.trend)}</span>` +
+                        (showFuel ? `<span class="tt-fuel">${fuelConfig[fuel].label}</span>` : '') +
+                        `<span class="tt-val" style="color:${trendInk}">${fmtPriceHtml(fitAt(ts))} €</span>` +
+                    `</div>`).join('');
             tooltip.style.display = 'block';
             positionTooltip(clientX, clientY);
         };

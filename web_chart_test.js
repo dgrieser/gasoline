@@ -84,7 +84,18 @@ const renderChartSource = lift('\n    function renderChart() {');
 const fuelConfig = new Function(`${lift('const fuelConfig = {')}\nreturn fuelConfig;`)();
 const translations = new Function(`${lift('const translations = {')}\nreturn translations;`)();
 const h = new Function(`${lift('function h(str) {')}\nreturn h;`)();
-const makeLoc = new Function('currentLang', `${lift('function _loc() {')}\nreturn _loc;`);
+// The locale helper and the price formatters read currentLang, so they are
+// built per language. Lifting them keeps the decimal separator, the raised
+// tenth-of-a-cent digit and the em-dash fallback the page's own.
+const makeLocale = new Function('currentLang', [
+    lift('function _loc() {'),
+    lift('function decimalSeparator() {'),
+    lift('function separatorHtml() {'),
+    lift('function priceParts(v) {'),
+    lift('function fmtPriceText(v, fallback) {'),
+    lift('function fmtPriceHtml(v, fallback) {'),
+    'return { _loc, fmtPriceText, fmtPriceHtml };',
+].join('\n'));
 
 /* ── DOM stub: enough of an element for an SVG chart and a legend ── */
 
@@ -157,7 +168,7 @@ const DEPS = [
     'hideCrosshair', 'tooltip', 'getRangeFilteredData', 'setChartVisibility',
     'stationFuelColor', 'fillSvgPrice', 'formatTickDate', 'formatTickTime',
     'positionTooltip', 'hideTooltip', 'attachLongPressCrosshair', 'fmtPriceHtml',
-    'h', '_loc',
+    'fmtPriceText', 'formatDateTime', 'h', '_loc',
 ];
 const compiled = new Function(...DEPS, `${renderChartSource}\nreturn renderChart;`);
 
@@ -169,36 +180,77 @@ const compiled = new Function(...DEPS, `${renderChartSource}\nreturn renderChart
 function render(rows, { fuels = ['diesel'], hidden = [], lang = 'en', theme = 'dark' } = {}) {
     const chartEl = makeElement('svg');
     const legendEl = makeElement('div');
+    const tooltip = makeElement('div');
     documentStub.documentElement.setAttribute('data-theme', theme);
     const hiddenTrends = new Set(hidden);
     const activeFuels = new Set(fuels);
+    const locale = makeLocale(lang);
 
     let renderChart;
     const reRender = () => renderChart();
     renderChart = compiled(
         chartEl, legendEl, documentStub, activeFuels, hiddenTrends, null,
         fuelConfig, translations, lang, reRender, 0,
-        () => {}, makeElement('div'), () => rows, () => {},
+        () => {}, tooltip, () => rows, () => {},
         () => '#888888', (el, v) => { el.textContent = String(v); }, () => '01/08', () => '00:00',
-        () => {}, () => {}, () => {}, (v) => String(v),
-        h, makeLoc(lang),
+        () => {}, () => {}, () => {}, locale.fmtPriceHtml,
+        locale.fmtPriceText, (iso) => iso, h, locale._loc,
     );
     renderChart();
-    return { chartEl, legendEl, hiddenTrends, redraw: renderChart };
+    // The crosshair fills the tooltip from the overlay's pointermove. The
+    // overlay is the last rect drawn, and the handler maps clientX through the
+    // element's box, which the stub reports as 960 wide starting at 0.
+    const overlay = [...chartEl.children].reverse().find((el) => el.tagName === 'rect');
+    const hover = (fraction) => {
+        for (const fn of overlay.listeners.pointermove || []) {
+            fn({ pointerType: 'mouse', clientX: fraction * 960, clientY: 100 });
+        }
+        return tooltip.innerHTML;
+    };
+    return { chartEl, legendEl, tooltip, hiddenTrends, hover, redraw: renderChart };
 }
 
-/** Only the trendlines: dashed strokes drawn from the fuel palette. */
-function trendLines(chartEl) {
+// The foreground the trend is drawn in, per theme, as renderChart picks it.
+const TREND_INK = { dark: '#e8eaed', light: '#1c1c1e' };
+
+const strokeOf = (el) => ({
+    stroke: el.getAttribute('stroke'),
+    dash: el.getAttribute('stroke-dasharray'),
+    width: el.getAttribute('stroke-width'),
+    opacity: el.getAttribute('opacity'),
+    x1: Number(el.getAttribute('x1')), y1: Number(el.getAttribute('y1')),
+    x2: Number(el.getAttribute('x2')), y2: Number(el.getAttribute('y2')),
+});
+
+/**
+ * One entry per trendline: the line itself, drawn in the theme's foreground,
+ * and the glow passes underneath it in the fuel's colour, outermost first.
+ * Grouped by the geometry they share, so the number of glow passes is the
+ * drawing's business and not this harness's.
+ */
+function trends(chartEl, theme = 'dark') {
     const palette = new Set(Object.values(fuelConfig).map((f) => f.color));
-    return chartEl.children
-        .filter((el) => el.tagName === 'line' && palette.has(el.getAttribute('stroke')))
-        .map((el) => ({
-            stroke: el.getAttribute('stroke'),
-            dash: el.getAttribute('stroke-dasharray'),
-            width: el.getAttribute('stroke-width'),
-            x1: Number(el.getAttribute('x1')), y1: Number(el.getAttribute('y1')),
-            x2: Number(el.getAttribute('x2')), y2: Number(el.getAttribute('y2')),
-        }));
+    const groups = new Map();
+    for (const el of chartEl.children) {
+        if (el.tagName !== 'line') continue;
+        const stroke = el.getAttribute('stroke');
+        if (stroke !== TREND_INK[theme] && !palette.has(stroke)) continue;   // not a trend
+        const s = strokeOf(el);
+        const key = [s.x1, s.y1, s.x2, s.y2, s.dash].join('|');
+        if (!groups.has(key)) groups.set(key, { line: null, glow: [] });
+        (stroke === TREND_INK[theme] ? (groups.get(key).line = s) : groups.get(key).glow.push(s));
+    }
+    return [...groups.values()];
+}
+
+/** Just the lines, which carry the geometry and the dash. */
+function trendLines(chartEl, theme = 'dark') {
+    return trends(chartEl, theme).map((t) => t.line).filter(Boolean);
+}
+
+/** Just the glow, flattened — its fuel colour is what identifies the trend. */
+function trendHalos(chartEl, theme = 'dark') {
+    return trends(chartEl, theme).flatMap((t) => t.glow);
 }
 
 /** Legend entries carrying a line swatch, i.e. the trend ones, as plain text. */
@@ -335,18 +387,40 @@ function reportedRate(legendEl, index = 0) {
 
     const { chartEl, legendEl } = render(rows, { fuels: ['e5', 'e10', 'diesel'] });
     const lines = trendLines(chartEl);
+    const halos = trendHalos(chartEl);
     check('every active fuel gets a trendline', lines.length, 3);
-    // Read the expected style off the page's own palette: what matters is that
-    // each fuel is drawn in the colour and dash the palette gives it, not what
-    // those happen to be today.
-    check('each fuel is drawn in its own colour and dash',
-        lines.map((l) => [l.stroke, l.dash]),
-        ['e5', 'e10', 'diesel'].map((f) => [fuelConfig[f].color, fuelConfig[f].dash]));
+
+    // Station hues are spread around the whole wheel, so a trend cannot be
+    // told apart by colour alone: it is drawn in the theme's foreground, which
+    // no station line takes, over a halo in its fuel's colour.
+    check('the line itself is the theme foreground, not a fuel colour',
+        lines.map((l) => l.stroke), [TREND_INK.dark, TREND_INK.dark, TREND_INK.dark]);
+    check('and the light theme switches it', trendLines(
+        render(rows, { fuels: ['diesel'], theme: 'light' }).chartEl, 'light').length, 1);
+    check('each trend glows in its own fuel colour',
+        trends(chartEl).map((t) => [...new Set(t.glow.map((g) => g.stroke))]),
+        ['e5', 'e10', 'diesel'].map((f) => [fuelConfig[f].color]));
+    // Each pass out from the line is wider and fainter than the one inside it,
+    // which is what makes a glow rather than a fat coloured line.
+    check('the glow widens and fades outward', trends(chartEl).map((t) => {
+        const passes = [...t.glow, t.line];   // outermost first, line last
+        return passes.every((p, i) => i === 0
+            || (Number(p.width) < Number(passes[i - 1].width)
+                && Number(p.opacity) > Number(passes[i - 1].opacity)));
+    }), [true, true, true]);
+    check('the glow is never fully opaque',
+        halos.every((g) => Number(g.opacity) < 1), true);
+    check('every trend is a line with glow behind it',
+        trends(chartEl).map((t) => [t.line !== null, t.glow.length > 0]),
+        [[true, true], [true, true], [true, true]]);
+
+    // Read the dash off the page's own palette: what matters is that each fuel
+    // gets the dash the palette gives it, not what that happens to be today.
+    check('each fuel is dashed the way its palette entry says',
+        lines.map((l) => l.dash), ['e5', 'e10', 'diesel'].map((f) => fuelConfig[f].dash));
     check('a trend is dashed, never solid', lines.every((l) => /\d/.test(l.dash || '')), true);
     check('the dash patterns tell the fuels apart',
         new Set(lines.map((l) => l.dash)).size, 3);
-    check('a trend is drawn heavier than a station line', lines.map((l) => l.width),
-        ['2.5', '2.5', '2.5']);
     check('the legend lists one entry per fuel',
         trendLegend(legendEl).map((e) => e.text),
         ['Trend E5 +1.19 ct/day', 'Trend E10 +1.19 ct/day', 'Trend Diesel +1.19 ct/day']);
@@ -354,7 +428,7 @@ function reportedRate(legendEl, index = 0) {
     // Only the fuels on the toggles are trended.
     const dieselOnly = render(rows, { fuels: ['diesel'] });
     check('a toggled-off fuel gets no trend',
-        trendLines(dieselOnly.chartEl).map((l) => l.stroke), ['#60a5fa']);
+        [...new Set(trendHalos(dieselOnly.chartEl).map((l) => l.stroke))], [fuelConfig.diesel.color]);
     check('and no legend entry either',
         trendLegend(dieselOnly.legendEl).map((e) => e.text), ['Trend Diesel +1.19 ct/day']);
 
@@ -389,7 +463,7 @@ function reportedRate(legendEl, index = 0) {
 
     const hidden = render(rows, { fuels: ['e10', 'diesel'], hidden: ['diesel'] });
     check('a hidden fuel draws no trendline',
-        trendLines(hidden.chartEl).map((l) => l.stroke), ['#34d399']);
+        [...new Set(trendHalos(hidden.chartEl).map((l) => l.stroke))], [fuelConfig.e10.color]);
     check('but keeps its legend entry, marked off',
         trendLegend(hidden.legendEl).map((e) => [e.text, e.off]),
         [['Trend E10 +1.19 ct/day', false], ['Trend Diesel +1.19 ct/day', true]]);
@@ -400,9 +474,61 @@ function reportedRate(legendEl, index = 0) {
     live.legendEl.children.find((el) => el.innerHTML.includes('Diesel')).click();
     check('clicking a legend entry hides that fuel', [...live.hiddenTrends], ['diesel']);
     check('and the redraw drops its line',
-        trendLines(live.chartEl).map((l) => l.stroke), ['#34d399']);
+        [...new Set(trendHalos(live.chartEl).map((l) => l.stroke))], [fuelConfig.e10.color]);
     live.legendEl.children.find((el) => el.innerHTML.includes('Diesel')).click();
     check('clicking again brings it back', trendLines(live.chartEl).length, 2);
+}
+
+/* ── What the crosshair and the hint report ─────────────────────── */
+
+// Hovering the chart should say where the trend stands at that moment, next to
+// the station prices, so a price can be read as above or below it.
+{
+    const rows = [
+        ...series('a', 'Alpha', (h) => 1.70 + (0.024 / 24) * h, { everyHours: 2 }),
+        ...series('b', 'Beta', (h) => 1.80 + (0.024 / 24) * h, { everyHours: 2 }),
+    ].sort((a, b) => a._ts - b._ts);
+    const { hover, legendEl } = render(rows);
+    const rowsOf = (html) => html.split('tt-row').length - 1;
+    // The last row is the trend's. Its name and price are read as fields: the
+    // price markup raises the third decimal into its own span, so flattening
+    // the row wholesale would break the number up.
+    const flat = (frag) => frag.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+    const trendRow = (html) => {
+        const row = html.slice(html.lastIndexOf('<div class="tt-row">'));
+        const name = flat((/class="tt-name">([\s\S]*?)<\/span>/.exec(row) || ['', ''])[1]);
+        const value = flat(row.slice(row.indexOf('class="tt-val"')).replace(/^[^>]*>/, ''));
+        return `${name} ${value}`;
+    };
+
+    const left = hover(0.08);
+    check('the crosshair lists both stations and the trend', rowsOf(left), 3);
+    // The pair averages 1.75 at the window's left edge and climbs 2.4 ct/day.
+    check('the trend row is labelled and priced', trendRow(left), 'Trend 1.749 €');
+    check('and it tracks the hovered moment', trendRow(hover(0.5)), 'Trend 1.761 €');
+    check('to the right it has climbed again', trendRow(hover(0.95)), 'Trend 1.773 €');
+    // It carries the same swatch the chart and the legend use.
+    check('the row carries the trend swatch, not a station dot',
+        hover(0.5).lastIndexOf('legend-line') > hover(0.5).lastIndexOf('legend-dot'), true);
+
+    // The legend entry's hint gives the same reading at the right edge, for
+    // anyone who has not hovered the chart.
+    check('the hint names the latest reading',
+        legendEl.children.find((el) => el.innerHTML.includes('legend-line')).title,
+        `${translations.en.trendHint}\n${translations.en.trendLatest}: 1.773 €`);
+    check('and it is localised too',
+        render(rows, { lang: 'de' }).legendEl.children
+            .find((el) => el.innerHTML.includes('legend-line')).title,
+        `${translations.de.trendHint}\n${translations.de.trendLatest}: 1,773 €`);
+}
+
+// A trend switched off in the legend is not reported by the crosshair either.
+{
+    const rows = series('a', 'Alpha', (h) => 1.70 + (0.024 / 24) * h, { everyHours: 2 });
+    check('a hidden trend is left out of the crosshair',
+        render(rows, { hidden: ['diesel'] }).hover(0.5).includes('legend-line'), false);
+    check('while a shown one is in it',
+        render(rows).hover(0.5).includes('legend-line'), true);
 }
 
 /* ── Staying inside the plot ────────────────────────────────────── */
@@ -445,7 +571,7 @@ function reportedRate(legendEl, index = 0) {
     const rows = series('a', 'Alpha', (h) => 1.7 + (0.012 / 24) * h, { everyHours: 2 });
     const mixed = render(rows, { fuels: ['e5', 'diesel'] });
     check('a fuel with no prices is skipped',
-        trendLines(mixed.chartEl).map((l) => l.stroke), ['#60a5fa']);
+        [...new Set(trendHalos(mixed.chartEl).map((l) => l.stroke))], [fuelConfig.diesel.color]);
     check('the fuel that has prices is unaffected', reportedRate(mixed.legendEl), 1.19);
 }
 
