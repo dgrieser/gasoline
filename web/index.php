@@ -6557,6 +6557,21 @@ function renderDocumentHead(string $titleSuffix): void
             flex-shrink: 0;
         }
 
+        /* Trend entries carry a line swatch instead of a dot so the legend
+           shows the exact dash pattern the trendline is drawn with. */
+        .legend-line {
+            flex-shrink: 0;
+            overflow: visible;
+        }
+
+        .legend-item.off .legend-line {
+            filter: grayscale(1);
+        }
+
+        .legend-trend-rate {
+            opacity: 0.75;
+        }
+
         .chart-empty {
             padding: 3rem 1.25rem;
             text-align: center;
@@ -7381,6 +7396,9 @@ const translations = {
         firstRecorded: 'First recorded',
         lastRecorded: 'Last recorded',
         priceTimeline: 'Price timeline',
+        trend: 'Trend',
+        trendPerDay: 'ct/day',
+        trendHint: 'Linear trend across the shown stations. Click to hide.',
         station: 'Station',
         brand: 'Brand',
         openYes: 'open',
@@ -7691,6 +7709,9 @@ const translations = {
         firstRecorded: 'Erste Aufzeichnung',
         lastRecorded: 'Letzte Aufzeichnung',
         priceTimeline: 'Preisverlauf',
+        trend: 'Trend',
+        trendPerDay: 'ct/Tag',
+        trendHint: 'Linearer Trend über die gezeigten Tankstellen. Klicken zum Ausblenden.',
         station: 'Tankstelle',
         brand: 'Marke',
         openYes: 'offen',
@@ -8755,6 +8776,10 @@ let dataLoaded = false;
 // In-memory, non-persistent chart-only filter: null = all stations shown,
 // otherwise a Set of visible station_ids (strings). Reset on fresh data.
 let stationFilter = null;
+// Fuels whose trendline the legend has toggled off. Chart-only and
+// non-persistent like stationFilter, but not tied to the payload's station
+// roster, so a refresh keeps the choice.
+const hiddenTrends = new Set();
 
 // Evenly-spread hues for all stations in this view using golden-angle spacing.
 // Stations sorted alphabetically → deterministic within a place. Recomputed
@@ -8781,9 +8806,12 @@ const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
 const hasDataScope = <?= json_encode($selectedCity !== '' || $selectedStationIds !== [] || $errors !== [], JSON_THROW_ON_ERROR) ?>;
 
 const fuelConfig = {
-    e5:     { label: 'E5',     color: '#f5a623', glow: 'rgba(245,166,35,0.18)' },
-    e10:    { label: 'E10',    color: '#34d399', glow: 'rgba(52,211,153,0.15)' },
-    diesel: { label: 'Diesel', color: '#60a5fa', glow: 'rgba(96,165,250,0.15)' },
+    // `dash` is the trendline's stroke-dasharray: dashed sets a trend apart
+    // from the solid per-station price lines, and one pattern per fuel keeps
+    // three trends apart from each other even where their colours crowd.
+    e5:     { label: 'E5',     color: '#f5a623', glow: 'rgba(245,166,35,0.18)', dash: '10 6' },
+    e10:    { label: 'E10',    color: '#34d399', glow: 'rgba(52,211,153,0.15)', dash: '2 5' },
+    diesel: { label: 'Diesel', color: '#60a5fa', glow: 'rgba(96,165,250,0.15)', dash: '12 5 2 5' },
 };
 
 const chartEl = document.getElementById('chart');
@@ -9123,6 +9151,109 @@ if (!chartEl) {
             }
         }
 
+        // Clip a fitted segment to the plot band: a trend can leave the padded
+        // y-range (a steep fit through lopsided data), and an unclipped line
+        // would paint over the axis labels.
+        const clipToPlot = (x1, y1, x2, y2) => {
+            const top = margin.top, bot = H - margin.bottom;
+            if ((y1 < top && y2 < top) || (y1 > bot && y2 > bot)) return null;
+            const xAt = (y) => x1 + ((y - y1) / (y2 - y1)) * (x2 - x1);
+            if (y1 < top)      { x1 = xAt(top); y1 = top; }
+            else if (y1 > bot) { x1 = xAt(bot); y1 = bot; }
+            if (y2 < top)      { x2 = xAt(top); y2 = top; }
+            else if (y2 > bot) { x2 = xAt(bot); y2 = bot; }
+            return { x1, y1, x2, y2 };
+        };
+
+        // Trendlines — one least-squares fit per fuel across every visible
+        // station, drawn dashed in the fuel's own colour so a trend reads as a
+        // summary rather than as one more station's price line. The fits follow
+        // the isolate filter, so isolating a station trends that station alone.
+        // trendLegend is collected while fitting, so the legend lists only the
+        // fuels that actually produced a line.
+        const trendLegend = [];
+        for (const fuel of activeFuels) {
+            // Each sample is weighted by how long its price stood, and sits at
+            // the middle of that hold. Weighting rows equally instead would let
+            // a station that repriced eight times a day outvote one that
+            // repriced once — snapshots are only written when a price moves —
+            // and would tilt the fit toward the hours when the market churns.
+            // Taking the hold's midpoint rather than fitting the staircase
+            // itself keeps the slope honest for a coarsely sampled station,
+            // which would otherwise read flatter than its prices really moved.
+            // Time is hours from the window's left edge, not epoch millis: the
+            // sums of squares stay small enough to hold their precision, and
+            // the slope comes out per hour, which is what the legend reports.
+            let sumW = 0, sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
+            let firstTs = Infinity;
+            for (const stationRows of byStation.values()) {
+                const series = stationRows.filter((r) => r[fuel] !== null);
+                if (series.length === 0) continue;
+                if (series[0]._ts < firstTs) firstTs = series[0]._ts;
+                for (let i = 0; i < series.length; i++) {
+                    // The last price of a series stands to the window's right
+                    // edge, the same reading the crosshair gives it.
+                    const until = i + 1 < series.length ? series[i + 1]._ts : maxX;
+                    const w = (until - series[i]._ts) / 3_600_000;
+                    if (w <= 0) continue;
+                    const v = series[i][fuel];
+                    const mid = ((series[i]._ts + until) / 2 - minX) / 3_600_000;
+                    sumW += w;
+                    sumX += w * mid;
+                    sumY += w * v;
+                    sumXX += w * mid * mid;
+                    sumXY += w * mid * v;
+                }
+            }
+            if (sumW <= 0) continue;                     // nothing holds for any time
+            const denom = sumW * sumXX - sumX * sumX;
+            if (denom <= 0) continue;                    // no spread in time to trend over
+            const slope = (sumW * sumXY - sumX * sumY) / denom;   // € per hour
+            const intercept = (sumY - slope * sumX) / sumW;
+            const fitAt = (ts) => intercept + slope * ((ts - minX) / 3_600_000);
+
+            trendLegend.push({ fuel, slope });
+            if (hiddenTrends.has(fuel)) continue;
+
+            const seg = clipToPlot(px(firstTs), py(fitAt(firstTs)), px(maxX), py(fitAt(maxX)));
+            if (!seg) continue;
+            mk('line', {
+                x1: seg.x1.toFixed(2), y1: seg.y1.toFixed(2),
+                x2: seg.x2.toFixed(2), y2: seg.y2.toFixed(2),
+                stroke: fuelConfig[fuel].color, 'stroke-width': 2.5,
+                'stroke-dasharray': fuelConfig[fuel].dash, 'stroke-linecap': 'round',
+                opacity: 0.95, 'pointer-events': 'none',
+            });
+        }
+
+        // Trend legend — the same dash the chart drew, plus the fit's slope in
+        // cents per day, which is the number the line is worth reading for.
+        // Clicking one hides or shows that fuel's trendline.
+        const drawTrendLegend = () => {
+            const t = translations[currentLang];
+            for (const { fuel, slope } of trendLegend) {
+                const color = fuelConfig[fuel].color;
+                const off = hiddenTrends.has(fuel);
+                const perDay = slope * 24 * 100;   // €/h → ct/day
+                const rate = (perDay < 0 ? '\u2212' : '+')
+                    + Math.abs(perDay).toLocaleString(_loc(), { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                const item = document.createElement('div');
+                item.className = 'legend-item' + (off ? ' off' : '');
+                item.title = t.trendHint;
+                item.innerHTML =
+                    `<svg class="legend-line" width="20" height="8" aria-hidden="true">`
+                    + `<line x1="0" y1="4" x2="20" y2="4" stroke="${color}" stroke-width="2"`
+                    + ` stroke-dasharray="${fuelConfig[fuel].dash}" stroke-linecap="round"/></svg>`
+                    + `${h(t.trend)} ${h(fuelConfig[fuel].label)}`
+                    + `<span class="legend-trend-rate">${h(rate)} ${h(t.trendPerDay)}</span>`;
+                item.addEventListener('click', () => {
+                    hiddenTrends.has(fuel) ? hiddenTrends.delete(fuel) : hiddenTrends.add(fuel);
+                    renderChart();
+                });
+                legendEl.appendChild(item);
+            }
+        };
+
         // Crosshair: a thin vertical line follows the pointer/finger and the
         // tooltip lists every station's price in effect at that timestamp.
         const crossSeries = [];
@@ -9222,6 +9353,7 @@ if (!chartEl) {
         // a few seconds after the finger lifts.
         attachLongPressCrosshair(overlay, showCrosshair, hideTooltip);
 
+        drawTrendLegend();
         drawLegend();
     }
 
