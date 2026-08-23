@@ -9357,6 +9357,16 @@ if (!chartEl) {
             const labels = translations[currentLang];   // `t` is the timestamp here
             tooltip.innerHTML =
                 `<div class="tt-meta">${h(formatDateTime(new Date(ts).toISOString()))}</div>` +
+                // The trend leads: it is the benchmark the prices under it are
+                // read against, and a long station list can spill into further
+                // columns, so anywhere but the top could put it out of sight.
+                trendFits.map(({ fuel, fitAt }) =>
+                    `<div class="tt-row tt-trend">` +
+                        trendSwatch(fuel, 14) +
+                        `<span class="tt-name">${h(labels.trend)}</span>` +
+                        (showFuel ? `<span class="tt-fuel">${fuelConfig[fuel].label}</span>` : '') +
+                        `<span class="tt-val" style="color:${trendInk}">${fmtPriceHtml(fitAt(ts))} €</span>` +
+                    `</div>`).join('') +
                 entries.map((en) => {
                     const color = stationFuelColor(en.name, en.fuel);
                     return `<div class="tt-row">` +
@@ -9365,18 +9375,7 @@ if (!chartEl) {
                         (showFuel ? `<span class="tt-fuel">${fuelConfig[en.fuel].label}</span>` : '') +
                         `<span class="tt-val" style="color:${color}">${fmtPriceHtml(en.price)} €</span>` +
                     `</div>`;
-                }).join('') +
-                // What the trend reads at this moment, so a station's price can
-                // be seen for what it is: above the trend or below it. Last in
-                // the list, since the prices above are sorted and these are not
-                // one of them.
-                trendFits.map(({ fuel, fitAt }) =>
-                    `<div class="tt-row">` +
-                        trendSwatch(fuel, 14) +
-                        `<span class="tt-name">${h(labels.trend)}</span>` +
-                        (showFuel ? `<span class="tt-fuel">${fuelConfig[fuel].label}</span>` : '') +
-                        `<span class="tt-val" style="color:${trendInk}">${fmtPriceHtml(fitAt(ts))} €</span>` +
-                    `</div>`).join('');
+                }).join('');
             tooltip.style.display = 'block';
             positionTooltip(clientX, clientY);
         };
