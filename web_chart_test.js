@@ -490,15 +490,20 @@ function reportedRate(legendEl, index = 0) {
     ].sort((a, b) => a._ts - b._ts);
     const { hover, legendEl } = render(rows);
     const rowsOf = (html) => html.split('tt-row').length - 1;
-    // The last row is the trend's. Its name and price are read as fields: the
-    // price markup raises the third decimal into its own span, so flattening
-    // the row wholesale would break the number up.
+    // Rows split off their opening tag, so the class list survives on each and
+    // the trend's row is found by it rather than by where it sits. Its name and
+    // price are read as fields: the price markup raises the third decimal into
+    // its own span, so flattening a row wholesale would break the number up.
     const flat = (frag) => frag.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+    const rowsIn = (html) => html.split('<div class="tt-row').slice(1).map((r) => ({
+        trend: r.startsWith(' tt-trend'),
+        name: flat((/class="tt-name">([\s\S]*?)<\/span>/.exec(r) || ['', ''])[1]),
+        value: flat(r.slice(r.indexOf('class="tt-val"')).replace(/^[^>]*>/, '')),
+        swatch: r.includes('legend-line') ? 'line' : r.includes('legend-dot') ? 'dot' : 'none',
+    }));
     const trendRow = (html) => {
-        const row = html.slice(html.lastIndexOf('<div class="tt-row">'));
-        const name = flat((/class="tt-name">([\s\S]*?)<\/span>/.exec(row) || ['', ''])[1]);
-        const value = flat(row.slice(row.indexOf('class="tt-val"')).replace(/^[^>]*>/, ''));
-        return `${name} ${value}`;
+        const row = rowsIn(html).find((r) => r.trend);
+        return row ? `${row.name} ${row.value}` : null;
     };
 
     const left = hover(0.08);
@@ -507,9 +512,14 @@ function reportedRate(legendEl, index = 0) {
     check('the trend row is labelled and priced', trendRow(left), 'Trend 1.749 €');
     check('and it tracks the hovered moment', trendRow(hover(0.5)), 'Trend 1.761 €');
     check('to the right it has climbed again', trendRow(hover(0.95)), 'Trend 1.773 €');
+    // The trend leads, so a long station list spilling into further columns
+    // cannot push the benchmark out of sight.
+    check('the trend leads the list', rowsIn(left).map((r) => r.trend), [true, false, false]);
+    check('the stations under it stay sorted by price',
+        rowsIn(left).filter((r) => !r.trend).map((r) => r.value), ['1.700 €', '1.800 €']);
     // It carries the same swatch the chart and the legend use.
-    check('the row carries the trend swatch, not a station dot',
-        hover(0.5).lastIndexOf('legend-line') > hover(0.5).lastIndexOf('legend-dot'), true);
+    check('the trend has a line swatch and the stations dots',
+        rowsIn(left).map((r) => r.swatch), ['line', 'dot', 'dot']);
 
     // The legend entry's hint gives the same reading at the right edge, for
     // anyone who has not hovered the chart.
