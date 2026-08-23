@@ -656,13 +656,11 @@ func runDashboardSpecs(ctx context.Context, db *sql.DB, d dialect, opts doctorOp
 			q.Considered = consideredIndexes(cells, spec.alias, q.UsesIndex)
 		}
 
-		started := time.Now()
-		count, err := countQueryRows(ctx, db, spec.sql, spec.args)
-		q.DurationMS = float64(time.Since(started).Microseconds()) / 1000
-		if err != nil {
-			q.Error = err.Error()
+		timed := timeQuery(ctx, db, spec.sql, spec.args, opts.Runs)
+		q.DurationMS, q.SpreadMS, q.Rows = timed.DurationMS, timed.SpreadMS, timed.Rows
+		if timed.Err != nil {
+			q.Error = timed.Err.Error()
 		}
-		q.Rows = count
 
 		if spec.probe != nil && opts.Probe {
 			q.Probe = measureProbe(ctx, db, d, spec.probe, opts, indexesByTable[spec.table], q)
@@ -862,7 +860,8 @@ func writeDoctorDashboardText(dash *doctorDashboard, opts doctorOptions, explain
 			fmt.Fprintf(stdout, "  %-18s %s\n", q.Name, q.Purpose)
 			continue
 		}
-		fmt.Fprintf(stdout, "  %-18s %9.1f ms %8d rows  %s\n", q.Name, q.DurationMS, q.Rows, queryNote(q))
+		fmt.Fprintf(stdout, "  %-18s %9.1f ms%s %8d rows  %s\n",
+			q.Name, q.DurationMS, spreadNote(q.DurationMS, q.SpreadMS), q.Rows, queryNote(q))
 		writeDoctorProbeText(q.Probe, opts, explain)
 		if opts.ShowSQL {
 			fmt.Fprintf(stdout, "      sql: %s\n", q.SQL)

@@ -75,13 +75,11 @@ func measureProbe(ctx context.Context, db *sql.DB, d dialect, spec *doctorProbeS
 	out.Plan = plan
 	out.UsesIndex, out.CoveringHit, out.FullScan = classifyPlan(plan, cells, d, indexNames, spec.alias)
 
-	started := time.Now()
-	count, err := countQueryRows(ctx, db, query, args)
-	out.DurationMS = float64(time.Since(started).Microseconds()) / 1000
-	if err != nil {
-		out.Error = err.Error()
+	timed := timeQuery(ctx, db, query, args, opts.Runs)
+	out.DurationMS, out.SpreadMS, out.Rows = timed.DurationMS, timed.SpreadMS, timed.Rows
+	if timed.Err != nil {
+		out.Error = timed.Err.Error()
 	}
-	out.Rows = count
 	out.Comparable = out.Error == "" && out.UsesIndex == parent.UsesIndex
 	return out
 }
@@ -152,6 +150,12 @@ func probeLookupFinding(q doctorQuery, detail string, opts doctorOptions) (docto
 		return doctorFinding{}, false
 	}
 	lookups := q.DurationMS - probe.DurationMS
+	// A gap the query's own timing moved by anyway is not a measurement of the
+	// probe's missing work. With one run there is no spread to check against and
+	// the absolute floor is the only guard, which is why --runs exists.
+	if lookups <= q.SpreadMS || lookups <= probe.SpreadMS {
+		return doctorFinding{}, false
+	}
 	severity, report := lookupSeverity(lookups, q.DurationMS, opts.SlowMS)
 	if !report {
 		return doctorFinding{}, false
@@ -202,6 +206,92 @@ func writeDoctorProbeText(p *doctorQueryProbe, opts doctorOptions, explain bool)
 			fmt.Fprintf(stdout, "      probe | %s\n", line)
 		}
 	}
+}
+
+// ── repeated timings ──────────────────────────────────────────────────────────
+//
+// One timing of a query is one sample of a noisy process, and the noise is not
+// small. On the production database the same statement, run twice minutes apart,
+// came back 60% faster; the first query in a report reliably absorbs cache
+// warming and reads slower than the rest; and a probe gap taken across two such
+// samples once reported 7.7 seconds of row lookups that three later runs put at
+// 0.2 seconds.
+//
+// --runs N takes N samples and keeps the fastest. The fastest is the right
+// summary rather than the mean: every disturbance — a cold cache, another query
+// on the box, a scheduler hiccup — can only make a run slower, so the minimum is
+// the closest thing to the query's own cost. The spread between fastest and
+// slowest is kept too, because it is this query's measured variance and any
+// difference smaller than it cannot be attributed to anything.
+
+// timedQuery is what one measurement produced: the fastest of N runs, the spread
+// across them, and the rows the fastest run returned.
+type timedQuery struct {
+	DurationMS float64
+	SpreadMS   float64
+	Rows       int
+	Err        error
+}
+
+// timeQuery runs a query up to runs times and reports the fastest.
+func timeQuery(ctx context.Context, db *sql.DB, query string, args []any, runs int) timedQuery {
+	if runs < 1 {
+		runs = 1
+	}
+	out := timedQuery{DurationMS: math.Inf(1)}
+	slowest := 0.0
+	for i := 0; i < runs; i++ {
+		started := time.Now()
+		count, err := countQueryRows(ctx, db, query, args)
+		elapsed := float64(time.Since(started).Microseconds()) / 1000
+		if err != nil {
+			// A failing query is reported once rather than N times; there is
+			// nothing to average about an error.
+			return timedQuery{DurationMS: elapsed, Rows: count, Err: err}
+		}
+		if elapsed < out.DurationMS {
+			out.DurationMS, out.Rows = elapsed, count
+		}
+		if elapsed > slowest {
+			slowest = elapsed
+		}
+	}
+	if runs > 1 {
+		out.SpreadMS = slowest - out.DurationMS
+	}
+	return out
+}
+
+// spreadFinding reports the widest variance --runs observed, which is the band
+// every difference in the report has to clear before it means anything. Without
+// --runs there is no such band, and the report says so rather than leaving a
+// reader to assume one timing is the truth.
+func spreadFinding(queries []doctorQuery, runs int) (doctorFinding, bool) {
+	if runs < 2 {
+		return doctorFinding{
+			Severity: "info",
+			Message: "each timing here is a single sample; pass --runs 3 before drawing a conclusion from the " +
+				"difference between two of them, since the first query measured also absorbs cache warming",
+		}, true
+	}
+	widest, name := 0.0, ""
+	for _, q := range queries {
+		if q.Skipped || q.Error != "" || q.DurationMS <= 0 {
+			continue
+		}
+		if share := q.SpreadMS / q.DurationMS * 100; share > widest {
+			widest, name = share, q.Name
+		}
+	}
+	if name == "" {
+		return doctorFinding{}, false
+	}
+	return doctorFinding{
+		Severity: "info",
+		Message: fmt.Sprintf("over %d runs the widest spread on one query was %.0f%% (%s), so treat differences "+
+			"below that as noise; the timings reported are the fastest of the %d",
+			runs, widest, name, runs),
+	}, true
 }
 
 // ── --try-index verdicts ──────────────────────────────────────────────────────
@@ -301,4 +391,13 @@ func tryIndexFindings(queries []doctorQuery, index string) []doctorFinding {
 				index, move, changed, hintedTotal, baseTotal)})
 	}
 	return findings
+}
+
+// spreadNote annotates a timing with how far its slowest sample sat above it, so
+// a reader can see at a glance which numbers are steady and which are not.
+func spreadNote(durationMS, spreadMS float64) string {
+	if spreadMS <= 0 || durationMS <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" +%.0f%%", spreadMS/durationMS*100)
 }

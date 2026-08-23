@@ -445,6 +445,27 @@ gasoline doctor --try-index idx_price_predictions_accuracy
 
 It ends with a verdict — whether forcing the index would be faster, slower, or much the same. This stays read-only: the hint applies to that one run, never to the page. Because an index hint changes the plan and not the answer, `doctor` compares row counts between the two runs and tells you to disregard the timings if they ever disagree.
 
+##### `--runs N`: one timing is one sample
+
+Every timing in the report is one sample of a noisy process, and on a production
+database the noise is not small: the same statement re-run minutes later came back
+60% faster, and the first query measured reliably absorbs cache warming and reads
+slower than the rest. A probe gap taken across two such samples once attributed
+7.7 seconds to row lookups that three later runs put at 0.2 seconds.
+
+`--runs N` takes N samples of each timing and reports the fastest, which is the
+right summary because every disturbance — a cold cache, another query on the box,
+a scheduler hiccup — can only make a run slower. The spread between fastest and
+slowest is kept as that query's own variance, shown on its line as `+N%`, and no
+difference smaller than it is attributed to anything:
+
+```bash
+gasoline doctor --runs 3            # before deciding anything from a difference
+```
+
+With a single run the report says so rather than letting one sample read as the
+truth. Use `--runs 3` or more whenever a number is going to change a decision.
+
 ##### Repeats, and the noise band they measure
 
 Naming an index a query **already** forces produces byte-identical SQL, so its second timing is the same statement run twice. Those pairs are labelled `repeat:` rather than `forced:`, they are kept out of the verdict, and they are put to work instead: the widest move they make is this database's own variance, measured in the same run under the same conditions.
@@ -462,7 +483,11 @@ info forcing idx_price_predictions_accuracy moved the queries (rows, series) by 
 
 Before this, the verdict averaged all seven pairs together and reported "little difference" — a single number over five comparisons that had compared nothing. If every query already forces the index, the report now says so outright rather than producing a verdict from no comparisons at all.
 
-If forcing the covering index is much faster, the optimizer is mis-costing it. Refreshing the statistics it reasons from is worth trying first — `ANALYZE TABLE price_predictions`, or `ANALYZE TABLE price_predictions UPDATE HISTOGRAM ON target_start` when the range estimate looks wrong (a `filtered` value pinned near 10% is the tell). Where that does not change the choice, the accuracy page forces the index itself: five of its aggregate queries carry `FORCE INDEX`/`INDEXED BY`, which measured 66–73% faster per query on a live MySQL after both of those statistics commands had failed to move it. The hint is omitted when the index is absent, so an un-migrated database still renders the page. `series` is deliberately left unhinted — forcing the index there measured −13%, +4%, −1% and +5% over four runs, which straddles zero, so there is nothing to buy.
+If forcing the covering index is much faster, the optimizer is mis-costing it. Refreshing the statistics it reasons from is worth trying first — `ANALYZE TABLE price_predictions`, or `ANALYZE TABLE price_predictions UPDATE HISTOGRAM ON target_start` when the range estimate looks wrong (a `filtered` value pinned near 10% is the tell). Where that does not change the choice, the accuracy page forces the index itself: five of its aggregate queries carry `FORCE INDEX`/`INDEXED BY`, which measured 66–73% faster per query on a live MySQL after both of those statistics commands had failed to move it. The hint is omitted when the index is absent, so an un-migrated database still renders the page. The three breakdown tables — by confidence, by lead-time bucket and by hour — come out of **one** query rather than three. They are three groupings of the same rows, and as three queries each walked the whole filtered slice again: on a production database 1.39M index entries read three times to produce 3, 6 and 24 rows. One pass grouped by all three keys returns at most 3 × 6 × 24 = 432 rows and PHP sums each table out of it. That requires the query to return `SUM` and `COUNT` rather than `AVG`, since the mean of means is not the mean unless every group is the same size; dividing once per table afterwards is exact.
+
+Measured on SQLite over 1.48M rows the three passes took 7.00 s and the single pass 4.81 s — **31% less**, not the two-thirds the shared walk suggests. Grouping is not free: the group key is evaluated for every row in the slice, and there the walk itself is only 0.68 s of it. That is also why the lead bucket is grouped as a small integer and labelled in PHP — the string form cost 674 ms more for exactly the same 336 groups. On MySQL the balance is the other way round (its probes put walking at 1.5–2.0 s of a 1.9–2.9 s query), so the saving there should be larger; measure it with `--runs 3` rather than taking either number on faith.
+
+`series` is deliberately left unhinted — forcing the index there measured −13%, +4%, −1% and +5% over four runs, which straddles zero, so there is nothing to buy.
 
 The raw-row query was in that group too, and stopped belonging there. It was measured at −2% when `price_predictions` was smaller; past 8M rows the optimizer began driving it from `idx_price_predictions_due`, which leads with `fuel` and then serves neither the `target_start` range nor the sort, and it became the slowest query on the page at 8.3–8.8 s against 6.0–6.5 s forced. That is the case for re-running `--try-index` after a schema or data-shape change rather than trusting an old number: a hint decision has a shelf life, and this one expired without anything failing.
 

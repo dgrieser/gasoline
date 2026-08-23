@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -158,8 +159,7 @@ func TestRunDoctorReportsTablesIndexesAndQueries(t *testing.T) {
 	}
 
 	// Every page query must run, return rows, and be attributed to a table.
-	wantQueries := []string{"summary", "summary_latest", "by_confidence", "by_lead",
-		"by_hour", "series", "rows", "decisions"}
+	wantQueries := []string{"summary", "summary_latest", "breakdowns", "series", "rows", "decisions"}
 	got := map[string]doctorQuery{}
 	for _, q := range result.Queries {
 		got[q.Name] = q
@@ -634,13 +634,18 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 			// database, so both sides must keep it.
 			"WHERE pp.fuel = ",
 		},
-		"by_confidence": {"GROUP BY pp.confidence"},
-		"by_lead": {
-			"WHEN pp.lead_minutes < 360 THEN '3-6h'",
+		// One pass for all three breakdown tables: the three group keys
+		// together, and SUM rather than AVG, because an average cannot be
+		// re-aggregated per dimension afterwards.
+		"breakdowns": {
+			"GROUP BY pp.confidence, ",
+			"WHEN pp.lead_minutes < 360 THEN 2",
 			"MIN(pp.lead_minutes)",
+			"SUBSTR(pp.target_start, 12, 2)",
+			"SUM(ABS(pp.error))",
+			"SUM(pp.error)",
 		},
-		"by_hour": {"SUBSTR(pp.target_start, 12, 2)"},
-		"series":  {"AVG(pp.predicted_price)", "GROUP BY pp.target_start"},
+		"series": {"AVG(pp.predicted_price)", "GROUP BY pp.target_start"},
 		"rows": {
 			"COALESCE(s.name_override, s.name)",
 			"ORDER BY pp.target_start DESC, pp.station_id ASC",
@@ -1016,8 +1021,7 @@ func TestPageHintsExactlyTheMeasuredQueries(t *testing.T) {
 	// measured 8.3-8.8 s against 6.0-6.5 s over four runs with the ranges never
 	// overlapping. series stays out — there the same four runs straddled zero.
 	wantHinted := map[string]bool{
-		"summary": true, "summary_latest": true,
-		"by_confidence": true, "by_lead": true, "by_hour": true, "rows": true,
+		"summary": true, "summary_latest": true, "breakdowns": true, "rows": true,
 	}
 	seen := map[string]bool{}
 	for _, spec := range pageSpecs(filters, true) {
@@ -2182,5 +2186,258 @@ func TestProbeAccountingForTheWholeQueryIsStated(t *testing.T) {
 	}
 	if !strings.Contains(got, "spends 7404 ms of its 7504 ms") {
 		t.Errorf("a real gap must be attributed:\n%s", got)
+	}
+}
+
+// TestTimeQueryKeepsTheFastestAndTheSpread pins what --runs means. The fastest
+// is the summary because every disturbance can only make a run slower, and the
+// spread is kept because a difference smaller than a query's own variance is not
+// a measurement of anything.
+func TestTimeQueryKeepsTheFastestAndTheSpread(t *testing.T) {
+	_, db := seedDoctorDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	single := timeQuery(ctx, db, "SELECT 1 FROM price_predictions", nil, 1)
+	if single.Err != nil {
+		t.Fatalf("single run: %v", single.Err)
+	}
+	if single.SpreadMS != 0 {
+		t.Errorf("one run cannot have a spread, got %v", single.SpreadMS)
+	}
+	if single.Rows == 0 {
+		t.Error("the seeded table has rows")
+	}
+
+	many := timeQuery(ctx, db, "SELECT 1 FROM price_predictions", nil, 5)
+	if many.Err != nil {
+		t.Fatalf("five runs: %v", many.Err)
+	}
+	if many.SpreadMS < 0 {
+		t.Errorf("spread must be slowest minus fastest, got %v", many.SpreadMS)
+	}
+	if many.Rows != single.Rows {
+		t.Errorf("row count changed between runs: %d then %d", single.Rows, many.Rows)
+	}
+	// The reported timing is the fastest, so more samples can only lower it.
+	if many.DurationMS > single.DurationMS+single.DurationMS {
+		t.Errorf("five runs reported %v against one run's %v; the fastest should not be slower",
+			many.DurationMS, single.DurationMS)
+	}
+
+	// A failing query is reported once, not N times, and carries its error.
+	bad := timeQuery(ctx, db, "SELECT * FROM no_such_table", nil, 4)
+	if bad.Err == nil {
+		t.Error("a broken query must report its error")
+	}
+	if bad.SpreadMS != 0 {
+		t.Errorf("a failed measurement has no spread, got %v", bad.SpreadMS)
+	}
+	// runs below one is treated as one rather than producing no measurement.
+	if zero := timeQuery(ctx, db, "SELECT 1 FROM price_predictions", nil, 0); zero.Err != nil || zero.Rows == 0 {
+		t.Errorf("--runs 0 must still measure once, got %+v", zero)
+	}
+}
+
+// TestProbeGapMustClearTheQuerysOwnVariance is the run-1 artefact as a test. The
+// production report once attributed 7.7 s to row lookups because that query's
+// single sample came in at 16 s where three later runs put it at 8.3 s. A gap
+// the timing moved by anyway is not evidence about the probe's missing work.
+func TestProbeGapMustClearTheQuerysOwnVariance(t *testing.T) {
+	opts := doctorOptions{Pages: doctorPages{Accuracy: true}, Probe: true, SlowMS: 1000, Runs: 3}
+	rows := doctorQuery{
+		Name: "rows", Table: "price_predictions", DurationMS: 16030.9, Rows: 1001,
+		UsesIndex: "idx_price_predictions_due", SpreadMS: 7800,
+		probeGap: "joining prediction_runs and stations onto the capped page",
+		Probe: &doctorQueryProbe{Name: "page only", DurationMS: 8308.9, Rows: 1001,
+			UsesIndex: "idx_price_predictions_due", Comparable: true},
+	}
+	if _, ok := probeLookupFinding(rows, rows.probeGap, opts); ok {
+		t.Error("a gap inside the query's own spread must not be attributed to the probe's missing work")
+	}
+	// The same shape with a steady timing is a real finding.
+	steady := rows
+	steady.SpreadMS = 200
+	if _, ok := probeLookupFinding(steady, steady.probeGap, opts); !ok {
+		t.Error("a gap well clear of the spread is a measurement and must be reported")
+	}
+	// The probe's own variance counts too — it is half the comparison.
+	noisyProbe := steady
+	noisyProbe.Probe = &doctorQueryProbe{Name: "page only", DurationMS: 8308.9, Rows: 1001,
+		UsesIndex: "idx_price_predictions_due", Comparable: true, SpreadMS: 9000}
+	if _, ok := probeLookupFinding(noisyProbe, noisyProbe.probeGap, opts); ok {
+		t.Error("a probe that varies more than the gap cannot establish it either")
+	}
+}
+
+// TestSpreadFindingSaysWhatWasAndWasNotMeasured covers both modes: with repeats
+// it reports the band, and without them it says there is none rather than
+// letting one sample read as the truth.
+func TestSpreadFindingSaysWhatWasAndWasNotMeasured(t *testing.T) {
+	queries := []doctorQuery{
+		{Name: "summary", DurationMS: 2308, SpreadMS: 120},
+		{Name: "rows", DurationMS: 6000, SpreadMS: 1800}, // 30%
+		{Name: "skipped", Skipped: true, SpreadMS: 9999},
+	}
+	finding, ok := spreadFinding(queries, 3)
+	if !ok {
+		t.Fatal("repeats must produce a band")
+	}
+	for _, want := range []string{"over 3 runs the widest spread on one query was 30% (rows)",
+		"treat differences below that as noise", "the fastest of the 3"} {
+		if !strings.Contains(finding.Message, want) {
+			t.Errorf("finding is missing %q:\n%s", want, finding.Message)
+		}
+	}
+
+	single, ok := spreadFinding(queries, 1)
+	if !ok {
+		t.Fatal("a single-sample run must say so")
+	}
+	for _, want := range []string{"single sample", "--runs 3", "absorbs cache warming"} {
+		if !strings.Contains(single.Message, want) {
+			t.Errorf("single-run finding is missing %q:\n%s", want, single.Message)
+		}
+	}
+}
+
+// TestBreakdownsOnePassMatchesThreeQueries is the correctness check the collapse
+// needs. The three breakdown tables used to be three grouped queries computing
+// AVG in SQL; they are now one pass returning SUM and COUNT per
+// (confidence, lead bucket, hour), with each table summed out of it afterwards.
+// This runs both forms against real rows and compares what the page would show.
+func TestBreakdownsOnePassMatchesThreeQueries(t *testing.T) {
+	_, db := seedDoctorDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	where := "pp.actual_price IS NOT NULL AND pp.fuel = ? AND pp.target_start >= ? AND pp.target_start <= ?"
+	args := []any{filters.Fuel, filters.From, filters.To}
+	leadBucket := "CASE" +
+		" WHEN pp.lead_minutes < 60 THEN '0-1h'" +
+		" WHEN pp.lead_minutes < 180 THEN '1-3h'" +
+		" WHEN pp.lead_minutes < 360 THEN '3-6h'" +
+		" WHEN pp.lead_minutes < 720 THEN '6-12h'" +
+		" WHEN pp.lead_minutes < 1440 THEN '12-24h'" +
+		" ELSE '24h+' END"
+	hourExpr := "SUBSTR(pp.target_start, 12, 2)"
+
+	type agg struct {
+		count int
+		mae   float64
+		bias  float64
+		floor int
+	}
+	// The old shape: one grouped query per dimension, averaging in SQL.
+	perDimension := func(key string) map[string]agg {
+		rows, err := db.QueryContext(ctx, "SELECT "+key+" AS k, COUNT(*), AVG(ABS(pp.error)), AVG(pp.error), "+
+			"MIN(pp.lead_minutes) FROM price_predictions pp WHERE "+where+" GROUP BY "+key, args...)
+		if err != nil {
+			t.Fatalf("grouped by %s: %v", key, err)
+		}
+		defer rows.Close()
+		out := map[string]agg{}
+		for rows.Next() {
+			var k string
+			var a agg
+			if err := rows.Scan(&k, &a.count, &a.mae, &a.bias, &a.floor); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out[k] = a
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		return out
+	}
+
+	// The new shape: one pass, summed down each dimension the way the page does.
+	byConfidence, byLead, byHour := map[string]agg{}, map[string]agg{}, map[string]agg{}
+	sums := map[string]map[string][3]float64{
+		"confidence": {}, "bucket": {}, "hour": {},
+	}
+	floors := map[string]int{}
+	rows, err := db.QueryContext(ctx, "SELECT pp.confidence, "+leadBucket+", "+hourExpr+", "+
+		"MIN(pp.lead_minutes), COUNT(*), SUM(ABS(pp.error)), SUM(pp.error) "+
+		"FROM price_predictions pp WHERE "+where+
+		" GROUP BY pp.confidence, "+leadBucket+", "+hourExpr, args...)
+	if err != nil {
+		t.Fatalf("one pass: %v", err)
+	}
+	defer rows.Close()
+	groups := 0
+	for rows.Next() {
+		var confidence, bucket, hour string
+		var floor, n int
+		var absError, sumError float64
+		if err := rows.Scan(&confidence, &bucket, &hour, &floor, &n, &absError, &sumError); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		groups++
+		for dim, key := range map[string]string{"confidence": confidence, "bucket": bucket, "hour": hour} {
+			prev := sums[dim][key]
+			sums[dim][key] = [3]float64{prev[0] + float64(n), prev[1] + absError, prev[2] + sumError}
+		}
+		if prev, ok := floors[bucket]; !ok || floor < prev {
+			floors[bucket] = floor
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if groups == 0 {
+		t.Fatal("the seeded range has rows, so the one pass must return groups")
+	}
+	for dim, into := range map[string]map[string]agg{
+		"confidence": byConfidence, "bucket": byLead, "hour": byHour,
+	} {
+		for key, totals := range sums[dim] {
+			n := int(totals[0])
+			into[key] = agg{count: n, mae: totals[1] / totals[0], bias: totals[2] / totals[0], floor: floors[key]}
+		}
+	}
+
+	// Both forms must agree on every table, to floating-point tolerance: the
+	// sums are re-added in a different order, which is the only difference
+	// permitted.
+	const tolerance = 1e-9
+	for _, tc := range []struct {
+		name string
+		key  string
+		got  map[string]agg
+	}{
+		{"by_confidence", "pp.confidence", byConfidence},
+		{"by_lead", leadBucket, byLead},
+		{"by_hour", hourExpr, byHour},
+	} {
+		want := perDimension(tc.key)
+		if len(want) == 0 {
+			t.Fatalf("%s: the reference query returned nothing to compare", tc.name)
+		}
+		if len(want) != len(tc.got) {
+			t.Errorf("%s: one pass produced %d groups, three queries produced %d", tc.name, len(tc.got), len(want))
+		}
+		for key, wantAgg := range want {
+			gotAgg, ok := tc.got[key]
+			if !ok {
+				t.Errorf("%s: one pass lost group %q", tc.name, key)
+				continue
+			}
+			if gotAgg.count != wantAgg.count {
+				t.Errorf("%s[%s]: count %d, want %d", tc.name, key, gotAgg.count, wantAgg.count)
+			}
+			if math.Abs(gotAgg.mae-wantAgg.mae) > tolerance {
+				t.Errorf("%s[%s]: mae %v, want %v", tc.name, key, gotAgg.mae, wantAgg.mae)
+			}
+			if math.Abs(gotAgg.bias-wantAgg.bias) > tolerance {
+				t.Errorf("%s[%s]: bias %v, want %v", tc.name, key, gotAgg.bias, wantAgg.bias)
+			}
+			// The lead table's sort key must survive the collapse.
+			if tc.name == "by_lead" && gotAgg.floor != wantAgg.floor {
+				t.Errorf("%s[%s]: lead_floor %d, want %d", tc.name, key, gotAgg.floor, wantAgg.floor)
+			}
+		}
 	}
 }

@@ -44,7 +44,8 @@ function extractFunction(string $source, string $name): string
 }
 
 $viewer = file_get_contents(__DIR__ . '/web/index.php');
-foreach (['raisedNinePrice', 'loadFilteredPredictions', 'gasolineCommandStatsSeries'] as $name) {
+foreach (['raisedNinePrice', 'loadFilteredPredictions', 'gasolineCommandStatsSeries',
+    'gasolineLeadBucketLabels', 'gasolineLeadBucketSql', 'gasolineBreakdownTables'] as $name) {
     eval(extractFunction($viewer, $name));
 }
 
@@ -285,6 +286,75 @@ $series = gasolineCommandStatsSeries([
 check('the series covers the window and nothing else', bucketKeys($series), [
     '2026-08-21T11', '2026-08-21T12',
 ]);
+
+echo "web_picker_test: gasolineBreakdownTables\n";
+
+// One pass grouped by (confidence, bucket, hour) summed down each dimension has
+// to produce what three separate grouped queries produced. The group sizes below
+// are deliberately unequal, because that is exactly when the mean of means
+// differs from the mean — the mistake returning SUM and COUNT exists to avoid.
+$brRow = static function (string $conf, int $bucket, string $hour, int $n,
+    float $abs, float $sum, int $floor): array {
+    return ['confidence' => $conf, 'bucket' => $bucket, 'hour' => $hour,
+        'n' => $n, 'abs_error' => $abs, 'sum_error' => $sum, 'lead_floor' => $floor];
+};
+$tables = gasolineBreakdownTables([
+    $brRow('high', 0, '08', 10, 0.100, 0.050, 5),
+    $brRow('high', 1, '08', 1, 0.500, -0.500, 61),
+    $brRow('low', 0, '09', 4, 0.080, 0.040, 12),
+    $brRow('low', 0, '08', 5, 0.250, -0.250, 3),
+]);
+$byKey = static function (array $list, string $key): array {
+    $out = [];
+    foreach ($list as $entry) {
+        $out[(string) $entry[$key]] = $entry;
+    }
+    return $out;
+};
+
+// high: 11 rows, abs 0.6, sum -0.45. Averaging the two group means instead would
+// give 0.3 and -0.225, nothing like it.
+$conf = $byKey($tables['by_confidence'], 'confidence');
+check('confidence counts are summed across groups', $conf['high']['count'], 11);
+check('confidence mae divides summed error by summed count',
+    round($conf['high']['mae'], 9), round(0.6 / 11, 9));
+check('confidence bias divides summed error by summed count',
+    round($conf['high']['bias'], 9), round(-0.45 / 11, 9));
+check('the other confidence stays separate', $conf['low']['count'], 9);
+
+// 0-1h spans three input groups across both confidences and two hours.
+$lead = $byKey($tables['by_lead'], 'bucket');
+check('lead bucket sums across confidences and hours', $lead['0-1h']['count'], 19);
+check('bucket indexes are labelled for the client',
+    array_map(static fn(array $r): string => $r['bucket'], $tables['by_lead']), ['0-1h', '1-3h']);
+check('lead bucket mae', round($lead['0-1h']['mae'], 9), round(0.43 / 19, 9));
+check('lead_floor is the minimum across the bucket, not the last seen',
+    $lead['0-1h']['lead_floor'], 3);
+check('a bucket built from one group keeps its floor', $lead['1-3h']['lead_floor'], 61);
+
+// Hour 08 spans three groups.
+$hour = $byKey($tables['by_hour'], 'hour');
+check('hour sums across confidences and buckets', $hour['8']['count'], 16);
+check('hour mae', round($hour['8']['mae'], 9), round(0.85 / 16, 9));
+check('hours come back in ascending order for the chart',
+    array_map(static fn(array $r): int => $r['hour'], $tables['by_hour']), [8, 9]);
+check('a zero-padded hour becomes an integer',
+    array_map(static fn(array $r): string => gettype($r['hour']), $tables['by_hour']),
+    ['integer', 'integer']);
+
+check('no rows produces three empty tables', gasolineBreakdownTables([]),
+    ['by_confidence' => [], 'by_lead' => [], 'by_hour' => []]);
+
+// The SQL emits one index per label, so the two cannot drift apart silently.
+$labels = gasolineLeadBucketLabels();
+check('every bucket index the SQL emits has a label',
+    substr_count(gasolineLeadBucketSql(), 'WHEN') + 1, count($labels));
+check('the labels are the ones the client renders', $labels,
+    ['0-1h', '1-3h', '3-6h', '6-12h', '12-24h', '24h+']);
+// An index past the end is shown rather than silently dropped.
+check('an unlabelled bucket index is still reported',
+    gasolineBreakdownTables([$brRow('high', 99, '08', 1, 0.1, 0.1, 7)])['by_lead'][0]['bucket'],
+    'bucket 99');
 
 if ($failures > 0) {
     printf("web_picker_test: %d failed\n", $failures);
