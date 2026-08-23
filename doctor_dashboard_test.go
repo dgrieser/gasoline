@@ -724,7 +724,7 @@ func TestRunDoctorDashboardRejectsInvalidFlags(t *testing.T) {
 		{"all fuels on accuracy", []string{"accuracy", "--db", dbPath, "--fuel", "all"}, "--fuel must be one of"},
 		// Dashboard-only flags must not be silently accepted elsewhere.
 		{"city on accuracy", []string{"accuracy", "--db", dbPath, "--city", "berlin"}, "not defined"},
-		{"probe on the default page", []string{"--db", dbPath, "--probe"}, "not defined"},
+		{"radius on accuracy", []string{"accuracy", "--db", dbPath, "--radius", "5"}, "not defined"},
 		// --try-index steers accuracy-page queries, of which a dashboard run
 		// has none.
 		{"try-index on dashboard", []string{"dashboard", "--db", dbPath, "--try-index", "idx_price_predictions_accuracy"}, "--try-index measures the accuracy page"},

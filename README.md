@@ -426,6 +426,8 @@ A configured target with no stations in scope is the inverse failure — the swe
 
 The section is built from indexed lookups only — one seek per station, plus one pass over the newest run's predictions — so it runs even under `--skip-queries` and costs nothing next to the page timings. Stored predictions are looked up only for stations that have *left* scope, newest first and capped at 500 stations.
 
+Every query carries a probe as well — the same measurement the dashboard checks use, see [Probes](#probes-what-a-querys-time-is-actually-spent-on). For the aggregates it is `probe/rows walked`: the index entries the filter matches and what walking them alone costs, so a slow pass can be told apart from a wide `--range`. `summary_latest` and `rows` get structural probes instead, dropping the self-join and the metadata joins respectively, because for those two a projection-only probe could not tell the join apart from the rest. `--probe=false` skips them.
+
 Its filter flags (`--fuel`, `--confidence`, `--range`, or `--from`/`--to`) mirror the page's own controls, so you can reproduce exactly the filter that felt slow in the browser. Each query line ends in a verdict: `covering <index>` means the query was answered from an index alone, a bare index name means it used that index but still fetched table rows, and `TABLE SCAN` means it read the whole table. The `findings` section collects the actionable parts — a missing index, a query over `--slow-ms` (default 1000), a table scan.
 
 When a query is slow but the index it needs exists, the usual cause is the optimizer passing that index over. `doctor` reports the index MySQL actually committed to (its `key`), not the ones it merely weighed, and warns when it chose a non-covering index while the covering one was among the candidates.
@@ -443,7 +445,72 @@ gasoline doctor --try-index idx_price_predictions_accuracy
 
 It ends with a verdict — whether forcing the index would be faster, slower, or much the same. This stays read-only: the hint applies to that one run, never to the page. Because an index hint changes the plan and not the answer, `doctor` compares row counts between the two runs and tells you to disregard the timings if they ever disagree.
 
-If forcing the covering index is much faster, the optimizer is mis-costing it. Refreshing the statistics it reasons from is worth trying first — `ANALYZE TABLE price_predictions`, or `ANALYZE TABLE price_predictions UPDATE HISTOGRAM ON target_start` when the range estimate looks wrong (a `filtered` value pinned near 10% is the tell). Where that does not change the choice, the accuracy page forces the index itself: five of its aggregate queries carry `FORCE INDEX`/`INDEXED BY`, which measured 66–73% faster per query on a live MySQL after both of those statistics commands had failed to move it. The hint is omitted when the index is absent, so an un-migrated database still renders the page. `series` and the raw-row query are deliberately left unhinted — the hint measured +1% and −2% there, so there is nothing to buy. Re-run `--try-index` after a schema or data-shape change: if forcing stops winning, the hint should go rather than be kept on faith.
+##### `--runs N`: one timing is one sample
+
+Every timing in the report is one sample of a noisy process, and on a production
+database the noise is not small: the same statement re-run minutes later came back
+60% faster, and the first query measured reliably absorbs cache warming and reads
+slower than the rest. A probe gap taken across two such samples once attributed
+7.7 seconds to row lookups that three later runs put at 0.2 seconds.
+
+`--runs N` takes N samples of each timing and reports the fastest, which is the
+right summary because every disturbance — a cold cache, another query on the box,
+a scheduler hiccup — can only make a run slower. The spread between fastest and
+slowest is kept as that query's own variance, shown on its line as `+N%`, and no
+difference smaller than it is attributed to anything:
+
+```bash
+gasoline doctor --runs 3            # before deciding anything from a difference
+```
+
+With a single run the report says so rather than letting one sample read as the
+truth. Use `--runs 3` or more whenever a number is going to change a decision.
+
+The band ignores queries under 250 ms. Interference costs a fixed number of
+milliseconds, so as a share it explodes on small timings: on one production run a
+58 ms query varied by 484%, and taking that as the page's band would have
+dismissed every real difference in the report as noise.
+
+##### Repeats, and the noise band they measure
+
+Naming an index a query **already** forces produces byte-identical SQL, so its second timing is the same statement run twice. Those pairs are labelled `repeat:` rather than `forced:`, they are kept out of the verdict, and they are put to work instead: the widest move they make is this database's own variance, measured in the same run under the same conditions.
+
+That matters more than it sounds. On a production MySQL, `--try-index idx_price_predictions_accuracy` re-ran identical SQL for the five queries the page already hints — and those repeats moved by −10%, −3%, −0%, +1% and **−27%**. The one query whose SQL genuinely changed moved −28%. Read on its own that looks like a result; read against a −27% repeat of unchanged SQL it is indistinguishable from the afternoon:
+
+```
+info 5 queries already force idx_price_predictions_accuracy, so their second timing
+     re-ran identical SQL: those repeats moved up to 27%, which is this database's own
+     variance and the bar any real difference below has to clear
+info forcing idx_price_predictions_accuracy moved the queries (rows, series) by -24%
+     (7400 ms against 9692 ms), which is inside the 27% a repeat of unchanged SQL moved
+     on its own — not established either way; repeat the run before acting on it
+```
+
+Before this, the verdict averaged all seven pairs together and reported "little difference" — a single number over five comparisons that had compared nothing. If every query already forces the index, the report now says so outright rather than producing a verdict from no comparisons at all.
+
+If forcing the covering index is much faster, the optimizer is mis-costing it. Refreshing the statistics it reasons from is worth trying first — `ANALYZE TABLE price_predictions`, or `ANALYZE TABLE price_predictions UPDATE HISTOGRAM ON target_start` when the range estimate looks wrong (a `filtered` value pinned near 10% is the tell). Where that does not change the choice, the accuracy page forces the index itself: five of its aggregate queries carry `FORCE INDEX`/`INDEXED BY`, which measured 66–73% faster per query on a live MySQL after both of those statistics commands had failed to move it. The hint is omitted when the index is absent, so an un-migrated database still renders the page. The three breakdown tables — by confidence, by lead-time bucket and by hour — and the predicted-vs-actual chart come out of **one** query rather than four. They are four groupings of the same rows, and as four queries each walked the whole filtered slice again: on a production database 1.4M index entries read four times to produce 3, 6, 24 and ~570 rows. One pass grouped by `(target_start, confidence, lead_bucket)` gives all four — the hour is a substring of `target_start`, and the chart is the sum per `target_start`. That requires the query to return `SUM` and `COUNT` rather than `AVG`, since the mean of means is not the mean unless every group is the same size; dividing once per table afterwards is exact.
+
+Both steps were measured on SQLite over ~1.48M rows, and neither matched the estimate the shared walk suggested:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| three grouped tables → one pass | 7.00 s | 4.81 s | −31% |
+| chart folded into that pass | 4.57 s | 3.83 s | −16% |
+
+Grouping is not free — the key is evaluated for every row in the slice, and the walk itself is only 0.68 s of it — so the first step returned a third rather than the two-thirds a pure walk-sharing argument predicts. The second was the opposite surprise: adding `target_start` to the key cost nothing measurable, so the chart's entire pass came for free. That difference is also why the lead bucket is grouped as a small integer and labelled in PHP: the string form cost 674 ms for exactly the same 336 groups.
+
+On MySQL the balance is inverted — its probes put walking at 1.5–2.0 s of a 1.9–2.9 s query — so both savings should be larger there. Measure with `--runs 3` rather than taking any of these numbers on faith.
+
+Two of the page's queries were sorting or grouping against the grain of that index, which the report made visible once `rows` and the breakdowns stopped dominating it:
+
+- **The raw-row query ordered `target_start DESC, station_id ASC`.** Within one fuel the index is ordered `(target_start, station_id)` ascending, so no single scan direction gives descending targets *and* ascending stations — the server had to materialise all 1.4M rows in the range and sort them to find 1001. Ordering both keys descending is that index read backwards, so the `LIMIT` stops after 1001 entries. SQLite's plan drops `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` entirely. The page re-sorts stations ascending for display afterwards, so the only difference is which stations fall inside the cap at its oldest hour — a boundary that is arbitrary either way.
+- **The latest-run subquery grouped `station_id, target_start`.** Same groups either way, but `target_start, station_id` is the index's own order with `run_id` the column immediately after both, which is the shape a server can stream or even answer with a loose index scan. SQLite streamed it both ways, so this went out unverified on the strength of the index shape alone — and on MySQL it took the query from 3.06 s to 2.31 s, its inner group-by from 2.51 s to 1.87 s.
+
+Every remaining query carries the hint. `series` used to be the exception — forcing the index there measured −13%, +4%, −1% and +5% over four runs, which straddles zero — but it is no longer a query of its own.
+
+The raw-row query was in that group too, and stopped belonging there. It was measured at −2% when `price_predictions` was smaller; past 8M rows the optimizer began driving it from `idx_price_predictions_due`, which leads with `fuel` and then serves neither the `target_start` range nor the sort, and it became the slowest query on the page at 8.3–8.8 s against 6.0–6.5 s forced. That is the case for re-running `--try-index` after a schema or data-shape change rather than trusting an old number: a hint decision has a shelf life, and this one expired without anything failing.
+
+Read the verdict against the noise band in the same run, not on its own. Across those four runs the reported delta on that query ranged from −28% to −60% while the band ranged from 11% to 60%, and one run called it not established — the conclusion came from the two distributions never overlapping (lowest unhinted 8271 ms, highest forced 6485 ms), which is what four runs buy you that one cannot.
 
 #### Why the dashboard is slow (`doctor dashboard`)
 
@@ -495,6 +562,19 @@ A verdict of `covering <index>` or a bare index name says which index was used, 
 
 - **`probe/keys only`** projects just the indexed columns. The query and the probe read exactly the same rows via exactly the same index, so the difference between their timings is what fetching the *unindexed* columns from table rows costs. When that difference is most of the query's time, an index carrying those columns would make the read index-only — which is precisely what `idx_price_predictions_accuracy` did for the accuracy page.
 - **`probe/rows walked`** counts the rows an aggregate reduces, and how long walking them takes — so an aggregate returning a handful of rows off millions can be told apart from one that is genuinely cheap.
+- **Structural probes** drop a join rather than a projection, where the join is what a projection-only probe could not price: `probe/inner group only` runs the accuracy page's latest-run group-by without the self-join back into `price_predictions`, and `probe/page only` runs its capped row page without the `prediction_runs` and `stations` joins. Which side of such a query dominates is not predictable — on one database the group-by was a fifth of `summary_latest` and on another it was all of it — which is the point of measuring rather than reasoning.
+
+A probe is only a floor for its query if it reads the same rows the same way, so each one is **pinned to the index its query actually chose** rather than to the hint the page emitted. That distinction is not academic: the two queries the accuracy page leaves unhinted are free to be costed differently once a probe narrows their projection, and before pinning, `series`'s probe picked another index and came out four times *slower* than the query it was measuring. Where the plans still differ the probe is labelled `(different plan, not comparable)`, no finding is drawn from it, and its rows stay out of the page totals.
+
+Where a query is answered from an index alone, the gap to its probe is the aggregation rather than row lookups, and the findings say so — calling it lookups would send you after an index the query is already using. And where there is no gap at all, that is the finding: whatever the probe drops is free, so the cost is in the part it kept. That is what ruled the metadata joins out of the accuracy page's slowest query and left its index choice as the only thing still to explain.
+
+Because the accuracy page runs several independent aggregate passes over the same `(fuel, target_start)` slice, `doctor` states that slice once for the page rather than under each query:
+
+```
+info 5 of the page's queries each walk the same 1,476,360 rows this filter selects
+     (by_confidence, by_hour, by_lead, series, summary), 2022 ms of the total spent
+     walking them over again; a narrower --range is what shrinks that slice
+```
 
 Where a probe shows the query paying for something its index could have carried, the finding also reports the cost **per row** in microseconds. That is the number that decides the fix: a few microseconds per lookup is a buffer-pool hit and the row count is the thing to reduce; hundreds of microseconds is a disk seek, and then the table has outgrown the cache and rewriting one query will not hide it.
 

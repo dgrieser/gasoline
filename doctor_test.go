@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -158,8 +160,7 @@ func TestRunDoctorReportsTablesIndexesAndQueries(t *testing.T) {
 	}
 
 	// Every page query must run, return rows, and be attributed to a table.
-	wantQueries := []string{"summary", "summary_latest", "by_confidence", "by_lead",
-		"by_hour", "series", "rows", "decisions"}
+	wantQueries := []string{"summary", "summary_latest", "breakdowns", "rows", "decisions"}
 	got := map[string]doctorQuery{}
 	for _, q := range result.Queries {
 		got[q.Name] = q
@@ -627,23 +628,33 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 		},
 		"summary_latest": {
 			"MAX(pp.run_id)",
-			"GROUP BY pp.station_id, pp.target_start",
+			// target_start first: the index's own order within one fuel, with
+			// run_id the column immediately after both keys.
+			"GROUP BY pp.target_start, pp.station_id",
 			"latest.run_id = pp.run_id",
 			// The outer fuel predicate is what makes the covering index usable
 			// for the join; losing it silently costs ~18 s on the live
 			// database, so both sides must keep it.
 			"WHERE pp.fuel = ",
 		},
-		"by_confidence": {"GROUP BY pp.confidence"},
-		"by_lead": {
-			"WHEN pp.lead_minutes < 360 THEN '3-6h'",
+		// One pass for the three breakdown tables and the chart. SUM rather
+		// than AVG, because an average cannot be re-aggregated per dimension
+		// afterwards; the hour is a substring of target_start and the chart is
+		// the sum per target_start, so neither needs a pass of its own.
+		"breakdowns": {
+			"GROUP BY pp.target_start, pp.confidence, ",
+			"WHEN pp.lead_minutes < 360 THEN 2",
 			"MIN(pp.lead_minutes)",
+			"SUM(ABS(pp.error))",
+			"SUM(pp.error)",
+			"SUM(pp.predicted_price)",
+			"SUM(pp.actual_price)",
 		},
-		"by_hour": {"SUBSTR(pp.target_start, 12, 2)"},
-		"series":  {"AVG(pp.predicted_price)", "GROUP BY pp.target_start"},
 		"rows": {
 			"COALESCE(s.name_override, s.name)",
-			"ORDER BY pp.target_start DESC, pp.station_id ASC",
+			// Both keys descending, so the LIMIT is a backward index read
+			// rather than a sort of the whole slice.
+			"ORDER BY pp.target_start DESC, pp.station_id DESC",
 			// Filter, order and cap must stay inside the derived table, ahead
 			// of the metadata joins.
 			") page ",
@@ -1005,15 +1016,18 @@ func TestIndexHintSyntax(t *testing.T) {
 // TestPageHintsExactlyTheMeasuredQueries pins the hint policy. Hinting is a
 // last resort justified by measurement, so the set of queries carrying one is
 // part of the decision, not an implementation detail: series and rows measured
-// +1% and -2% on the live database and must stay unhinted.
+// zero across four runs on the live database and must stay unhinted.
 func TestPageHintsExactlyTheMeasuredQueries(t *testing.T) {
 	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
 		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
 	hint := indexHintSyntax(dialectSQLite, "idx_price_predictions_accuracy")
 
+	// rows joined this set once the table passed 8M rows: the optimizer began
+	// driving it from idx_price_predictions_due, and forcing the covering index
+	// measured 8.3-8.8 s against 6.0-6.5 s over four runs with the ranges never
+	// overlapping. series stays out — there the same four runs straddled zero.
 	wantHinted := map[string]bool{
-		"summary": true, "summary_latest": true,
-		"by_confidence": true, "by_lead": true, "by_hour": true,
+		"summary": true, "summary_latest": true, "breakdowns": true, "rows": true,
 	}
 	seen := map[string]bool{}
 	for _, spec := range pageSpecs(filters, true) {
@@ -1141,14 +1155,18 @@ func TestViewerHintMatchesDoctor(t *testing.T) {
 	if !strings.Contains(php, "gasolineIndexExists") {
 		t.Error("web/index.php hints without checking the index exists")
 	}
-	// And it must apply it to exactly the queries doctor thinks it does. Six
-	// SQL references, because summary_latest reads price_predictions twice; the
-	// two unhinted queries keep naming the table directly.
-	if got := strings.Count(php, "$ppHinted ."); got != 6 {
-		t.Errorf("web/index.php splices $ppHinted into %d queries, want 6", got)
+	// And it must apply it to exactly the queries doctor thinks it does. Seven
+	// SQL references for six hinted queries, because summary_latest reads
+	// price_predictions twice; series is the one query still naming the table
+	// directly.
+	wantRefs := len(pageHintedQueries) + 1
+	if got := strings.Count(php, "$ppHinted ."); got != wantRefs {
+		t.Errorf("web/index.php splices $ppHinted into %d references, want %d", got, wantRefs)
 	}
-	if got := strings.Count(php, "'FROM price_predictions pp ' . $joinRuns"); got != 2 {
-		t.Errorf("web/index.php has %d unhinted accuracy queries, want 2 (series and rows)", got)
+	// Every accuracy query is hinted now that the chart comes out of the
+	// breakdown pass, so nothing should still name the table directly.
+	if got := strings.Count(php, "'FROM price_predictions pp ' . $joinRuns"); got != 0 {
+		t.Errorf("web/index.php has %d unhinted accuracy queries, want none", got)
 	}
 }
 
@@ -1193,16 +1211,42 @@ func TestRunDoctorTryIndexReportsBothTimings(t *testing.T) {
 	if hintedCount == 0 {
 		t.Fatal("no query was compared")
 	}
-	var verdict bool
+	var verdict, band bool
 	for _, f := range result.Findings {
-		if strings.Contains(f.Message, "idx_price_predictions_accuracy") &&
-			(strings.Contains(f.Message, "would cut") || strings.Contains(f.Message, "little difference") ||
-				strings.Contains(f.Message, "is slower")) {
+		if !strings.Contains(f.Message, "idx_price_predictions_accuracy") {
+			continue
+		}
+		if strings.Contains(f.Message, "cuts") || strings.Contains(f.Message, "not established") ||
+			strings.Contains(f.Message, "slower on") || strings.Contains(f.Message, "nothing was actually compared") {
 			verdict = true
+		}
+		// The queries the page already hints re-ran identical SQL, so the report
+		// has to say what their repeats measured before any verdict lands.
+		if strings.Contains(f.Message, "re-ran identical SQL") {
+			band = true
 		}
 	}
 	if !verdict {
 		t.Fatalf("--try-index produced no verdict; findings=%v", result.Findings)
+	}
+	if !band {
+		t.Fatalf("--try-index did not report the repeats' noise band; findings=%v", result.Findings)
+	}
+
+	// Five of these queries already force the index, so their comparison is a
+	// repeat of the same statement and must be marked as one.
+	repeats := 0
+	for _, q := range result.Queries {
+		if q.Hinted != nil && q.Hinted.Repeat {
+			repeats++
+			if !pageHintedQueries[q.Name] {
+				t.Errorf("query %s is not one the page hints, so its comparison is not a repeat", q.Name)
+			}
+		}
+	}
+	if repeats != len(pageHintedQueries) {
+		t.Errorf("%d comparisons were marked as repeats, want the %d the page already hints",
+			repeats, len(pageHintedQueries))
 	}
 
 	// Without the flag there must be no comparison at all.
@@ -1789,5 +1833,816 @@ func TestFormatDurationMS(t *testing.T) {
 		if got := formatDurationMS(tc.ms); got != tc.want {
 			t.Errorf("formatDurationMS(%v) = %q, want %q", tc.ms, got, tc.want)
 		}
+	}
+}
+
+// TestAccuracyQueriesCarryProbes pins that every accuracy-page query has a probe
+// and that each probe reads the same rows through the same access path as its
+// query — a probe on a different plan would price the wrong thing.
+func TestAccuracyQueriesCarryProbes(t *testing.T) {
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	specs := map[string]accuracyQuerySpec{}
+	for _, spec := range pageSpecs(filters, true) {
+		specs[spec.name] = spec
+	}
+	for name, spec := range specs {
+		if spec.probe == nil {
+			t.Errorf("query %s has no probe, so nothing can say where its time goes", name)
+			continue
+		}
+		if spec.probeGap == "" {
+			t.Errorf("query %s has a probe but does not say what the gap to it is", name)
+		}
+		if spec.probe.alias != spec.alias {
+			t.Errorf("query %s probes alias %q but drives from %q", name, spec.probe.alias, spec.alias)
+		}
+		// Carrying the same hint is not enough: two of these queries are
+		// unhinted, and there only pinning the plan the query actually took
+		// keeps the probe comparable.
+		if spec.table == "price_predictions" && spec.probe.sqlFor == nil {
+			t.Errorf("query %s has a probe that cannot be pinned to its plan", name)
+		}
+		if spec.probe.sqlFor != nil {
+			pinned := spec.probe.sqlFor("idx_price_predictions_due")
+			if !strings.Contains(pinned, "idx_price_predictions_due") {
+				t.Errorf("query %s probe ignores the index it is pinned to:\n%s", name, pinned)
+			}
+		}
+		// A probe that carried a different hint would take a different plan and
+		// its timing would not be comparable.
+		if strings.Contains(spec.sql, "idx_price_predictions_accuracy") !=
+			strings.Contains(spec.probe.sql, "idx_price_predictions_accuracy") {
+			t.Errorf("query %s and its probe disagree about the index hint:\n%s\n%s",
+				name, spec.sql, spec.probe.sql)
+		}
+	}
+
+	// The two structural probes isolate a join rather than a projection, which
+	// is the whole reason they are spelled out separately.
+	if got := specs["summary_latest"].probe.sql; strings.Contains(got, "JOIN (") {
+		t.Errorf("the summary_latest probe must drop the self-join, got:\n%s", got)
+	}
+	if got := specs["rows"].probe.sql; strings.Contains(got, "JOIN prediction_runs") ||
+		strings.Contains(got, "JOIN stations") {
+		t.Errorf("the rows probe must drop the metadata joins, got:\n%s", got)
+	}
+	// ...but must keep the cap, or it would read the whole range instead.
+	if !strings.Contains(specs["rows"].probe.sql, "LIMIT 1001") {
+		t.Errorf("the rows probe lost the page cap:\n%s", specs["rows"].probe.sql)
+	}
+}
+
+// TestAccuracyProbesReadTheSameRows runs each query and its probe for real and
+// checks the probe is not measuring a smaller slice than the query aggregates
+// over, which is what makes the difference between them meaningful.
+func TestAccuracyProbesReadTheSameRows(t *testing.T) {
+	_, db := seedDoctorDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	for _, spec := range pageSpecs(filters, true) {
+		if spec.probe == nil {
+			continue
+		}
+		queryRows, err := countQueryRows(ctx, db, spec.sql, spec.args)
+		if err != nil {
+			t.Fatalf("%s: %v", spec.name, err)
+		}
+		probeRows, err := countQueryRows(ctx, db, spec.probe.sql, spec.probe.args)
+		if err != nil {
+			t.Fatalf("%s probe: %v", spec.name, err)
+		}
+		if probeRows == 0 {
+			t.Errorf("%s probe read nothing while the query returned %d rows", spec.name, queryRows)
+		}
+		// The aggregates reduce, so the probe reads at least as much as the
+		// query returns; rows and its probe both stop at the cap.
+		if probeRows < queryRows {
+			t.Errorf("%s probe read %d rows, fewer than the query's %d — it is not the same slice",
+				spec.name, probeRows, queryRows)
+		}
+	}
+}
+
+// TestAccuracyProbeFindingsDistinguishAggregationFromLookups pins the
+// distinction the wording turns on: a covering read's remaining time is the
+// aggregation, and calling it row lookups would send an operator after an index
+// the query is already using.
+func TestAccuracyProbeFindingsDistinguishAggregationFromLookups(t *testing.T) {
+	opts := doctorOptions{Pages: doctorPages{Accuracy: true}, Probe: true, SlowMS: 1000}
+
+	covering := doctorQuery{
+		Name: "summary", Table: "price_predictions", DurationMS: 3600, Rows: 1,
+		UsesIndex: "idx_price_predictions_accuracy", CoveringHit: true,
+		Probe: &doctorQueryProbe{Name: "rows walked", DurationMS: 900, Rows: 2_400_000,
+			UsesIndex: "idx_price_predictions_accuracy", CoveringHit: true, Comparable: true},
+	}
+	// A covering read's remaining time is the aggregation, so there is nothing
+	// here to attribute to lookups. Its slice is reported once for the page
+	// instead; see TestAccuracySliceFindingIsStatedOnce.
+	if got := accuracyProbeFindings(covering, "aggregating those rows", opts); len(got) != 0 {
+		t.Errorf("a covering read must not be reported as paying for lookups:\n%s", renderFindings(got))
+	}
+
+	lookupBound := doctorQuery{
+		Name: "rows", Table: "price_predictions", DurationMS: 4100, Rows: 1001,
+		UsesIndex: "idx_price_predictions_station_fuel_target",
+		probeGap:  "joining prediction_runs and stations onto the capped page",
+		Probe: &doctorQueryProbe{Name: "page only", DurationMS: 100, Rows: 1001,
+			UsesIndex: "idx_price_predictions_station_fuel_target", Comparable: true},
+	}
+	got := renderFindings(accuracyProbeFindings(lookupBound, lookupBound.probeGap, opts))
+	for _, want := range []string{
+		"query rows spends 4000 ms of its 4100 ms joining prediction_runs and stations onto the capped page",
+		"about 3996 µs each",
+		"That is seek latency rather than a cache hit",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("findings are missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestProbeOnADifferentPlanIsRefused pins the guard the production run needed:
+// `series` is one of the two queries the page leaves unhinted, its probe's
+// narrower projection led the optimizer to a different index, and the probe came
+// out four times slower than the query it was meant to be a floor for. A gap
+// between two unrelated plans is not a measurement of anything.
+func TestProbeOnADifferentPlanIsRefused(t *testing.T) {
+	opts := doctorOptions{Pages: doctorPages{Accuracy: true}, Probe: true, SlowMS: 1000}
+	series := doctorQuery{
+		Name: "series", Table: "price_predictions", DurationMS: 1627, Rows: 575,
+		UsesIndex: "idx_price_predictions_accuracy", CoveringHit: true,
+		probeGap: "grouping and ordering those rows",
+		Probe: &doctorQueryProbe{Name: "rows walked", DurationMS: 6508, Rows: 1_363_186,
+			UsesIndex: "idx_price_predictions_due", Comparable: false},
+	}
+	got := renderFindings(accuracyProbeFindings(series, series.probeGap, opts))
+	for _, want := range []string{
+		"query series took idx_price_predictions_accuracy while its probe took idx_price_predictions_due",
+		"not measuring the same work",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("findings are missing %q:\n%s", want, got)
+		}
+	}
+	// Above all it must not be reported as a cost of the query.
+	if strings.Contains(got, "spends") {
+		t.Errorf("an incomparable probe must not be attributed to the query:\n%s", got)
+	}
+
+	// The line itself has to carry the caveat, or its timing reads as a floor.
+	line := captureStdout(t, func() error {
+		writeDoctorProbeText(series.Probe, doctorOptions{}, false)
+		return nil
+	})
+	if !strings.Contains(line, "different plan, not comparable") {
+		t.Errorf("the probe line must say it is not comparable:\n%s", line)
+	}
+
+	// Nor may its rows or its time reach the page-level slice total.
+	comparable := doctorQuery{Name: "summary", Table: "price_predictions", CoveringHit: true,
+		Probe: &doctorQueryProbe{Name: "rows walked", Rows: 1_363_186, DurationMS: 1686, Comparable: true}}
+	finding, ok := accuracySliceFinding([]doctorQuery{comparable, series})
+	if !ok {
+		t.Fatal("the comparable probe still reports its slice")
+	}
+	if strings.Contains(finding.Message, "series") || strings.Contains(finding.Message, "2 of") {
+		t.Errorf("an incomparable probe must not be counted into the slice total:\n%s", finding.Message)
+	}
+}
+
+// TestRunDoctorProbesAreOptIntoOut covers the flag on the accuracy page, which
+// did not have one until the probes reached it.
+func TestRunDoctorProbesAreOptIntoOut(t *testing.T) {
+	dbPath, db := seedDoctorDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	out := captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath})
+	})
+	if !strings.Contains(out, "probe/rows walked") {
+		t.Errorf("the accuracy page must probe by default:\n%s", out)
+	}
+	if !strings.Contains(out, "probe/page only") || !strings.Contains(out, "probe/inner group only") {
+		t.Errorf("the two structural probes must appear:\n%s", out)
+	}
+
+	out = captureStdout(t, func() error {
+		return run([]string{"doctor", "--db", dbPath, "--probe=false"})
+	})
+	if strings.Contains(out, "probe/") {
+		t.Errorf("--probe=false must run no probes:\n%s", out)
+	}
+	if !strings.Contains(out, "probes were skipped") {
+		t.Errorf("--probe=false must say the report is missing those numbers:\n%s", out)
+	}
+}
+
+// TestAccuracySliceFindingIsStatedOnce pins the shape of the page-level slice
+// finding. The page runs several independent aggregate passes over the same
+// range, so the row count belongs to the page rather than to any one query —
+// repeating it under each of them said the same number five times.
+func TestAccuracySliceFindingIsStatedOnce(t *testing.T) {
+	walked := func(name string, rows int, ms float64) doctorQuery {
+		return doctorQuery{Name: name, Table: "price_predictions", CoveringHit: true,
+			Probe: &doctorQueryProbe{Name: "rows walked", Rows: rows, DurationMS: ms, Comparable: true}}
+	}
+	queries := []doctorQuery{
+		walked("summary", 1_476_360, 371),
+		walked("by_confidence", 1_476_360, 457),
+		walked("by_lead", 1_476_360, 383),
+		// A different slice and a differently-named probe must not be folded in.
+		{Name: "summary_latest", Table: "price_predictions", CoveringHit: true,
+			Probe: &doctorQueryProbe{Name: "inner group only", Rows: 21_570, DurationMS: 414, Comparable: true}},
+		{Name: "skipped", Skipped: true},
+	}
+	finding, ok := accuracySliceFinding(queries)
+	if !ok {
+		t.Fatal("three queries over one slice must produce a finding")
+	}
+	for _, want := range []string{
+		"3 of the page's queries each walk the same 1,476,360 rows",
+		"(by_confidence, by_lead, summary)",
+		"1211 ms of the total spent walking them over again",
+		"a narrower --range is what shrinks that slice",
+	} {
+		if !strings.Contains(finding.Message, want) {
+			t.Errorf("finding is missing %q:\n%s", want, finding.Message)
+		}
+	}
+
+	// One query over a slice is not "over again", so it reads differently.
+	single, ok := accuracySliceFinding([]doctorQuery{walked("summary", 900, 12)})
+	if !ok {
+		t.Fatal("a single probed query still reports its slice")
+	}
+	if !strings.Contains(single.Message, "query summary reads 900 rows for this filter, walked in 12 ms") {
+		t.Errorf("single-query wording is wrong:\n%s", single.Message)
+	}
+
+	// Nothing probed, nothing to say.
+	if _, ok := accuracySliceFinding([]doctorQuery{{Name: "summary"}}); ok {
+		t.Error("no probes must produce no slice finding")
+	}
+}
+
+// TestTryIndexVerdictIsJudgedAgainstItsOwnRepeats uses the production numbers
+// that exposed the flaw. Five accuracy-page queries already force
+// idx_price_predictions_accuracy, so forcing it again re-ran identical SQL and
+// still moved by up to 27%. Against that, the one query whose SQL genuinely
+// changed moved 28% — indistinguishable from the database having a different
+// afternoon, and the old verdict called the whole thing "little difference"
+// while five of its seven pairs were not comparisons at all.
+func TestTryIndexVerdictIsJudgedAgainstItsOwnRepeats(t *testing.T) {
+	pair := func(name string, base, hinted float64, repeat bool) doctorQuery {
+		return doctorQuery{Name: name, Table: "price_predictions", DurationMS: base, Rows: 1,
+			Hinted: &doctorQueryHint{Index: "idx_price_predictions_accuracy",
+				DurationMS: hinted, Rows: 1, Repeat: repeat}}
+	}
+	queries := []doctorQuery{
+		pair("summary", 2414.7, 2180.9, true),        // -10%
+		pair("summary_latest", 2941.3, 2861.9, true), //  -3%
+		pair("by_confidence", 2034.3, 2028.5, true),  //  -0%
+		pair("by_lead", 2121.2, 2150.0, true),        //  +1%
+		pair("by_hour", 2563.5, 1876.2, true),        // -27%, identical SQL
+		pair("series", 1667.9, 1629.6, false),        //  -2%, genuinely unhinted
+		pair("rows", 8024.2, 5770.6, false),          // -28%, genuinely unhinted
+	}
+
+	band, repeats := hintNoiseBand(queries)
+	if repeats != 5 {
+		t.Fatalf("repeats = %d, want the 5 pairs the page already hints", repeats)
+	}
+	if band < 26 || band > 28 {
+		t.Fatalf("noise band = %.1f%%, want by_hour's ~27%%", band)
+	}
+
+	got := renderFindings(tryIndexFindings(queries, "idx_price_predictions_accuracy"))
+	for _, want := range []string{
+		"5 queries already force idx_price_predictions_accuracy, so their second timing re-ran identical SQL",
+		"those repeats moved up to 27%",
+		// series + rows together are -24%, inside the 27% band.
+		"not established either way; repeat the run before acting on it",
+		"(rows, series)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("findings are missing %q:\n%s", want, got)
+		}
+	}
+	// The five no-op pairs must not be counted into the compared totals.
+	if strings.Contains(got, "summary") || strings.Contains(got, "by_hour") {
+		t.Errorf("a repeat must not appear among the queries actually compared:\n%s", got)
+	}
+
+	// A move clear of the band is a result, and says so.
+	clear := []doctorQuery{
+		pair("by_hour", 2000, 1990, true), // -0.5% band
+		pair("rows", 8000, 2000, false),   // -75%, unmistakable
+	}
+	got = renderFindings(tryIndexFindings(clear, "idx_price_predictions_accuracy"))
+	if !strings.Contains(got, "cuts the one query (rows) from 8000 ms to 2000 ms (75% less)") {
+		t.Errorf("a move clear of the band must be reported as a result:\n%s", got)
+	}
+	if !strings.Contains(got, "warn") {
+		t.Errorf("the optimizer picking a slower index is a warning:\n%s", got)
+	}
+
+	// Naming an index every query already forces compares nothing at all.
+	allRepeats := []doctorQuery{pair("summary", 2400, 2100, true), pair("by_hour", 2000, 2200, true)}
+	got = renderFindings(tryIndexFindings(allRepeats, "idx_price_predictions_accuracy"))
+	if !strings.Contains(got, "nothing was actually compared") {
+		t.Errorf("all-repeats must say nothing was compared:\n%s", got)
+	}
+}
+
+// TestProbeAccountingForTheWholeQueryIsStated covers the case production hit on
+// `rows`: the probe cost as much as the query, so the joins it drops are free
+// and the cost is entirely in the part the probe kept. Saying nothing there
+// leaves an 8-second query with no explanation at all.
+func TestProbeAccountingForTheWholeQueryIsStated(t *testing.T) {
+	opts := doctorOptions{Pages: doctorPages{Accuracy: true}, Probe: true, SlowMS: 1000}
+	rows := doctorQuery{
+		Name: "rows", Table: "price_predictions", DurationMS: 7503.7, Rows: 1001,
+		UsesIndex: "idx_price_predictions_due",
+		probeGap:  "joining prediction_runs and stations onto the capped page",
+		Probe: &doctorQueryProbe{Name: "page only", DurationMS: 7872.0, Rows: 1001,
+			UsesIndex: "idx_price_predictions_due", Comparable: true},
+	}
+	got := renderFindings(accuracyProbeFindings(rows, rows.probeGap, opts))
+	for _, want := range []string{
+		"query rows costs 7504 ms and its probe alone costs 7872 ms",
+		"joining prediction_runs and stations onto the capped page adds nothing measurable",
+		"what the probe itself does is the whole cost",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("findings are missing %q:\n%s", want, got)
+		}
+	}
+	// A probe that accounts for only part of the query keeps the lookup wording.
+	partial := rows
+	partial.Probe = &doctorQueryProbe{Name: "page only", DurationMS: 100, Rows: 1001,
+		UsesIndex: "idx_price_predictions_due", Comparable: true}
+	got = renderFindings(accuracyProbeFindings(partial, partial.probeGap, opts))
+	if strings.Contains(got, "adds nothing measurable") {
+		t.Errorf("a real gap must not be reported as nothing:\n%s", got)
+	}
+	if !strings.Contains(got, "spends 7404 ms of its 7504 ms") {
+		t.Errorf("a real gap must be attributed:\n%s", got)
+	}
+}
+
+// TestTimeQueryKeepsTheFastestAndTheSpread pins what --runs means. The fastest
+// is the summary because every disturbance can only make a run slower, and the
+// spread is kept because a difference smaller than a query's own variance is not
+// a measurement of anything.
+func TestTimeQueryKeepsTheFastestAndTheSpread(t *testing.T) {
+	_, db := seedDoctorDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	single := timeQuery(ctx, db, "SELECT 1 FROM price_predictions", nil, 1)
+	if single.Err != nil {
+		t.Fatalf("single run: %v", single.Err)
+	}
+	if single.SpreadMS != 0 {
+		t.Errorf("one run cannot have a spread, got %v", single.SpreadMS)
+	}
+	if single.Rows == 0 {
+		t.Error("the seeded table has rows")
+	}
+
+	many := timeQuery(ctx, db, "SELECT 1 FROM price_predictions", nil, 5)
+	if many.Err != nil {
+		t.Fatalf("five runs: %v", many.Err)
+	}
+	if many.SpreadMS < 0 {
+		t.Errorf("spread must be slowest minus fastest, got %v", many.SpreadMS)
+	}
+	if many.Rows != single.Rows {
+		t.Errorf("row count changed between runs: %d then %d", single.Rows, many.Rows)
+	}
+	// The reported timing is the fastest, so more samples can only lower it.
+	if many.DurationMS > single.DurationMS+single.DurationMS {
+		t.Errorf("five runs reported %v against one run's %v; the fastest should not be slower",
+			many.DurationMS, single.DurationMS)
+	}
+
+	// A failing query is reported once, not N times, and carries its error.
+	bad := timeQuery(ctx, db, "SELECT * FROM no_such_table", nil, 4)
+	if bad.Err == nil {
+		t.Error("a broken query must report its error")
+	}
+	if bad.SpreadMS != 0 {
+		t.Errorf("a failed measurement has no spread, got %v", bad.SpreadMS)
+	}
+	// runs below one is treated as one rather than producing no measurement.
+	if zero := timeQuery(ctx, db, "SELECT 1 FROM price_predictions", nil, 0); zero.Err != nil || zero.Rows == 0 {
+		t.Errorf("--runs 0 must still measure once, got %+v", zero)
+	}
+}
+
+// TestProbeGapMustClearTheQuerysOwnVariance is the run-1 artefact as a test. The
+// production report once attributed 7.7 s to row lookups because that query's
+// single sample came in at 16 s where three later runs put it at 8.3 s. A gap
+// the timing moved by anyway is not evidence about the probe's missing work.
+func TestProbeGapMustClearTheQuerysOwnVariance(t *testing.T) {
+	opts := doctorOptions{Pages: doctorPages{Accuracy: true}, Probe: true, SlowMS: 1000, Runs: 3}
+	rows := doctorQuery{
+		Name: "rows", Table: "price_predictions", DurationMS: 16030.9, Rows: 1001,
+		UsesIndex: "idx_price_predictions_due", SpreadMS: 7800,
+		probeGap: "joining prediction_runs and stations onto the capped page",
+		Probe: &doctorQueryProbe{Name: "page only", DurationMS: 8308.9, Rows: 1001,
+			UsesIndex: "idx_price_predictions_due", Comparable: true},
+	}
+	if _, ok := probeLookupFinding(rows, rows.probeGap, opts); ok {
+		t.Error("a gap inside the query's own spread must not be attributed to the probe's missing work")
+	}
+	// The same shape with a steady timing is a real finding.
+	steady := rows
+	steady.SpreadMS = 200
+	if _, ok := probeLookupFinding(steady, steady.probeGap, opts); !ok {
+		t.Error("a gap well clear of the spread is a measurement and must be reported")
+	}
+	// The probe's own variance counts too — it is half the comparison.
+	noisyProbe := steady
+	noisyProbe.Probe = &doctorQueryProbe{Name: "page only", DurationMS: 8308.9, Rows: 1001,
+		UsesIndex: "idx_price_predictions_due", Comparable: true, SpreadMS: 9000}
+	if _, ok := probeLookupFinding(noisyProbe, noisyProbe.probeGap, opts); ok {
+		t.Error("a probe that varies more than the gap cannot establish it either")
+	}
+}
+
+// TestSpreadFindingSaysWhatWasAndWasNotMeasured covers both modes: with repeats
+// it reports the band, and without them it says there is none rather than
+// letting one sample read as the truth.
+func TestSpreadFindingSaysWhatWasAndWasNotMeasured(t *testing.T) {
+	queries := []doctorQuery{
+		{Name: "summary", DurationMS: 2308, SpreadMS: 120},
+		{Name: "rows", DurationMS: 6000, SpreadMS: 1800}, // 30%
+		{Name: "skipped", Skipped: true, SpreadMS: 9999},
+		// Below the floor: a 58 ms query moved 484% on production, and letting
+		// that set the page's band dismissed every real difference as noise.
+		{Name: "decisions", DurationMS: 58, SpreadMS: 281},
+	}
+	finding, ok := spreadFinding(queries, 3)
+	if !ok {
+		t.Fatal("repeats must produce a band")
+	}
+	for _, want := range []string{"widest spread on any query above 250 ms was 30% (rows)",
+		"treat differences below that as noise", "the fastest of the 3"} {
+		if !strings.Contains(finding.Message, want) {
+			t.Errorf("finding is missing %q:\n%s", want, finding.Message)
+		}
+	}
+
+	if strings.Contains(finding.Message, "decisions") {
+		t.Errorf("a 58 ms query must not set the page's band:\n%s", finding.Message)
+	}
+
+	single, ok := spreadFinding(queries, 1)
+	if !ok {
+		t.Fatal("a single-sample run must say so")
+	}
+	for _, want := range []string{"single sample", "--runs 3", "absorbs cache warming"} {
+		if !strings.Contains(single.Message, want) {
+			t.Errorf("single-run finding is missing %q:\n%s", want, single.Message)
+		}
+	}
+}
+
+// TestBreakdownsOnePassMatchesFourQueries is the correctness check the collapse
+// needs. The three breakdown tables and the chart series used to be four grouped
+// queries computing AVG in SQL; they are now one pass returning SUM and COUNT
+// per (target_start, confidence, lead bucket), with each table summed out of it
+// afterwards. This runs both forms against real rows and compares what the page
+// would show.
+func TestBreakdownsOnePassMatchesFourQueries(t *testing.T) {
+	_, db := seedDoctorDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-07-01T00:00:00Z", To: "2026-07-31T23:59:59Z"}
+	where := "pp.actual_price IS NOT NULL AND pp.fuel = ? AND pp.target_start >= ? AND pp.target_start <= ?"
+	args := []any{filters.Fuel, filters.From, filters.To}
+	leadBucket := "CASE" +
+		" WHEN pp.lead_minutes < 60 THEN '0-1h'" +
+		" WHEN pp.lead_minutes < 180 THEN '1-3h'" +
+		" WHEN pp.lead_minutes < 360 THEN '3-6h'" +
+		" WHEN pp.lead_minutes < 720 THEN '6-12h'" +
+		" WHEN pp.lead_minutes < 1440 THEN '12-24h'" +
+		" ELSE '24h+' END"
+	hourExpr := "SUBSTR(pp.target_start, 12, 2)"
+
+	type agg struct {
+		count int
+		mae   float64
+		bias  float64
+		floor int
+	}
+	// The old shape: one grouped query per dimension, averaging in SQL.
+	perDimension := func(key string) map[string]agg {
+		rows, err := db.QueryContext(ctx, "SELECT "+key+" AS k, COUNT(*), AVG(ABS(pp.error)), AVG(pp.error), "+
+			"MIN(pp.lead_minutes) FROM price_predictions pp WHERE "+where+" GROUP BY "+key, args...)
+		if err != nil {
+			t.Fatalf("grouped by %s: %v", key, err)
+		}
+		defer rows.Close()
+		out := map[string]agg{}
+		for rows.Next() {
+			var k string
+			var a agg
+			if err := rows.Scan(&k, &a.count, &a.mae, &a.bias, &a.floor); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out[k] = a
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		return out
+	}
+
+	// The new shape: one pass, summed down each dimension the way the page does.
+	byConfidence, byLead, byHour := map[string]agg{}, map[string]agg{}, map[string]agg{}
+	sums := map[string]map[string][3]float64{
+		"confidence": {}, "bucket": {}, "hour": {},
+	}
+	floors := map[string]int{}
+	seriesGot := map[string][3]float64{} // target_start -> {count, sum predicted, sum actual}
+	rows, err := db.QueryContext(ctx, "SELECT pp.target_start, pp.confidence, "+leadBucket+", "+
+		"MIN(pp.lead_minutes), COUNT(*), SUM(ABS(pp.error)), SUM(pp.error), "+
+		"SUM(pp.predicted_price), SUM(pp.actual_price) "+
+		"FROM price_predictions pp WHERE "+where+
+		" GROUP BY pp.target_start, pp.confidence, "+leadBucket, args...)
+	if err != nil {
+		t.Fatalf("one pass: %v", err)
+	}
+	defer rows.Close()
+	groups := 0
+	for rows.Next() {
+		var target, confidence, bucket string
+		var floor, n int
+		var absError, sumError, sumPredicted, sumActual float64
+		if err := rows.Scan(&target, &confidence, &bucket, &floor, &n,
+			&absError, &sumError, &sumPredicted, &sumActual); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		groups++
+		// The hour the page derives in PHP: characters 12-13 of target_start.
+		hour := target[11:13]
+		for dim, key := range map[string]string{"confidence": confidence, "bucket": bucket, "hour": hour} {
+			prev := sums[dim][key]
+			sums[dim][key] = [3]float64{prev[0] + float64(n), prev[1] + absError, prev[2] + sumError}
+		}
+		if prev, ok := floors[bucket]; !ok || floor < prev {
+			floors[bucket] = floor
+		}
+		point := seriesGot[target]
+		seriesGot[target] = [3]float64{point[0] + float64(n), point[1] + sumPredicted, point[2] + sumActual}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if groups == 0 {
+		t.Fatal("the seeded range has rows, so the one pass must return groups")
+	}
+	for dim, into := range map[string]map[string]agg{
+		"confidence": byConfidence, "bucket": byLead, "hour": byHour,
+	} {
+		for key, totals := range sums[dim] {
+			n := int(totals[0])
+			into[key] = agg{count: n, mae: totals[1] / totals[0], bias: totals[2] / totals[0], floor: floors[key]}
+		}
+	}
+
+	// Both forms must agree on every table, to floating-point tolerance: the
+	// sums are re-added in a different order, which is the only difference
+	// permitted.
+	const tolerance = 1e-9
+	for _, tc := range []struct {
+		name string
+		key  string
+		got  map[string]agg
+	}{
+		{"by_confidence", "pp.confidence", byConfidence},
+		{"by_lead", leadBucket, byLead},
+		{"by_hour", hourExpr, byHour},
+	} {
+		want := perDimension(tc.key)
+		if len(want) == 0 {
+			t.Fatalf("%s: the reference query returned nothing to compare", tc.name)
+		}
+		if len(want) != len(tc.got) {
+			t.Errorf("%s: one pass produced %d groups, three queries produced %d", tc.name, len(tc.got), len(want))
+		}
+		for key, wantAgg := range want {
+			gotAgg, ok := tc.got[key]
+			if !ok {
+				t.Errorf("%s: one pass lost group %q", tc.name, key)
+				continue
+			}
+			if gotAgg.count != wantAgg.count {
+				t.Errorf("%s[%s]: count %d, want %d", tc.name, key, gotAgg.count, wantAgg.count)
+			}
+			if math.Abs(gotAgg.mae-wantAgg.mae) > tolerance {
+				t.Errorf("%s[%s]: mae %v, want %v", tc.name, key, gotAgg.mae, wantAgg.mae)
+			}
+			if math.Abs(gotAgg.bias-wantAgg.bias) > tolerance {
+				t.Errorf("%s[%s]: bias %v, want %v", tc.name, key, gotAgg.bias, wantAgg.bias)
+			}
+			// The lead table's sort key must survive the collapse.
+			if tc.name == "by_lead" && gotAgg.floor != wantAgg.floor {
+				t.Errorf("%s[%s]: lead_floor %d, want %d", tc.name, key, gotAgg.floor, wantAgg.floor)
+			}
+		}
+	}
+
+	// And the chart, which was the fourth query: mean predicted against mean
+	// actual per window.
+	seriesRows, err := db.QueryContext(ctx, "SELECT pp.target_start, AVG(pp.predicted_price), "+
+		"AVG(pp.actual_price), COUNT(*) FROM price_predictions pp WHERE "+where+
+		" GROUP BY pp.target_start", args...)
+	if err != nil {
+		t.Fatalf("series reference: %v", err)
+	}
+	defer seriesRows.Close()
+	points := 0
+	for seriesRows.Next() {
+		var target string
+		var wantPredicted, wantActual float64
+		var wantCount int
+		if err := seriesRows.Scan(&target, &wantPredicted, &wantActual, &wantCount); err != nil {
+			t.Fatalf("scan series: %v", err)
+		}
+		points++
+		got, ok := seriesGot[target]
+		if !ok {
+			t.Errorf("the one pass lost chart window %s", target)
+			continue
+		}
+		if int(got[0]) != wantCount {
+			t.Errorf("series[%s]: count %d, want %d", target, int(got[0]), wantCount)
+		}
+		if math.Abs(got[1]/got[0]-wantPredicted) > tolerance {
+			t.Errorf("series[%s]: mean predicted %v, want %v", target, got[1]/got[0], wantPredicted)
+		}
+		if math.Abs(got[2]/got[0]-wantActual) > tolerance {
+			t.Errorf("series[%s]: mean actual %v, want %v", target, got[2]/got[0], wantActual)
+		}
+	}
+	if err := seriesRows.Err(); err != nil {
+		t.Fatalf("series rows: %v", err)
+	}
+	if points == 0 {
+		t.Fatal("the reference series returned nothing to compare")
+	}
+	if len(seriesGot) != points {
+		t.Errorf("the one pass produced %d chart windows, the reference %d", len(seriesGot), points)
+	}
+}
+
+// TestAccuracyRowsCapAtATiedBoundary covers what changed when the inner select
+// started reading the index backwards on both keys. The cap can only fall in the
+// middle of an hour that several stations share, so which of them it keeps is
+// what the tie-break decides — and whatever it decides, the page's contract is
+// the same: exactly the cap, nothing older than the boundary hour, and displayed
+// newest-first with stations ascending.
+func TestAccuracyRowsCapAtATiedBoundary(t *testing.T) {
+	ctx := context.Background()
+	db, err := openDB(filepath.Join(t.TempDir(), "tied.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	// 20 stations x 60 hours = 1200 rows, so the 1001-row cap lands inside an
+	// hour that all 20 stations share.
+	const stations, hours = 20, 60
+	for i := 0; i < stations; i++ {
+		if _, err := db.ExecContext(ctx, `INSERT INTO stations
+			(id, name, lat, lng, first_seen_at, last_seen_at) VALUES (?, ?, 52.0, 13.0, '', '')`,
+			fmt.Sprintf("st-%02d", i), fmt.Sprintf("Station %02d", i)); err != nil {
+			t.Fatalf("insert station: %v", err)
+		}
+	}
+	res, err := db.ExecContext(ctx, `INSERT INTO prediction_runs
+		(run_at, city_name, fuel, range_km, history_days, predict_days)
+		VALUES ('2026-07-01T00:00:00Z', 'Berlin', 'diesel', 5, 30, 3)`)
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	runID, _ := res.LastInsertId()
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	for h := 0; h < hours; h++ {
+		target := base.Add(time.Duration(h) * time.Hour)
+		for i := 0; i < stations; i++ {
+			if _, err := db.ExecContext(ctx, `INSERT INTO price_predictions
+				(run_id, station_id, fuel, target_start, target_end, predicted_price, confidence,
+				 sample_count, is_suggestion, lead_minutes, applied_correction, actual_price, error, evaluated_at)
+				VALUES (?, ?, 'diesel', ?, ?, 1.7, 'medium', 20, 0, 60, 0.0, 1.71, 0.01, ?)`,
+				runID, fmt.Sprintf("st-%02d", i), target.Format(time.RFC3339),
+				target.Add(time.Hour).Format(time.RFC3339), target.Format(time.RFC3339)); err != nil {
+				t.Fatalf("insert prediction: %v", err)
+			}
+		}
+	}
+
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-01-01T00:00:00Z", To: "2027-01-01T23:59:59Z"}
+	var spec accuracyQuerySpec
+	for _, candidate := range pageSpecs(filters, false) {
+		if candidate.name == "rows" {
+			spec = candidate
+		}
+	}
+	rows, err := db.QueryContext(ctx, spec.sql, spec.args...)
+	if err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("columns: %v", err)
+	}
+	type seen struct {
+		target  string
+		station string
+	}
+	var got []seen
+	for rows.Next() {
+		cells := make([]any, len(columns))
+		for i := range cells {
+			cells[i] = new(sql.NullString)
+		}
+		if err := rows.Scan(cells...); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		var entry seen
+		for i, name := range columns {
+			value := cells[i].(*sql.NullString).String
+			switch name {
+			case "target_start":
+				entry.target = value
+			case "station_id":
+				entry.station = value
+			}
+		}
+		got = append(got, entry)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	if len(got) != 1001 {
+		t.Fatalf("returned %d rows, want the 1001 cap", len(got))
+	}
+	// Newest-first for display, stations ascending inside an hour. This is the
+	// outer ORDER BY and it must hold whichever direction the inner select read.
+	for i := 1; i < len(got); i++ {
+		prev, cur := got[i-1], got[i]
+		if cur.target > prev.target {
+			t.Fatalf("row %d target %s is newer than the row before it (%s)", i, cur.target, prev.target)
+		}
+		if cur.target == prev.target && cur.station < prev.station {
+			t.Fatalf("row %d station %s precedes %s within one hour", i, cur.station, prev.station)
+		}
+	}
+	// Nothing older than the boundary hour, and the boundary hour is partial —
+	// which is the case that only exists because stations tie there.
+	boundary := got[len(got)-1].target
+	counts := map[string]int{}
+	for _, entry := range got {
+		if entry.target < boundary {
+			t.Fatalf("row older than the boundary hour %s slipped in: %s", boundary, entry.target)
+		}
+		counts[entry.target]++
+	}
+	if counts[boundary] == stations {
+		t.Fatalf("the boundary hour is complete, so the cap did not land on a tie; the test proves nothing")
+	}
+	// Every hour above the boundary is complete: the cap took whole hours until
+	// it ran out, which is what "keep the newest" means here.
+	for target, n := range counts {
+		if target != boundary && n != stations {
+			t.Errorf("hour %s kept %d of %d stations; only the boundary hour may be partial",
+				target, n, stations)
+		}
+	}
+	// And the newest hour in the data is present, not the oldest.
+	newest := base.Add(time.Duration(hours-1) * time.Hour).Format(time.RFC3339)
+	if counts[newest] != stations {
+		t.Errorf("the newest hour %s is not fully present", newest)
+	}
+	if _, ok := counts[base.Format(time.RFC3339)]; ok {
+		t.Error("the oldest hour was kept; the cap must keep the newest")
 	}
 }
