@@ -270,6 +270,29 @@ function reportedRate(legendEl, index = 0) {
     check('and it is the least-squares line through that staircase', coarseRate, 8.67);
 }
 
+// The last price a station posted stands to the window's right edge — that is
+// what the chart shows and what the crosshair reports. A station that has not
+// repriced in days must therefore count for those days, not drop out after its
+// final row: writing that same price out again at the edge cannot change the
+// staircase, so it cannot change the trend either.
+{
+    const pin = series('other', 'Other', () => 1.60, { everyHours: 4 });   // runs to the edge
+    const row = (h, diesel) => ({
+        station_id: 'quiet', station_name: 'Quiet', recorded_at: new Date(T0 + h * HOUR).toISOString(),
+        _ts: T0 + h * HOUR, e5: null, e10: null, diesel,
+    });
+    const stops = [...pin, row(0, 1.90), row(2, 1.60)].sort((a, b) => a._ts - b._ts);
+    const spelledOut = [...stops, row(24, 1.60)].sort((a, b) => a._ts - b._ts);
+    const rate = reportedRate(render(stops).legendEl);
+    check('a station that stopped reporting still holds its last price',
+        rate, reportedRate(render(spelledOut).legendEl));
+    // Its 1.90 stood for two of the twenty-four hours and its 1.60 for the
+    // other twenty-two. Stop the clock at its final row instead and only the
+    // 1.90 counts, which reads -10.63 — half again as steep as the prices on
+    // screen went.
+    check('and holding it is what keeps the fit honest', rate, -6.87);
+}
+
 // A flat market trends flat, however unevenly it was sampled.
 {
     const rows = [
@@ -339,6 +362,23 @@ function reportedRate(legendEl, index = 0) {
     check('the legend follows the language',
         trendLegend(render(rows, { lang: 'de' }).legendEl).map((e) => e.text),
         ['Trend Diesel +1,19 ct/Tag']);
+}
+
+// A trend spans the prices it was fitted from, not the whole chart. A fuel
+// that only started being reported halfway through the window must not have a
+// line drawn across the half where it has no data to claim anything about.
+{
+    const rows = series('a', 'Alpha', (h, fuel) => {
+        if (fuel === 'e5' && h < 12) return null;
+        return (fuel === 'diesel' ? 1.70 : 1.82) + (0.012 / 24) * h;
+    }, { everyHours: 2, fuels: ['e5', 'diesel'] });
+    const [e5Line, dieselLine] = trendLines(render(rows, { fuels: ['e5', 'diesel'] }).chartEl);
+    // margin.left is 68 and the plot 868 wide at the stub's 960px, so a fuel
+    // that starts at the window's midpoint starts at 68 + 434 = 502.
+    check('a trend starts where its own fuel does',
+        [Math.round(dieselLine.x1), Math.round(e5Line.x1)], [68, 502]);
+    check('and both run to the right edge',
+        Math.round(e5Line.x2), Math.round(dieselLine.x2));
 }
 
 /* ── Hiding a trend from the legend ─────────────────────────────── */
