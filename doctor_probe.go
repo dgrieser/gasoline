@@ -262,6 +262,10 @@ func timeQuery(ctx context.Context, db *sql.DB, query string, args []any, runs i
 	return out
 }
 
+// doctorSpreadFloorMS is the timing below which a query's variance says nothing
+// about the report's. Fixed-cost interference is a share of a small number.
+const doctorSpreadFloorMS = 250
+
 // spreadFinding reports the widest variance --runs observed, which is the band
 // every difference in the report has to clear before it means anything. Without
 // --runs there is no such band, and the report says so rather than leaving a
@@ -276,7 +280,12 @@ func spreadFinding(queries []doctorQuery, runs int) (doctorFinding, bool) {
 	}
 	widest, name := 0.0, ""
 	for _, q := range queries {
-		if q.Skipped || q.Error != "" || q.DurationMS <= 0 {
+		// A query too fast to matter has nothing useful to say about variance:
+		// a 58 ms query moved 484% on a production run, and taking that as the
+		// page's band would have dismissed every real difference in the report
+		// as noise. Scheduler and cache effects are a fixed number of
+		// milliseconds, so as a share they explode on small timings.
+		if q.Skipped || q.Error != "" || q.DurationMS < doctorSpreadFloorMS {
 			continue
 		}
 		if share := q.SpreadMS / q.DurationMS * 100; share > widest {
@@ -288,9 +297,9 @@ func spreadFinding(queries []doctorQuery, runs int) (doctorFinding, bool) {
 	}
 	return doctorFinding{
 		Severity: "info",
-		Message: fmt.Sprintf("over %d runs the widest spread on one query was %.0f%% (%s), so treat differences "+
-			"below that as noise; the timings reported are the fastest of the %d",
-			runs, widest, name, runs),
+		Message: fmt.Sprintf("over %d runs the widest spread on any query above %.0f ms was %.0f%% (%s), so treat "+
+			"differences below that as noise; the timings reported are the fastest of the %d",
+			runs, float64(doctorSpreadFloorMS), widest, name, runs),
 	}, true
 }
 

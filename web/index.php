@@ -4073,7 +4073,13 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
             . 'SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id '
             . 'FROM ' . $ppHinted . $joinRuns
             . 'WHERE ' . $where
-            . ' GROUP BY pp.station_id, pp.target_start'
+            // Grouped target_start first, station_id second. Same groups
+            // either way — the join below matches on both — but this is the
+            // index's own order within one fuel, and run_id is the column
+            // immediately after them in it. Look for "Using index for group-by"
+            // or the loss of "Using temporary" in EXPLAIN to see whether the
+            // server takes advantage; SQLite streamed it both ways.
+            . ' GROUP BY pp.target_start, pp.station_id'
             . ') latest ON latest.station_id = pp.station_id'
             . ' AND latest.target_start = pp.target_start'
             . ' AND latest.run_id = pp.run_id';
@@ -4233,7 +4239,18 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
             . 'pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion '
             . 'FROM ' . $ppHinted . $joinRuns
             . 'WHERE ' . $where
-            . ' ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT ' . ($rawTableLimit + 1)
+            // Both keys descending: that is this index read backwards, so the
+            // LIMIT stops after 1001 entries instead of sorting the whole slice
+            // to find them. With station_id ascending the server cannot walk one
+            // direction for both keys and has to materialise and sort every row
+            // in the range first — SQLite's plan says "USE TEMP B-TREE FOR LAST
+            // TERM OF ORDER BY", and on 8M rows that query was 6.1 s of a 15.8 s
+            // page while its own probe showed the joins costing nothing.
+            //
+            // The outer query re-sorts station_id ascending for display, so the
+            // only difference is which stations fall inside the cap at its
+            // oldest hour, and that boundary is arbitrary either way.
+            . ' ORDER BY pp.target_start DESC, pp.station_id DESC LIMIT ' . ($rawTableLimit + 1)
             . ') page '
             . 'JOIN prediction_runs pr ON pr.id = page.run_id '
             . 'JOIN stations s ON s.id = page.station_id '

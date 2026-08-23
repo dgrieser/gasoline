@@ -466,6 +466,11 @@ gasoline doctor --runs 3            # before deciding anything from a difference
 With a single run the report says so rather than letting one sample read as the
 truth. Use `--runs 3` or more whenever a number is going to change a decision.
 
+The band ignores queries under 250 ms. Interference costs a fixed number of
+milliseconds, so as a share it explodes on small timings: on one production run a
+58 ms query varied by 484%, and taking that as the page's band would have
+dismissed every real difference in the report as noise.
+
 ##### Repeats, and the noise band they measure
 
 Naming an index a query **already** forces produces byte-identical SQL, so its second timing is the same statement run twice. Those pairs are labelled `repeat:` rather than `forced:`, they are kept out of the verdict, and they are put to work instead: the widest move they make is this database's own variance, measured in the same run under the same conditions.
@@ -486,6 +491,11 @@ Before this, the verdict averaged all seven pairs together and reported "little 
 If forcing the covering index is much faster, the optimizer is mis-costing it. Refreshing the statistics it reasons from is worth trying first — `ANALYZE TABLE price_predictions`, or `ANALYZE TABLE price_predictions UPDATE HISTOGRAM ON target_start` when the range estimate looks wrong (a `filtered` value pinned near 10% is the tell). Where that does not change the choice, the accuracy page forces the index itself: five of its aggregate queries carry `FORCE INDEX`/`INDEXED BY`, which measured 66–73% faster per query on a live MySQL after both of those statistics commands had failed to move it. The hint is omitted when the index is absent, so an un-migrated database still renders the page. The three breakdown tables — by confidence, by lead-time bucket and by hour — come out of **one** query rather than three. They are three groupings of the same rows, and as three queries each walked the whole filtered slice again: on a production database 1.39M index entries read three times to produce 3, 6 and 24 rows. One pass grouped by all three keys returns at most 3 × 6 × 24 = 432 rows and PHP sums each table out of it. That requires the query to return `SUM` and `COUNT` rather than `AVG`, since the mean of means is not the mean unless every group is the same size; dividing once per table afterwards is exact.
 
 Measured on SQLite over 1.48M rows the three passes took 7.00 s and the single pass 4.81 s — **31% less**, not the two-thirds the shared walk suggests. Grouping is not free: the group key is evaluated for every row in the slice, and there the walk itself is only 0.68 s of it. That is also why the lead bucket is grouped as a small integer and labelled in PHP — the string form cost 674 ms more for exactly the same 336 groups. On MySQL the balance is the other way round (its probes put walking at 1.5–2.0 s of a 1.9–2.9 s query), so the saving there should be larger; measure it with `--runs 3` rather than taking either number on faith.
+
+Two of the page's queries were sorting or grouping against the grain of that index, which the report made visible once `rows` and the breakdowns stopped dominating it:
+
+- **The raw-row query ordered `target_start DESC, station_id ASC`.** Within one fuel the index is ordered `(target_start, station_id)` ascending, so no single scan direction gives descending targets *and* ascending stations — the server had to materialise all 1.4M rows in the range and sort them to find 1001. Ordering both keys descending is that index read backwards, so the `LIMIT` stops after 1001 entries. SQLite's plan drops `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` entirely. The page re-sorts stations ascending for display afterwards, so the only difference is which stations fall inside the cap at its oldest hour — a boundary that is arbitrary either way.
+- **The latest-run subquery grouped `station_id, target_start`.** Same groups either way, but `target_start, station_id` is the index's own order with `run_id` the column immediately after both, which is the shape a server can stream or even answer with a loose index scan. SQLite streamed it both ways, so this one is unverified: look for `Using index for group-by`, or the loss of `Using temporary`, in MySQL's plan.
 
 `series` is deliberately left unhinted — forcing the index there measured −13%, +4%, −1% and +5% over four runs, which straddles zero, so there is nothing to buy.
 

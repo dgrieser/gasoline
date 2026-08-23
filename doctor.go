@@ -501,16 +501,25 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 
 	// The two inner selects below are each built once and used twice: the query
 	// nests them, the probe runs them alone.
+	// GROUP BY target_start first, station_id second. The grouping is the same
+	// either way — the join downstream matches on both keys — but this order is
+	// the index's own within one fuel, so the group-by streams instead of
+	// materialising the whole slice into a temporary table.
 	innerLatestGroup := func(ref string) string {
 		return "SELECT pp.station_id AS station_id, pp.target_start AS target_start, MAX(pp.run_id) AS run_id " +
 			"FROM " + ref + joinRuns + "WHERE " + where +
-			" GROUP BY pp.station_id, pp.target_start"
+			" GROUP BY pp.target_start, pp.station_id"
 	}
+	// Both keys descending, which is the index read backwards, so the LIMIT can
+	// stop after 1001 entries instead of sorting the whole slice to find them.
+	// The page re-sorts station_id ascending for display afterwards; the only
+	// thing this changes is which stations fall inside the cap at its oldest
+	// hour, and that boundary is arbitrary either way.
 	innerRowsPage := func(ref string) string {
 		return "SELECT pp.run_id, pp.station_id, pp.fuel, pp.target_start, pp.target_end, " +
 			"pp.predicted_price, pp.actual_price, pp.error, pp.confidence, pp.lead_minutes, pp.is_suggestion " +
 			"FROM " + ref + joinRuns + "WHERE " + where +
-			" ORDER BY pp.target_start DESC, pp.station_id ASC LIMIT 1001"
+			" ORDER BY pp.target_start DESC, pp.station_id DESC LIMIT 1001"
 	}
 
 	// Bucketed as an integer, labelled in PHP: the group key is evaluated once

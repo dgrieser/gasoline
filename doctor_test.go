@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -627,7 +628,9 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 		},
 		"summary_latest": {
 			"MAX(pp.run_id)",
-			"GROUP BY pp.station_id, pp.target_start",
+			// target_start first: the index's own order within one fuel, with
+			// run_id the column immediately after both keys.
+			"GROUP BY pp.target_start, pp.station_id",
 			"latest.run_id = pp.run_id",
 			// The outer fuel predicate is what makes the covering index usable
 			// for the join; losing it silently costs ~18 s on the live
@@ -648,7 +651,9 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 		"series": {"AVG(pp.predicted_price)", "GROUP BY pp.target_start"},
 		"rows": {
 			"COALESCE(s.name_override, s.name)",
-			"ORDER BY pp.target_start DESC, pp.station_id ASC",
+			// Both keys descending, so the LIMIT is a backward index read
+			// rather than a sort of the whole slice.
+			"ORDER BY pp.target_start DESC, pp.station_id DESC",
 			// Filter, order and cap must stay inside the derived table, ahead
 			// of the metadata joins.
 			") page ",
@@ -2278,16 +2283,23 @@ func TestSpreadFindingSaysWhatWasAndWasNotMeasured(t *testing.T) {
 		{Name: "summary", DurationMS: 2308, SpreadMS: 120},
 		{Name: "rows", DurationMS: 6000, SpreadMS: 1800}, // 30%
 		{Name: "skipped", Skipped: true, SpreadMS: 9999},
+		// Below the floor: a 58 ms query moved 484% on production, and letting
+		// that set the page's band dismissed every real difference as noise.
+		{Name: "decisions", DurationMS: 58, SpreadMS: 281},
 	}
 	finding, ok := spreadFinding(queries, 3)
 	if !ok {
 		t.Fatal("repeats must produce a band")
 	}
-	for _, want := range []string{"over 3 runs the widest spread on one query was 30% (rows)",
+	for _, want := range []string{"widest spread on any query above 250 ms was 30% (rows)",
 		"treat differences below that as noise", "the fastest of the 3"} {
 		if !strings.Contains(finding.Message, want) {
 			t.Errorf("finding is missing %q:\n%s", want, finding.Message)
 		}
+	}
+
+	if strings.Contains(finding.Message, "decisions") {
+		t.Errorf("a 58 ms query must not set the page's band:\n%s", finding.Message)
 	}
 
 	single, ok := spreadFinding(queries, 1)
@@ -2439,5 +2451,144 @@ func TestBreakdownsOnePassMatchesThreeQueries(t *testing.T) {
 				t.Errorf("%s[%s]: lead_floor %d, want %d", tc.name, key, gotAgg.floor, wantAgg.floor)
 			}
 		}
+	}
+}
+
+// TestAccuracyRowsCapAtATiedBoundary covers what changed when the inner select
+// started reading the index backwards on both keys. The cap can only fall in the
+// middle of an hour that several stations share, so which of them it keeps is
+// what the tie-break decides — and whatever it decides, the page's contract is
+// the same: exactly the cap, nothing older than the boundary hour, and displayed
+// newest-first with stations ascending.
+func TestAccuracyRowsCapAtATiedBoundary(t *testing.T) {
+	ctx := context.Background()
+	db, err := openDB(filepath.Join(t.TempDir(), "tied.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(ctx, db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	// 20 stations x 60 hours = 1200 rows, so the 1001-row cap lands inside an
+	// hour that all 20 stations share.
+	const stations, hours = 20, 60
+	for i := 0; i < stations; i++ {
+		if _, err := db.ExecContext(ctx, `INSERT INTO stations
+			(id, name, lat, lng, first_seen_at, last_seen_at) VALUES (?, ?, 52.0, 13.0, '', '')`,
+			fmt.Sprintf("st-%02d", i), fmt.Sprintf("Station %02d", i)); err != nil {
+			t.Fatalf("insert station: %v", err)
+		}
+	}
+	res, err := db.ExecContext(ctx, `INSERT INTO prediction_runs
+		(run_at, city_name, fuel, range_km, history_days, predict_days)
+		VALUES ('2026-07-01T00:00:00Z', 'Berlin', 'diesel', 5, 30, 3)`)
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	runID, _ := res.LastInsertId()
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	for h := 0; h < hours; h++ {
+		target := base.Add(time.Duration(h) * time.Hour)
+		for i := 0; i < stations; i++ {
+			if _, err := db.ExecContext(ctx, `INSERT INTO price_predictions
+				(run_id, station_id, fuel, target_start, target_end, predicted_price, confidence,
+				 sample_count, is_suggestion, lead_minutes, applied_correction, actual_price, error, evaluated_at)
+				VALUES (?, ?, 'diesel', ?, ?, 1.7, 'medium', 20, 0, 60, 0.0, 1.71, 0.01, ?)`,
+				runID, fmt.Sprintf("st-%02d", i), target.Format(time.RFC3339),
+				target.Add(time.Hour).Format(time.RFC3339), target.Format(time.RFC3339)); err != nil {
+				t.Fatalf("insert prediction: %v", err)
+			}
+		}
+	}
+
+	filters := doctorFilters{Fuel: "diesel", Confidence: "all",
+		From: "2026-01-01T00:00:00Z", To: "2027-01-01T23:59:59Z"}
+	var spec accuracyQuerySpec
+	for _, candidate := range pageSpecs(filters, false) {
+		if candidate.name == "rows" {
+			spec = candidate
+		}
+	}
+	rows, err := db.QueryContext(ctx, spec.sql, spec.args...)
+	if err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("columns: %v", err)
+	}
+	type seen struct {
+		target  string
+		station string
+	}
+	var got []seen
+	for rows.Next() {
+		cells := make([]any, len(columns))
+		for i := range cells {
+			cells[i] = new(sql.NullString)
+		}
+		if err := rows.Scan(cells...); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		var entry seen
+		for i, name := range columns {
+			value := cells[i].(*sql.NullString).String
+			switch name {
+			case "target_start":
+				entry.target = value
+			case "station_id":
+				entry.station = value
+			}
+		}
+		got = append(got, entry)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	if len(got) != 1001 {
+		t.Fatalf("returned %d rows, want the 1001 cap", len(got))
+	}
+	// Newest-first for display, stations ascending inside an hour. This is the
+	// outer ORDER BY and it must hold whichever direction the inner select read.
+	for i := 1; i < len(got); i++ {
+		prev, cur := got[i-1], got[i]
+		if cur.target > prev.target {
+			t.Fatalf("row %d target %s is newer than the row before it (%s)", i, cur.target, prev.target)
+		}
+		if cur.target == prev.target && cur.station < prev.station {
+			t.Fatalf("row %d station %s precedes %s within one hour", i, cur.station, prev.station)
+		}
+	}
+	// Nothing older than the boundary hour, and the boundary hour is partial —
+	// which is the case that only exists because stations tie there.
+	boundary := got[len(got)-1].target
+	counts := map[string]int{}
+	for _, entry := range got {
+		if entry.target < boundary {
+			t.Fatalf("row older than the boundary hour %s slipped in: %s", boundary, entry.target)
+		}
+		counts[entry.target]++
+	}
+	if counts[boundary] == stations {
+		t.Fatalf("the boundary hour is complete, so the cap did not land on a tie; the test proves nothing")
+	}
+	// Every hour above the boundary is complete: the cap took whole hours until
+	// it ran out, which is what "keep the newest" means here.
+	for target, n := range counts {
+		if target != boundary && n != stations {
+			t.Errorf("hour %s kept %d of %d stations; only the boundary hour may be partial",
+				target, n, stations)
+		}
+	}
+	// And the newest hour in the data is present, not the oldest.
+	newest := base.Add(time.Duration(hours-1) * time.Hour).Format(time.RFC3339)
+	if counts[newest] != stations {
+		t.Errorf("the newest hour %s is not fully present", newest)
+	}
+	if _, ok := counts[base.Format(time.RFC3339)]; ok {
+		t.Error("the oldest hour was kept; the cap must keep the newest")
 	}
 }
