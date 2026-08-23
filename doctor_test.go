@@ -160,7 +160,7 @@ func TestRunDoctorReportsTablesIndexesAndQueries(t *testing.T) {
 	}
 
 	// Every page query must run, return rows, and be attributed to a table.
-	wantQueries := []string{"summary", "summary_latest", "breakdowns", "series", "rows", "decisions"}
+	wantQueries := []string{"summary", "summary_latest", "breakdowns", "rows", "decisions"}
 	got := map[string]doctorQuery{}
 	for _, q := range result.Queries {
 		got[q.Name] = q
@@ -637,18 +637,19 @@ func TestDoctorAccuracyQueriesMatchViewer(t *testing.T) {
 			// database, so both sides must keep it.
 			"WHERE pp.fuel = ",
 		},
-		// One pass for all three breakdown tables: the three group keys
-		// together, and SUM rather than AVG, because an average cannot be
-		// re-aggregated per dimension afterwards.
+		// One pass for the three breakdown tables and the chart. SUM rather
+		// than AVG, because an average cannot be re-aggregated per dimension
+		// afterwards; the hour is a substring of target_start and the chart is
+		// the sum per target_start, so neither needs a pass of its own.
 		"breakdowns": {
-			"GROUP BY pp.confidence, ",
+			"GROUP BY pp.target_start, pp.confidence, ",
 			"WHEN pp.lead_minutes < 360 THEN 2",
 			"MIN(pp.lead_minutes)",
-			"SUBSTR(pp.target_start, 12, 2)",
 			"SUM(ABS(pp.error))",
 			"SUM(pp.error)",
+			"SUM(pp.predicted_price)",
+			"SUM(pp.actual_price)",
 		},
-		"series": {"AVG(pp.predicted_price)", "GROUP BY pp.target_start"},
 		"rows": {
 			"COALESCE(s.name_override, s.name)",
 			// Both keys descending, so the LIMIT is a backward index read
@@ -1162,8 +1163,10 @@ func TestViewerHintMatchesDoctor(t *testing.T) {
 	if got := strings.Count(php, "$ppHinted ."); got != wantRefs {
 		t.Errorf("web/index.php splices $ppHinted into %d references, want %d", got, wantRefs)
 	}
-	if got := strings.Count(php, "'FROM price_predictions pp ' . $joinRuns"); got != 1 {
-		t.Errorf("web/index.php has %d unhinted accuracy queries, want 1 (series)", got)
+	// Every accuracy query is hinted now that the chart comes out of the
+	// breakdown pass, so nothing should still name the table directly.
+	if got := strings.Count(php, "'FROM price_predictions pp ' . $joinRuns"); got != 0 {
+		t.Errorf("web/index.php has %d unhinted accuracy queries, want none", got)
 	}
 }
 
@@ -2313,12 +2316,13 @@ func TestSpreadFindingSaysWhatWasAndWasNotMeasured(t *testing.T) {
 	}
 }
 
-// TestBreakdownsOnePassMatchesThreeQueries is the correctness check the collapse
-// needs. The three breakdown tables used to be three grouped queries computing
-// AVG in SQL; they are now one pass returning SUM and COUNT per
-// (confidence, lead bucket, hour), with each table summed out of it afterwards.
-// This runs both forms against real rows and compares what the page would show.
-func TestBreakdownsOnePassMatchesThreeQueries(t *testing.T) {
+// TestBreakdownsOnePassMatchesFourQueries is the correctness check the collapse
+// needs. The three breakdown tables and the chart series used to be four grouped
+// queries computing AVG in SQL; they are now one pass returning SUM and COUNT
+// per (target_start, confidence, lead bucket), with each table summed out of it
+// afterwards. This runs both forms against real rows and compares what the page
+// would show.
+func TestBreakdownsOnePassMatchesFourQueries(t *testing.T) {
 	_, db := seedDoctorDB(t)
 	defer db.Close()
 	ctx := context.Background()
@@ -2371,23 +2375,28 @@ func TestBreakdownsOnePassMatchesThreeQueries(t *testing.T) {
 		"confidence": {}, "bucket": {}, "hour": {},
 	}
 	floors := map[string]int{}
-	rows, err := db.QueryContext(ctx, "SELECT pp.confidence, "+leadBucket+", "+hourExpr+", "+
-		"MIN(pp.lead_minutes), COUNT(*), SUM(ABS(pp.error)), SUM(pp.error) "+
+	seriesGot := map[string][3]float64{} // target_start -> {count, sum predicted, sum actual}
+	rows, err := db.QueryContext(ctx, "SELECT pp.target_start, pp.confidence, "+leadBucket+", "+
+		"MIN(pp.lead_minutes), COUNT(*), SUM(ABS(pp.error)), SUM(pp.error), "+
+		"SUM(pp.predicted_price), SUM(pp.actual_price) "+
 		"FROM price_predictions pp WHERE "+where+
-		" GROUP BY pp.confidence, "+leadBucket+", "+hourExpr, args...)
+		" GROUP BY pp.target_start, pp.confidence, "+leadBucket, args...)
 	if err != nil {
 		t.Fatalf("one pass: %v", err)
 	}
 	defer rows.Close()
 	groups := 0
 	for rows.Next() {
-		var confidence, bucket, hour string
+		var target, confidence, bucket string
 		var floor, n int
-		var absError, sumError float64
-		if err := rows.Scan(&confidence, &bucket, &hour, &floor, &n, &absError, &sumError); err != nil {
+		var absError, sumError, sumPredicted, sumActual float64
+		if err := rows.Scan(&target, &confidence, &bucket, &floor, &n,
+			&absError, &sumError, &sumPredicted, &sumActual); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
 		groups++
+		// The hour the page derives in PHP: characters 12-13 of target_start.
+		hour := target[11:13]
 		for dim, key := range map[string]string{"confidence": confidence, "bucket": bucket, "hour": hour} {
 			prev := sums[dim][key]
 			sums[dim][key] = [3]float64{prev[0] + float64(n), prev[1] + absError, prev[2] + sumError}
@@ -2395,6 +2404,8 @@ func TestBreakdownsOnePassMatchesThreeQueries(t *testing.T) {
 		if prev, ok := floors[bucket]; !ok || floor < prev {
 			floors[bucket] = floor
 		}
+		point := seriesGot[target]
+		seriesGot[target] = [3]float64{point[0] + float64(n), point[1] + sumPredicted, point[2] + sumActual}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("rows: %v", err)
@@ -2451,6 +2462,49 @@ func TestBreakdownsOnePassMatchesThreeQueries(t *testing.T) {
 				t.Errorf("%s[%s]: lead_floor %d, want %d", tc.name, key, gotAgg.floor, wantAgg.floor)
 			}
 		}
+	}
+
+	// And the chart, which was the fourth query: mean predicted against mean
+	// actual per window.
+	seriesRows, err := db.QueryContext(ctx, "SELECT pp.target_start, AVG(pp.predicted_price), "+
+		"AVG(pp.actual_price), COUNT(*) FROM price_predictions pp WHERE "+where+
+		" GROUP BY pp.target_start", args...)
+	if err != nil {
+		t.Fatalf("series reference: %v", err)
+	}
+	defer seriesRows.Close()
+	points := 0
+	for seriesRows.Next() {
+		var target string
+		var wantPredicted, wantActual float64
+		var wantCount int
+		if err := seriesRows.Scan(&target, &wantPredicted, &wantActual, &wantCount); err != nil {
+			t.Fatalf("scan series: %v", err)
+		}
+		points++
+		got, ok := seriesGot[target]
+		if !ok {
+			t.Errorf("the one pass lost chart window %s", target)
+			continue
+		}
+		if int(got[0]) != wantCount {
+			t.Errorf("series[%s]: count %d, want %d", target, int(got[0]), wantCount)
+		}
+		if math.Abs(got[1]/got[0]-wantPredicted) > tolerance {
+			t.Errorf("series[%s]: mean predicted %v, want %v", target, got[1]/got[0], wantPredicted)
+		}
+		if math.Abs(got[2]/got[0]-wantActual) > tolerance {
+			t.Errorf("series[%s]: mean actual %v, want %v", target, got[2]/got[0], wantActual)
+		}
+	}
+	if err := seriesRows.Err(); err != nil {
+		t.Fatalf("series rows: %v", err)
+	}
+	if points == 0 {
+		t.Fatal("the reference series returned nothing to compare")
+	}
+	if len(seriesGot) != points {
+		t.Errorf("the one pass produced %d chart windows, the reference %d", len(seriesGot), points)
 	}
 }
 

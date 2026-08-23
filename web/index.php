@@ -374,14 +374,15 @@ function gasolineLeadBucketSql(): string
  * the mean of means is not the mean unless every group is the same size. Adding
  * the sums and dividing once per table is exact, not an approximation.
  *
- * @param array<int, array<string, mixed>> $rows one row per (confidence, bucket, hour)
- * @return array{by_confidence: array<int, array<string, mixed>>, by_lead: array<int, array<string, mixed>>, by_hour: array<int, array<string, mixed>>}
+ * @param array<int, array<string, mixed>> $rows one row per (target_start, confidence, bucket)
+ * @return array{by_confidence: array<int, array<string, mixed>>, by_lead: array<int, array<string, mixed>>, by_hour: array<int, array<string, mixed>>, series: array<int, array<string, mixed>>}
  */
 function gasolineBreakdownTables(array $rows): array
 {
     $byConfidence = [];
     $byLead = [];
     $byHour = [];
+    $byTarget = [];
 
     // lead_floor is carried through as the JS sort key for the lead table, which
     // orders buckets by their lower bound rather than by the label — otherwise
@@ -402,9 +403,21 @@ function gasolineBreakdownTables(array $rows): array
         $n = (int) $row['n'];
         $absError = (float) $row['abs_error'];
         $sumError = (float) $row['sum_error'];
+        $target = (string) $row['t'];
         $add($byConfidence, (string) $row['confidence'], $n, $absError, $sumError, null);
         $add($byLead, (string) $row['bucket'], $n, $absError, $sumError, (int) $row['lead_floor']);
-        $add($byHour, (string) $row['hour'], $n, $absError, $sumError, null);
+        // Target windows are hourly and target_start is fixed-width RFC3339, so
+        // characters 12-13 are the UTC hour.
+        $add($byHour, substr($target, 11, 2), $n, $absError, $sumError, null);
+
+        // The chart wants mean predicted against mean actual per window, which
+        // is the same sum-then-divide as the tables above on different columns.
+        if (!isset($byTarget[$target])) {
+            $byTarget[$target] = ['count' => 0, 'predicted' => 0.0, 'actual' => 0.0];
+        }
+        $byTarget[$target]['count'] += $n;
+        $byTarget[$target]['predicted'] += (float) $row['sum_predicted'];
+        $byTarget[$target]['actual'] += (float) $row['sum_actual'];
     }
 
     // A group with no rows cannot occur — GROUP BY only returns keys that
@@ -414,7 +427,7 @@ function gasolineBreakdownTables(array $rows): array
         return $count > 0 ? $total / $count : 0.0;
     };
 
-    $out = ['by_confidence' => [], 'by_lead' => [], 'by_hour' => []];
+    $out = ['by_confidence' => [], 'by_lead' => [], 'by_hour' => [], 'series' => []];
     foreach ($byConfidence as $confidence => $agg) {
         $out['by_confidence'][] = [
             'confidence' => (string) $confidence,
@@ -444,6 +457,18 @@ function gasolineBreakdownTables(array $rows): array
             'count' => $agg['count'],
             'mae' => $mean($agg['abs'], $agg['count']),
             'bias' => $mean($agg['sum'], $agg['count']),
+        ];
+    }
+    // Oldest window first: the chart plots left to right in time, and the query
+    // no longer orders its rows because this sort is cheaper than one over the
+    // whole slice.
+    ksort($byTarget);
+    foreach ($byTarget as $target => $agg) {
+        $out['series'][] = [
+            't' => (string) $target,
+            'p' => round($mean($agg['predicted'], $agg['count']), 4),
+            'a' => round($mean($agg['actual'], $agg['count']), 4),
+            'n' => $agg['count'],
         ];
     }
     return $out;
@@ -4105,14 +4130,18 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         }
 
         // 2) The three breakdown tables — by confidence, by lead-time bucket and
-        //    by hour of day — come out of one pass.
+        //    by hour of day — and the predicted-vs-actual chart series all come
+        //    out of one pass.
         //
-        //    They are three groupings of exactly the same rows, and they used to
-        //    be three queries, each walking the whole filtered slice again: on a
-        //    production database that was 1.39M index entries read three times
-        //    for 4.5-6 s, to produce 3, 6 and 24 rows. Grouping by all three
-        //    keys at once reads the slice once and returns at most
-        //    3 x 6 x 24 = 432 rows, which PHP then sums down each dimension.
+        //    They are four groupings of exactly the same rows, and they used to
+        //    be four queries, each walking the whole filtered slice again: on a
+        //    production database that was 1.4M index entries read four times, to
+        //    produce 3, 6, 24 and ~570 rows. Grouping by target_start,
+        //    confidence and lead bucket at once reads the slice once; hour is a
+        //    substring of target_start and the chart is the sum per
+        //    target_start, so every table falls out of that one result. Measured
+        //    on SQLite, folding the chart into the breakdown pass cost nothing
+        //    at all — the merged query timed the same as the breakdowns alone.
         //
         //    The sums are what make that possible: an average cannot be
         //    re-aggregated (the mean of means is not the mean unless every group
@@ -4127,21 +4156,23 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         //
         //    The 3-6h lead boundary is deliberately 360 minutes, the cutoff
         //    below which predictions.go lets predictions train the bias
-        //    correction, so the table shows both sides of that line. Hours come
-        //    from SUBSTR on target_start, a fixed-width RFC3339 UTC string (see
-        //    the invariant above): SUBSTR avoids strftime()/HOUR(), neither of
-        //    which exists in both SQLite and MySQL, so the buckets are UTC hours
-        //    and the UI labels them as such rather than silently shifting them
-        //    into the viewer's timezone.
+        //    correction, so the table shows both sides of that line. Hours are
+        //    taken in PHP from characters 12-13 of target_start, a fixed-width
+        //    RFC3339 UTC string (see the invariant above); doing it there rather
+        //    than with SUBSTR in the group key avoids evaluating it per row, and
+        //    sidesteps strftime()/HOUR(), neither of which exists in both SQLite
+        //    and MySQL. The buckets are therefore UTC hours and the UI labels
+        //    them as such rather than silently shifting them into the viewer's
+        //    timezone.
         $leadBucket = gasolineLeadBucketSql();
-        $hourExpr = 'SUBSTR(pp.target_start, 12, 2)';
         $breakdownStmt = $pdo->prepare(
-            'SELECT pp.confidence AS confidence, ' . $leadBucket . ' AS bucket, '
-            . $hourExpr . ' AS hour, MIN(pp.lead_minutes) AS lead_floor, '
-            . 'COUNT(*) AS n, SUM(ABS(pp.error)) AS abs_error, SUM(pp.error) AS sum_error '
+            'SELECT pp.target_start AS t, pp.confidence AS confidence, '
+            . $leadBucket . ' AS bucket, MIN(pp.lead_minutes) AS lead_floor, '
+            . 'COUNT(*) AS n, SUM(ABS(pp.error)) AS abs_error, SUM(pp.error) AS sum_error, '
+            . 'SUM(pp.predicted_price) AS sum_predicted, SUM(pp.actual_price) AS sum_actual '
             . 'FROM ' . $ppHinted . $joinRuns
             . 'WHERE ' . $where
-            . ' GROUP BY pp.confidence, ' . $leadBucket . ', ' . $hourExpr
+            . ' GROUP BY pp.target_start, pp.confidence, ' . $leadBucket
         );
         $bind($breakdownStmt);
         $breakdownStmt->execute();
@@ -4150,6 +4181,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         $out['by_confidence'] = $breakdowns['by_confidence'];
         $out['by_lead'] = $breakdowns['by_lead'];
         $out['by_hour'] = $breakdowns['by_hour'];
+        $out['series'] = $breakdowns['series'];
 
         // 2d) Alert outcomes: when the check path said buy, how close to that
         //     pricing day's floor did the price turn out to be? Only settled
@@ -4187,25 +4219,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
                 ];
             }
             $out['decisions'] = $decisions;
-        }
-
-        // 3) Time series aggregated per target hour. Target windows are hourly, so
-        //    GROUP BY target_start is one point per hour — bounded to the range
-        //    (<= 24*days). Each point carries mean predicted vs mean actual.
-        $seriesStmt = $pdo->prepare(
-            'SELECT pp.target_start AS t, AVG(pp.predicted_price) AS p, AVG(pp.actual_price) AS a, COUNT(*) AS n '
-            . 'FROM price_predictions pp ' . $joinRuns
-            . 'WHERE ' . $where . ' GROUP BY pp.target_start ORDER BY pp.target_start ASC'
-        );
-        $bind($seriesStmt);
-        $seriesStmt->execute();
-        foreach ($seriesStmt->fetchAll() as $row) {
-            $out['series'][] = [
-                't' => (string) $row['t'],
-                'p' => round((float) $row['p'], 4),
-                'a' => round((float) $row['a'], 4),
-                'n' => (int) $row['n'],
-            ];
         }
 
         // 4) Raw rows for the table — newest target first, capped. Station metadata

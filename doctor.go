@@ -414,9 +414,11 @@ type accuracyQueryContext struct {
 // idx_price_predictions_accuracy on (see gasolineAccuracyIndexHint in
 // web/index.php).
 //
-// series is the only one deliberately absent: forcing the index there moved it
-// by -13%, +4%, -1% and +5% over four runs, which straddles zero, so it keeps
-// the plain reference and leaves the optimizer free.
+// Every price_predictions query is on this list now. series used to be the
+// exception — forcing the index there moved it by -13%, +4%, -1% and +5% over
+// four runs, which straddles zero — but it is no longer a query of its own: the
+// chart comes out of the breakdowns pass. The map stays because a query added
+// later should default to unhinted and be measured rather than inherit a hint.
 //
 // rows was absent too until the table passed 8M rows and the measurement that
 // justified it (-2%) stopped holding. The optimizer now drives it from
@@ -532,7 +534,6 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 		" WHEN pp.lead_minutes < 720 THEN 3" +
 		" WHEN pp.lead_minutes < 1440 THEN 4" +
 		" ELSE 5 END"
-	hourExpr := "SUBSTR(pp.target_start, 12, 2)"
 
 	specs := []accuracyQuerySpec{
 		{
@@ -582,29 +583,18 @@ func accuracyQuerySpecsFor(qc accuracyQueryContext) []accuracyQuerySpec {
 		},
 		{
 			name:    "breakdowns",
-			purpose: "the confidence, lead-time and hour tables, from one pass",
-			sql: "SELECT pp.confidence AS confidence, " + leadBucket + " AS bucket, " +
-				hourExpr + " AS hour, MIN(pp.lead_minutes) AS lead_floor, " +
-				"COUNT(*) AS n, SUM(ABS(pp.error)) AS abs_error, SUM(pp.error) AS sum_error " +
+			purpose: "the confidence, lead-time and hour tables plus the chart series, from one pass",
+			sql: "SELECT pp.target_start AS t, pp.confidence AS confidence, " +
+				leadBucket + " AS bucket, MIN(pp.lead_minutes) AS lead_floor, " +
+				"COUNT(*) AS n, SUM(ABS(pp.error)) AS abs_error, SUM(pp.error) AS sum_error, " +
+				"SUM(pp.predicted_price) AS sum_predicted, SUM(pp.actual_price) AS sum_actual " +
 				"FROM " + predictionsFor("breakdowns") + joinRuns + "WHERE " + where +
-				" GROUP BY pp.confidence, " + leadBucket + ", " + hourExpr,
+				" GROUP BY pp.target_start, pp.confidence, " + leadBucket,
 			args:     argsFor(1),
 			table:    "price_predictions",
 			alias:    "pp",
 			probe:    walkedProbe("breakdowns"),
-			probeGap: "grouping those rows by confidence, lead bucket and hour at once",
-		},
-		{
-			name:    "series",
-			purpose: "predicted-vs-actual timeline",
-			sql: "SELECT pp.target_start AS t, AVG(pp.predicted_price) AS p, AVG(pp.actual_price) AS a, COUNT(*) AS n " +
-				"FROM " + predictionsFor("series") + joinRuns + "WHERE " + where +
-				" GROUP BY pp.target_start ORDER BY pp.target_start ASC",
-			args:     argsFor(1),
-			table:    "price_predictions",
-			alias:    "pp",
-			probe:    walkedProbe("series"),
-			probeGap: "grouping and ordering those rows",
+			probeGap: "grouping those rows by window, confidence and lead bucket at once",
 		},
 		{
 			name:    "rows",

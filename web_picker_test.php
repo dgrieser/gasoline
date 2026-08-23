@@ -294,9 +294,12 @@ echo "web_picker_test: gasolineBreakdownTables\n";
 // are deliberately unequal, because that is exactly when the mean of means
 // differs from the mean — the mistake returning SUM and COUNT exists to avoid.
 $brRow = static function (string $conf, int $bucket, string $hour, int $n,
-    float $abs, float $sum, int $floor): array {
-    return ['confidence' => $conf, 'bucket' => $bucket, 'hour' => $hour,
-        'n' => $n, 'abs_error' => $abs, 'sum_error' => $sum, 'lead_floor' => $floor];
+    float $abs, float $sum, int $floor, float $predicted = 0.0, float $actual = 0.0): array {
+    // hour is a substring of target_start now, so the fixture builds a window at
+    // that hour rather than passing the hour separately.
+    return ['t' => '2026-07-01T' . $hour . ':00:00Z', 'confidence' => $conf, 'bucket' => $bucket,
+        'n' => $n, 'abs_error' => $abs, 'sum_error' => $sum, 'lead_floor' => $floor,
+        'sum_predicted' => $predicted, 'sum_actual' => $actual];
 };
 $tables = gasolineBreakdownTables([
     $brRow('high', 0, '08', 10, 0.100, 0.050, 5),
@@ -342,8 +345,26 @@ check('a zero-padded hour becomes an integer',
     array_map(static fn(array $r): string => gettype($r['hour']), $tables['by_hour']),
     ['integer', 'integer']);
 
-check('no rows produces three empty tables', gasolineBreakdownTables([]),
-    ['by_confidence' => [], 'by_lead' => [], 'by_hour' => []]);
+check('no rows produces four empty tables', gasolineBreakdownTables([]),
+    ['by_confidence' => [], 'by_lead' => [], 'by_hour' => [], 'series' => []]);
+
+// The chart series comes out of the same pass: mean predicted against mean
+// actual per window, summed across that window's confidence and bucket groups.
+$chart = gasolineBreakdownTables([
+    $brRow('high', 0, '09', 2, 0.2, 0.1, 5, 3.40, 3.50),
+    $brRow('low', 1, '09', 1, 0.5, -0.5, 61, 1.70, 1.20),
+    $brRow('high', 0, '08', 1, 0.1, 0.1, 7, 1.80, 1.90),
+])['series'];
+check('the series has one point per window', count($chart), 2);
+check('windows are ordered oldest first for the chart',
+    array_map(static fn(array $p): string => $p['t'], $chart),
+    ['2026-07-01T08:00:00Z', '2026-07-01T09:00:00Z']);
+check('a window sums its groups before dividing', $chart[1]['n'], 3);
+// (3.40 + 1.70) / 3 = 1.7, (3.50 + 1.20) / 3 = 1.5667
+check('mean predicted divides the summed price by the summed count', $chart[1]['p'], 1.7);
+check('mean actual likewise', $chart[1]['a'], round(4.70 / 3, 4));
+check('a single-group window still averages', [$chart[0]['p'], $chart[0]['a'], $chart[0]['n']],
+    [1.8, 1.9, 1]);
 
 // The SQL emits one index per label, so the two cannot drift apart silently.
 $labels = gasolineLeadBucketLabels();
