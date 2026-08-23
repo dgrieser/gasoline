@@ -9173,23 +9173,29 @@ if (!chartEl) {
         // fuels that actually produced a line.
         const trendLegend = [];
         for (const fuel of activeFuels) {
-            // Each sample is weighted by how long its price stood, and sits at
-            // the middle of that hold. Weighting rows equally instead would let
-            // a station that repriced eight times a day outvote one that
-            // repriced once — snapshots are only written when a price moves —
-            // and would tilt the fit toward the hours when the market churns.
-            // Taking the hold's midpoint rather than fitting the staircase
-            // itself keeps the slope honest for a coarsely sampled station,
-            // which would otherwise read flatter than its prices really moved.
+            // Fit the step function the chart actually draws, not the rows
+            // that encode it: a price holds until the station reprices, so
+            // each sample carries the weight of its hold and sits at the
+            // middle of it. The five sums below are then the exact integrals
+            // of that step function over the window, which makes the fit
+            // depend only on the prices and how long each one stood — never on
+            // how many rows they arrive in. That last part matters here: row
+            // density is partly an artefact. Snapshots are only written when a
+            // price moves, the newest one is refreshed in place, and a ranged
+            // view synthesizes carry-in rows at the left edge. Weighting rows
+            // equally would let all of that move the line — the same staircase
+            // read 12.5 ct/day cut one way and 8.7 cut another — and would let
+            // a station that reprices hourly outvote one that reprices daily.
             // Time is hours from the window's left edge, not epoch millis: the
             // sums of squares stay small enough to hold their precision, and
             // the slope comes out per hour, which is what the legend reports.
             let sumW = 0, sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
-            let firstTs = Infinity;
+            let firstTs = Infinity, lastTs = -Infinity;
             for (const stationRows of byStation.values()) {
                 const series = stationRows.filter((r) => r[fuel] !== null);
                 if (series.length === 0) continue;
                 if (series[0]._ts < firstTs) firstTs = series[0]._ts;
+                if (series[series.length - 1]._ts > lastTs) lastTs = series[series.length - 1]._ts;
                 for (let i = 0; i < series.length; i++) {
                     // The last price of a series stands to the window's right
                     // edge, the same reading the crosshair gives it.
@@ -9201,11 +9207,18 @@ if (!chartEl) {
                     sumW += w;
                     sumX += w * mid;
                     sumY += w * v;
-                    sumXX += w * mid * mid;
+                    // The w^2/12 term is the hold's own spread about its
+                    // midpoint. Without it this sum is not the integral of
+                    // t^2, and splitting one hold into two would move the fit.
+                    sumXX += w * (mid * mid + (w * w) / 12);
                     sumXY += w * mid * v;
                 }
             }
-            if (sumW <= 0) continue;                     // nothing holds for any time
+            // A single observation holds for the window's whole width, which is
+            // enough for the arithmetic but not enough to claim a direction
+            // from — the chart does not even draw a price line for it. A trend
+            // needs this fuel priced at two different times.
+            if (sumW <= 0 || lastTs <= firstTs) continue;
             const denom = sumW * sumXX - sumX * sumX;
             if (denom <= 0) continue;                    // no spread in time to trend over
             const slope = (sumW * sumXY - sumX * sumY) / denom;   // € per hour
