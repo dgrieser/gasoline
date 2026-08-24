@@ -44,9 +44,22 @@ function extractFunction(string $source, string $name): string
 }
 
 $viewer = file_get_contents(__DIR__ . '/web/index.php');
+// The filter functions read the page's own limits, so the constants come from
+// the page too rather than being restated here where they could drift.
+foreach (['DASHBOARD_RADIUS_OPTIONS', 'DASHBOARD_RANGE_DAYS', 'DASHBOARD_FUELS',
+    'DASHBOARD_STATION_LIMIT'] as $name) {
+    if (!preg_match('/^const ' . $name . ' = .*?;$/ms', $viewer, $match)) {
+        fwrite(STDERR, "web/index.php no longer defines {$name}\n");
+        exit(2);
+    }
+    eval($match[0]);
+}
 foreach (['raisedNinePrice', 'raisedNinePriceSql', 'loadNearbyPrices', 'geocodeLabel',
-    'cacheGeocodedPlace', 'nowUTC', 'loadFilteredPredictions', 'gasolineCommandStatsSeries',
-    'gasolineLeadBucketLabels', 'gasolineLeadBucketSql', 'gasolineBreakdownTables'] as $name) {
+    'postalCodeMatches', 'nowUTC', 'validISODate', 'defaultDashboardFilters',
+    'normalizeDashboardFilters', 'normalizeDashboardStationIds', 'loadDashboardFilters',
+    'saveDashboardFilters', 'clearDashboardFilters', 'loadFilteredPredictions',
+    'gasolineCommandStatsSeries', 'gasolineLeadBucketLabels', 'gasolineLeadBucketSql',
+    'gasolineBreakdownTables'] as $name) {
     eval(extractFunction($viewer, $name));
 }
 
@@ -465,10 +478,11 @@ check('a station without any snapshot is dropped',
 check('a station without a measured distance still lists, with a null distance',
     loadNearbyPrices($pdo, scopeStations(['a']), [], 10)[0]['dist'], null);
 
-echo "web_picker_test: geocodeLabel / cacheGeocodedPlace\n";
+echo "web_picker_test: geocodeLabel\n";
 
-// The label is the cache key and what the filter input shows, so what matters
-// is that it folds Nominatim's verbose answer down deterministically.
+// The label is what the sidebar shows and what gets stored on the filter row,
+// so what matters is that it folds Nominatim's verbose answer down to something
+// a reader recognises as their own address.
 check('a house number folds to street, postcode, place',
     geocodeLabel([
         'display_name' => '5, Hauptstraße, Mitte, Berlin, 10115, Deutschland',
@@ -479,9 +493,12 @@ check('a house number folds to street, postcode, place',
 check('a street without a number keeps the street',
     geocodeLabel(['address' => ['road' => 'Hauptstraße', 'city' => 'Berlin', 'postcode' => '10115']]),
     'Hauptstraße, 10115 Berlin');
-check('a plain city folds to the city, matching what the CLI caches',
+check('a plain city folds to the city',
     geocodeLabel(['display_name' => 'Berlin, Deutschland', 'address' => ['city' => 'Berlin']]),
     'Berlin');
+check('a postal code alone resolves to its place',
+    geocodeLabel(['address' => ['postcode' => '10115', 'city' => 'Berlin']]),
+    '10115 Berlin');
 check('a village stands in for a city',
     geocodeLabel(['address' => ['village' => 'Kleinkleckersdorf', 'postcode' => '12345']]),
     '12345 Kleinkleckersdorf');
@@ -490,55 +507,181 @@ check('no structured address falls back to the leading free-text parts',
     'Steinhuder Meer, Wunstorf');
 check('and to the bare name when there is not even that',
     geocodeLabel(['name' => 'Nirgendwo']), 'Nirgendwo');
-// cities.name is VARCHAR(255) and the label is its primary key.
-check('an absurd label is cut to fit the key column',
+// user_filters.location_label is VARCHAR(255).
+check('an absurd label is cut to fit the column',
     mb_strlen(geocodeLabel(['display_name' => str_repeat('a', 400) . ', x'])), 200);
 
-/** An empty cities cache, as `gasoline migrate` creates it. */
-function seedCities(array $rows): PDO
+echo "web_picker_test: postalCodeMatches\n";
+
+/** Station rows, enough of them for the postal-code half of the typeahead. */
+function seedStations(array $rows): PDO
 {
     $pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-    $pdo->exec('CREATE TABLE cities (name TEXT PRIMARY KEY, normalized_name TEXT NOT NULL,
-        normalized_lower TEXT NOT NULL DEFAULT \'\', display_name TEXT NOT NULL,
-        lat REAL NOT NULL, lng REAL NOT NULL, created_at TEXT NOT NULL)');
-    $stmt = $pdo->prepare('INSERT INTO cities (name, normalized_name, normalized_lower, display_name,
-        lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    $pdo->exec('CREATE TABLE stations (id TEXT PRIMARY KEY, post_code INTEGER, place TEXT,
+        lat REAL NOT NULL, lng REAL NOT NULL)');
+    $stmt = $pdo->prepare('INSERT INTO stations (id, post_code, place, lat, lng) VALUES (?, ?, ?, ?, ?)');
     foreach ($rows as $row) {
         $stmt->execute($row);
     }
     return $pdo;
 }
 
-$pdo = seedCities([]);
-$key = cacheGeocodedPlace($pdo, 'sqlite', ['label' => 'Hauptstraße 5, 10115 Berlin', 'lat' => 52.5, 'lng' => 13.4]);
-check('the key handed back is the label the filter carries', $key, 'Hauptstraße 5, 10115 Berlin');
-$row = $pdo->query('SELECT * FROM cities')->fetch();
-check('the row is keyed by that label on every name column',
-    [$row['name'], $row['normalized_name'], $row['display_name']],
-    ['Hauptstraße 5, 10115 Berlin', 'Hauptstraße 5, 10115 Berlin', 'Hauptstraße 5, 10115 Berlin']);
-// The typeahead's prefix range only matches rows folded the way citySearchKey
-// folds them on the Go side; plain strtolower would leave the ß's neighbours be.
-check('the search column is folded so the typeahead can find it again',
-    $row['normalized_lower'], 'hauptstraße 5, 10115 berlin');
-check('the coordinates are the ones the radius will measure from',
-    [$row['lat'], $row['lng']], [52.5, 13.4]);
+$pdo = seedStations([
+    ['a', 10115, 'Berlin', 52.52, 13.40],
+    ['b', 10115, 'Berlin', 52.54, 13.42],
+    ['c', 10117, 'Berlin', 52.53, 13.41],
+    ['d', 20095, 'Hamburg', 53.55, 10.00],
+]);
 
-// Searching the same address again must not grow the cache.
-cacheGeocodedPlace($pdo, 'sqlite', ['label' => 'Hauptstraße 5, 10115 Berlin', 'lat' => 52.5, 'lng' => 13.4]);
-check('resolving the same address twice keeps one row',
-    (int) $pdo->query('SELECT COUNT(*) AS n FROM cities')->fetch()['n'], 1);
+check('a full postal code resolves to its place',
+    postalCodeMatches($pdo, '10115'),
+    [['label' => '10115 Berlin', 'lat' => 52.53, 'lng' => 13.41]]);
+// The prefix is a numeric range, because post_code is an integer column and
+// the two engines spell string casts differently.
+check('a partial code offers every code beneath it',
+    array_column(postalCodeMatches($pdo, '101'), 'label'), ['10115 Berlin', '10117 Berlin']);
+check('and stops at the end of that range',
+    array_column(postalCodeMatches($pdo, '200'), 'label'), ['20095 Hamburg']);
+// The centre of a code is the middle of its stations, not any one of them.
+check('several stations under one code average to its centre',
+    postalCodeMatches($pdo, '10115')[0]['lat'], 52.53);
+check('a place name is not a postal code', postalCodeMatches($pdo, 'Berlin'), []);
+check('nor is something longer than a postal code', postalCodeMatches($pdo, '101150'), []);
+check('a code nothing is registered under finds nothing', postalCodeMatches($pdo, '99999'), []);
 
-// A place the CLI already cached under its own query name is left alone: one
-// dropdown entry, and the coordinates stay the ones the CLI maintains.
-$pdo = seedCities([['Berlin, Germany', 'Berlin', 'berlin', 'Berlin', 52.52, 13.405, '2026-01-01T00:00:00Z']]);
-$key = cacheGeocodedPlace($pdo, 'sqlite', ['label' => 'Berlin', 'lat' => 52.4, 'lng' => 13.3]);
-check('a place the cache already answers for is reused, not duplicated',
-    [(int) $pdo->query('SELECT COUNT(*) AS n FROM cities')->fetch()['n'], $key], [1, 'Berlin']);
-check('and the row the CLI owns keeps its own coordinates',
-    array_map('floatval', [$pdo->query('SELECT lat, lng FROM cities')->fetch()['lat'],
-        $pdo->query('SELECT lat, lng FROM cities')->fetch()['lng']]),
-    [52.52, 13.405]);
+echo "web_picker_test: normalizeDashboardFilters\n";
+
+$defaults = defaultDashboardFilters();
+check('nothing submitted is the default filter set', normalizeDashboardFilters([]), $defaults);
+
+// The location is all-or-nothing: half of one cannot centre a radius.
+$located = normalizeDashboardFilters([
+    'location_label' => '  Hauptstraße 5, 10115 Berlin  ',
+    'location_lat' => '52.52',
+    'location_lng' => '13.405',
+]);
+check('a resolved place is kept, trimmed, as label plus point',
+    [$located['location_label'], $located['location_lat'], $located['location_lng']],
+    ['Hauptstraße 5, 10115 Berlin', 52.52, 13.405]);
+check('a label without coordinates is not a location',
+    normalizeDashboardFilters(['location_label' => 'Somewhere'])['location_label'], '');
+check('coordinates without a label are not one either',
+    normalizeDashboardFilters(['location_lat' => '52.5', 'location_lng' => '13.4'])['location_lat'], 0.0);
+check('coordinates off the globe are rejected whole',
+    normalizeDashboardFilters(['location_label' => 'X', 'location_lat' => '91', 'location_lng' => '13'])['location_label'], '');
+check('and so is a longitude past the date line',
+    normalizeDashboardFilters(['location_label' => 'X', 'location_lat' => '52', 'location_lng' => '181'])['location_label'], '');
+check('a label longer than the column is cut, not dropped',
+    mb_strlen(normalizeDashboardFilters([
+        'location_label' => str_repeat('ä', 400), 'location_lat' => '52', 'location_lng' => '13',
+    ])['location_label']), 200);
+
+check('a radius the dropdown offers is kept',
+    normalizeDashboardFilters(['radius_km' => '20'])['radius_km'], 20);
+check('one it does not falls back to the smallest',
+    normalizeDashboardFilters(['radius_km' => '17'])['radius_km'], 5);
+check('a known fuel is kept', normalizeDashboardFilters(['fuel' => 'diesel'])['fuel'], 'diesel');
+check('an unknown one falls back to all', normalizeDashboardFilters(['fuel' => 'lpg'])['fuel'], 'all');
+
+// A quick range and explicit dates are alternatives, never both.
+$ranged = normalizeDashboardFilters(['range' => '30d', 'from' => '2026-01-01', 'to' => '2026-02-01']);
+check('a quick range wins over dates stored beside it',
+    [$ranged['range'], $ranged['from'], $ranged['to']], ['30d', '', '']);
+$dated = normalizeDashboardFilters(['from' => '2026-01-01', 'to' => '2026-02-01']);
+check('explicit dates clear the range',
+    [$dated['range'], $dated['from'], $dated['to']], ['', '2026-01-01', '2026-02-01']);
+check('an unparseable range is not a range',
+    normalizeDashboardFilters(['range' => '90d'])['range'], '7d');
+check('a date that is not a date is dropped',
+    normalizeDashboardFilters(['from' => '2026-02-30'])['from'], '');
+check('and dropping the only date restores the default window',
+    normalizeDashboardFilters(['from' => 'yesterday'])['range'], '7d');
+check('one usable date is enough to leave the range empty',
+    normalizeDashboardFilters(['from' => '2026-01-01'])['range'], '');
+
+echo "web_picker_test: normalizeDashboardStationIds\n";
+
+check('ids are kept in the order they were submitted',
+    normalizeDashboardStationIds(['b', 'a', 'c']), ['b', 'a', 'c']);
+check('blanks and repeats are dropped',
+    normalizeDashboardStationIds(['a', '', '  ', 'a', 'b']), ['a', 'b']);
+check('ids are trimmed', normalizeDashboardStationIds([' a ']), ['a']);
+check('anything that is not a list is no selection at all',
+    normalizeDashboardStationIds('a,b'), []);
+check('nested junk is skipped rather than stringified',
+    normalizeDashboardStationIds([['a'], 'b']), ['b']);
+check('the cap bounds what one row can hold',
+    count(normalizeDashboardStationIds(range(1, DASHBOARD_STATION_LIMIT + 50))),
+    DASHBOARD_STATION_LIMIT);
+
+echo "web_picker_test: loadDashboardFilters / saveDashboardFilters\n";
+
+/** An empty user_filters table, as `gasoline migrate` creates it. */
+function seedFilters(): PDO
+{
+    $pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    $pdo->exec("CREATE TABLE user_filters (user_id INTEGER PRIMARY KEY,
+        location_label TEXT NOT NULL DEFAULT '', location_lat REAL NOT NULL DEFAULT 0,
+        location_lng REAL NOT NULL DEFAULT 0, radius_km INTEGER NOT NULL DEFAULT 5,
+        range_key TEXT NOT NULL DEFAULT '', from_date TEXT NOT NULL DEFAULT '',
+        to_date TEXT NOT NULL DEFAULT '', fuel TEXT NOT NULL DEFAULT 'all',
+        station_ids TEXT NOT NULL, updated_at TEXT NOT NULL)");
+    return $pdo;
+}
+
+$pdo = seedFilters();
+check('an account that never touched the sidebar gets the defaults',
+    loadDashboardFilters($pdo, 1), defaultDashboardFilters());
+
+$submitted = [
+    'location_label' => 'Hauptstraße 5, 10115 Berlin',
+    'location_lat' => '52.52',
+    'location_lng' => '13.405',
+    'radius_km' => '20',
+    'range' => '14d',
+    'fuel' => 'diesel',
+    'station_ids' => ['s2', 's1'],
+];
+saveDashboardFilters($pdo, 'sqlite', 7, $submitted);
+check('what was saved is what comes back',
+    loadDashboardFilters($pdo, 7),
+    [
+        'location_label' => 'Hauptstraße 5, 10115 Berlin',
+        'location_lat' => 52.52,
+        'location_lng' => 13.405,
+        'radius_km' => 20,
+        'range' => '14d',
+        'from' => '',
+        'to' => '',
+        'fuel' => 'diesel',
+        'station_ids' => ['s2', 's1'],
+    ]);
+check('another account is unaffected by it',
+    loadDashboardFilters($pdo, 1), defaultDashboardFilters());
+
+// Saving again is an update, not a second row: one filter set per account.
+saveDashboardFilters($pdo, 'sqlite', 7, ['radius_km' => '10', 'fuel' => 'e5']);
+check('saving again replaces the row rather than adding one',
+    (int) $pdo->query('SELECT COUNT(*) AS n FROM user_filters')->fetch()['n'], 1);
+check('and a save that carries no location clears the one stored',
+    loadDashboardFilters($pdo, 7)['location_label'], '');
+check('the rest of that save landed',
+    [loadDashboardFilters($pdo, 7)['radius_km'], loadDashboardFilters($pdo, 7)['fuel']], [10, 'e5']);
+
+// A row an older release wrote, or one edited by hand, must not be able to
+// render a dashboard the page cannot make sense of.
+$pdo->exec("INSERT INTO user_filters (user_id, location_label, location_lat, location_lng,
+    radius_km, range_key, from_date, to_date, fuel, station_ids, updated_at)
+    VALUES (9, 'Nowhere', 999, 0, 42, 'forever', 'not-a-date', '', 'lpg', 'not json', '')");
+check('a nonsense row reads back as the defaults, field by field',
+    loadDashboardFilters($pdo, 9), defaultDashboardFilters());
+
+clearDashboardFilters($pdo, 7);
+check('reset drops the row', loadDashboardFilters($pdo, 7), defaultDashboardFilters());
+check('and leaves the other accounts alone',
+    (int) $pdo->query('SELECT COUNT(*) AS n FROM user_filters')->fetch()['n'], 1);
 
 if ($failures > 0) {
     printf("web_picker_test: %d failed\n", $failures);

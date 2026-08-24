@@ -508,16 +508,18 @@ function gasolineSchemaReady(PDO $pdo, string $driver): bool
         if ($driver === 'mysql') {
             $stmt = $pdo->query(
                 "SELECT COUNT(*) AS n FROM information_schema.tables
-                 WHERE table_schema = DATABASE() AND table_name IN ('users', 'settings', 'update_targets')"
+                 WHERE table_schema = DATABASE()
+                   AND table_name IN ('users', 'user_filters', 'settings', 'update_targets')"
             );
         } else {
             $stmt = $pdo->query(
                 "SELECT COUNT(*) AS n FROM sqlite_master
-                 WHERE type = 'table' AND name IN ('users', 'settings', 'update_targets')"
+                 WHERE type = 'table'
+                   AND name IN ('users', 'user_filters', 'settings', 'update_targets')"
             );
         }
         $row = $stmt->fetch();
-        return (int) ($row['n'] ?? 0) === 3;
+        return (int) ($row['n'] ?? 0) === 4;
     } catch (Throwable $e) {
         error_log('gasoline schema check error: ' . $e->getMessage());
         return false;
@@ -1160,6 +1162,270 @@ function normalizeTimeList(array $times): ?string
 
 
 
+/* ── Dashboard filters ────────────────────────────────────────────────────────
+ *
+ * The sidebar's filters belong to the account, not to the URL: one row per user
+ * in `user_filters`, written by the save_filters post and read back on every
+ * load — including by ?action=data, which no longer copies the page's query
+ * string because there is nothing in it to copy.
+ *
+ * They used to be query parameters kept alive by a cookie. That made a filtered
+ * dashboard a link, but it also meant one account saw different filters in
+ * every browser it signed in from, and the reader's own location — the thing
+ * the surroundings card is about — lived in a cookie that any cache clear threw
+ * away.
+ *
+ * The location is stored as the label the reader sees plus the coordinates it
+ * resolved to. Deliberately not as a key into `cities`: that table is the CLI's
+ * cache of the places it collects, one row per city, and a reader's street
+ * address is neither a city nor something the CLI should have to carry.
+ */
+
+/** Radii the sidebar offers. doctor accepts exactly these (doctor_dashboard.go). */
+const DASHBOARD_RADIUS_OPTIONS = [5, 10, 20];
+
+/** Quick ranges, and how many days back each one reaches. */
+const DASHBOARD_RANGE_DAYS = ['7d' => 7, '14d' => 14, '30d' => 30];
+
+/** Fuel filter values, "all" included. */
+const DASHBOARD_FUELS = ['all', 'diesel', 'e5', 'e10'];
+
+/**
+ * How many hand-picked stations one filter row keeps. The picker is for
+ * comparing a handful, and the cap is what stops a row from growing without
+ * bound if something ever posts the whole list.
+ */
+const DASHBOARD_STATION_LIMIT = 200;
+
+/** What a user who has never touched the sidebar sees. */
+function defaultDashboardFilters(): array
+{
+    return [
+        'location_label' => '',
+        'location_lat' => 0.0,
+        'location_lng' => 0.0,
+        'radius_km' => DASHBOARD_RADIUS_OPTIONS[0],
+        'range' => '7d',
+        'from' => '',
+        'to' => '',
+        'fuel' => 'all',
+        'station_ids' => [],
+    ];
+}
+
+/** True for a "YYYY-MM-DD" that is also a real calendar date. */
+function validISODate(string $value): bool
+{
+    $parsed = DateTimeImmutable::createFromFormat('!Y-m-d', $value, new DateTimeZone('UTC'));
+
+    return $parsed !== false && $parsed->format('Y-m-d') === $value;
+}
+
+/**
+ * Clamp a raw filter set to what the page can render.
+ *
+ * The same function guards both directions: what the sidebar posts (which is
+ * whatever a form can be made to send) and what comes back out of the database
+ * (which an older release, a hand-edited row or a dropped station could have
+ * left inconsistent). Anything it cannot make sense of falls back to the
+ * default rather than propagating — a bad radius must not empty the dashboard.
+ *
+ * @param array<string, mixed> $raw
+ * @return array<string, mixed>
+ */
+function normalizeDashboardFilters(array $raw): array
+{
+    $filters = defaultDashboardFilters();
+
+    // The location is all-or-nothing: a label without usable coordinates
+    // cannot centre a radius, and coordinates without a label would leave the
+    // sidebar unable to say where the reader is.
+    $label = trim((string) ($raw['location_label'] ?? ''));
+    $lat = $raw['location_lat'] ?? '';
+    $lng = $raw['location_lng'] ?? '';
+    if ($label !== '' && is_numeric($lat) && is_numeric($lng)
+        && (float) $lat >= -90.0 && (float) $lat <= 90.0
+        && (float) $lng >= -180.0 && (float) $lng <= 180.0
+    ) {
+        // user_filters.location_label is VARCHAR(255).
+        $filters['location_label'] = mb_substr($label, 0, 200, 'UTF-8');
+        $filters['location_lat'] = (float) $lat;
+        $filters['location_lng'] = (float) $lng;
+    }
+
+    $radius = (int) ($raw['radius_km'] ?? 0);
+    if (in_array($radius, DASHBOARD_RADIUS_OPTIONS, true)) {
+        $filters['radius_km'] = $radius;
+    }
+
+    $fuel = trim((string) ($raw['fuel'] ?? ''));
+    if (in_array($fuel, DASHBOARD_FUELS, true)) {
+        $filters['fuel'] = $fuel;
+    }
+
+    // A quick range and explicit dates are alternatives: picking a range is
+    // what clears the date boxes, so a row carrying both would render two
+    // different answers in one sidebar.
+    $range = trim((string) ($raw['range'] ?? ''));
+    $from = trim((string) ($raw['from'] ?? ''));
+    $to = trim((string) ($raw['to'] ?? ''));
+    if (isset(DASHBOARD_RANGE_DAYS[$range])) {
+        $filters['range'] = $range;
+        return $filters;
+    }
+    $filters['from'] = validISODate($from) ? $from : '';
+    $filters['to'] = validISODate($to) ? $to : '';
+    // Neither a range nor a usable date: back to the default window rather
+    // than to the whole history, which is what the page did before too.
+    $filters['range'] = ($filters['from'] === '' && $filters['to'] === '') ? '7d' : '';
+
+    return $filters;
+}
+
+/**
+ * The hand-picked station ids, cleaned up.
+ *
+ * Split out of normalizeDashboardFilters because it is the one field that
+ * arrives as a list, and the ordering matters: the picker renders in scope
+ * order, so what is stored is a set, deduplicated, capped and otherwise left
+ * as submitted.
+ *
+ * @param mixed $raw
+ * @return array<int, string>
+ */
+function normalizeDashboardStationIds($raw): array
+{
+    if (!is_array($raw)) {
+        return [];
+    }
+    $ids = [];
+    foreach ($raw as $value) {
+        if (!is_scalar($value)) {
+            continue;
+        }
+        $id = trim((string) $value);
+        if ($id === '' || isset($ids[$id])) {
+            continue;
+        }
+        $ids[$id] = true;
+        if (count($ids) >= DASHBOARD_STATION_LIMIT) {
+            break;
+        }
+    }
+
+    return array_keys($ids);
+}
+
+/**
+ * Read one user's stored filters, falling back to the defaults for an account
+ * that has never saved any — or to a row a later release cannot read.
+ */
+function loadDashboardFilters(PDO $pdo, int $userId): array
+{
+    $stmt = $pdo->prepare(
+        <<<'SQL'
+        SELECT location_label, location_lat, location_lng, radius_km,
+               range_key, from_date, to_date, fuel, station_ids
+        FROM user_filters
+        WHERE user_id = :user_id
+        SQL
+    );
+    $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+    $stmt->execute();
+    $row = $stmt->fetch();
+    if ($row === false) {
+        return defaultDashboardFilters();
+    }
+
+    $stationIds = json_decode((string) $row['station_ids'], true);
+    $filters = normalizeDashboardFilters([
+        'location_label' => $row['location_label'],
+        'location_lat' => $row['location_lat'],
+        'location_lng' => $row['location_lng'],
+        'radius_km' => $row['radius_km'],
+        'range' => $row['range_key'],
+        'from' => $row['from_date'],
+        'to' => $row['to_date'],
+        'fuel' => $row['fuel'],
+    ]);
+    $filters['station_ids'] = normalizeDashboardStationIds($stationIds);
+
+    return $filters;
+}
+
+/**
+ * Write one user's filters, normalizing on the way in. Upsert rather than
+ * insert-or-update, mirroring how the CLI writes its own single-row tables
+ * (citiesUpsertSQL in db.go).
+ *
+ * @param array<string, mixed> $raw as submitted by the sidebar
+ */
+function saveDashboardFilters(PDO $pdo, string $driver, int $userId, array $raw): array
+{
+    $filters = normalizeDashboardFilters($raw);
+    $filters['station_ids'] = normalizeDashboardStationIds($raw['station_ids'] ?? []);
+
+    $sql = $driver === 'mysql'
+        ? <<<'SQL'
+            INSERT INTO user_filters (user_id, location_label, location_lat, location_lng,
+                radius_km, range_key, from_date, to_date, fuel, station_ids, updated_at)
+            VALUES (:user_id, :label, :lat, :lng, :radius, :range_key, :from_date, :to_date,
+                :fuel, :station_ids, :updated_at)
+            ON DUPLICATE KEY UPDATE
+                location_label = VALUES(location_label),
+                location_lat = VALUES(location_lat),
+                location_lng = VALUES(location_lng),
+                radius_km = VALUES(radius_km),
+                range_key = VALUES(range_key),
+                from_date = VALUES(from_date),
+                to_date = VALUES(to_date),
+                fuel = VALUES(fuel),
+                station_ids = VALUES(station_ids),
+                updated_at = VALUES(updated_at)
+            SQL
+        : <<<'SQL'
+            INSERT INTO user_filters (user_id, location_label, location_lat, location_lng,
+                radius_km, range_key, from_date, to_date, fuel, station_ids, updated_at)
+            VALUES (:user_id, :label, :lat, :lng, :radius, :range_key, :from_date, :to_date,
+                :fuel, :station_ids, :updated_at)
+            ON CONFLICT(user_id) DO UPDATE SET
+                location_label = excluded.location_label,
+                location_lat = excluded.location_lat,
+                location_lng = excluded.location_lng,
+                radius_km = excluded.radius_km,
+                range_key = excluded.range_key,
+                from_date = excluded.from_date,
+                to_date = excluded.to_date,
+                fuel = excluded.fuel,
+                station_ids = excluded.station_ids,
+                updated_at = excluded.updated_at
+            SQL;
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+    $stmt->bindValue(':label', $filters['location_label']);
+    $stmt->bindValue(':lat', $filters['location_lat']);
+    $stmt->bindValue(':lng', $filters['location_lng']);
+    $stmt->bindValue(':radius', $filters['radius_km'], PDO::PARAM_INT);
+    $stmt->bindValue(':range_key', $filters['range']);
+    $stmt->bindValue(':from_date', $filters['from']);
+    $stmt->bindValue(':to_date', $filters['to']);
+    $stmt->bindValue(':fuel', $filters['fuel']);
+    $stmt->bindValue(':station_ids', json_encode($filters['station_ids'], JSON_UNESCAPED_UNICODE));
+    $stmt->bindValue(':updated_at', nowUTC());
+    $stmt->execute();
+
+    return $filters;
+}
+
+/** Drop one user's filters, which is what the sidebar's Reset does. */
+function clearDashboardFilters(PDO $pdo, int $userId): void
+{
+    $stmt = $pdo->prepare('DELETE FROM user_filters WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+    $stmt->execute();
+}
+
 // ── POST router ───────────────────────────────────────────────────────────────
 
 function handlePost(PDO $pdo, string $driver): void
@@ -1506,6 +1772,35 @@ function handlePost(PDO $pdo, string $driver): void
             $stmt->execute();
             setFlash($stmt->rowCount() > 0 ? 'success' : 'error', $stmt->rowCount() > 0 ? 'targetRemoved' : 'notFound');
             redirectTo('?page=admin_settings');
+            // no break
+
+        case 'save_filters':
+            // The sidebar posts its whole state on every change, so this is
+            // both "apply" and "remember": there is nowhere else the filters
+            // live now.
+            if ($user === null) {
+                redirectTo('?page=login');
+            }
+            saveDashboardFilters($pdo, $driver, (int) $user['id'], [
+                'location_label' => $_POST['location_label'] ?? '',
+                'location_lat' => $_POST['location_lat'] ?? '',
+                'location_lng' => $_POST['location_lng'] ?? '',
+                'radius_km' => $_POST['radius_km'] ?? '',
+                'range' => $_POST['range'] ?? '',
+                'from' => $_POST['from'] ?? '',
+                'to' => $_POST['to'] ?? '',
+                'fuel' => $_POST['fuel'] ?? '',
+                'station_ids' => (array) ($_POST['station_ids'] ?? []),
+            ]);
+            redirectTo('');
+            // no break
+
+        case 'reset_filters':
+            if ($user === null) {
+                redirectTo('?page=login');
+            }
+            clearDashboardFilters($pdo, (int) $user['id']);
+            redirectTo('');
             // no break
 
         case 'rename_station':
@@ -1861,21 +2156,25 @@ function renderAccountPage(PDO $pdo, array $user): never
                     const results = await fetchMatches(q);
                     if (results === null) return;
                     list.innerHTML = '';
-                    results.forEach(({ city_key, display_name }) => {
+                    // A notification covers a city, so the postal-code hits the
+                    // dashboard's own picker offers are dropped here: they carry
+                    // no city key to subscribe to.
+                    const cities = results.filter((match) => match.city_key);
+                    cities.forEach(({ city_key, label }) => {
                         const li = document.createElement('li');
                         li.className = 'city-ac-item';
                         li.role = 'option';
                         li.setAttribute('aria-selected', 'false');
-                        li.textContent = display_name || city_key;
+                        li.textContent = label || city_key;
                         li.addEventListener('mousedown', (e) => {
                             e.preventDefault();
-                            input.value = display_name || city_key;
+                            input.value = label || city_key;
                             hidden.value = city_key;
                             hide();
                         });
                         list.appendChild(li);
                     });
-                    if (results.length) show(); else hide();
+                    if (cities.length) show(); else hide();
                 }, 200);
             });
 
@@ -3724,92 +4023,39 @@ switch ($requestedPage) {
 
 // Fall through: the dashboard (default page) below.
 
-// ── Filter persistence ────────────────────────────────────────────────────────
-// The last submitted dashboard filters are kept in a cookie so revisiting the
-// bare URL restores them. Requests with explicit filter params refresh the
-// cookie; requests without any are populated from it before validation below.
-$filterCookieName = 'gasoline_filters';
-$filterParamKeys = ['city', 'radius_km', 'range', 'from', 'to', 'fuel', 'station_ids'];
-$cookieSecure = (($_SERVER['HTTPS'] ?? '') !== '' && strtolower((string) $_SERVER['HTTPS']) !== 'off')
-    || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
+// ── Filter state ──────────────────────────────────────────────────────────────
+// Straight out of user_filters, for this account, on every load — page and
+// ?action=data alike. Nothing in the query string selects data any more; the
+// sidebar posts save_filters and comes back to the bare URL.
+$dashboardFilters = loadDashboardFilters($authPdo, (int) $currentUser['id']);
 
-if (isset($_GET['reset'])) {
-    setcookie($filterCookieName, '', ['expires' => time() - 3600, 'path' => '/', 'secure' => $cookieSecure, 'httponly' => true, 'samesite' => 'Lax']);
-    redirectTo('');
-}
-
-$hasFilterParams = false;
-foreach ($filterParamKeys as $filterKey) {
-    if (array_key_exists($filterKey, $_GET)) {
-        $hasFilterParams = true;
-        break;
-    }
-}
-
-if ($hasFilterParams) {
-    // The async ?action=data fetch copies the page URL, so only page loads
-    // need to refresh the cookie.
-    if (!isset($_GET['action'])) {
-        $filtersToSave = [];
-        foreach ($filterParamKeys as $filterKey) {
-            if (array_key_exists($filterKey, $_GET)) {
-                $filtersToSave[$filterKey] = $_GET[$filterKey];
-            }
-        }
-        setcookie($filterCookieName, json_encode($filtersToSave), ['expires' => time() + 60 * 60 * 24 * 365, 'path' => '/', 'secure' => $cookieSecure, 'httponly' => true, 'samesite' => 'Lax']);
-    }
-} else {
-    $savedFilters = json_decode((string) ($_COOKIE[$filterCookieName] ?? ''), true);
-    if (is_array($savedFilters)) {
-        foreach ($filterParamKeys as $filterKey) {
-            if (!array_key_exists($filterKey, $savedFilters)) {
-                continue;
-            }
-            $savedValue = $savedFilters[$filterKey];
-            if ($filterKey === 'station_ids') {
-                if (is_array($savedValue)) {
-                    $_GET[$filterKey] = array_values(array_filter($savedValue, 'is_string'));
-                }
-            } elseif (is_string($savedValue)) {
-                $_GET[$filterKey] = $savedValue;
-            }
-        }
-    }
-}
-
+// The filter panel's own collapsed state stays a cookie: it only applies below
+// 900px, so it is a property of the phone in the reader's hand rather than of
+// the account, and storing it per user would fold the desktop sidebar shut too.
 $filtersCollapsed = (($_COOKIE['gasoline_filters_collapsed'] ?? '') === '1');
 
 $errors = [];
 $stations = [];
 
-$selectedStationIds = array_values(array_filter(
-    array_map(
-        static function ($value): string {
-            return trim((string) $value);
-        },
-        (array) ($_GET['station_ids'] ?? [])
-    ),
-    static function (string $value): bool {
-        return $value !== '';
-    }
-));
+$selectedStationIds = $dashboardFilters['station_ids'];
+$selectedRange = $dashboardFilters['range'];
+$fromDate = $dashboardFilters['from'];
+$toDate = $dashboardFilters['to'];
+$selectedFuel = $dashboardFilters['fuel'];
+$selectedRadiusKm = $dashboardFilters['radius_km'];
 
-$selectedRange = trim((string) ($_GET['range'] ?? ''));
-$validRanges = ['7d', '14d', '30d'];
-if (!in_array($selectedRange, $validRanges, true)) {
-    $selectedRange = '';
-}
+// The reader's location: the label they picked and the point it resolved to.
+// Shaped like the cities row this used to be, because loadScopeStations and
+// the snapshot query only ever wanted the coordinates out of it.
+$selectedLocation = $dashboardFilters['location_label'];
+$selectedCityRow = $selectedLocation === '' ? null : [
+    'display_name' => $selectedLocation,
+    'lat' => $dashboardFilters['location_lat'],
+    'lng' => $dashboardFilters['location_lng'],
+];
 
-$fromDate = trim((string) ($_GET['from'] ?? ''));
-$toDate = trim((string) ($_GET['to'] ?? ''));
-
-// Default to the last 7 days when the visitor hasn't chosen a range or explicit dates.
-if ($selectedRange === '' && $fromDate === '' && $toDate === '') {
-    $selectedRange = '7d';
-}
-
+$rangeDays = DASHBOARD_RANGE_DAYS;
 if ($selectedRange !== '') {
-    $rangeDays = ['7d' => 7, '14d' => 14, '30d' => 30];
     $fromDate = (new DateTimeImmutable('now', new DateTimeZone('UTC')))
         ->modify('-' . $rangeDays[$selectedRange] . ' days')
         ->format('Y-m-d');
@@ -3833,17 +4079,8 @@ if ($selectedRange !== '') {
     }
 }
 
-$selectedFuel = trim((string) ($_GET['fuel'] ?? 'all'));
-$selectedCity = trim((string) ($_GET['city'] ?? ''));
-$selectedRadiusKmRaw = trim((string) ($_GET['radius_km'] ?? ''));
-$validFuels = ['all', 'diesel', 'e5', 'e10'];
-$validRadiusOptions = [5, 10, 20];
-if (!in_array($selectedFuel, $validFuels, true)) {
-    $selectedFuel = 'all';
-}
-$selectedRadiusKm = in_array((int) $selectedRadiusKmRaw, $validRadiusOptions, true)
-    ? (int) $selectedRadiusKmRaw
-    : ($selectedCity !== '' ? 5 : $validRadiusOptions[0]);
+$validFuels = DASHBOARD_FUELS;
+$validRadiusOptions = DASHBOARD_RADIUS_OPTIONS;
 
 if ($dbDriver === 'sqlite' && !file_exists($dbPath)) {
     $errors[] = [
@@ -3852,8 +4089,15 @@ if ($dbDriver === 'sqlite' && !file_exists($dbPath)) {
         'message' => sprintf('SQLite database not found at %s', $dbPath),
     ];
 }
-
-// ── AJAX: city prefix search ──────────────────────────────────────────────────
+// ── AJAX: location typeahead ──────────────────────────────────────────────────
+// Answers from the database only, which is what makes it safe to run on a
+// keystroke: Nominatim's usage policy rules out autocomplete traffic. Two
+// sources, because a reader names where they are in two ways — the place, and
+// the postal code of the place. A street address is neither, and is resolved by
+// the dropdown's closing row instead (?action=geocode).
+//
+// Every hit carries its coordinates, so picking one costs no second lookup and
+// nothing has to be looked up again when the filter is saved.
 if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
     header('Content-Type: application/json; charset=utf-8');
     $q = trim((string) ($_GET['q'] ?? ''));
@@ -3877,7 +4121,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
         // the column; plain strtolower would not, since it leaves Ü alone.
         $prefix = mb_strtolower($q, 'UTF-8');
         $searchStmt = $searchPdo->prepare(
-            "SELECT normalized_name AS city_key, display_name
+            "SELECT normalized_name AS city_key, display_name, lat, lng
              FROM cities
              WHERE normalized_lower >= :prefix AND normalized_lower < :prefix_end
              ORDER BY normalized_lower ASC
@@ -3886,8 +4130,25 @@ if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
         $searchStmt->bindValue(':prefix', $prefix);
         $searchStmt->bindValue(':prefix_end', $prefix . "\u{10FFFF}");
         $searchStmt->execute();
-        echo json_encode($searchStmt->fetchAll(), JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+
+        $matches = [];
+        foreach ($searchStmt->fetchAll() as $row) {
+            $matches[] = [
+                // city_key only on rows that are a whole city: the account
+                // page's notification area subscribes to one and needs its
+                // key, and a postal code is not one.
+                'city_key' => (string) $row['city_key'],
+                'label' => (string) ($row['display_name'] !== '' ? $row['display_name'] : $row['city_key']),
+                'lat' => (float) $row['lat'],
+                'lng' => (float) $row['lng'],
+            ];
+        }
+        foreach (postalCodeMatches($searchPdo, $q) as $match) {
+            $matches[] = $match;
+        }
+        echo json_encode($matches, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
     } catch (Throwable $e) {
+        error_log('gasoline city_search error: ' . $e->getMessage());
         echo '[]';
     }
     exit;
@@ -4016,10 +4277,10 @@ if (isset($_GET['action']) && $_GET['action'] === 'geocode') {
             }
         }
 
-        $geocodePdo = gasolineConnect($dbDriver, $dbPath);
-        $cityKey = cacheGeocodedPlace($geocodePdo, $dbDriver, $place);
+        // Handed straight back, not stored: where the reader is belongs on
+        // their filter row, which the sidebar writes when it posts this.
         echo json_encode(
-            ['city_key' => $cityKey, 'display_name' => $cityKey],
+            ['label' => $place['label'], 'lat' => $place['lat'], 'lng' => $place['lng']],
             JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
         );
     } catch (Throwable $e) {
@@ -4654,8 +4915,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
     exit;
 }
 
-$selectedCityRow = null;
-
 function boundingBox(float $lat, float $lng, int $radiusKm): array
 {
     $latDelta = $radiusKm / 111.32;
@@ -4682,9 +4941,15 @@ function haversineKm(float $lat1, float $lng1, float $lat2, float $lng2): float
 }
 
 /**
- * Resolve the selected city to its cities-table row, or null when no city is
- * selected or the key is unknown. Callers distinguish the two by also checking
- * whether $selectedCity was non-empty.
+ * Resolve a city key to its cities-table row, or null when the key is empty or
+ * unknown. Callers distinguish the two by also checking whether the key was
+ * non-empty.
+ *
+ * This serves the account page's notification area, whose picker still selects
+ * a whole city from the CLI's cache — that is the unit a subscription covers.
+ * The dashboard's own location does not come through here: it is a label and a
+ * point on the reader's filter row, which may be an address the cities table
+ * has never heard of.
  */
 function resolveCity(PDO $pdo, string $selectedCity): ?array
 {
@@ -4705,21 +4970,82 @@ function resolveCity(PDO $pdo, string $selectedCity): ?array
     return $stmt->fetch() ?: null;
 }
 
+/**
+ * Places matching a postal code, from the station addresses themselves.
+ *
+ * The cities table is names only — it is the CLI's cache of the places it
+ * collects, and nothing in it is a postal code. But every station carries one,
+ * so a reader who thinks of home as "10115" can be answered from the same
+ * database the rest of the typeahead reads, without a geocoder.
+ *
+ * The prefix becomes a numeric range rather than a string comparison, because
+ * post_code is an integer column and the two engines spell string casts
+ * differently. German codes are five digits (the feed is German), so "101"
+ * covers 10100 to 10199.
+ *
+ * The centre is the mean of the matching stations' coordinates: a postal code
+ * is an area, and the middle of its filling stations is a better place to
+ * measure a radius from than any one of them.
+ *
+ * @return array<int, array{label: string, lat: float, lng: float}>
+ */
+function postalCodeMatches(PDO $pdo, string $term): array
+{
+    $digits = trim($term);
+    if ($digits === '' || !ctype_digit($digits) || strlen($digits) > 5) {
+        return [];
+    }
+    $low = (int) str_pad($digits, 5, '0');
+    $high = (int) str_pad($digits, 5, '9');
+
+    $stmt = $pdo->prepare(
+        <<<'SQL'
+        SELECT s.post_code, TRIM(COALESCE(s.place, '')) AS place,
+               AVG(s.lat) AS lat, AVG(s.lng) AS lng
+        FROM stations s
+        WHERE s.post_code BETWEEN :low AND :high
+        GROUP BY s.post_code, TRIM(COALESCE(s.place, ''))
+        ORDER BY s.post_code ASC
+        LIMIT 10
+        SQL
+    );
+    $stmt->bindValue(':low', $low, PDO::PARAM_INT);
+    $stmt->bindValue(':high', $high, PDO::PARAM_INT);
+    $stmt->execute();
+
+    $matches = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $code = trim((string) $row['post_code']);
+        $place = trim((string) $row['place']);
+        if ($code === '') {
+            continue;
+        }
+        $matches[] = [
+            'label' => trim($code . ' ' . $place),
+            'lat' => (float) $row['lat'],
+            'lng' => (float) $row['lng'],
+        ];
+    }
+
+    return $matches;
+}
+
 /* ── Geocoding for the location filter ────────────────────────────────────────
  *
- * The CLI geocodes every place it updates and caches the answer in the `cities`
- * table (main.go geocodeCity / getOrCreateCity). The filter's typeahead reads
- * that cache and nothing else, which is what keeps a keystroke from becoming an
- * HTTP request: Nominatim's usage policy rules out autocomplete traffic
- * outright.
+ * The typeahead answers from the database — cities the CLI has geocoded, postal
+ * codes read off the station addresses — and nothing else, which is what keeps
+ * a keystroke from becoming an HTTP request: Nominatim's usage policy rules out
+ * autocomplete traffic outright.
  *
- * A house number is not in that cache, so the page has to be able to add one.
- * It does that only on an explicit act — picking the "search this address" row
- * of the dropdown, or pressing the locate button — which is one request per
- * user action, not per keystroke. The answer is written back into the same
- * cache, so from then on the address is an ordinary row: resolveCity finds it,
- * the radius filter measures from it, and the typeahead offers it again without
- * another lookup.
+ * A street and house number is in neither source, so this is the path that asks
+ * a geocoder, and only on an explicit act: picking the "search this address"
+ * row of the dropdown, or pressing the locate button. One user action, one
+ * request.
+ *
+ * What comes back is not written to the database here. It goes to the sidebar,
+ * which posts it onto the reader's own filter row — a label and a point. The
+ * `cities` table stays what the CLI made it: one row per place it collects,
+ * with no reader's front door in it.
  */
 
 /** User-Agent for the viewer's Nominatim calls; mirrors the CLI's --user-agent. */
@@ -4917,70 +5243,6 @@ function geocodeReverse(float $lat, float $lng): ?array
     return ['label' => $resolved['label'], 'lat' => $lat, 'lng' => $lng];
 }
 
-/**
- * Write a geocoded place into the cities cache and return the key the location
- * filter carries (cities.normalized_name).
- *
- * Keyed by the folded label, so searching the same address twice updates the
- * one row instead of growing a second. The upsert mirrors citiesUpsertSQL in
- * db.go, including leaving created_at alone on a conflict so the row keeps the
- * moment it entered the cache.
- *
- * A place the cache already answers for is left exactly as it is. The CLI keys
- * its rows by the query an update target was written with ("Berlin, Germany")
- * and the viewer keys its own by the folded label ("Berlin"), so inserting
- * regardless would put two rows in the dropdown for one place and hand the
- * page's own copy of the coordinates to a row the CLI maintains.
- *
- * @param array{label: string, lat: float, lng: float} $place
- */
-function cacheGeocodedPlace(PDO $pdo, string $driver, array $place): string
-{
-    $label = $place['label'];
-
-    $known = $pdo->prepare('SELECT normalized_name FROM cities WHERE normalized_name = :key LIMIT 1');
-    $known->bindValue(':key', $label);
-    $known->execute();
-    if ($known->fetch() !== false) {
-        return $label;
-    }
-
-    $sql = $driver === 'mysql'
-        ? <<<'SQL'
-            INSERT INTO cities (name, normalized_name, normalized_lower, display_name, lat, lng, created_at)
-            VALUES (:name, :normalized_name, :normalized_lower, :display_name, :lat, :lng, :created_at)
-            ON DUPLICATE KEY UPDATE
-                normalized_name = VALUES(normalized_name),
-                normalized_lower = VALUES(normalized_lower),
-                display_name = VALUES(display_name),
-                lat = VALUES(lat),
-                lng = VALUES(lng)
-            SQL
-        : <<<'SQL'
-            INSERT INTO cities (name, normalized_name, normalized_lower, display_name, lat, lng, created_at)
-            VALUES (:name, :normalized_name, :normalized_lower, :display_name, :lat, :lng, :created_at)
-            ON CONFLICT(name) DO UPDATE SET
-                normalized_name = excluded.normalized_name,
-                normalized_lower = excluded.normalized_lower,
-                display_name = excluded.display_name,
-                lat = excluded.lat,
-                lng = excluded.lng
-            SQL;
-
-    $stmt = $pdo->prepare($sql);
-    $stmt->bindValue(':name', $label);
-    $stmt->bindValue(':normalized_name', $label);
-    // mb_strtolower is the fold citySearchKey() writes on the Go side; the
-    // typeahead's prefix range only matches rows that agree with it.
-    $stmt->bindValue(':normalized_lower', mb_strtolower($label, 'UTF-8'));
-    $stmt->bindValue(':display_name', $label);
-    $stmt->bindValue(':lat', $place['lat']);
-    $stmt->bindValue(':lng', $place['lng']);
-    $stmt->bindValue(':created_at', nowUTC());
-    $stmt->execute();
-
-    return $label;
-}
 
 /**
  * Load the stations in scope for the filter sidebar and data endpoint.
@@ -5593,12 +5855,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
 
     try {
         $pdo = gasolineConnect($dbDriver, $dbPath);
-        $cityRow = resolveCity($pdo, $selectedCity);
-        if ($selectedCity !== '' && $cityRow === null) {
-            $out['errors'][] = ['key' => 'cityNotFound', 'params' => [], 'message' => 'Selected city not found.'];
-            echo json_encode($out, $jsonFlags);
-            exit;
-        }
+        $cityRow = $selectedCityRow;
 
         [$stations, $distances] = loadScopeStations($pdo, $cityRow, $selectedRadiusKm);
 
@@ -5629,6 +5886,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
         if ($cityRow !== null) {
             $out['nearby_total'] = count($stations);
             $out['nearby'] = loadNearbyPrices($pdo, $stations, $distances, NEARBY_STATION_LIMIT);
+            // Its stations are not the chart's: the date range or the picker
+            // can leave them out of the snapshot rows entirely, and without
+            // their metadata the card would list bare station ids.
+            foreach ($out['nearby'] as $nearbyRow) {
+                $nearbyId = (string) $nearbyRow['s'];
+                if (isset($metaById[$nearbyId])) {
+                    $out['stations'][$nearbyId] = $metaById[$nearbyId];
+                }
+            }
         }
 
         [$sql, $params, $shouldRun, $queryErrors] = buildSnapshotQuery(
@@ -5747,21 +6013,11 @@ if ($errors === []) {
     try {
         $pdo = gasolineConnect($dbDriver, $dbPath);
 
-        // Shell only resolves the filter scope (city + station list) so the
-        // sidebar renders immediately. The heavy snapshot payload is fetched
-        // asynchronously via ?action=data.
-        $selectedCityRow = resolveCity($pdo, $selectedCity);
-        if ($selectedCity !== '' && $selectedCityRow === null) {
-            $errors[] = [
-                'key' => 'cityNotFound',
-                'params' => [],
-                'message' => 'Selected city not found.',
-            ];
-        } else {
-            // Distances are only needed client-side (sent via ?action=data), so
-            // the shell just needs the in-scope station list for the dropdown.
-            [$stations] = loadScopeStations($pdo, $selectedCityRow, $selectedRadiusKm);
-        }
+        // The location came out of the filter row already resolved, so the
+        // shell only has the station list left to load for the sidebar. The
+        // heavy snapshot payload is fetched asynchronously via ?action=data.
+        // Distances are only needed client-side (sent with that payload).
+        [$stations] = loadScopeStations($pdo, $selectedCityRow, $selectedRadiusKm);
     } catch (Throwable $e) {
         // Never leak the raw message (DB host, DSN, paths, SQL) to the client.
         error_log('gasoline shell error: ' . $e->getMessage());
@@ -9155,7 +9411,11 @@ renderDocumentHead('Price History');
                 <span class="sidebar-chevron" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
             </div>
 
-            <form method="get">
+            <?php // Saved against the account, not the URL: every change posts the
+                  // whole sidebar and comes back to the bare dashboard. ?>
+            <form method="post" action="" id="filters-form">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="save_filters">
                 <div class="field">
                     <label for="f-city" data-i18n="location">Location</label>
                     <div class="city-ac" id="city-ac">
@@ -9178,7 +9438,13 @@ renderDocumentHead('Price History');
                                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/><line x1="12" y1="1.5" x2="12" y2="4.5"/><line x1="12" y1="19.5" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4.5" y2="12"/><line x1="19.5" y1="12" x2="22.5" y2="12"/></svg>
                             </button>
                         </div>
-                        <input type="hidden" name="city" id="f-city-value" value="<?= h($selectedCity) ?>">
+                        <?php // The text box is deliberately unnamed. What gets posted is
+                              // the last *resolved* place, so changing the fuel while a
+                              // half-typed address sits in the box cannot move the reader
+                              // somewhere they never picked. ?>
+                        <input type="hidden" name="location_label" id="f-loc-label" value="<?= h($selectedLocation) ?>">
+                        <input type="hidden" name="location_lat" id="f-loc-lat" value="<?= $selectedCityRow ? h(sprintf('%.6f', (float) $selectedCityRow['lat'])) : '' ?>">
+                        <input type="hidden" name="location_lng" id="f-loc-lng" value="<?= $selectedCityRow ? h(sprintf('%.6f', (float) $selectedCityRow['lng'])) : '' ?>">
                         <ul class="city-ac-list" id="city-ac-list" role="listbox" hidden></ul>
                     </div>
                 </div>
@@ -9189,7 +9455,7 @@ renderDocumentHead('Price History');
                         name="radius_km"
                         id="f-radius"
                         onchange="this.form.submit()"
-                        <?= $selectedCity === '' ? 'disabled' : '' ?>
+                        <?= $selectedLocation === '' ? 'disabled' : '' ?>
                     >
                         <?php foreach ($validRadiusOptions as $radiusOption): ?>
                             <option value="<?= h((string) $radiusOption) ?>" <?= $selectedRadiusKm === $radiusOption ? 'selected' : '' ?>>
@@ -9276,7 +9542,11 @@ renderDocumentHead('Price History');
             </form>
 
             <div class="sidebar-actions">
-                <a class="btn-reset" href="<?= h((strtok($_SERVER['REQUEST_URI'] ?? '/web/index.php', '?') ?: '/web/index.php') . '?reset=1') ?>" data-i18n="reset">Reset</a>
+                <form method="post" action="">
+                    <?= csrfField() ?>
+                    <input type="hidden" name="action" value="reset_filters">
+                    <button type="submit" class="btn-reset" data-i18n="reset">Reset</button>
+                </form>
             </div>
         </aside>
 
@@ -9495,13 +9765,13 @@ const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
 // the snapshot query (the payload is known-empty), so the client can skip the
 // fetch and render the empty state immediately instead of showing spinners.
 // Server-side errors still force a fetch so the usual error UI renders.
-const hasDataScope = <?= json_encode($selectedCity !== '' || $selectedStationIds !== [] || $errors !== [], JSON_THROW_ON_ERROR) ?>;
+const hasDataScope = <?= json_encode($selectedLocation !== '' || $selectedStationIds !== [] || $errors !== [], JSON_THROW_ON_ERROR) ?>;
 // ?action=geocode writes to the cities cache, so it is token-checked like a
 // form post even though it is fetched with GET.
 const geocodeCsrf = <?= json_encode(csrfToken(), JSON_THROW_ON_ERROR) ?>;
 // The selected location, as the surroundings card names it in its header. Empty
 // when no city, address or position has been picked.
-const locationLabel = <?= json_encode($selectedCityRow ? (string) $selectedCityRow['display_name'] : '', JSON_THROW_ON_ERROR) ?>;
+const locationLabel = <?= json_encode($selectedLocation, JSON_THROW_ON_ERROR) ?>;
 const locationRadiusKm = <?= json_encode($selectedRadiusKm, JSON_THROW_ON_ERROR) ?>;
 
 const fuelConfig = {
@@ -10694,13 +10964,15 @@ function onDateChange(el) {
 (function () {
     const wrap   = document.getElementById('city-ac');
     const input  = document.getElementById('f-city');
-    const hidden = document.getElementById('f-city-value');
+    const label  = document.getElementById('f-loc-label');
+    const latIn  = document.getElementById('f-loc-lat');
+    const lngIn  = document.getElementById('f-loc-lng');
     const list   = document.getElementById('city-ac-list');
     const form   = input?.closest('form');
     const radius = document.getElementById('f-radius');
     const locate = document.getElementById('f-locate');
 
-    if (!wrap || !input || !hidden || !list || !form) return;
+    if (!wrap || !input || !label || !latIn || !lngIn || !list || !form) return;
 
     const ICON_SEARCH = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>`;
 
@@ -10727,11 +10999,16 @@ function onDateChange(el) {
         activeIdx = idx;
     }
 
-    function selectCity(cityKey, displayName) {
-        input.value  = displayName;
-        hidden.value = cityKey;
+    // Apply a resolved place: the three hidden fields are the location, the
+    // text box is only what the reader reads. Saving is what applying means
+    // now — the post writes the filter row and the page comes back from it.
+    function applyLocation(placeLabel, lat, lng) {
+        input.value = placeLabel;
+        label.value = placeLabel;
+        latIn.value = placeLabel === '' ? '' : String(lat);
+        lngIn.value = placeLabel === '' ? '' : String(lng);
         hideList();
-        if (radius) radius.disabled = (cityKey === '');
+        if (radius) radius.disabled = (placeLabel === '');
         form.submit();
     }
 
@@ -10766,8 +11043,8 @@ function onDateChange(el) {
             if (res.status === 401) { location.href = '?page=login'; return; }
             const payload = await res.json();
             const t = translations[currentLang];
-            if (payload && payload.city_key) {
-                selectCity(payload.city_key, payload.display_name || payload.city_key);
+            if (payload && payload.label) {
+                applyLocation(payload.label, payload.lat, payload.lng);
                 return;
             }
             const failure = payload && payload.errors && payload.errors[0];
@@ -10823,9 +11100,10 @@ function onDateChange(el) {
     let debounceTimer = null;
 
     input.addEventListener('input', () => {
+        // Typing alone changes nothing: the stored location stands until a
+        // resolved place replaces it, so an unfinished edit cannot ride along
+        // on the next radius or fuel change.
         const q = input.value.trim();
-        hidden.value = '';
-        if (radius) radius.disabled = true;
         clearTimeout(debounceTimer);
         if (q.length < 3) { hideList(); return; }
 
@@ -10836,15 +11114,15 @@ function onDateChange(el) {
             if (input.value.trim() !== q) return;
 
             list.innerHTML = '';
-            results.forEach(({ city_key, display_name }) => {
+            results.forEach((match) => {
                 const li = document.createElement('li');
                 li.className    = 'city-ac-item';
                 li.role         = 'option';
                 li.setAttribute('aria-selected', 'false');
-                li.textContent  = display_name || city_key;
+                li.textContent  = match.label;
                 li.addEventListener('mousedown', (e) => {
                     e.preventDefault();
-                    selectCity(city_key, display_name || city_key);
+                    applyLocation(match.label, match.lat, match.lng);
                 });
                 list.appendChild(li);
             });
@@ -10865,9 +11143,10 @@ function onDateChange(el) {
         } else if (e.key === 'Enter' && !list.hidden && activeIdx >= 0 && items[activeIdx]) {
             e.preventDefault();
             items[activeIdx].dispatchEvent(new MouseEvent('mousedown'));
-        } else if (e.key === 'Enter' && hidden.value === '' && input.value.trim().length >= 3) {
-            // Nothing highlighted and nothing selected: submitting would only
-            // clear the filter, so read Enter as "resolve what I typed".
+        } else if (e.key === 'Enter' && input.value.trim() !== label.value) {
+            // Nothing highlighted, and the box no longer says what is stored:
+            // read Enter as "resolve what I just typed" rather than as a
+            // submit that would re-save the location already in place.
             e.preventDefault();
             searchAddress();
         } else if (e.key === 'Escape') {
@@ -10877,9 +11156,9 @@ function onDateChange(el) {
 
     input.addEventListener('blur', () => setTimeout(hideList, 150));
 
-    // Submit with empty city when user clears the field and blurs
+    // Clearing the box and leaving it is how a reader says "no location".
     input.addEventListener('change', () => {
-        if (input.value.trim() === '' && hidden.value === '') form.submit();
+        if (input.value.trim() === '' && label.value !== '') applyLocation('', 0, 0);
     });
 
     if (locate) {
@@ -11037,7 +11316,10 @@ function resetLoadingUI() {
 }
 
 async function loadData() {
+    // No filters in the URL: the endpoint reads the same stored row the page
+    // was rendered from, so there is nothing to copy across.
     const url = new URL(location.href);
+    url.search = '';
     url.searchParams.set('action', 'data');
     try {
         const res = await fetch(url.toString(), { headers: { Accept: 'application/json' } });

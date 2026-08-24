@@ -141,7 +141,7 @@ func TestRunDashboardChecksReproducesAPageLoad(t *testing.T) {
 	for _, q := range dash.Queries {
 		got[q.Name] = q
 	}
-	for _, name := range []string{"city", "city_search", "scope_stations", "snapshots",
+	for _, name := range []string{"city_search", "scope_stations", "nearby_latest", "snapshots",
 		"predictions_grid"} {
 		q, ok := got[name]
 		if !ok {
@@ -230,15 +230,14 @@ func TestDashboardChecksReportAnUnknownCity(t *testing.T) {
 	if dash.Scope.CityFound {
 		t.Fatal("nowhere is not geocoded")
 	}
-	// The lookup that failed is still timed: that is the query an operator
-	// wants to see, and it is the only one the page reaches.
+	// Without a resolvable centre there is no bounding box, so doctor stops
+	// before the scope: the typeahead is the only page query left to time.
 	names := []string{}
 	for _, q := range dash.Queries {
 		names = append(names, q.Name)
 	}
-	// The page renders its error and stops, so nothing past the lookup runs.
-	if strings.Join(names, ",") != "city,city_search" {
-		t.Fatalf("queries = %v, want just the two cities lookups", names)
+	if strings.Join(names, ",") != "city_search" {
+		t.Fatalf("queries = %v, want just the typeahead", names)
 	}
 	if !containsFinding(doctorDashboardFindings(dash, nil, opts), "is not in the cities table") {
 		t.Error("an unresolvable city must be a finding")
@@ -528,13 +527,10 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	php := string(viewer)
 
 	signatures := map[string][]string{
-		"city": {
-			"SELECT normalized_name AS city_key, normalized_name AS city_name, display_name, lat, lng",
-			"WHERE normalized_name = ",
-		},
 		"city_search": {
 			// The prefix range is what idx_cities_search can answer; a
 			// function around the column, or a LIKE, would not be seekable.
+			"SELECT normalized_name AS city_key, display_name, lat, lng",
 			"WHERE normalized_lower >= ",
 			"AND normalized_lower < ",
 			"ORDER BY normalized_lower ASC",
@@ -609,6 +605,25 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	if !strings.Contains(specs["snapshots"].sql, "% 10 + 9) / 1000.0") {
 		t.Errorf("doctor's snapshot query lost the raised-9 projection:\n%s", specs["snapshots"].sql)
 	}
+	// The page no longer resolves a city on load — the location comes off the
+	// reader's own filter row — so doctor must not be measuring a lookup the
+	// page stopped doing, and the page must really be reading that row.
+	if _, ok := specs["city"]; ok {
+		t.Error("doctor still measures a city lookup the dashboard no longer performs")
+	}
+	if !strings.Contains(php, "FROM user_filters") {
+		t.Error("web/index.php no longer reads the dashboard filters from user_filters")
+	}
+	// The filters must not come back from anywhere else: a cookie or a query
+	// parameter would mean two accounts sharing a browser share a dashboard.
+	// Only the dashboard's own names are listed — the admin pages legitimately
+	// read a fuel and a range out of their own URLs.
+	for _, gone := range []string{"'gasoline_filters'", "$_GET['city']", "$_GET['radius_km']", "$_GET['station_ids']"} {
+		if strings.Contains(php, gone) {
+			t.Errorf("web/index.php still reads the dashboard filters from %q", gone)
+		}
+	}
+
 	// The surroundings card reads the radius, not the picker: its query has to
 	// cover the station the picker dropped, or doctor is timing a smaller page
 	// than the reader loaded.
@@ -885,7 +900,8 @@ func TestCitySearchRangeFindsNamesRegardlessOfCase(t *testing.T) {
 		var found []string
 		for rows.Next() {
 			var key, display string
-			if err := rows.Scan(&key, &display); err != nil {
+			var lat, lng float64
+			if err := rows.Scan(&key, &display, &lat, &lng); err != nil {
 				t.Fatalf("scan: %v", err)
 			}
 			found = append(found, key)

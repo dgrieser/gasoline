@@ -409,6 +409,20 @@ func schemaStatements(d dialect) []string {
 				INDEX idx_user_sessions_expires (expires_at),
 				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS user_filters (
+				user_id BIGINT PRIMARY KEY,
+				location_label VARCHAR(255) NOT NULL DEFAULT '',
+				location_lat DOUBLE NOT NULL DEFAULT 0,
+				location_lng DOUBLE NOT NULL DEFAULT 0,
+				radius_km INT NOT NULL DEFAULT 5,
+				range_key VARCHAR(8) NOT NULL DEFAULT '',
+				from_date VARCHAR(10) NOT NULL DEFAULT '',
+				to_date VARCHAR(10) NOT NULL DEFAULT '',
+				fuel VARCHAR(8) NOT NULL DEFAULT 'all',
+				station_ids TEXT NOT NULL,
+				updated_at VARCHAR(64) NOT NULL,
+				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 			`CREATE TABLE IF NOT EXISTS settings (
 				name VARCHAR(191) PRIMARY KEY,
 				value TEXT NOT NULL,
@@ -602,6 +616,20 @@ func schemaStatements(d dialect) []string {
 			ON user_sessions(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_sessions_expires
 			ON user_sessions(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS user_filters (
+			user_id INTEGER PRIMARY KEY,
+			location_label TEXT NOT NULL DEFAULT '',
+			location_lat REAL NOT NULL DEFAULT 0,
+			location_lng REAL NOT NULL DEFAULT 0,
+			radius_km INTEGER NOT NULL DEFAULT 5,
+			range_key TEXT NOT NULL DEFAULT '',
+			from_date TEXT NOT NULL DEFAULT '',
+			to_date TEXT NOT NULL DEFAULT '',
+			fuel TEXT NOT NULL DEFAULT 'all',
+			station_ids TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
 		`CREATE TABLE IF NOT EXISTS settings (
 			name TEXT PRIMARY KEY,
 			value TEXT NOT NULL,
