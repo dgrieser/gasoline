@@ -549,10 +549,13 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 			"ORDER BY ps.recorded_at ASC, ps.station_id ASC",
 		},
 		"nearby_latest": {
-			// The correlated maximum is what makes this one indexed seek per
-			// station instead of a scan of each station's history.
-			"SELECT MAX(newest.recorded_at)",
-			"WHERE newest.station_id = ps.station_id",
+			// The freshness bound on both halves is what keeps this to one
+			// index range per station. Without it the search covers every
+			// snapshot each station ever recorded.
+			"SELECT station_id, MAX(recorded_at) AS newest_at",
+			"AND recorded_at >= ",
+			"GROUP BY station_id",
+			"AND ps.recorded_at >= ",
 		},
 		"predictions_grid": {
 			"pp.predicted_price, pp.confidence, pr.run_at, pr.suggestion_bias",
@@ -627,8 +630,20 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	// The surroundings card reads the radius, not the picker: its query has to
 	// cover the station the picker dropped, or doctor is timing a smaller page
 	// than the reader loaded.
-	if got := len(specs["nearby_latest"].args); got != 3 {
-		t.Errorf("doctor's nearby_latest query binds %d stations, want the 3 in scope rather than the 2 selected", got)
+	// Three stations in scope, bound twice, with the cutoff after each list.
+	if got := len(specs["nearby_latest"].args); got != 8 {
+		t.Errorf("doctor's nearby_latest query binds %d values, want the 3 in-scope stations and the cutoff on each half", got)
+	}
+	// The correlated form this replaced re-ran a subquery for every snapshot
+	// row the nearby stations had ever recorded. Neither side may regrow it.
+	for _, gone := range []string{"MAX(newest.recorded_at)", "ps.recorded_at = ("} {
+		if strings.Contains(php, gone) {
+			t.Errorf("web/index.php has regrown the correlated newest-snapshot subquery (%q); "+
+				"the surroundings prices come from a grouped lookup bounded to the freshness window", gone)
+		}
+		if strings.Contains(specs["nearby_latest"].sql, gone) {
+			t.Errorf("doctor's nearby_latest query has regrown %q", gone)
+		}
 	}
 	if want := fmt.Sprintf("const NEARBY_STATION_LIMIT = %d;", dashboardNearbyLimit); !strings.Contains(php, want) {
 		t.Errorf("web/index.php no longer mirrors dashboardNearbyLimit: %q missing", want)

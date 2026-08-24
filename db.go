@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -305,6 +306,23 @@ func openMySQL(ctx context.Context, dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("cannot connect to mysql server: %w", err)
 	}
 	return db, nil
+}
+
+// schemaTableNamePattern picks the table out of a CREATE TABLE statement in
+// schemaStatements. Reading the names off the statements rather than keeping a
+// list beside them is what stops the two from drifting when a table is added.
+var schemaTableNamePattern = regexp.MustCompile(`(?i)CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)`)
+
+// schemaTableNames are the tables schemaStatements creates, in the order it
+// creates them.
+func schemaTableNames(d dialect) []string {
+	var names []string
+	for _, stmt := range schemaStatements(d) {
+		if match := schemaTableNamePattern.FindStringSubmatch(stmt); match != nil {
+			names = append(names, match[1])
+		}
+	}
+	return names
 }
 
 // schemaStatements returns the CREATE statements for the given dialect. The

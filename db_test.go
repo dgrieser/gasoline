@@ -11,6 +11,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -617,6 +619,66 @@ func isCommand(name string) bool {
 		return true
 	}
 	return false
+}
+
+// Every table has to be declared for both engines. A table added to one dialect
+// and not the other installs cleanly on the developer's SQLite file and leaves
+// the MySQL deployment without it, which the viewer then refuses to start on.
+func TestSchemaDeclaresTheSameTablesForBothEngines(t *testing.T) {
+	sqlite := append([]string{}, schemaTableNames(dialectSQLite)...)
+	mysql := append([]string{}, schemaTableNames(dialectMySQL)...)
+	if len(sqlite) == 0 {
+		t.Fatal("schemaTableNames found no tables, so the pattern no longer matches the DDL")
+	}
+	sort.Strings(sqlite)
+	sort.Strings(mysql)
+	if !slices.Equal(sqlite, mysql) {
+		t.Errorf("the two dialects declare different tables:\n sqlite: %v\n  mysql: %v", sqlite, mysql)
+	}
+	// The viewer refuses to start without these four, so name them explicitly
+	// rather than trusting that both lists happen to agree about them.
+	for _, want := range []string{"users", "user_filters", "settings", "update_targets"} {
+		if !slices.Contains(sqlite, want) {
+			t.Errorf("schemaStatements no longer creates %q, which the viewer's schema guard requires", want)
+		}
+	}
+}
+
+// `migrate` on a database that is current except for one missing table used to
+// print "no migrations needed": ensureSchema creates it with CREATE TABLE IF
+// NOT EXISTS, which says nothing, and the migration list was the only thing the
+// command reported. An operator who had just been told to run migrate then had
+// no way to tell it apart from a no-op.
+func TestMigrateReportsTablesItCreates(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `DROP TABLE user_filters`); err != nil {
+		t.Fatalf("drop user_filters: %v", err)
+	}
+	created, err := ensureSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	if !slices.Contains(created, "user_filters") {
+		t.Errorf("ensureSchema reported %v, want the table it had to create", created)
+	}
+	exists, err := tableExists(ctx, db, dialectSQLite, "user_filters")
+	if err != nil {
+		t.Fatalf("tableExists: %v", err)
+	}
+	if !exists {
+		t.Error("ensureSchema did not actually create user_filters")
+	}
+
+	// And a second pass reports nothing, so the line really means "this is new".
+	created, err = ensureSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("ensureSchema again: %v", err)
+	}
+	if len(created) != 0 {
+		t.Errorf("ensureSchema reported %v on an unchanged database, want nothing", created)
+	}
 }
 
 // The PHP viewer keeps the durable half of a login in user_sessions: without

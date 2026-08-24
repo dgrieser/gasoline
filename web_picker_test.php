@@ -394,6 +394,19 @@ check('an unlabelled bucket index is still reported',
 echo "web_picker_test: loadNearbyPrices\n";
 
 /**
+ * The station-freshness window, fixed so the fixtures can sit on either side of
+ * it. The page derives this from the clock; what matters here is that the
+ * lookup really is bounded by it, which is what keeps it from walking every
+ * snapshot a station ever recorded.
+ */
+const NEARBY_CUTOFF = '2026-08-20T12:00:00Z';
+
+function stationFreshnessCutoff(): string
+{
+    return NEARBY_CUTOFF;
+}
+
+/**
  * A snapshot table holding the given rows, each [station, recorded_at, is_open,
  * e5, e10, diesel]. Only the columns loadNearbyPrices reads are created.
  */
@@ -477,6 +490,22 @@ check('a station without any snapshot is dropped',
     array_column(loadNearbyPrices($pdo, scopeStations(['a', 'ghost']), [], 10), 's'), ['a']);
 check('a station without a measured distance still lists, with a null distance',
     loadNearbyPrices($pdo, scopeStations(['a']), [], 10)[0]['dist'], null);
+
+// The lookup is bounded to the freshness window on both halves. That is what
+// stops it from walking a station's whole history — the shipped version
+// correlated a MAX() against every snapshot row instead, which SQLite absorbed
+// and MySQL did not. loadScopeStations only hands over stations fed inside the
+// window, so nothing that belongs in the card is lost by looking no further.
+$pdo = seedSnapshots([
+    ['fresh', '2026-08-19T09:00:00Z', 1, 1.609, null, null],
+    ['fresh', '2026-08-21T09:00:00Z', 1, 1.709, null, null],
+    ['stale', '2026-08-01T09:00:00Z', 1, 1.509, null, null],
+    ['stale', '2026-08-19T09:00:00Z', 1, 1.519, null, null],
+]);
+check('a reading from before the window cannot win',
+    loadNearbyPrices($pdo, scopeStations(['fresh']), [], 10)[0]['e5'], 1.709);
+check('a station with nothing inside the window is left out',
+    array_column(loadNearbyPrices($pdo, scopeStations(['fresh', 'stale']), [], 10), 's'), ['fresh']);
 
 echo "web_picker_test: geocodeLabel\n";
 

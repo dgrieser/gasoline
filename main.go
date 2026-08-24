@@ -1244,13 +1244,24 @@ func runMigrate(args []string) error {
 	}
 	defer db.Close()
 
-	if err := ensureSchema(ctx, db, dbCfg.Driver); err != nil {
+	created, err := ensureSchema(ctx, db, dbCfg.Driver)
+	if err != nil {
 		return err
 	}
 
 	result, err := migrateSchema(ctx, db, dbCfg.Driver)
 	if err != nil {
 		return err
+	}
+	// Created tables lead: they are the coarsest thing that can have happened,
+	// and the column and index migrations below them read as detail once a
+	// whole table has just appeared.
+	if len(created) > 0 {
+		leading := make([]string, 0, len(created)+len(result.Applied))
+		for _, name := range created {
+			leading = append(leading, name+".created")
+		}
+		result.Applied = append(leading, result.Applied...)
 	}
 	result.DBPath = dbCfg.Description()
 
@@ -3578,20 +3589,53 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func initSchema(ctx context.Context, db *sql.DB, d dialect) error {
-	if err := ensureSchema(ctx, db, d); err != nil {
+	if _, err := ensureSchema(ctx, db, d); err != nil {
 		return err
 	}
 	_, err := migrateSchema(ctx, db, d)
 	return err
 }
 
-func ensureSchema(ctx context.Context, db *sql.DB, d dialect) error {
-	for _, stmt := range schemaStatements(d) {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return err
+// ensureSchema installs anything schemaStatements declares that is not there
+// yet, and reports the tables it had to create.
+//
+// It reports them because CREATE TABLE IF NOT EXISTS is silent by design, and
+// `migrate` used to be silent with it: an install that gained a whole table —
+// user_filters, say, which the viewer refuses to start without — printed "no
+// migrations needed", which reads as "nothing was wrong" rather than as "the
+// table you were missing is now there".
+func ensureSchema(ctx context.Context, db *sql.DB, d dialect) ([]string, error) {
+	missing := map[string]bool{}
+	for _, name := range schemaTableNames(d) {
+		exists, err := tableExists(ctx, db, d, name)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			missing[name] = true
 		}
 	}
-	return nil
+
+	for _, stmt := range schemaStatements(d) {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return nil, err
+		}
+	}
+
+	var created []string
+	for _, name := range schemaTableNames(d) {
+		if !missing[name] {
+			continue
+		}
+		exists, err := tableExists(ctx, db, d, name)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			created = append(created, name)
+		}
+	}
+	return created, nil
 }
 
 func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, error) {
