@@ -249,18 +249,26 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 	// loadNearbyPrices: the current price at each of the nearest stations. Its
 	// scope is the radius alone, so it runs whenever a location is selected —
 	// including when the picker has narrowed everything below it away.
+	//
+	// Both halves are bounded by the freshness window, which is the point of
+	// its shape: the station list is already known to have been fed inside that
+	// window, so neither half ever has to walk a station's full history.
 	if qc.BBox != nil && len(qc.ScopeStationIDs) > 0 {
 		nearbyIDs := qc.ScopeStationIDs
 		if len(nearbyIDs) > dashboardNearbyLimit {
 			nearbyIDs = nearbyIDs[:dashboardNearbyLimit]
 		}
-		nearbyArgs := make([]any, 0, len(nearbyIDs))
+		nearbyIn := boundPlaceholders(len(nearbyIDs))
+		// The grouped half's list and cutoff, then the outer half's, in the
+		// order the page binds them.
+		nearbyInner := make([]any, 0, len(nearbyIDs)+1)
 		for _, id := range nearbyIDs {
-			nearbyArgs = append(nearbyArgs, id)
+			nearbyInner = append(nearbyInner, id)
 		}
-		nearbyWhere := "ps.station_id IN (" + boundPlaceholders(len(nearbyIDs)) + ") " +
-			"AND ps.recorded_at = (SELECT MAX(newest.recorded_at) FROM price_snapshots newest " +
-			"WHERE newest.station_id = ps.station_id)"
+		nearbyInner = append(nearbyInner, qc.FreshCutoff)
+		nearbyArgs := append(append([]any{}, nearbyInner...), nearbyInner...)
+		nearbyNewest := "SELECT station_id, MAX(recorded_at) AS newest_at FROM price_snapshots " +
+			"WHERE station_id IN (" + nearbyIn + ") AND recorded_at >= ? GROUP BY station_id"
 		specs = append(specs, dashboardQuerySpec{
 			name:    "nearby_latest",
 			purpose: "the current price at each of the nearest stations (loadNearbyPrices)",
@@ -268,16 +276,18 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 				raisedNinePriceSQL("ps.e5") + " AS e5, " +
 				raisedNinePriceSQL("ps.e10") + " AS e10, " +
 				raisedNinePriceSQL("ps.diesel") + " AS diesel " +
-				"FROM price_snapshots ps WHERE " + nearbyWhere,
+				"FROM price_snapshots ps JOIN (" + nearbyNewest + ") newest " +
+				"ON newest.station_id = ps.station_id AND newest.newest_at = ps.recorded_at " +
+				"WHERE ps.station_id IN (" + nearbyIn + ") AND ps.recorded_at >= ?",
 			args:  nearbyArgs,
 			table: "price_snapshots",
 			alias: "ps",
 			probe: &doctorProbeSpec{
 				name:    "newest only",
-				purpose: "the correlated maximum on its own, so the difference is the row lookups",
-				sql:     "SELECT ps.station_id FROM price_snapshots ps WHERE " + nearbyWhere,
-				args:    nearbyArgs,
-				alias:   "ps",
+				purpose: "the grouped lookup alone, so the difference is the join back and the row lookups",
+				sql:     nearbyNewest,
+				args:    nearbyInner,
+				alias:   "price_snapshots",
 			},
 		})
 	}

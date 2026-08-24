@@ -1084,7 +1084,16 @@ const NEARBY_STATION_LIMIT = 40;
 /** The RFC3339 instant a station's newest snapshot must reach to be in scope. */
 function stationFreshnessCutoff(): string
 {
-    return gmdate('Y-m-d\TH:i:s\Z', time() - GASOLINE_STATION_FRESHNESS_HOURS * 3600);
+    // Resolved once per request. Several queries in one page load apply this
+    // bound — the station scope and the surroundings prices among them — and a
+    // station whose newest snapshot sits within a second of the boundary must
+    // not be in scope for one of them and out of scope for the next.
+    static $cutoff = null;
+    if ($cutoff === null) {
+        $cutoff = gmdate('Y-m-d\TH:i:s\Z', time() - GASOLINE_STATION_FRESHNESS_HOURS * 3600);
+    }
+
+    return $cutoff;
 }
 
 
@@ -5101,13 +5110,25 @@ function geocodeRequest(string $path, array $query): mixed
             $body = $response;
         }
     } else {
+        // The http context's timeout covers the read, not opening the socket:
+        // a host that cannot reach the geocoder at all would otherwise sit on
+        // default_socket_timeout (60s by default) with the reader watching a
+        // spinner. Narrow it for this one call and put it back afterwards.
         $context = stream_context_create(['http' => [
             'method' => 'GET',
             'header' => 'User-Agent: ' . geocodeUserAgent() . "\r\n",
             'timeout' => $timeout,
             'ignore_errors' => false,
         ]]);
-        $body = @file_get_contents($url, false, $context);
+        $previousSocketTimeout = ini_get('default_socket_timeout');
+        ini_set('default_socket_timeout', (string) $timeout);
+        try {
+            $body = @file_get_contents($url, false, $context);
+        } finally {
+            if ($previousSocketTimeout !== false) {
+                ini_set('default_socket_timeout', $previousSocketTimeout);
+            }
+        }
     }
 
     if (!is_string($body) || $body === '') {
@@ -5365,11 +5386,15 @@ function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
  * every station the selected location and radius admit — the same scope list
  * the sidebar shows, which loadScopeStations has already sorted by distance.
  *
- * One indexed seek per station: the correlated MAX() lands on
- * idx_price_snapshots_station_recorded, whose DESC ordering makes it the first
- * row of that station's range rather than a scan of its history. The station
- * list is capped first, so the query's cost is bounded by the cap and not by
- * how dense the area is.
+ * Bounded to the freshness window on both sides, which is what keeps it cheap.
+ * The first shipped version correlated a MAX() against the outer row instead:
+ * that reads every snapshot each station ever recorded and re-runs the
+ * subquery for each one — 93,000 rows and 93,000 subquery executions for forty
+ * stations on a database with 888,000 snapshots, which SQLite absorbed and
+ * MySQL did not. Since loadScopeStations has already established that every
+ * station here was fed inside the window, the newest snapshot is inside it too,
+ * so the search never has to leave it: the grouped lookup reads one index range
+ * per station and the join back is one seek per station.
  *
  * Prices are normalized to the raised-9 board style in the projection, exactly
  * like the snapshot query, so the card and the chart quote the same number.
@@ -5385,18 +5410,28 @@ function loadNearbyPrices(PDO $pdo, array $stations, array $distancesKm, int $li
         return [];
     }
 
-    $placeholders = [];
+    // Two parameter sets for one list of stations: the bound is repeated on the
+    // outer query so that the work stays inside the freshness window whichever
+    // side the engine decides to drive the join from, and a native prepared
+    // statement cannot reuse one placeholder twice.
+    $inner = [];
+    $outer = [];
     $params = [];
     foreach ($stations as $index => $station) {
-        $placeholder = ':nearby_station_' . $index;
-        $placeholders[] = $placeholder;
-        $params[$placeholder] = (string) $station['id'];
+        $id = (string) $station['id'];
+        $inner[] = ':nearby_inner_' . $index;
+        $outer[] = ':nearby_outer_' . $index;
+        $params[':nearby_inner_' . $index] = $id;
+        $params[':nearby_outer_' . $index] = $id;
     }
+    $params[':nearby_inner_cutoff'] = stationFreshnessCutoff();
+    $params[':nearby_outer_cutoff'] = stationFreshnessCutoff();
 
     $e5 = raisedNinePriceSql('ps.e5');
     $e10 = raisedNinePriceSql('ps.e10');
     $diesel = raisedNinePriceSql('ps.diesel');
-    $in = implode(', ', $placeholders);
+    $innerIn = implode(', ', $inner);
+    $outerIn = implode(', ', $outer);
     $stmt = $pdo->prepare(
         <<<SQL
         SELECT
@@ -5407,12 +5442,17 @@ function loadNearbyPrices(PDO $pdo, array $stations, array $distancesKm, int $li
             {$e10} AS e10,
             {$diesel} AS diesel
         FROM price_snapshots ps
-        WHERE ps.station_id IN ({$in})
-          AND ps.recorded_at = (
-              SELECT MAX(newest.recorded_at)
-              FROM price_snapshots newest
-              WHERE newest.station_id = ps.station_id
-          )
+        JOIN (
+            SELECT station_id, MAX(recorded_at) AS newest_at
+            FROM price_snapshots
+            WHERE station_id IN ({$innerIn})
+              AND recorded_at >= :nearby_inner_cutoff
+            GROUP BY station_id
+        ) newest
+          ON newest.station_id = ps.station_id
+         AND newest.newest_at = ps.recorded_at
+        WHERE ps.station_id IN ({$outerIn})
+          AND ps.recorded_at >= :nearby_outer_cutoff
         SQL
     );
     foreach ($params as $key => $value) {
@@ -5436,8 +5476,9 @@ function loadNearbyPrices(PDO $pdo, array $stations, array $distancesKm, int $li
     foreach ($stations as $station) {
         $id = (string) $station['id'];
         if (!isset($latestById[$id])) {
-            // No snapshot at all. The freshness rule makes this unreachable in
-            // practice, so rather than invent an empty row, leave it out.
+            // No snapshot inside the freshness window. loadScopeStations only
+            // returns stations that have one, so rather than invent an empty
+            // row, leave it out.
             continue;
         }
         $latest = $latestById[$id];
