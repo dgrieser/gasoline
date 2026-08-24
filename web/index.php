@@ -508,16 +508,18 @@ function gasolineSchemaReady(PDO $pdo, string $driver): bool
         if ($driver === 'mysql') {
             $stmt = $pdo->query(
                 "SELECT COUNT(*) AS n FROM information_schema.tables
-                 WHERE table_schema = DATABASE() AND table_name IN ('users', 'settings', 'update_targets')"
+                 WHERE table_schema = DATABASE()
+                   AND table_name IN ('users', 'user_filters', 'settings', 'update_targets')"
             );
         } else {
             $stmt = $pdo->query(
                 "SELECT COUNT(*) AS n FROM sqlite_master
-                 WHERE type = 'table' AND name IN ('users', 'settings', 'update_targets')"
+                 WHERE type = 'table'
+                   AND name IN ('users', 'user_filters', 'settings', 'update_targets')"
             );
         }
         $row = $stmt->fetch();
-        return (int) ($row['n'] ?? 0) === 3;
+        return (int) ($row['n'] ?? 0) === 4;
     } catch (Throwable $e) {
         error_log('gasoline schema check error: ' . $e->getMessage());
         return false;
@@ -1072,6 +1074,13 @@ const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
  */
 const GASOLINE_STATION_FRESHNESS_HOURS = 48;
 
+/**
+ * How many of the nearest stations the surroundings card reads a current price
+ * for. A radius that admits more than this many stations has long stopped being
+ * a neighbourhood, and the cap is what bounds that query's cost.
+ */
+const NEARBY_STATION_LIMIT = 40;
+
 /** The RFC3339 instant a station's newest snapshot must reach to be in scope. */
 function stationFreshnessCutoff(): string
 {
@@ -1152,6 +1161,270 @@ function normalizeTimeList(array $times): ?string
 
 
 
+
+/* ── Dashboard filters ────────────────────────────────────────────────────────
+ *
+ * The sidebar's filters belong to the account, not to the URL: one row per user
+ * in `user_filters`, written by the save_filters post and read back on every
+ * load — including by ?action=data, which no longer copies the page's query
+ * string because there is nothing in it to copy.
+ *
+ * They used to be query parameters kept alive by a cookie. That made a filtered
+ * dashboard a link, but it also meant one account saw different filters in
+ * every browser it signed in from, and the reader's own location — the thing
+ * the surroundings card is about — lived in a cookie that any cache clear threw
+ * away.
+ *
+ * The location is stored as the label the reader sees plus the coordinates it
+ * resolved to. Deliberately not as a key into `cities`: that table is the CLI's
+ * cache of the places it collects, one row per city, and a reader's street
+ * address is neither a city nor something the CLI should have to carry.
+ */
+
+/** Radii the sidebar offers. doctor accepts exactly these (doctor_dashboard.go). */
+const DASHBOARD_RADIUS_OPTIONS = [5, 10, 20];
+
+/** Quick ranges, and how many days back each one reaches. */
+const DASHBOARD_RANGE_DAYS = ['7d' => 7, '14d' => 14, '30d' => 30];
+
+/** Fuel filter values, "all" included. */
+const DASHBOARD_FUELS = ['all', 'diesel', 'e5', 'e10'];
+
+/**
+ * How many hand-picked stations one filter row keeps. The picker is for
+ * comparing a handful, and the cap is what stops a row from growing without
+ * bound if something ever posts the whole list.
+ */
+const DASHBOARD_STATION_LIMIT = 200;
+
+/** What a user who has never touched the sidebar sees. */
+function defaultDashboardFilters(): array
+{
+    return [
+        'location_label' => '',
+        'location_lat' => 0.0,
+        'location_lng' => 0.0,
+        'radius_km' => DASHBOARD_RADIUS_OPTIONS[0],
+        'range' => '7d',
+        'from' => '',
+        'to' => '',
+        'fuel' => 'all',
+        'station_ids' => [],
+    ];
+}
+
+/** True for a "YYYY-MM-DD" that is also a real calendar date. */
+function validISODate(string $value): bool
+{
+    $parsed = DateTimeImmutable::createFromFormat('!Y-m-d', $value, new DateTimeZone('UTC'));
+
+    return $parsed !== false && $parsed->format('Y-m-d') === $value;
+}
+
+/**
+ * Clamp a raw filter set to what the page can render.
+ *
+ * The same function guards both directions: what the sidebar posts (which is
+ * whatever a form can be made to send) and what comes back out of the database
+ * (which an older release, a hand-edited row or a dropped station could have
+ * left inconsistent). Anything it cannot make sense of falls back to the
+ * default rather than propagating — a bad radius must not empty the dashboard.
+ *
+ * @param array<string, mixed> $raw
+ * @return array<string, mixed>
+ */
+function normalizeDashboardFilters(array $raw): array
+{
+    $filters = defaultDashboardFilters();
+
+    // The location is all-or-nothing: a label without usable coordinates
+    // cannot centre a radius, and coordinates without a label would leave the
+    // sidebar unable to say where the reader is.
+    $label = trim((string) ($raw['location_label'] ?? ''));
+    $lat = $raw['location_lat'] ?? '';
+    $lng = $raw['location_lng'] ?? '';
+    if ($label !== '' && is_numeric($lat) && is_numeric($lng)
+        && (float) $lat >= -90.0 && (float) $lat <= 90.0
+        && (float) $lng >= -180.0 && (float) $lng <= 180.0
+    ) {
+        // user_filters.location_label is VARCHAR(255).
+        $filters['location_label'] = mb_substr($label, 0, 200, 'UTF-8');
+        $filters['location_lat'] = (float) $lat;
+        $filters['location_lng'] = (float) $lng;
+    }
+
+    $radius = (int) ($raw['radius_km'] ?? 0);
+    if (in_array($radius, DASHBOARD_RADIUS_OPTIONS, true)) {
+        $filters['radius_km'] = $radius;
+    }
+
+    $fuel = trim((string) ($raw['fuel'] ?? ''));
+    if (in_array($fuel, DASHBOARD_FUELS, true)) {
+        $filters['fuel'] = $fuel;
+    }
+
+    // A quick range and explicit dates are alternatives: picking a range is
+    // what clears the date boxes, so a row carrying both would render two
+    // different answers in one sidebar.
+    $range = trim((string) ($raw['range'] ?? ''));
+    $from = trim((string) ($raw['from'] ?? ''));
+    $to = trim((string) ($raw['to'] ?? ''));
+    if (isset(DASHBOARD_RANGE_DAYS[$range])) {
+        $filters['range'] = $range;
+        return $filters;
+    }
+    $filters['from'] = validISODate($from) ? $from : '';
+    $filters['to'] = validISODate($to) ? $to : '';
+    // Neither a range nor a usable date: back to the default window rather
+    // than to the whole history, which is what the page did before too.
+    $filters['range'] = ($filters['from'] === '' && $filters['to'] === '') ? '7d' : '';
+
+    return $filters;
+}
+
+/**
+ * The hand-picked station ids, cleaned up.
+ *
+ * Split out of normalizeDashboardFilters because it is the one field that
+ * arrives as a list, and the ordering matters: the picker renders in scope
+ * order, so what is stored is a set, deduplicated, capped and otherwise left
+ * as submitted.
+ *
+ * @param mixed $raw
+ * @return array<int, string>
+ */
+function normalizeDashboardStationIds($raw): array
+{
+    if (!is_array($raw)) {
+        return [];
+    }
+    $ids = [];
+    foreach ($raw as $value) {
+        if (!is_scalar($value)) {
+            continue;
+        }
+        $id = trim((string) $value);
+        if ($id === '' || isset($ids[$id])) {
+            continue;
+        }
+        $ids[$id] = true;
+        if (count($ids) >= DASHBOARD_STATION_LIMIT) {
+            break;
+        }
+    }
+
+    return array_keys($ids);
+}
+
+/**
+ * Read one user's stored filters, falling back to the defaults for an account
+ * that has never saved any — or to a row a later release cannot read.
+ */
+function loadDashboardFilters(PDO $pdo, int $userId): array
+{
+    $stmt = $pdo->prepare(
+        <<<'SQL'
+        SELECT location_label, location_lat, location_lng, radius_km,
+               range_key, from_date, to_date, fuel, station_ids
+        FROM user_filters
+        WHERE user_id = :user_id
+        SQL
+    );
+    $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+    $stmt->execute();
+    $row = $stmt->fetch();
+    if ($row === false) {
+        return defaultDashboardFilters();
+    }
+
+    $stationIds = json_decode((string) $row['station_ids'], true);
+    $filters = normalizeDashboardFilters([
+        'location_label' => $row['location_label'],
+        'location_lat' => $row['location_lat'],
+        'location_lng' => $row['location_lng'],
+        'radius_km' => $row['radius_km'],
+        'range' => $row['range_key'],
+        'from' => $row['from_date'],
+        'to' => $row['to_date'],
+        'fuel' => $row['fuel'],
+    ]);
+    $filters['station_ids'] = normalizeDashboardStationIds($stationIds);
+
+    return $filters;
+}
+
+/**
+ * Write one user's filters, normalizing on the way in. Upsert rather than
+ * insert-or-update, mirroring how the CLI writes its own single-row tables
+ * (citiesUpsertSQL in db.go).
+ *
+ * @param array<string, mixed> $raw as submitted by the sidebar
+ */
+function saveDashboardFilters(PDO $pdo, string $driver, int $userId, array $raw): array
+{
+    $filters = normalizeDashboardFilters($raw);
+    $filters['station_ids'] = normalizeDashboardStationIds($raw['station_ids'] ?? []);
+
+    $sql = $driver === 'mysql'
+        ? <<<'SQL'
+            INSERT INTO user_filters (user_id, location_label, location_lat, location_lng,
+                radius_km, range_key, from_date, to_date, fuel, station_ids, updated_at)
+            VALUES (:user_id, :label, :lat, :lng, :radius, :range_key, :from_date, :to_date,
+                :fuel, :station_ids, :updated_at)
+            ON DUPLICATE KEY UPDATE
+                location_label = VALUES(location_label),
+                location_lat = VALUES(location_lat),
+                location_lng = VALUES(location_lng),
+                radius_km = VALUES(radius_km),
+                range_key = VALUES(range_key),
+                from_date = VALUES(from_date),
+                to_date = VALUES(to_date),
+                fuel = VALUES(fuel),
+                station_ids = VALUES(station_ids),
+                updated_at = VALUES(updated_at)
+            SQL
+        : <<<'SQL'
+            INSERT INTO user_filters (user_id, location_label, location_lat, location_lng,
+                radius_km, range_key, from_date, to_date, fuel, station_ids, updated_at)
+            VALUES (:user_id, :label, :lat, :lng, :radius, :range_key, :from_date, :to_date,
+                :fuel, :station_ids, :updated_at)
+            ON CONFLICT(user_id) DO UPDATE SET
+                location_label = excluded.location_label,
+                location_lat = excluded.location_lat,
+                location_lng = excluded.location_lng,
+                radius_km = excluded.radius_km,
+                range_key = excluded.range_key,
+                from_date = excluded.from_date,
+                to_date = excluded.to_date,
+                fuel = excluded.fuel,
+                station_ids = excluded.station_ids,
+                updated_at = excluded.updated_at
+            SQL;
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+    $stmt->bindValue(':label', $filters['location_label']);
+    $stmt->bindValue(':lat', $filters['location_lat']);
+    $stmt->bindValue(':lng', $filters['location_lng']);
+    $stmt->bindValue(':radius', $filters['radius_km'], PDO::PARAM_INT);
+    $stmt->bindValue(':range_key', $filters['range']);
+    $stmt->bindValue(':from_date', $filters['from']);
+    $stmt->bindValue(':to_date', $filters['to']);
+    $stmt->bindValue(':fuel', $filters['fuel']);
+    $stmt->bindValue(':station_ids', json_encode($filters['station_ids'], JSON_UNESCAPED_UNICODE));
+    $stmt->bindValue(':updated_at', nowUTC());
+    $stmt->execute();
+
+    return $filters;
+}
+
+/** Drop one user's filters, which is what the sidebar's Reset does. */
+function clearDashboardFilters(PDO $pdo, int $userId): void
+{
+    $stmt = $pdo->prepare('DELETE FROM user_filters WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+    $stmt->execute();
+}
 
 // ── POST router ───────────────────────────────────────────────────────────────
 
@@ -1499,6 +1772,35 @@ function handlePost(PDO $pdo, string $driver): void
             $stmt->execute();
             setFlash($stmt->rowCount() > 0 ? 'success' : 'error', $stmt->rowCount() > 0 ? 'targetRemoved' : 'notFound');
             redirectTo('?page=admin_settings');
+            // no break
+
+        case 'save_filters':
+            // The sidebar posts its whole state on every change, so this is
+            // both "apply" and "remember": there is nowhere else the filters
+            // live now.
+            if ($user === null) {
+                redirectTo('?page=login');
+            }
+            saveDashboardFilters($pdo, $driver, (int) $user['id'], [
+                'location_label' => $_POST['location_label'] ?? '',
+                'location_lat' => $_POST['location_lat'] ?? '',
+                'location_lng' => $_POST['location_lng'] ?? '',
+                'radius_km' => $_POST['radius_km'] ?? '',
+                'range' => $_POST['range'] ?? '',
+                'from' => $_POST['from'] ?? '',
+                'to' => $_POST['to'] ?? '',
+                'fuel' => $_POST['fuel'] ?? '',
+                'station_ids' => (array) ($_POST['station_ids'] ?? []),
+            ]);
+            redirectTo('');
+            // no break
+
+        case 'reset_filters':
+            if ($user === null) {
+                redirectTo('?page=login');
+            }
+            clearDashboardFilters($pdo, (int) $user['id']);
+            redirectTo('');
             // no break
 
         case 'rename_station':
@@ -1854,21 +2156,25 @@ function renderAccountPage(PDO $pdo, array $user): never
                     const results = await fetchMatches(q);
                     if (results === null) return;
                     list.innerHTML = '';
-                    results.forEach(({ city_key, display_name }) => {
+                    // A notification covers a city, so the postal-code hits the
+                    // dashboard's own picker offers are dropped here: they carry
+                    // no city key to subscribe to.
+                    const cities = results.filter((match) => match.city_key);
+                    cities.forEach(({ city_key, label }) => {
                         const li = document.createElement('li');
                         li.className = 'city-ac-item';
                         li.role = 'option';
                         li.setAttribute('aria-selected', 'false');
-                        li.textContent = display_name || city_key;
+                        li.textContent = label || city_key;
                         li.addEventListener('mousedown', (e) => {
                             e.preventDefault();
-                            input.value = display_name || city_key;
+                            input.value = label || city_key;
                             hidden.value = city_key;
                             hide();
                         });
                         list.appendChild(li);
                     });
-                    if (results.length) show(); else hide();
+                    if (cities.length) show(); else hide();
                 }, 200);
             });
 
@@ -3623,7 +3929,7 @@ gasolineStartSession();
 
 $requestedAction = (string) ($_GET['action'] ?? '');
 $requestedPage = (string) ($_GET['page'] ?? '');
-$isJSONRequest = in_array($requestedAction, ['city_search', 'station_search', 'data', 'prediction_accuracy', 'command_stats'], true);
+$isJSONRequest = in_array($requestedAction, ['city_search', 'station_search', 'geocode', 'data', 'prediction_accuracy', 'command_stats'], true);
 
 $authPdo = null;
 $schemaGuardReason = null;
@@ -3717,92 +4023,39 @@ switch ($requestedPage) {
 
 // Fall through: the dashboard (default page) below.
 
-// ── Filter persistence ────────────────────────────────────────────────────────
-// The last submitted dashboard filters are kept in a cookie so revisiting the
-// bare URL restores them. Requests with explicit filter params refresh the
-// cookie; requests without any are populated from it before validation below.
-$filterCookieName = 'gasoline_filters';
-$filterParamKeys = ['city', 'radius_km', 'range', 'from', 'to', 'fuel', 'station_ids'];
-$cookieSecure = (($_SERVER['HTTPS'] ?? '') !== '' && strtolower((string) $_SERVER['HTTPS']) !== 'off')
-    || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
+// ── Filter state ──────────────────────────────────────────────────────────────
+// Straight out of user_filters, for this account, on every load — page and
+// ?action=data alike. Nothing in the query string selects data any more; the
+// sidebar posts save_filters and comes back to the bare URL.
+$dashboardFilters = loadDashboardFilters($authPdo, (int) $currentUser['id']);
 
-if (isset($_GET['reset'])) {
-    setcookie($filterCookieName, '', ['expires' => time() - 3600, 'path' => '/', 'secure' => $cookieSecure, 'httponly' => true, 'samesite' => 'Lax']);
-    redirectTo('');
-}
-
-$hasFilterParams = false;
-foreach ($filterParamKeys as $filterKey) {
-    if (array_key_exists($filterKey, $_GET)) {
-        $hasFilterParams = true;
-        break;
-    }
-}
-
-if ($hasFilterParams) {
-    // The async ?action=data fetch copies the page URL, so only page loads
-    // need to refresh the cookie.
-    if (!isset($_GET['action'])) {
-        $filtersToSave = [];
-        foreach ($filterParamKeys as $filterKey) {
-            if (array_key_exists($filterKey, $_GET)) {
-                $filtersToSave[$filterKey] = $_GET[$filterKey];
-            }
-        }
-        setcookie($filterCookieName, json_encode($filtersToSave), ['expires' => time() + 60 * 60 * 24 * 365, 'path' => '/', 'secure' => $cookieSecure, 'httponly' => true, 'samesite' => 'Lax']);
-    }
-} else {
-    $savedFilters = json_decode((string) ($_COOKIE[$filterCookieName] ?? ''), true);
-    if (is_array($savedFilters)) {
-        foreach ($filterParamKeys as $filterKey) {
-            if (!array_key_exists($filterKey, $savedFilters)) {
-                continue;
-            }
-            $savedValue = $savedFilters[$filterKey];
-            if ($filterKey === 'station_ids') {
-                if (is_array($savedValue)) {
-                    $_GET[$filterKey] = array_values(array_filter($savedValue, 'is_string'));
-                }
-            } elseif (is_string($savedValue)) {
-                $_GET[$filterKey] = $savedValue;
-            }
-        }
-    }
-}
-
+// The filter panel's own collapsed state stays a cookie: it only applies below
+// 900px, so it is a property of the phone in the reader's hand rather than of
+// the account, and storing it per user would fold the desktop sidebar shut too.
 $filtersCollapsed = (($_COOKIE['gasoline_filters_collapsed'] ?? '') === '1');
 
 $errors = [];
 $stations = [];
 
-$selectedStationIds = array_values(array_filter(
-    array_map(
-        static function ($value): string {
-            return trim((string) $value);
-        },
-        (array) ($_GET['station_ids'] ?? [])
-    ),
-    static function (string $value): bool {
-        return $value !== '';
-    }
-));
+$selectedStationIds = $dashboardFilters['station_ids'];
+$selectedRange = $dashboardFilters['range'];
+$fromDate = $dashboardFilters['from'];
+$toDate = $dashboardFilters['to'];
+$selectedFuel = $dashboardFilters['fuel'];
+$selectedRadiusKm = $dashboardFilters['radius_km'];
 
-$selectedRange = trim((string) ($_GET['range'] ?? ''));
-$validRanges = ['7d', '14d', '30d'];
-if (!in_array($selectedRange, $validRanges, true)) {
-    $selectedRange = '';
-}
+// The reader's location: the label they picked and the point it resolved to.
+// Shaped like the cities row this used to be, because loadScopeStations and
+// the snapshot query only ever wanted the coordinates out of it.
+$selectedLocation = $dashboardFilters['location_label'];
+$selectedCityRow = $selectedLocation === '' ? null : [
+    'display_name' => $selectedLocation,
+    'lat' => $dashboardFilters['location_lat'],
+    'lng' => $dashboardFilters['location_lng'],
+];
 
-$fromDate = trim((string) ($_GET['from'] ?? ''));
-$toDate = trim((string) ($_GET['to'] ?? ''));
-
-// Default to the last 7 days when the visitor hasn't chosen a range or explicit dates.
-if ($selectedRange === '' && $fromDate === '' && $toDate === '') {
-    $selectedRange = '7d';
-}
-
+$rangeDays = DASHBOARD_RANGE_DAYS;
 if ($selectedRange !== '') {
-    $rangeDays = ['7d' => 7, '14d' => 14, '30d' => 30];
     $fromDate = (new DateTimeImmutable('now', new DateTimeZone('UTC')))
         ->modify('-' . $rangeDays[$selectedRange] . ' days')
         ->format('Y-m-d');
@@ -3826,17 +4079,8 @@ if ($selectedRange !== '') {
     }
 }
 
-$selectedFuel = trim((string) ($_GET['fuel'] ?? 'all'));
-$selectedCity = trim((string) ($_GET['city'] ?? ''));
-$selectedRadiusKmRaw = trim((string) ($_GET['radius_km'] ?? ''));
-$validFuels = ['all', 'diesel', 'e5', 'e10'];
-$validRadiusOptions = [5, 10, 20];
-if (!in_array($selectedFuel, $validFuels, true)) {
-    $selectedFuel = 'all';
-}
-$selectedRadiusKm = in_array((int) $selectedRadiusKmRaw, $validRadiusOptions, true)
-    ? (int) $selectedRadiusKmRaw
-    : ($selectedCity !== '' ? 5 : $validRadiusOptions[0]);
+$validFuels = DASHBOARD_FUELS;
+$validRadiusOptions = DASHBOARD_RADIUS_OPTIONS;
 
 if ($dbDriver === 'sqlite' && !file_exists($dbPath)) {
     $errors[] = [
@@ -3845,8 +4089,15 @@ if ($dbDriver === 'sqlite' && !file_exists($dbPath)) {
         'message' => sprintf('SQLite database not found at %s', $dbPath),
     ];
 }
-
-// ── AJAX: city prefix search ──────────────────────────────────────────────────
+// ── AJAX: location typeahead ──────────────────────────────────────────────────
+// Answers from the database only, which is what makes it safe to run on a
+// keystroke: Nominatim's usage policy rules out autocomplete traffic. Two
+// sources, because a reader names where they are in two ways — the place, and
+// the postal code of the place. A street address is neither, and is resolved by
+// the dropdown's closing row instead (?action=geocode).
+//
+// Every hit carries its coordinates, so picking one costs no second lookup and
+// nothing has to be looked up again when the filter is saved.
 if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
     header('Content-Type: application/json; charset=utf-8');
     $q = trim((string) ($_GET['q'] ?? ''));
@@ -3870,7 +4121,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
         // the column; plain strtolower would not, since it leaves Ü alone.
         $prefix = mb_strtolower($q, 'UTF-8');
         $searchStmt = $searchPdo->prepare(
-            "SELECT normalized_name AS city_key, display_name
+            "SELECT normalized_name AS city_key, display_name, lat, lng
              FROM cities
              WHERE normalized_lower >= :prefix AND normalized_lower < :prefix_end
              ORDER BY normalized_lower ASC
@@ -3879,8 +4130,25 @@ if (isset($_GET['action']) && $_GET['action'] === 'city_search') {
         $searchStmt->bindValue(':prefix', $prefix);
         $searchStmt->bindValue(':prefix_end', $prefix . "\u{10FFFF}");
         $searchStmt->execute();
-        echo json_encode($searchStmt->fetchAll(), JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+
+        $matches = [];
+        foreach ($searchStmt->fetchAll() as $row) {
+            $matches[] = [
+                // city_key only on rows that are a whole city: the account
+                // page's notification area subscribes to one and needs its
+                // key, and a postal code is not one.
+                'city_key' => (string) $row['city_key'],
+                'label' => (string) ($row['display_name'] !== '' ? $row['display_name'] : $row['city_key']),
+                'lat' => (float) $row['lat'],
+                'lng' => (float) $row['lng'],
+            ];
+        }
+        foreach (postalCodeMatches($searchPdo, $q) as $match) {
+            $matches[] = $match;
+        }
+        echo json_encode($matches, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
     } catch (Throwable $e) {
+        error_log('gasoline city_search error: ' . $e->getMessage());
         echo '[]';
     }
     exit;
@@ -3946,6 +4214,79 @@ if (isset($_GET['action']) && $_GET['action'] === 'station_search') {
     } catch (Throwable $e) {
         error_log('gasoline station_search error: ' . $e->getMessage());
         echo '[]';
+    }
+    exit;
+}
+
+// ── AJAX: resolve an address or a browser position ────────────────────────────
+// The location filter's typeahead is served from the cities cache and never
+// leaves the server; this is the one path that adds to that cache, and it runs
+// only when the reader explicitly asks for an address or presses the locate
+// button. See the geocoding block further down for why that separation matters.
+if (isset($_GET['action']) && $_GET['action'] === 'geocode') {
+    header('Content-Type: application/json; charset=utf-8');
+    $geocodeFail = static function (string $key, string $message): void {
+        echo json_encode(
+            ['errors' => [['key' => $key, 'params' => [], 'message' => $message]]],
+            JSON_UNESCAPED_UNICODE
+        );
+        exit;
+    };
+
+    // A GET that writes to the cache, so it carries the page's token: without
+    // it another site could have a signed-in reader's browser spend the
+    // server's Nominatim budget.
+    if (!hash_equals(csrfToken(), (string) ($_GET['csrf'] ?? ''))) {
+        http_response_code(403);
+        $geocodeFail('geocodeFailed', 'Invalid request token.');
+    }
+
+    $query = trim((string) ($_GET['q'] ?? ''));
+    $latRaw = trim((string) ($_GET['lat'] ?? ''));
+    $lngRaw = trim((string) ($_GET['lng'] ?? ''));
+    $fromPosition = $latRaw !== '' || $lngRaw !== '';
+
+    try {
+        if ($fromPosition) {
+            if (!is_numeric($latRaw) || !is_numeric($lngRaw)) {
+                $geocodeFail('geocodeFailed', 'Invalid position.');
+            }
+            $lat = (float) $latRaw;
+            $lng = (float) $lngRaw;
+            if ($lat < -90.0 || $lat > 90.0 || $lng < -180.0 || $lng > 180.0) {
+                $geocodeFail('geocodeFailed', 'Invalid position.');
+            }
+            $place = geocodeEnabled() ? geocodeReverse($lat, $lng) : null;
+            if ($place === null) {
+                // No reverse lookup (disabled, or the service is unreachable):
+                // the fix itself is still a perfectly good centre, so fall back
+                // to labelling it by its coordinates rather than failing. The
+                // radius filter only ever needs the coordinates.
+                $place = ['label' => sprintf('%.4f, %.4f', $lat, $lng), 'lat' => $lat, 'lng' => $lng];
+            }
+        } else {
+            if (!geocodeEnabled()) {
+                $geocodeFail('geocodeDisabled', 'Address lookup is disabled on this server.');
+            }
+            if (mb_strlen($query, 'UTF-8') < 3) {
+                $geocodeFail('geocodeFailed', 'Enter at least three characters.');
+            }
+            $place = geocodeSearch($query);
+            if ($place === null) {
+                $geocodeFail('geocodeNoMatch', 'No place found for that address.');
+            }
+        }
+
+        // Handed straight back, not stored: where the reader is belongs on
+        // their filter row, which the sidebar writes when it posts this.
+        echo json_encode(
+            ['label' => $place['label'], 'lat' => $place['lat'], 'lng' => $place['lng']],
+            JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+        );
+    } catch (Throwable $e) {
+        error_log('gasoline geocode error: ' . $e->getMessage());
+        http_response_code(500);
+        $geocodeFail('geocodeFailed', 'Could not resolve that location.');
     }
     exit;
 }
@@ -4574,8 +4915,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
     exit;
 }
 
-$selectedCityRow = null;
-
 function boundingBox(float $lat, float $lng, int $radiusKm): array
 {
     $latDelta = $radiusKm / 111.32;
@@ -4602,9 +4941,15 @@ function haversineKm(float $lat1, float $lng1, float $lat2, float $lng2): float
 }
 
 /**
- * Resolve the selected city to its cities-table row, or null when no city is
- * selected or the key is unknown. Callers distinguish the two by also checking
- * whether $selectedCity was non-empty.
+ * Resolve a city key to its cities-table row, or null when the key is empty or
+ * unknown. Callers distinguish the two by also checking whether the key was
+ * non-empty.
+ *
+ * This serves the account page's notification area, whose picker still selects
+ * a whole city from the CLI's cache — that is the unit a subscription covers.
+ * The dashboard's own location does not come through here: it is a label and a
+ * point on the reader's filter row, which may be an address the cities table
+ * has never heard of.
  */
 function resolveCity(PDO $pdo, string $selectedCity): ?array
 {
@@ -4624,6 +4969,280 @@ function resolveCity(PDO $pdo, string $selectedCity): ?array
 
     return $stmt->fetch() ?: null;
 }
+
+/**
+ * Places matching a postal code, from the station addresses themselves.
+ *
+ * The cities table is names only — it is the CLI's cache of the places it
+ * collects, and nothing in it is a postal code. But every station carries one,
+ * so a reader who thinks of home as "10115" can be answered from the same
+ * database the rest of the typeahead reads, without a geocoder.
+ *
+ * The prefix becomes a numeric range rather than a string comparison, because
+ * post_code is an integer column and the two engines spell string casts
+ * differently. German codes are five digits (the feed is German), so "101"
+ * covers 10100 to 10199.
+ *
+ * The centre is the mean of the matching stations' coordinates: a postal code
+ * is an area, and the middle of its filling stations is a better place to
+ * measure a radius from than any one of them.
+ *
+ * @return array<int, array{label: string, lat: float, lng: float}>
+ */
+function postalCodeMatches(PDO $pdo, string $term): array
+{
+    $digits = trim($term);
+    if ($digits === '' || !ctype_digit($digits) || strlen($digits) > 5) {
+        return [];
+    }
+    $low = (int) str_pad($digits, 5, '0');
+    $high = (int) str_pad($digits, 5, '9');
+
+    $stmt = $pdo->prepare(
+        <<<'SQL'
+        SELECT s.post_code, TRIM(COALESCE(s.place, '')) AS place,
+               AVG(s.lat) AS lat, AVG(s.lng) AS lng
+        FROM stations s
+        WHERE s.post_code BETWEEN :low AND :high
+        GROUP BY s.post_code, TRIM(COALESCE(s.place, ''))
+        ORDER BY s.post_code ASC
+        LIMIT 10
+        SQL
+    );
+    $stmt->bindValue(':low', $low, PDO::PARAM_INT);
+    $stmt->bindValue(':high', $high, PDO::PARAM_INT);
+    $stmt->execute();
+
+    $matches = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $code = trim((string) $row['post_code']);
+        $place = trim((string) $row['place']);
+        if ($code === '') {
+            continue;
+        }
+        $matches[] = [
+            'label' => trim($code . ' ' . $place),
+            'lat' => (float) $row['lat'],
+            'lng' => (float) $row['lng'],
+        ];
+    }
+
+    return $matches;
+}
+
+/* ── Geocoding for the location filter ────────────────────────────────────────
+ *
+ * The typeahead answers from the database — cities the CLI has geocoded, postal
+ * codes read off the station addresses — and nothing else, which is what keeps
+ * a keystroke from becoming an HTTP request: Nominatim's usage policy rules out
+ * autocomplete traffic outright.
+ *
+ * A street and house number is in neither source, so this is the path that asks
+ * a geocoder, and only on an explicit act: picking the "search this address"
+ * row of the dropdown, or pressing the locate button. One user action, one
+ * request.
+ *
+ * What comes back is not written to the database here. It goes to the sidebar,
+ * which posts it onto the reader's own filter row — a label and a point. The
+ * `cities` table stays what the CLI made it: one row per place it collects,
+ * with no reader's front door in it.
+ */
+
+/** User-Agent for the viewer's Nominatim calls; mirrors the CLI's --user-agent. */
+function geocodeUserAgent(): string
+{
+    $agent = trim((string) getenv('GASOLINE_USER_AGENT'));
+
+    return $agent !== '' ? $agent : 'gasoline-web/1.0 (viewer)';
+}
+
+/** False when the operator has switched the viewer's outbound lookups off. */
+function geocodeEnabled(): bool
+{
+    $flag = strtolower(trim((string) getenv('GASOLINE_GEOCODE')));
+
+    return !in_array($flag, ['0', 'false', 'off', 'no'], true);
+}
+
+/** Base URL of the Nominatim instance to ask, without a trailing slash. */
+function geocodeBaseURL(): string
+{
+    $base = rtrim(trim((string) getenv('GASOLINE_NOMINATIM_URL')), '/');
+
+    return $base !== '' ? $base : 'https://nominatim.openstreetmap.org';
+}
+
+/**
+ * One Nominatim GET, decoded. Null on any failure — a viewer that cannot reach
+ * the internet still has to render, so the caller degrades to "not found"
+ * rather than to an error page.
+ *
+ * @param array<string, string> $query
+ */
+function geocodeRequest(string $path, array $query): mixed
+{
+    $url = geocodeBaseURL() . $path . '?' . http_build_query($query);
+    $timeout = 6;
+    $body = false;
+
+    if (function_exists('curl_init')) {
+        $curl = curl_init($url);
+        curl_setopt_array($curl, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_USERAGENT => geocodeUserAgent(),
+            CURLOPT_CONNECTTIMEOUT => $timeout,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_FOLLOWLOCATION => false,
+        ]);
+        $response = curl_exec($curl);
+        $status = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+        curl_close($curl);
+        if (is_string($response) && $status === 200) {
+            $body = $response;
+        }
+    } else {
+        $context = stream_context_create(['http' => [
+            'method' => 'GET',
+            'header' => 'User-Agent: ' . geocodeUserAgent() . "\r\n",
+            'timeout' => $timeout,
+            'ignore_errors' => false,
+        ]]);
+        $body = @file_get_contents($url, false, $context);
+    }
+
+    if (!is_string($body) || $body === '') {
+        return null;
+    }
+
+    try {
+        return json_decode($body, true, 32, JSON_THROW_ON_ERROR);
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
+ * Compact one Nominatim hit into the short label the cache stores.
+ *
+ * The CLI keeps display_name short (the place's own name), and the filter input
+ * has to stay readable, so a full "5, Hauptstraße, Mitte, Berlin, 10115,
+ * Deutschland" is folded back into "Hauptstraße 5, 10115 Berlin". Falls back to
+ * the leading components of display_name when the structured parts are missing.
+ *
+ * The label is also the cache key, so it has to be derived deterministically:
+ * the same address must fold to the same string on every lookup, or a second
+ * search would store a duplicate row.
+ *
+ * @param array<string, mixed> $hit
+ */
+function geocodeLabel(array $hit): string
+{
+    $address = is_array($hit['address'] ?? null) ? $hit['address'] : [];
+    $pick = static function (array $address, array $keys): string {
+        foreach ($keys as $key) {
+            $value = trim((string) ($address[$key] ?? ''));
+            if ($value !== '') {
+                return $value;
+            }
+        }
+        return '';
+    };
+
+    $street = $pick($address, ['road', 'pedestrian', 'footway', 'residential', 'neighbourhood']);
+    $houseNumber = $pick($address, ['house_number']);
+    $place = $pick($address, ['city', 'town', 'village', 'municipality', 'suburb', 'county', 'state']);
+    $postcode = $pick($address, ['postcode']);
+
+    $line1 = trim($street . ($houseNumber !== '' ? ' ' . $houseNumber : ''));
+    $line2 = trim($postcode . ($postcode !== '' && $place !== '' ? ' ' : '') . $place);
+    $label = implode(', ', array_filter([$line1, $line2], static fn (string $part): bool => $part !== ''));
+
+    if ($label === '') {
+        // No structured address (a lake, a country, an instance that does not
+        // return addressdetails): keep the first two components of the free
+        // text, which is the place and what contains it.
+        $parts = array_slice(array_map('trim', explode(',', (string) ($hit['display_name'] ?? ''))), 0, 2);
+        $label = implode(', ', array_filter($parts, static fn (string $part): bool => $part !== ''));
+    }
+    if ($label === '') {
+        $label = trim((string) ($hit['name'] ?? ''));
+    }
+
+    // cities.name is VARCHAR(255) and this label is the primary key.
+    return mb_substr($label, 0, 200, 'UTF-8');
+}
+
+/**
+ * Turn one raw Nominatim hit into the cache row shape, or null when it carries
+ * no usable coordinates.
+ *
+ * @param array<string, mixed> $hit
+ * @return array{label: string, lat: float, lng: float}|null
+ */
+function geocodeHit(array $hit): ?array
+{
+    $lat = $hit['lat'] ?? null;
+    $lng = $hit['lon'] ?? null;
+    if (!is_numeric($lat) || !is_numeric($lng)) {
+        return null;
+    }
+    $label = geocodeLabel($hit);
+    if ($label === '') {
+        return null;
+    }
+
+    return ['label' => $label, 'lat' => (float) $lat, 'lng' => (float) $lng];
+}
+
+/**
+ * Forward-geocode a free-form place or address.
+ *
+ * @return array{label: string, lat: float, lng: float}|null
+ */
+function geocodeSearch(string $query): ?array
+{
+    $results = geocodeRequest('/search', [
+        'q' => $query,
+        'format' => 'jsonv2',
+        'limit' => '1',
+        'addressdetails' => '1',
+    ]);
+    if (!is_array($results) || $results === [] || !is_array($results[0] ?? null)) {
+        return null;
+    }
+
+    return geocodeHit($results[0]);
+}
+
+/**
+ * Reverse-geocode a browser position. zoom=18 asks for building precision, so a
+ * fix in a street returns that street rather than the whole district.
+ *
+ * @return array{label: string, lat: float, lng: float}|null
+ */
+function geocodeReverse(float $lat, float $lng): ?array
+{
+    $hit = geocodeRequest('/reverse', [
+        'lat' => sprintf('%.6f', $lat),
+        'lon' => sprintf('%.6f', $lng),
+        'format' => 'jsonv2',
+        'zoom' => '18',
+        'addressdetails' => '1',
+    ]);
+    if (!is_array($hit) || isset($hit['error'])) {
+        return null;
+    }
+    $resolved = geocodeHit($hit);
+    if ($resolved === null) {
+        return null;
+    }
+
+    // Keep the browser's own fix rather than the matched building's centroid:
+    // the label describes where the reader is, the coordinates are where they
+    // actually are, and the radius is measured from the latter.
+    return ['label' => $resolved['label'], 'lat' => $lat, 'lng' => $lng];
+}
+
 
 /**
  * Load the stations in scope for the filter sidebar and data endpoint.
@@ -4734,6 +5353,106 @@ function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
     });
 
     return [$stations, $distances];
+}
+
+/**
+ * The current price at each of the nearest stations, for the surroundings card.
+ *
+ * Deliberately not derived from the snapshot payload the chart is drawn from.
+ * That one is cut by the date filter and by the station picker, and the card
+ * answers a question neither of those applies to: what does fuel cost around
+ * here, right now. So it reads the newest snapshot per station directly, for
+ * every station the selected location and radius admit — the same scope list
+ * the sidebar shows, which loadScopeStations has already sorted by distance.
+ *
+ * One indexed seek per station: the correlated MAX() lands on
+ * idx_price_snapshots_station_recorded, whose DESC ordering makes it the first
+ * row of that station's range rather than a scan of its history. The station
+ * list is capped first, so the query's cost is bounded by the cap and not by
+ * how dense the area is.
+ *
+ * Prices are normalized to the raised-9 board style in the projection, exactly
+ * like the snapshot query, so the card and the chart quote the same number.
+ *
+ * @param array<int, array<string, mixed>> $stations scope stations, nearest first
+ * @param array<string, float> $distancesKm station id -> km from the location
+ * @return array<int, array<string, mixed>> rows in distance order
+ */
+function loadNearbyPrices(PDO $pdo, array $stations, array $distancesKm, int $limit): array
+{
+    $stations = array_slice($stations, 0, max(0, $limit));
+    if ($stations === []) {
+        return [];
+    }
+
+    $placeholders = [];
+    $params = [];
+    foreach ($stations as $index => $station) {
+        $placeholder = ':nearby_station_' . $index;
+        $placeholders[] = $placeholder;
+        $params[$placeholder] = (string) $station['id'];
+    }
+
+    $e5 = raisedNinePriceSql('ps.e5');
+    $e10 = raisedNinePriceSql('ps.e10');
+    $diesel = raisedNinePriceSql('ps.diesel');
+    $in = implode(', ', $placeholders);
+    $stmt = $pdo->prepare(
+        <<<SQL
+        SELECT
+            ps.station_id,
+            ps.recorded_at,
+            ps.is_open,
+            {$e5} AS e5,
+            {$e10} AS e10,
+            {$diesel} AS diesel
+        FROM price_snapshots ps
+        WHERE ps.station_id IN ({$in})
+          AND ps.recorded_at = (
+              SELECT MAX(newest.recorded_at)
+              FROM price_snapshots newest
+              WHERE newest.station_id = ps.station_id
+          )
+        SQL
+    );
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value);
+    }
+    $stmt->execute();
+
+    $latestById = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $id = (string) $row['station_id'];
+        // Two snapshots can carry the same recorded_at for one station (two
+        // update targets covering it in the same sweep); either is that
+        // station's current price, so the first one wins.
+        if (isset($latestById[$id])) {
+            continue;
+        }
+        $latestById[$id] = $row;
+    }
+
+    $rows = [];
+    foreach ($stations as $station) {
+        $id = (string) $station['id'];
+        if (!isset($latestById[$id])) {
+            // No snapshot at all. The freshness rule makes this unreachable in
+            // practice, so rather than invent an empty row, leave it out.
+            continue;
+        }
+        $latest = $latestById[$id];
+        $rows[] = [
+            's' => $id,
+            'dist' => isset($distancesKm[$id]) ? round($distancesKm[$id], 3) : null,
+            't' => (string) $latest['recorded_at'],
+            'o' => (int) $latest['is_open'] === 1,
+            'e5' => $latest['e5'] === null ? null : (float) $latest['e5'],
+            'e10' => $latest['e10'] === null ? null : (float) $latest['e10'],
+            'diesel' => $latest['diesel'] === null ? null : (float) $latest['diesel'],
+        ];
+    }
+
+    return $rows;
 }
 
 /* ── Raised-9 price normalization ──────────────────────────────────
@@ -5124,6 +5843,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
         'rows' => [],
         'predictions' => [],
         'predictions_as_of' => [],
+        'nearby' => [],
+        'nearby_total' => 0,
         'errors' => $errors,
     ];
 
@@ -5134,12 +5855,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
 
     try {
         $pdo = gasolineConnect($dbDriver, $dbPath);
-        $cityRow = resolveCity($pdo, $selectedCity);
-        if ($selectedCity !== '' && $cityRow === null) {
-            $out['errors'][] = ['key' => 'cityNotFound', 'params' => [], 'message' => 'Selected city not found.'];
-            echo json_encode($out, $jsonFlags);
-            exit;
-        }
+        $cityRow = $selectedCityRow;
 
         [$stations, $distances] = loadScopeStations($pdo, $cityRow, $selectedRadiusKm);
 
@@ -5161,6 +5877,24 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
                 'lng' => isset($station['lng']) ? (float) $station['lng'] : null,
                 'dist' => isset($distances[$id]) ? round($distances[$id], 3) : null,
             ];
+        }
+
+        // Surroundings card: the stations around the selected location with
+        // their current price, independent of the date range and the station
+        // picker. Only with a location — without one there is no "around here"
+        // and $stations is every station being fed.
+        if ($cityRow !== null) {
+            $out['nearby_total'] = count($stations);
+            $out['nearby'] = loadNearbyPrices($pdo, $stations, $distances, NEARBY_STATION_LIMIT);
+            // Its stations are not the chart's: the date range or the picker
+            // can leave them out of the snapshot rows entirely, and without
+            // their metadata the card would list bare station ids.
+            foreach ($out['nearby'] as $nearbyRow) {
+                $nearbyId = (string) $nearbyRow['s'];
+                if (isset($metaById[$nearbyId])) {
+                    $out['stations'][$nearbyId] = $metaById[$nearbyId];
+                }
+            }
         }
 
         [$sql, $params, $shouldRun, $queryErrors] = buildSnapshotQuery(
@@ -5279,21 +6013,11 @@ if ($errors === []) {
     try {
         $pdo = gasolineConnect($dbDriver, $dbPath);
 
-        // Shell only resolves the filter scope (city + station list) so the
-        // sidebar renders immediately. The heavy snapshot payload is fetched
-        // asynchronously via ?action=data.
-        $selectedCityRow = resolveCity($pdo, $selectedCity);
-        if ($selectedCity !== '' && $selectedCityRow === null) {
-            $errors[] = [
-                'key' => 'cityNotFound',
-                'params' => [],
-                'message' => 'Selected city not found.',
-            ];
-        } else {
-            // Distances are only needed client-side (sent via ?action=data), so
-            // the shell just needs the in-scope station list for the dropdown.
-            [$stations] = loadScopeStations($pdo, $selectedCityRow, $selectedRadiusKm);
-        }
+        // The location came out of the filter row already resolved, so the
+        // shell only has the station list left to load for the sidebar. The
+        // heavy snapshot payload is fetched asynchronously via ?action=data.
+        // Distances are only needed client-side (sent with that payload).
+        [$stations] = loadScopeStations($pdo, $selectedCityRow, $selectedRadiusKm);
     } catch (Throwable $e) {
         // Never leak the raw message (DB host, DSN, paths, SQL) to the client.
         error_log('gasoline shell error: ' . $e->getMessage());
@@ -5742,8 +6466,53 @@ function renderDocumentHead(string $titleSuffix): void
 
         .station-option-label { min-width: 0; overflow-wrap: anywhere; }
 
-        /* ── City autocomplete ─────────────────────────────────────── */
+        /* ── Location filter (city / address typeahead + locate) ───── */
         .city-ac { position: relative; }
+
+        /* Location field: the text box and the locate button share a row, so the
+           dropdown underneath still spans the whole sidebar width. */
+        .loc-row {
+            display: flex;
+            gap: 0.4rem;
+            align-items: stretch;
+        }
+
+        .loc-row .city-ac-input {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .loc-gps {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2.5rem;
+            padding: 0;
+            background: var(--surface-hi);
+            border: 1px solid var(--border-hi);
+            border-radius: 8px;
+            color: var(--muted);
+            cursor: pointer;
+            transition: border-color 0.15s, color 0.15s;
+        }
+
+        .loc-gps:hover:not(:disabled) { border-color: var(--amber); color: var(--amber); }
+        .loc-gps:disabled { cursor: progress; color: var(--amber); }
+        .loc-gps:disabled svg { animation: spin 1.1s linear infinite; }
+
+        /* The dropdown row that spends a Nominatim lookup. Set apart from the
+           cached matches above it, because it is the one that leaves the host. */
+        .city-ac-search {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            color: var(--amber);
+        }
+
+        .city-ac-search svg { flex-shrink: 0; }
+        .city-ac-item + .city-ac-search { border-top: 1px solid var(--border); margin-top: 0.2rem; padding-top: 0.55rem; }
+        .city-ac-empty.is-error { color: var(--red); }
 
         .city-ac-input {
             width: 100%;
@@ -6114,6 +6883,128 @@ function renderDocumentHead(string $titleSuffix): void
 
         .pred-asof {
             margin-top: 0.8rem;
+            font-family: var(--mono);
+            font-size: 0.66rem;
+            color: var(--muted);
+        }
+
+        /* ── Surroundings card ─────────────────────────────────── */
+        /* A list, not the three-column fuel grid the other cards use: the
+           question here is which pump is nearest, so distance leads the row and
+           every fuel in scope sits on it. */
+        .nearby-list {
+            display: grid;
+            gap: 1px;
+            background: var(--border);
+        }
+
+        .nearby-btn {
+            appearance: none;
+            width: 100%;
+            border: none;
+            background: var(--surface);
+            color: inherit;
+            font: inherit;
+            text-align: left;
+            cursor: pointer;
+            padding: 0.7rem 1.25rem;
+            display: grid;
+            grid-template-columns: 4.4rem minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 0.15rem 0.9rem;
+            transition: background 0.15s ease;
+        }
+
+        .nearby-btn:hover { background: var(--surface-hi); }
+
+        .nearby-btn:focus-visible {
+            outline: 2px solid var(--amber);
+            outline-offset: -2px;
+            background: var(--surface-hi);
+        }
+
+        /* Every cell is placed by hand: a row whose address or price list is
+           empty must not let the rest of it reflow into the gap. */
+        .nearby-dist {
+            grid-column: 1;
+            grid-row: 1 / span 2;
+            font-family: var(--mono);
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--amber);
+            white-space: nowrap;
+        }
+
+        .nearby-name {
+            grid-column: 2;
+            grid-row: 1;
+            display: flex;
+            align-items: center;
+            min-width: 0;
+            font-family: var(--mono);
+            font-size: 0.8rem;
+            color: var(--ink);
+        }
+
+        .nearby-addr {
+            grid-column: 2;
+            grid-row: 2;
+            font-family: var(--mono);
+            font-size: 0.7rem;
+            color: var(--muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .nearby-prices {
+            grid-column: 3;
+            grid-row: 1 / span 2;
+            display: flex;
+            align-items: baseline;
+            gap: 0.9rem;
+            font-family: var(--mono);
+            white-space: nowrap;
+        }
+
+        .nearby-price {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 0.3rem;
+            font-size: 0.95rem;
+            font-weight: 500;
+        }
+
+        .nearby-price-label {
+            font-size: 0.6rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            opacity: 0.75;
+        }
+
+        .nearby-price.empty { color: var(--muted); opacity: 0.5; }
+
+        .nearby-closed {
+            flex-shrink: 0;
+            margin-left: 0.45rem;
+            padding: 0.05rem 0.4rem;
+            border: 1px solid var(--border-hi);
+            border-radius: 999px;
+            font-size: 0.6rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--muted);
+        }
+
+        .nearby-more {
+            background: var(--surface);
+            padding: 0.75rem 1.25rem;
+            text-align: center;
+        }
+
+        .nearby-foot {
+            background: var(--surface);
+            padding: 0 1.25rem 0.9rem;
             font-family: var(--mono);
             font-size: 0.66rem;
             color: var(--muted);
@@ -6736,6 +7627,8 @@ function renderDocumentHead(string $titleSuffix): void
             /* Keep the predictions card directly beneath the top-5 card (equal
                order preserves DOM sequence) and above the filters on mobile. */
             #predictions-card { order: -1; }
+            /* Same for the surroundings card, which follows it in the DOM. */
+            #nearby-card { order: -1; }
             .sidebar { position: static; }
             .sidebar-head { cursor: pointer; }
             .sidebar-chevron { display: inline-flex; }
@@ -6753,6 +7646,10 @@ function renderDocumentHead(string $titleSuffix): void
             .brand-icon,
             .brand-icon img { width: 40px; height: 40px; }
             h1 { font-size: 1.4rem; }
+            /* Too narrow for three columns: the prices drop to their own row
+               under the address, still left-aligned with the station. */
+            .nearby-btn { grid-template-columns: 3.6rem minmax(0, 1fr); }
+            .nearby-prices { grid-column: 1 / -1; grid-row: 3; gap: 0.75rem; margin-top: 0.35rem; }
             /* Give the plot itself more width on phones. */
             .chart-body { padding: 0.75rem 0.5rem; }
             .chart-legend { padding: 0.75rem; gap: 0.5rem 0.85rem; }
@@ -7378,6 +8275,17 @@ const translations = {
         city: 'City',
         enterCity: 'Enter city...',
         allCities: '— all cities —',
+        location: 'Location',
+        enterLocation: 'City or address...',
+        useMyLocation: 'Use my location',
+        searchAddress: 'Search address "{query}"',
+        locating: 'Searching…',
+        geocodeFailed: 'Could not resolve that location.',
+        geocodeNoMatch: 'No place found for that address.',
+        geocodeDisabled: 'Address lookup is switched off on this server.',
+        gpsUnsupported: 'This browser cannot report a position.',
+        gpsDenied: 'Location access was denied.',
+        gpsFailed: 'Could not determine your position.',
         radius: 'Radius',
         from: 'From',
         to: 'To',
@@ -7419,6 +8327,10 @@ const translations = {
         highestPrefix: 'Highest price',
         highestNoData: 'No price data available.',
         rangeScopeHint: 'in range',
+        nearbyTitle: 'Nearby',
+        nearbyNoLocation: 'Pick a location in the filters: a city, an address, or your current position.',
+        nearbyNoData: 'No stations with current prices within this radius.',
+        nearbyCapped: 'The {shown} nearest of {total} stations in range.',
         predictionsTitle: 'Recommended fill-ups',
         predictionsNoData: 'No upcoming predictions in the database for these stations.',
         predictionsAsOf: 'as of {time}',
@@ -7692,6 +8604,17 @@ const translations = {
         city: 'Stadt',
         enterCity: 'Stadt eingeben...',
         allCities: '— alle Städte —',
+        location: 'Standort',
+        enterLocation: 'Stadt oder Adresse...',
+        useMyLocation: 'Meinen Standort verwenden',
+        searchAddress: 'Adresse „{query}“ suchen',
+        locating: 'Suche…',
+        geocodeFailed: 'Standort konnte nicht ermittelt werden.',
+        geocodeNoMatch: 'Zu dieser Adresse wurde nichts gefunden.',
+        geocodeDisabled: 'Die Adresssuche ist auf diesem Server deaktiviert.',
+        gpsUnsupported: 'Dieser Browser kann keinen Standort melden.',
+        gpsDenied: 'Zugriff auf den Standort wurde abgelehnt.',
+        gpsFailed: 'Standort konnte nicht bestimmt werden.',
         radius: 'Radius',
         from: 'Von',
         to: 'Bis',
@@ -7733,6 +8656,10 @@ const translations = {
         highestPrefix: 'Höchstpreis',
         highestNoData: 'Keine Preisdaten vorhanden.',
         rangeScopeHint: 'im Zeitraum',
+        nearbyTitle: 'Umgebung',
+        nearbyNoLocation: 'Standort links auswählen: Stadt, Adresse oder aktuelle Position.',
+        nearbyNoData: 'Keine Stationen mit aktuellen Preisen in diesem Umkreis.',
+        nearbyCapped: 'Die {shown} nächsten von {total} Stationen im Umkreis.',
         predictionsTitle: 'Tankempfehlungen',
         predictionsNoData: 'Keine kommenden Vorhersagen für diese Tankstellen in der Datenbank.',
         predictionsAsOf: 'Stand {time}',
@@ -8484,24 +9411,40 @@ renderDocumentHead('Price History');
                 <span class="sidebar-chevron" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
             </div>
 
-            <form method="get">
+            <?php // Saved against the account, not the URL: every change posts the
+                  // whole sidebar and comes back to the bare dashboard. ?>
+            <form method="post" action="" id="filters-form">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="save_filters">
                 <div class="field">
-                    <label for="f-city" data-i18n="city">City</label>
+                    <label for="f-city" data-i18n="location">Location</label>
                     <div class="city-ac" id="city-ac">
-                        <input
-                            type="text"
-                            id="f-city"
-                            class="city-ac-input"
-                            data-i18n-placeholder="enterCity"
-                            placeholder="Enter city..."
-                            autocomplete="off"
-                            spellcheck="false"
-                            value="<?= h($selectedCityRow ? (string) $selectedCityRow['display_name'] : '') ?>"
-                            aria-autocomplete="list"
-                            aria-controls="city-ac-list"
-                            aria-expanded="false"
-                        >
-                        <input type="hidden" name="city" id="f-city-value" value="<?= h($selectedCity) ?>">
+                        <div class="loc-row">
+                            <input
+                                type="text"
+                                id="f-city"
+                                class="city-ac-input"
+                                data-i18n-placeholder="enterLocation"
+                                placeholder="City or address..."
+                                autocomplete="off"
+                                spellcheck="false"
+                                value="<?= h($selectedCityRow ? (string) $selectedCityRow['display_name'] : '') ?>"
+                                aria-autocomplete="list"
+                                aria-controls="city-ac-list"
+                                aria-expanded="false"
+                            >
+                            <?php // One tap, one position fix, one reverse lookup - see the geocode handler. ?>
+                            <button type="button" class="loc-gps" id="f-locate" data-i18n-title="useMyLocation" data-i18n-aria-label="useMyLocation" title="Use my location" aria-label="Use my location">
+                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/><line x1="12" y1="1.5" x2="12" y2="4.5"/><line x1="12" y1="19.5" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4.5" y2="12"/><line x1="19.5" y1="12" x2="22.5" y2="12"/></svg>
+                            </button>
+                        </div>
+                        <?php // The text box is deliberately unnamed. What gets posted is
+                              // the last *resolved* place, so changing the fuel while a
+                              // half-typed address sits in the box cannot move the reader
+                              // somewhere they never picked. ?>
+                        <input type="hidden" name="location_label" id="f-loc-label" value="<?= h($selectedLocation) ?>">
+                        <input type="hidden" name="location_lat" id="f-loc-lat" value="<?= $selectedCityRow ? h(sprintf('%.6f', (float) $selectedCityRow['lat'])) : '' ?>">
+                        <input type="hidden" name="location_lng" id="f-loc-lng" value="<?= $selectedCityRow ? h(sprintf('%.6f', (float) $selectedCityRow['lng'])) : '' ?>">
                         <ul class="city-ac-list" id="city-ac-list" role="listbox" hidden></ul>
                     </div>
                 </div>
@@ -8512,7 +9455,7 @@ renderDocumentHead('Price History');
                         name="radius_km"
                         id="f-radius"
                         onchange="this.form.submit()"
-                        <?= $selectedCity === '' ? 'disabled' : '' ?>
+                        <?= $selectedLocation === '' ? 'disabled' : '' ?>
                     >
                         <?php foreach ($validRadiusOptions as $radiusOption): ?>
                             <option value="<?= h((string) $radiusOption) ?>" <?= $selectedRadiusKm === $radiusOption ? 'selected' : '' ?>>
@@ -8599,7 +9542,11 @@ renderDocumentHead('Price History');
             </form>
 
             <div class="sidebar-actions">
-                <a class="btn-reset" href="<?= h((strtok($_SERVER['REQUEST_URI'] ?? '/web/index.php', '?') ?: '/web/index.php') . '?reset=1') ?>" data-i18n="reset">Reset</a>
+                <form method="post" action="">
+                    <?= csrfField() ?>
+                    <input type="hidden" name="action" value="reset_filters">
+                    <button type="submit" class="btn-reset" data-i18n="reset">Reset</button>
+                </form>
             </div>
         </aside>
 
@@ -8619,6 +9566,9 @@ renderDocumentHead('Price History');
 
             <!-- Upcoming predictions (only those a suggest notification would send) -->
             <div class="cheapest-card" id="predictions-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
+
+            <!-- The stations around the selected location, nearest first -->
+            <div class="cheapest-card" id="nearby-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Chart -->
             <div class="chart-card">
@@ -8775,6 +9725,16 @@ let predictionData = [];
 let predictionAsOf = {};
 let predictionStationMeta = {};
 let dataLoaded = false;
+// Surroundings card: the nearest stations with their current price
+// (payload.nearby), the count the radius actually holds, and whether the reader
+// has expanded past the preview.
+let nearbyRows = [];
+let nearbyTotal = 0;
+let nearbyExpanded = false;
+// Current price per station id from that same block, which is what lets the
+// detail dialog answer for a station the date filter left out of the chart.
+let nearbyLatestById = new Map();
+const NEARBY_PREVIEW_ROWS = 8;
 // In-memory, non-persistent chart-only filter: null = all stations shown,
 // otherwise a Set of visible station_ids (strings). Reset on fresh data.
 let stationFilter = null;
@@ -8805,7 +9765,14 @@ const selectedFuel = <?= json_encode($selectedFuel, JSON_THROW_ON_ERROR) ?>;
 // the snapshot query (the payload is known-empty), so the client can skip the
 // fetch and render the empty state immediately instead of showing spinners.
 // Server-side errors still force a fetch so the usual error UI renders.
-const hasDataScope = <?= json_encode($selectedCity !== '' || $selectedStationIds !== [] || $errors !== [], JSON_THROW_ON_ERROR) ?>;
+const hasDataScope = <?= json_encode($selectedLocation !== '' || $selectedStationIds !== [] || $errors !== [], JSON_THROW_ON_ERROR) ?>;
+// ?action=geocode writes to the cities cache, so it is token-checked like a
+// form post even though it is fetched with GET.
+const geocodeCsrf = <?= json_encode(csrfToken(), JSON_THROW_ON_ERROR) ?>;
+// The selected location, as the surroundings card names it in its header. Empty
+// when no city, address or position has been picked.
+const locationLabel = <?= json_encode($selectedLocation, JSON_THROW_ON_ERROR) ?>;
+const locationRadiusKm = <?= json_encode($selectedRadiusKm, JSON_THROW_ON_ERROR) ?>;
 
 const fuelConfig = {
     // `dash` is the trendline's stroke-dasharray: dashed sets a trend apart
@@ -9698,6 +10665,99 @@ function renderPredictions() {
         );
 }
 
+/* ── Surroundings card ─────────────────────────────────────────── */
+// The stations the selected location and radius admit, nearest first, each with
+// the price it is showing right now. Its rows come from payload.nearby, which
+// the server reads straight from the newest snapshot per station — so unlike
+// the cards above it, this one is not narrowed by the date range or by the
+// station picker. Pick a location in the filters (a city, an address, or the
+// locate button) and this is what is around it.
+const nearbyCard = document.getElementById('nearby-card');
+
+const ICON_PIN = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>`;
+
+function nearbyRowHtml(row, fuels) {
+    const t = translations[currentLang];
+    const meta = predictionStationMeta[row.s] || {};
+    const name = meta.name || row.s;
+    const distHtml = fmtDistanceKmHtml(row.dist);
+    const distText = fmtDistanceKm(row.dist);
+    const address = [meta.street, meta.place].filter(Boolean).map(h).join(', ');
+
+    const prices = fuels.map((fuel) => {
+        const value = row[fuel];
+        const has = value !== null && value !== undefined;
+        return `<span class="nearby-price${has ? '' : ' empty'}"${has ? ` style="color:${FUEL_CSS_COLORS[fuel]}"` : ''}>` +
+            `<span class="nearby-price-label">${fuelConfig[fuel].label}</span>` +
+            (has ? fmtPriceHtml(value) : '—') +
+        `</span>`;
+    }).join('');
+
+    // Spoken label: distance, station, then each price — the same reading order
+    // the row has visually, which the grid's column spans would otherwise lose.
+    const spokenPrices = fuels
+        .map((fuel) => `${fuelConfig[fuel].label} ${fmtPriceText(row[fuel], '—')}`)
+        .join(', ');
+    const spoken = [distText, name, spokenPrices].filter(Boolean).join(' — ');
+
+    return `<button type="button" class="nearby-btn" data-station-id="${h(row.s)}"` +
+        ` title="${h(t.sdHint)}" aria-label="${h(t.sdHint + ': ' + spoken)}">` +
+        `<span class="nearby-dist">${distHtml === null ? '' : distHtml}</span>` +
+        `<span class="nearby-name">` +
+            stationDot(name, fuels[0]) +
+            `<span class="sd-name-text">${h(name)}</span>` +
+            (row.o ? '' : `<span class="nearby-closed">${h(t.openNo)}</span>`) +
+            ICON_STATION_INFO +
+        `</span>` +
+        `<span class="nearby-addr">${address}</span>` +
+        `<span class="nearby-prices">${prices}</span>` +
+    `</button>`;
+}
+
+function renderNearby() {
+    const t = translations[currentLang];
+    if (!nearbyCard) return;
+    const fuels = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
+
+    const scope = locationLabel === ''
+        ? ''
+        : `<span class="cheapest-scope">${h(locationLabel + ' · ' + locationRadiusKm + ' km')}</span>`;
+    const header = `<div class="cheapest-header">${ICON_PIN}<span class="cheapest-title">${h(t.nearbyTitle)}</span>${scope}</div>`;
+
+    if (locationLabel === '') {
+        nearbyCard.innerHTML = header + `<div class="cheapest-empty">${h(t.nearbyNoLocation)}</div>`;
+        return;
+    }
+    if (nearbyRows.length === 0) {
+        nearbyCard.innerHTML = header + `<div class="cheapest-empty">${h(t.nearbyNoData)}</div>`;
+        return;
+    }
+
+    const visible = nearbyExpanded ? nearbyRows : nearbyRows.slice(0, NEARBY_PREVIEW_ROWS);
+    const hidden = nearbyRows.length - visible.length;
+    // Say when the radius holds more than the card asked the server for, so a
+    // short list never reads as "that is all there is".
+    const capped = nearbyTotal > nearbyRows.length
+        ? `<div class="nearby-foot">${h(t.nearbyCapped
+            .replace('{shown}', String(nearbyRows.length))
+            .replace('{total}', String(nearbyTotal)))}</div>`
+        : '';
+
+    nearbyCard.innerHTML = header +
+        `<div class="nearby-list">${visible.map((row) => nearbyRowHtml(row, fuels)).join('')}</div>` +
+        (hidden > 0
+            ? `<div class="nearby-more"><button type="button" class="btn-small" id="nearby-more">${h(t.showMore)} (${hidden})</button></div>`
+            : '') +
+        capped;
+}
+
+document.addEventListener('click', (e) => {
+    if (e.target instanceof Element && e.target.closest('#nearby-more')) {
+        nearbyExpanded = true;
+        renderNearby();
+    }
+});
+
 /* ── Station detail dialog ─────────────────────────────────────── */
 // Clicking/tapping any station in the four price cards opens this dialog: the
 // full record for that station (current prices, address, open state, upcoming
@@ -9727,7 +10787,9 @@ function stationDialogHtml(stationId) {
     const t       = translations[currentLang];
     const meta    = predictionStationMeta[stationId] || {};
     const name    = meta.name || stationId;
-    const latest  = latestRowById().get(stationId) || null;
+    // The chart payload first; the surroundings card's current price is the
+    // fallback for a station the date range or the station picker excluded.
+    const latest  = latestRowById().get(stationId) || nearbyLatestById.get(stationId) || null;
     const dist    = stationDistancesById[stationId] ?? null;
     const addressLines = [meta.street, [meta.zip, meta.place].filter(Boolean).join(' ')].filter(Boolean);
 
@@ -9892,19 +10954,33 @@ function onDateChange(el) {
     });
 })();
 
-/* ── City autocomplete ─────────────────────────────────────────── */
+/* ── Location field: city, address, or the browser's own position ── */
+// Two very different lookups behind one input. Typing searches the cached
+// places table and nothing else: Nominatim's usage policy rules out
+// autocomplete traffic, so a keystroke never leaves the host. The trailing
+// "search address" row and the locate button are the explicit acts that do
+// spend one lookup — and the server caches what they resolve, so the same
+// address is an ordinary typeahead hit from then on (?action=geocode).
 (function () {
     const wrap   = document.getElementById('city-ac');
     const input  = document.getElementById('f-city');
-    const hidden = document.getElementById('f-city-value');
+    const label  = document.getElementById('f-loc-label');
+    const latIn  = document.getElementById('f-loc-lat');
+    const lngIn  = document.getElementById('f-loc-lng');
     const list   = document.getElementById('city-ac-list');
     const form   = input?.closest('form');
     const radius = document.getElementById('f-radius');
+    const locate = document.getElementById('f-locate');
 
-    if (!wrap || !input || !hidden || !list || !form) return;
+    if (!wrap || !input || !label || !latIn || !lngIn || !list || !form) return;
+
+    const ICON_SEARCH = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>`;
 
     let controller = null;
     let activeIdx  = -1;
+    // One outbound lookup at a time; the locate button and the address row
+    // share it, so neither can fire while the other is waiting.
+    let busy = false;
 
     function showList() {
         list.hidden = false;
@@ -9923,12 +10999,68 @@ function onDateChange(el) {
         activeIdx = idx;
     }
 
-    function selectCity(cityKey, displayName) {
-        input.value  = displayName;
-        hidden.value = cityKey;
+    // Apply a resolved place: the three hidden fields are the location, the
+    // text box is only what the reader reads. Saving is what applying means
+    // now — the post writes the filter row and the page comes back from it.
+    function applyLocation(placeLabel, lat, lng) {
+        input.value = placeLabel;
+        label.value = placeLabel;
+        latIn.value = placeLabel === '' ? '' : String(lat);
+        lngIn.value = placeLabel === '' ? '' : String(lng);
         hideList();
-        if (radius) radius.disabled = (cityKey === '');
+        if (radius) radius.disabled = (placeLabel === '');
         form.submit();
+    }
+
+    // Replaces the dropdown with a single status line ("searching", "denied",
+    // "nothing found"), so the field answers where the reader is looking.
+    function showMessage(text, isError) {
+        list.innerHTML = '';
+        const li = document.createElement('li');
+        li.className = 'city-ac-empty' + (isError ? ' is-error' : '');
+        li.textContent = text;
+        list.appendChild(li);
+        showList();
+    }
+
+    // The one path that spends a geocoding request. The server resolves it,
+    // writes it into the places cache and answers with the key the filter
+    // carries, which is then selected exactly like a cached match.
+    async function resolveLocation(params) {
+        if (busy) return;
+        busy = true;
+        if (locate) locate.disabled = true;
+        showMessage(translations[currentLang].locating, false);
+        try {
+            const url = new URL(location.href);
+            url.search = '';
+            url.searchParams.set('action', 'geocode');
+            url.searchParams.set('csrf', geocodeCsrf);
+            for (const [key, value] of Object.entries(params)) {
+                url.searchParams.set(key, value);
+            }
+            const res = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
+            if (res.status === 401) { location.href = '?page=login'; return; }
+            const payload = await res.json();
+            const t = translations[currentLang];
+            if (payload && payload.label) {
+                applyLocation(payload.label, payload.lat, payload.lng);
+                return;
+            }
+            const failure = payload && payload.errors && payload.errors[0];
+            showMessage((failure && t[failure.key]) || t.geocodeFailed, true);
+        } catch {
+            showMessage(translations[currentLang].geocodeFailed, true);
+        } finally {
+            busy = false;
+            if (locate) locate.disabled = false;
+        }
+    }
+
+    function searchAddress() {
+        const q = input.value.trim();
+        if (q.length < 3) return;
+        resolveLocation({ q });
     }
 
     async function fetchMatches(q) {
@@ -9946,39 +11078,55 @@ function onDateChange(el) {
         }
     }
 
+    // Closing row of the dropdown: what the cache could not answer, the
+    // geocoder can. Always offered, because a cached city and a house number
+    // in that same city are both plausible readings of what was typed.
+    function addressRow(q) {
+        const li = document.createElement('li');
+        li.className = 'city-ac-item city-ac-search';
+        li.role      = 'option';
+        li.setAttribute('aria-selected', 'false');
+        const label = document.createElement('span');
+        label.textContent = translations[currentLang].searchAddress.replace('{query}', q);
+        li.innerHTML = ICON_SEARCH;
+        li.appendChild(label);
+        li.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            searchAddress();
+        });
+        return li;
+    }
+
     let debounceTimer = null;
 
     input.addEventListener('input', () => {
+        // Typing alone changes nothing: the stored location stands until a
+        // resolved place replaces it, so an unfinished edit cannot ride along
+        // on the next radius or fuel change.
         const q = input.value.trim();
-        hidden.value = '';
-        if (radius) radius.disabled = true;
         clearTimeout(debounceTimer);
         if (q.length < 3) { hideList(); return; }
 
         debounceTimer = setTimeout(async () => {
             const results = await fetchMatches(q);
             if (results === null) return;
+            // A slower answer to an older prefix must not overwrite the list.
+            if (input.value.trim() !== q) return;
 
             list.innerHTML = '';
-            if (results.length === 0) {
-                const empty = document.createElement('li');
-                empty.className = 'city-ac-empty';
-                empty.textContent = '— no matches —';
-                list.appendChild(empty);
-            } else {
-                results.forEach(({ city_key, display_name }) => {
-                    const li = document.createElement('li');
-                    li.className    = 'city-ac-item';
-                    li.role         = 'option';
-                    li.setAttribute('aria-selected', 'false');
-                    li.textContent  = display_name || city_key;
-                    li.addEventListener('mousedown', (e) => {
-                        e.preventDefault();
-                        selectCity(city_key, display_name || city_key);
-                    });
-                    list.appendChild(li);
+            results.forEach((match) => {
+                const li = document.createElement('li');
+                li.className    = 'city-ac-item';
+                li.role         = 'option';
+                li.setAttribute('aria-selected', 'false');
+                li.textContent  = match.label;
+                li.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    applyLocation(match.label, match.lat, match.lng);
                 });
-            }
+                list.appendChild(li);
+            });
+            list.appendChild(addressRow(q));
             showList();
             activeIdx = -1;
         }, 200);
@@ -9995,6 +11143,12 @@ function onDateChange(el) {
         } else if (e.key === 'Enter' && !list.hidden && activeIdx >= 0 && items[activeIdx]) {
             e.preventDefault();
             items[activeIdx].dispatchEvent(new MouseEvent('mousedown'));
+        } else if (e.key === 'Enter' && input.value.trim() !== label.value) {
+            // Nothing highlighted, and the box no longer says what is stored:
+            // read Enter as "resolve what I just typed" rather than as a
+            // submit that would re-save the location already in place.
+            e.preventDefault();
+            searchAddress();
         } else if (e.key === 'Escape') {
             hideList();
         }
@@ -10002,10 +11156,42 @@ function onDateChange(el) {
 
     input.addEventListener('blur', () => setTimeout(hideList, 150));
 
-    // Submit with empty city when user clears the field and blurs
+    // Clearing the box and leaving it is how a reader says "no location".
     input.addEventListener('change', () => {
-        if (input.value.trim() === '' && hidden.value === '') form.submit();
+        if (input.value.trim() === '' && label.value !== '') applyLocation('', 0, 0);
     });
+
+    if (locate) {
+        locate.addEventListener('click', () => {
+            const t = translations[currentLang];
+            if (!navigator.geolocation) { showMessage(t.gpsUnsupported, true); return; }
+            if (busy) return;
+            busy = true;
+            locate.disabled = true;
+            showMessage(t.locating, false);
+            // One fix, once. The resolved address becomes the filter's
+            // location and rides along in the filter cookie, so later visits
+            // reuse it instead of asking the browser again; maximumAge lets
+            // the browser answer from a recent fix rather than powering the
+            // receiver up for a second one.
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    busy = false;
+                    locate.disabled = false;
+                    resolveLocation({
+                        lat: position.coords.latitude.toFixed(6),
+                        lng: position.coords.longitude.toFixed(6),
+                    });
+                },
+                (error) => {
+                    busy = false;
+                    locate.disabled = false;
+                    showMessage(error && error.code === 1 ? t.gpsDenied : t.gpsFailed, true);
+                },
+                { enableHighAccuracy: true, timeout: 12000, maximumAge: 600000 }
+            );
+        });
+    }
 
     document.addEventListener('click', (e) => {
         if (!wrap.contains(e.target)) hideList();
@@ -10063,6 +11249,18 @@ function applyData(payload) {
     predictionData = payload.predictions || [];
     predictionAsOf = payload.predictions_as_of || {};
     predictionStationMeta = meta;
+    nearbyRows = payload.nearby || [];
+    nearbyTotal = payload.nearby_total || nearbyRows.length;
+    nearbyExpanded = false;
+    // Same row, re-shaped to what the detail dialog reads, so a station the
+    // date filter kept out of the chart still opens with a current price.
+    nearbyLatestById = new Map(nearbyRows.map((row) => [row.s, {
+        recorded_at: row.t,
+        is_open: !!row.o,
+        e5: row.e5 ?? null,
+        e10: row.e10 ?? null,
+        diesel: row.diesel ?? null,
+    }]));
     _stationHues = computeStationHues();
     stationFilter = null;
     dataLoaded = true;
@@ -10075,6 +11273,7 @@ function applyData(payload) {
 
     renderCheapest();
     renderPredictions();
+    renderNearby();
     renderCheapestRange();
     renderHighest();
     if (chartEl) renderChart();
@@ -10117,7 +11316,10 @@ function resetLoadingUI() {
 }
 
 async function loadData() {
+    // No filters in the URL: the endpoint reads the same stored row the page
+    // was rendered from, so there is nothing to copy across.
     const url = new URL(location.href);
+    url.search = '';
     url.searchParams.set('action', 'data');
     try {
         const res = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
@@ -10146,6 +11348,7 @@ window.onLangChange = () => {
     if (dataLoaded) {
         renderCheapest();
         renderPredictions();
+        renderNearby();
         renderCheapestRange();
         renderHighest();
         if (chartEl) renderChart();

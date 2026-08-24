@@ -20,14 +20,20 @@ import (
 // whose load time an operator complains about, and it is slow for entirely
 // different reasons, so it needs its own mirror rather than a shared one.
 //
-// What a dashboard load does, in the order web/index.php does it: resolve the
-// selected city (resolveCity), resolve the stations in scope for that city and
-// radius (loadScopeStations), read the snapshot history for those stations over
-// the date filter (buildSnapshotQuery), then read the upcoming fill-up windows
-// (loadFilteredPredictions, which is two queries). doctor reproduces all of it,
-// including the station list the page would have inlined into IN(...) — the
-// length of that list is part of the cost, so guessing it would defeat the
-// point.
+// What a dashboard load does, in the order web/index.php does it: read the
+// reader's stored filters, resolve the stations in scope for that location and
+// radius (loadScopeStations), read the current price at the nearest of them
+// (loadNearbyPrices), read the snapshot history for the selected ones over the
+// date filter (buildSnapshotQuery), then read the upcoming fill-up windows
+// (loadFilteredPredictions). doctor reproduces all of it, including the station
+// list the page would have inlined into IN(...) — the length of that list is
+// part of the cost, so guessing it would defeat the point.
+//
+// The filter read itself is not among them: it is one primary-key row out of
+// user_filters, and timing that would tell an operator nothing. It is why the
+// page no longer resolves a city on load, though, which is why --city is now
+// doctor's own stand-in for a reader's stored location rather than something
+// the page looks up.
 //
 // dashboardQuerySpecsFor documents that duplication the same way the accuracy
 // side does, and TestDoctorDashboardQueriesMatchViewer fails if the two drift.
@@ -36,6 +42,11 @@ import (
 // accepts exactly these, because a value the page cannot produce would not be
 // reproducing a page load.
 var dashboardRadiusOptions = []int{5, 10, 20}
+
+// dashboardNearbyLimit mirrors NEARBY_STATION_LIMIT in web/index.php: how many
+// of the nearest stations the surroundings card reads a current price for, and
+// so how many correlated seeks that query costs at most.
+const dashboardNearbyLimit = 40
 
 // dashboardFuels expands the page's fuel filter: "all" loads three fuels, which
 // triples what the prediction queries read.
@@ -46,10 +57,12 @@ func dashboardFuels(fuel string) []string {
 	return []string{fuel}
 }
 
-// doctorDashboardFilters is the request the page would have received. Every
-// field maps to one of its query parameters.
+// doctorDashboardFilters is the filter state the page would have loaded. Every
+// field maps to one column of the reader's user_filters row.
 type doctorDashboardFilters struct {
-	// City is the normalized city name, empty for the unscoped view.
+	// City stands in for the reader's stored location: doctor takes a city
+	// name because that is what an operator can type, and resolves it to the
+	// coordinates the filter row would have held. Empty for the unscoped view.
 	City string `json:"city"`
 	// CityAuto marks a city doctor picked rather than one the operator named.
 	CityAuto bool     `json:"city_auto"`
@@ -112,9 +125,14 @@ type dashboardQueryContext struct {
 	// BBox is the bounding box for the selected city and radius; nil for the
 	// unscoped view.
 	BBox *dashboardBBox
-	// CityMissing marks a named city the cities table does not hold. The page
-	// stops there and renders an error, so there is no scope query to measure
-	// past the lookup that failed.
+	// ScopeStationIDs is every station the radius admits, before the picker
+	// narrows it. The surroundings card reads a current price for the nearest
+	// of them and is deliberately not narrowed by the picker, so it is that
+	// list — not StationIDs — that sizes its query.
+	ScopeStationIDs []string
+	// CityMissing marks a named city the cities table does not hold. doctor
+	// cannot place a bounding box without one, so there is no scope query to
+	// measure past it — the operator named somewhere doctor cannot stand.
 	CityMissing bool
 	// Now is the instant the prediction grid is cut at.
 	Now time.Time
@@ -168,32 +186,27 @@ const stationScopeColumns = "s.id, COALESCE(s.name_override, s.name) AS name, " 
 
 // dashboardQuerySpecsFor builds the queries one dashboard load issues.
 //
-// The last three are skipped by the page itself and so are absent here when
-// there is no scope: with neither a city nor a station selection,
+// The last ones are skipped by the page itself and so are absent here when
+// there is no scope: with neither a location nor a station selection,
 // buildSnapshotQuery and loadFilteredPredictions are never reached (see the "no
-// scope to display" guard in web/index.php). A named city the cities table does
-// not hold stops the page even earlier, at the lookup that failed.
+// scope to display" guard in web/index.php), and without a location there is no
+// "around here" for loadNearbyPrices to answer. A city doctor cannot resolve
+// stops it earlier still, before it can place a bounding box.
 func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 	f := qc.Filters
 	var specs []dashboardQuerySpec
 
 	if f.City != "" {
-		specs = append(specs, dashboardQuerySpec{
-			name:    "city",
-			purpose: "resolve the selected city (resolveCity)",
-			sql: "SELECT normalized_name AS city_key, normalized_name AS city_name, display_name, lat, lng " +
-				"FROM cities WHERE normalized_name = ? LIMIT 1",
-			args:  []any{f.City},
-			table: "cities",
-			alias: "cities",
-		})
-		// The city dropdown is a typeahead, so a dashboard visit that changes
-		// city runs this too. Three letters is the page's own minimum.
+		// The location field is a typeahead, so a dashboard visit that changes
+		// where the reader is runs this. Three letters is the page's own
+		// minimum. Its postal-code half is not mirrored: it only fires for an
+		// all-digit term, and it reads the stations table rather than the
+		// history, so it is not what makes a dashboard slow.
 		if term := citySearchTerm(f.City); term != "" {
 			specs = append(specs, dashboardQuerySpec{
 				name:    "city_search",
-				purpose: "city typeahead, first 3 letters (?action=city_search)",
-				sql: "SELECT normalized_name AS city_key, display_name FROM cities " +
+				purpose: "location typeahead, first 3 letters (?action=city_search)",
+				sql: "SELECT normalized_name AS city_key, display_name, lat, lng FROM cities " +
 					"WHERE normalized_lower >= ? AND normalized_lower < ? " +
 					"ORDER BY normalized_lower ASC LIMIT 20",
 				// The page's own upper bound: the prefix with the highest code
@@ -229,6 +242,43 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 			args:  []any{qc.FreshCutoff},
 			table: "stations",
 			alias: "s",
+		})
+	}
+
+	// ── surroundings ──────────────────────────────────────────────────────
+	// loadNearbyPrices: the current price at each of the nearest stations. Its
+	// scope is the radius alone, so it runs whenever a location is selected —
+	// including when the picker has narrowed everything below it away.
+	if qc.BBox != nil && len(qc.ScopeStationIDs) > 0 {
+		nearbyIDs := qc.ScopeStationIDs
+		if len(nearbyIDs) > dashboardNearbyLimit {
+			nearbyIDs = nearbyIDs[:dashboardNearbyLimit]
+		}
+		nearbyArgs := make([]any, 0, len(nearbyIDs))
+		for _, id := range nearbyIDs {
+			nearbyArgs = append(nearbyArgs, id)
+		}
+		nearbyWhere := "ps.station_id IN (" + boundPlaceholders(len(nearbyIDs)) + ") " +
+			"AND ps.recorded_at = (SELECT MAX(newest.recorded_at) FROM price_snapshots newest " +
+			"WHERE newest.station_id = ps.station_id)"
+		specs = append(specs, dashboardQuerySpec{
+			name:    "nearby_latest",
+			purpose: "the current price at each of the nearest stations (loadNearbyPrices)",
+			sql: "SELECT ps.station_id, ps.recorded_at, ps.is_open, " +
+				raisedNinePriceSQL("ps.e5") + " AS e5, " +
+				raisedNinePriceSQL("ps.e10") + " AS e10, " +
+				raisedNinePriceSQL("ps.diesel") + " AS diesel " +
+				"FROM price_snapshots ps WHERE " + nearbyWhere,
+			args:  nearbyArgs,
+			table: "price_snapshots",
+			alias: "ps",
+			probe: &doctorProbeSpec{
+				name:    "newest only",
+				purpose: "the correlated maximum on its own, so the difference is the row lookups",
+				sql:     "SELECT ps.station_id FROM price_snapshots ps WHERE " + nearbyWhere,
+				args:    nearbyArgs,
+				alias:   "ps",
+			},
 		})
 	}
 
@@ -598,6 +648,7 @@ func runDashboardChecks(ctx context.Context, db *sql.DB, d dialect, opts doctorO
 		}
 		dash.Scope.Candidates = candidates
 		dash.Scope.Stations = len(ids)
+		qc.ScopeStationIDs = ids
 		qc.StationIDs = intersectStationSelection(ids, filters.Stations)
 	} else {
 		// The unscoped view: the page loads the station list for the sidebar

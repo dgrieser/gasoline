@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -140,7 +141,7 @@ func TestRunDashboardChecksReproducesAPageLoad(t *testing.T) {
 	for _, q := range dash.Queries {
 		got[q.Name] = q
 	}
-	for _, name := range []string{"city", "city_search", "scope_stations", "snapshots",
+	for _, name := range []string{"city_search", "scope_stations", "nearby_latest", "snapshots",
 		"predictions_grid"} {
 		q, ok := got[name]
 		if !ok {
@@ -229,15 +230,14 @@ func TestDashboardChecksReportAnUnknownCity(t *testing.T) {
 	if dash.Scope.CityFound {
 		t.Fatal("nowhere is not geocoded")
 	}
-	// The lookup that failed is still timed: that is the query an operator
-	// wants to see, and it is the only one the page reaches.
+	// Without a resolvable centre there is no bounding box, so doctor stops
+	// before the scope: the typeahead is the only page query left to time.
 	names := []string{}
 	for _, q := range dash.Queries {
 		names = append(names, q.Name)
 	}
-	// The page renders its error and stops, so nothing past the lookup runs.
-	if strings.Join(names, ",") != "city,city_search" {
-		t.Fatalf("queries = %v, want just the two cities lookups", names)
+	if strings.Join(names, ",") != "city_search" {
+		t.Fatalf("queries = %v, want just the typeahead", names)
 	}
 	if !containsFinding(doctorDashboardFindings(dash, nil, opts), "is not in the cities table") {
 		t.Error("an unresolvable city must be a finding")
@@ -527,13 +527,10 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	php := string(viewer)
 
 	signatures := map[string][]string{
-		"city": {
-			"SELECT normalized_name AS city_key, normalized_name AS city_name, display_name, lat, lng",
-			"WHERE normalized_name = ",
-		},
 		"city_search": {
 			// The prefix range is what idx_cities_search can answer; a
 			// function around the column, or a LIKE, would not be seekable.
+			"SELECT normalized_name AS city_key, display_name, lat, lng",
 			"WHERE normalized_lower >= ",
 			"AND normalized_lower < ",
 			"ORDER BY normalized_lower ASC",
@@ -551,6 +548,12 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 			"ps.station_id IN (",
 			"ORDER BY ps.recorded_at ASC, ps.station_id ASC",
 		},
+		"nearby_latest": {
+			// The correlated maximum is what makes this one indexed seek per
+			// station instead of a scan of each station's history.
+			"SELECT MAX(newest.recorded_at)",
+			"WHERE newest.station_id = ps.station_id",
+		},
 		"predictions_grid": {
 			"pp.predicted_price, pp.confidence, pr.run_at, pr.suggestion_bias",
 			"AND pp.target_start > :pred_now",
@@ -565,11 +568,12 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	specs := map[string]dashboardQuerySpec{}
 	box := dashboardBoundingBox(52.52, 13.405, 5)
 	for _, spec := range dashboardQuerySpecsFor(dashboardQueryContext{
-		Filters:     doctorDashboardFilters{City: "berlin", RadiusKM: 5, Fuel: "all", From: "2026-08-14T00:00:00Z"},
-		StationIDs:  []string{"near-1", "near-2"},
-		FreshCutoff: "2026-08-19T12:00:00Z",
-		BBox:        &box,
-		Now:         time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC),
+		Filters:         doctorDashboardFilters{City: "berlin", RadiusKM: 5, Fuel: "all", From: "2026-08-14T00:00:00Z"},
+		StationIDs:      []string{"near-1", "near-2"},
+		ScopeStationIDs: []string{"near-1", "near-2", "near-3"},
+		FreshCutoff:     "2026-08-19T12:00:00Z",
+		BBox:            &box,
+		Now:             time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC),
 	}) {
 		specs[spec.name] = spec
 	}
@@ -600,6 +604,34 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	}
 	if !strings.Contains(specs["snapshots"].sql, "% 10 + 9) / 1000.0") {
 		t.Errorf("doctor's snapshot query lost the raised-9 projection:\n%s", specs["snapshots"].sql)
+	}
+	// The page no longer resolves a city on load — the location comes off the
+	// reader's own filter row — so doctor must not be measuring a lookup the
+	// page stopped doing, and the page must really be reading that row.
+	if _, ok := specs["city"]; ok {
+		t.Error("doctor still measures a city lookup the dashboard no longer performs")
+	}
+	if !strings.Contains(php, "FROM user_filters") {
+		t.Error("web/index.php no longer reads the dashboard filters from user_filters")
+	}
+	// The filters must not come back from anywhere else: a cookie or a query
+	// parameter would mean two accounts sharing a browser share a dashboard.
+	// Only the dashboard's own names are listed — the admin pages legitimately
+	// read a fuel and a range out of their own URLs.
+	for _, gone := range []string{"'gasoline_filters'", "$_GET['city']", "$_GET['radius_km']", "$_GET['station_ids']"} {
+		if strings.Contains(php, gone) {
+			t.Errorf("web/index.php still reads the dashboard filters from %q", gone)
+		}
+	}
+
+	// The surroundings card reads the radius, not the picker: its query has to
+	// cover the station the picker dropped, or doctor is timing a smaller page
+	// than the reader loaded.
+	if got := len(specs["nearby_latest"].args); got != 3 {
+		t.Errorf("doctor's nearby_latest query binds %d stations, want the 3 in scope rather than the 2 selected", got)
+	}
+	if want := fmt.Sprintf("const NEARBY_STATION_LIMIT = %d;", dashboardNearbyLimit); !strings.Contains(php, want) {
+		t.Errorf("web/index.php no longer mirrors dashboardNearbyLimit: %q missing", want)
 	}
 	// The page's fuel filter expands to three fuels, which is three times the
 	// prediction rows; both prediction queries must carry the expansion.
@@ -639,6 +671,7 @@ func TestRunDoctorDashboardEndToEnd(t *testing.T) {
 		"dashboard queries: city=berlin",
 		"scope: ",
 		"scope_stations",
+		"nearby_latest",
 		"snapshots",
 		"probe/keys only",
 		"predictions_grid",
@@ -685,8 +718,8 @@ func TestRunDoctorDashboardEndToEnd(t *testing.T) {
 			probed++
 		}
 	}
-	if probed != 2 {
-		t.Errorf("%d queries carry a probe, want the 2 that have one", probed)
+	if probed != 3 {
+		t.Errorf("%d queries carry a probe, want the 3 that have one", probed)
 	}
 }
 
@@ -867,7 +900,8 @@ func TestCitySearchRangeFindsNamesRegardlessOfCase(t *testing.T) {
 		var found []string
 		for rows.Next() {
 			var key, display string
-			if err := rows.Scan(&key, &display); err != nil {
+			var lat, lng float64
+			if err := rows.Scan(&key, &display, &lat, &lng); err != nil {
 				t.Fatalf("scan: %v", err)
 			}
 			found = append(found, key)
