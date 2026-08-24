@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -551,6 +552,12 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 			"ps.station_id IN (",
 			"ORDER BY ps.recorded_at ASC, ps.station_id ASC",
 		},
+		"nearby_latest": {
+			// The correlated maximum is what makes this one indexed seek per
+			// station instead of a scan of each station's history.
+			"SELECT MAX(newest.recorded_at)",
+			"WHERE newest.station_id = ps.station_id",
+		},
 		"predictions_grid": {
 			"pp.predicted_price, pp.confidence, pr.run_at, pr.suggestion_bias",
 			"AND pp.target_start > :pred_now",
@@ -565,11 +572,12 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	specs := map[string]dashboardQuerySpec{}
 	box := dashboardBoundingBox(52.52, 13.405, 5)
 	for _, spec := range dashboardQuerySpecsFor(dashboardQueryContext{
-		Filters:     doctorDashboardFilters{City: "berlin", RadiusKM: 5, Fuel: "all", From: "2026-08-14T00:00:00Z"},
-		StationIDs:  []string{"near-1", "near-2"},
-		FreshCutoff: "2026-08-19T12:00:00Z",
-		BBox:        &box,
-		Now:         time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC),
+		Filters:         doctorDashboardFilters{City: "berlin", RadiusKM: 5, Fuel: "all", From: "2026-08-14T00:00:00Z"},
+		StationIDs:      []string{"near-1", "near-2"},
+		ScopeStationIDs: []string{"near-1", "near-2", "near-3"},
+		FreshCutoff:     "2026-08-19T12:00:00Z",
+		BBox:            &box,
+		Now:             time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC),
 	}) {
 		specs[spec.name] = spec
 	}
@@ -600,6 +608,15 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	}
 	if !strings.Contains(specs["snapshots"].sql, "% 10 + 9) / 1000.0") {
 		t.Errorf("doctor's snapshot query lost the raised-9 projection:\n%s", specs["snapshots"].sql)
+	}
+	// The surroundings card reads the radius, not the picker: its query has to
+	// cover the station the picker dropped, or doctor is timing a smaller page
+	// than the reader loaded.
+	if got := len(specs["nearby_latest"].args); got != 3 {
+		t.Errorf("doctor's nearby_latest query binds %d stations, want the 3 in scope rather than the 2 selected", got)
+	}
+	if want := fmt.Sprintf("const NEARBY_STATION_LIMIT = %d;", dashboardNearbyLimit); !strings.Contains(php, want) {
+		t.Errorf("web/index.php no longer mirrors dashboardNearbyLimit: %q missing", want)
 	}
 	// The page's fuel filter expands to three fuels, which is three times the
 	// prediction rows; both prediction queries must carry the expansion.
@@ -639,6 +656,7 @@ func TestRunDoctorDashboardEndToEnd(t *testing.T) {
 		"dashboard queries: city=berlin",
 		"scope: ",
 		"scope_stations",
+		"nearby_latest",
 		"snapshots",
 		"probe/keys only",
 		"predictions_grid",
@@ -685,8 +703,8 @@ func TestRunDoctorDashboardEndToEnd(t *testing.T) {
 			probed++
 		}
 	}
-	if probed != 2 {
-		t.Errorf("%d queries carry a probe, want the 2 that have one", probed)
+	if probed != 3 {
+		t.Errorf("%d queries carry a probe, want the 3 that have one", probed)
 	}
 }
 

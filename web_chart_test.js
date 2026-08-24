@@ -585,6 +585,172 @@ function reportedRate(legendEl, index = 0) {
     check('the fuel that has prices is unaffected', reportedRate(mixed.legendEl), 1.19);
 }
 
+/* ── The surroundings card ──────────────────────────────────────── */
+// renderNearby answers "what does fuel cost around here", so what is tested is
+// the order it lists stations in, that it shows the price the payload carries,
+// and that a radius holding more than it can show says so instead of reading as
+// a complete list. Lifted the same way renderChart is.
+
+const nearbySource = [
+    lift('\nfunction nearbyRowHtml(row, fuels) {'),
+    lift('\nfunction renderNearby() {'),
+].join('\n');
+
+const NEARBY_DEPS = [
+    'nearbyCard', 'translations', 'currentLang', 'selectedFuel', 'locationLabel',
+    'locationRadiusKm', 'nearbyRows', 'nearbyTotal', 'nearbyExpanded', 'NEARBY_PREVIEW_ROWS',
+    'predictionStationMeta', 'fuelConfig', 'FUEL_CSS_COLORS', 'ICON_PIN', 'ICON_STATION_INFO',
+    'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml', 'fmtPriceHtml', 'fmtPriceText',
+];
+const compiledNearby = new Function(...NEARBY_DEPS, `${nearbySource}\nreturn renderNearby;`);
+
+// The distance formatters read currentLang the same way the price ones do.
+const makeDistance = new Function('currentLang', [
+    lift('function _loc() {'),
+    lift('function decimalSeparator() {'),
+    lift('function separatorHtml() {'),
+    lift('function fmtDecimal(v, digits) {'),
+    lift('function fmtDecimalHtml(v, digits) {'),
+    lift('function fmtDistanceKm(v) {'),
+    lift('function fmtDistanceKmHtml(v) {'),
+    'return { fmtDistanceKm, fmtDistanceKmHtml };',
+].join('\n'));
+
+/** One payload row: station id, distance, and a price per fuel. */
+function nearbyRow(id, distKm, prices = {}, open = true) {
+    return {
+        s: id,
+        dist: distKm,
+        t: '2026-08-01T09:00:00Z',
+        o: open,
+        e5: prices.e5 ?? null,
+        e10: prices.e10 ?? null,
+        diesel: prices.diesel ?? null,
+    };
+}
+
+/**
+ * Render the card and hand back its markup plus the pieces the tests read out
+ * of it. `label` empty stands for "no location picked yet".
+ */
+function renderNearbyCard(rows, {
+    label = 'Berlin', radiusKm = 5, total = null, expanded = false,
+    fuel = 'all', lang = 'en', meta = {},
+} = {}) {
+    const card = makeElement('div');
+    const locale = makeLocale(lang);
+    const distance = makeDistance(lang);
+    compiledNearby(
+        card, translations, lang, fuel, label,
+        radiusKm, rows, total === null ? rows.length : total, expanded, 8,
+        meta, fuelConfig, { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' }, '<pin/>', '<info/>',
+        (name) => `<dot ${name}>`, h, distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
+        locale.fmtPriceHtml, locale.fmtPriceText,
+    )();
+    const html = card.innerHTML;
+    return {
+        html,
+        // Station ids in the order the rows were emitted.
+        listed: [...html.matchAll(/data-station-id="([^"]+)"/g)].map((m) => m[1]),
+        // Text of the card with markup stripped, for the empty-state messages.
+        text: html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(),
+    };
+}
+
+const nearbyMeta = {
+    a: { name: 'Aral Mitte', street: 'Hauptstraße 1', place: 'Berlin' },
+    b: { name: 'Shell Nord', street: 'Nordstraße 12', place: 'Berlin' },
+};
+
+{
+    const rows = [
+        nearbyRow('a', 0.42, { e5: 1.789, e10: 1.729, diesel: 1.659 }),
+        nearbyRow('b', 3.1, { e5: 1.819, diesel: 1.689 }),
+    ];
+    const out = renderNearbyCard(rows, { meta: nearbyMeta });
+
+    check('the card lists the payload rows in the order they arrive', out.listed, ['a', 'b']);
+    check('the header names the location and the radius it covers',
+        out.html.includes('Berlin · 5 km'), true);
+    check('the nearest station leads with its distance',
+        out.html.includes('<span class="nearby-dist">0<span class="price-sep">.</span>4 km</span>'), true);
+    check('a station name reaches the row', out.text.includes('Aral Mitte'), true);
+    check('so does its address', out.text.includes('Hauptstraße 1, Berlin'), true);
+    // 1.789 renders as 1.78 with the last digit raised, which is what the
+    // pump board shows; five prices are quoted across the two rows.
+    check('the price is rendered in the board style',
+        (out.html.match(/<span class="price-milli">/g) || []).length, 5);
+    check('and it is the payload price, not a rounded one',
+        out.html.includes('1<span class="price-sep">.</span>78<span class="price-milli">9</span>'), true);
+    check('a fuel the station does not sell shows a dash, not a zero',
+        (out.html.match(/nearby-price empty/g) || []).length, 1);
+    check('every row opens the station dialog',
+        (out.html.match(/class="nearby-btn"/g) || []).length, 2);
+}
+
+{
+    // The fuel filter narrows the row to that fuel alone, like every other card.
+    const out = renderNearbyCard([nearbyRow('a', 0.4, { e5: 1.789, diesel: 1.659 })],
+        { fuel: 'diesel', meta: nearbyMeta });
+    check('one fuel selected renders one price',
+        (out.html.match(/class="nearby-price"/g) || []).length, 1);
+    check('and it is the selected one', out.text.includes('Diesel'), true);
+}
+
+{
+    // A closed station still lists — its price is the one it will reopen with —
+    // but it says so.
+    const out = renderNearbyCard([nearbyRow('a', 0.4, { diesel: 1.659 }, false)], { meta: nearbyMeta });
+    check('a closed station is marked', out.html.includes('nearby-closed'), true);
+    const open = renderNearbyCard([nearbyRow('a', 0.4, { diesel: 1.659 }, true)], { meta: nearbyMeta });
+    check('an open one is not', open.html.includes('nearby-closed'), false);
+}
+
+{
+    // More rows than the preview holds: eight are shown and the rest wait
+    // behind a button that names how many they are.
+    const rows = Array.from({ length: 11 }, (_, i) => nearbyRow(`s${i}`, i * 0.5, { diesel: 1.6 + i / 1000 }));
+    const collapsed = renderNearbyCard(rows);
+    check('the preview stops at eight rows', collapsed.listed.length, 8);
+    check('and offers the remainder by count', collapsed.text.includes('Show more (3)'), true);
+
+    const expanded = renderNearbyCard(rows, { expanded: true });
+    check('expanded shows every row', expanded.listed.length, 11);
+    check('and drops the button', expanded.html.includes('nearby-more'), false);
+}
+
+{
+    // The server caps how many stations it prices. Saying so is what keeps a
+    // capped list from reading as "that is all there is in range".
+    const rows = Array.from({ length: 9 }, (_, i) => nearbyRow(`s${i}`, i, { diesel: 1.6 }));
+    const capped = renderNearbyCard(rows, { total: 23, expanded: true });
+    check('a capped list says how much of the radius it covers',
+        capped.text.includes('The 9 nearest of 23 stations in range.'), true);
+    const whole = renderNearbyCard(rows, { total: 9, expanded: true });
+    check('an uncapped one does not', whole.html.includes('nearby-foot'), false);
+}
+
+{
+    // Without a location there is no "around here" to answer, and the card says
+    // where to set one rather than looking broken.
+    const none = renderNearbyCard([], { label: '' });
+    check('no location asks for one',
+        none.text.endsWith(translations.en.nearbyNoLocation), true);
+    check('and shows no rows', none.listed, []);
+
+    const empty = renderNearbyCard([], { label: 'Nowhere' });
+    check('a location with nothing in range says that instead',
+        empty.text.includes(translations.en.nearbyNoData), true);
+}
+
+{
+    // German is not a copy of the English card: the title is the one the
+    // page ships, and the numbers carry the German separators.
+    const out = renderNearbyCard([nearbyRow('a', 0.42, { diesel: 1.659 })], { lang: 'de', meta: nearbyMeta });
+    check('the German card is titled Umgebung', out.text.includes('Umgebung'), true);
+    check('and writes the distance with a comma', out.html.includes('0<span class="price-sep">,</span>4'), true);
+}
+
 if (failures > 0) {
     console.log(`web_chart_test: ${failures} failed`);
     process.exit(1);

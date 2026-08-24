@@ -37,6 +37,11 @@ import (
 // reproducing a page load.
 var dashboardRadiusOptions = []int{5, 10, 20}
 
+// dashboardNearbyLimit mirrors NEARBY_STATION_LIMIT in web/index.php: how many
+// of the nearest stations the surroundings card reads a current price for, and
+// so how many correlated seeks that query costs at most.
+const dashboardNearbyLimit = 40
+
 // dashboardFuels expands the page's fuel filter: "all" loads three fuels, which
 // triples what the prediction queries read.
 func dashboardFuels(fuel string) []string {
@@ -112,6 +117,11 @@ type dashboardQueryContext struct {
 	// BBox is the bounding box for the selected city and radius; nil for the
 	// unscoped view.
 	BBox *dashboardBBox
+	// ScopeStationIDs is every station the radius admits, before the picker
+	// narrows it. The surroundings card reads a current price for the nearest
+	// of them and is deliberately not narrowed by the picker, so it is that
+	// list — not StationIDs — that sizes its query.
+	ScopeStationIDs []string
 	// CityMissing marks a named city the cities table does not hold. The page
 	// stops there and renders an error, so there is no scope query to measure
 	// past the lookup that failed.
@@ -229,6 +239,43 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 			args:  []any{qc.FreshCutoff},
 			table: "stations",
 			alias: "s",
+		})
+	}
+
+	// ── surroundings ──────────────────────────────────────────────────────
+	// loadNearbyPrices: the current price at each of the nearest stations. Its
+	// scope is the radius alone, so it runs whenever a location is selected —
+	// including when the picker has narrowed everything below it away.
+	if qc.BBox != nil && len(qc.ScopeStationIDs) > 0 {
+		nearbyIDs := qc.ScopeStationIDs
+		if len(nearbyIDs) > dashboardNearbyLimit {
+			nearbyIDs = nearbyIDs[:dashboardNearbyLimit]
+		}
+		nearbyArgs := make([]any, 0, len(nearbyIDs))
+		for _, id := range nearbyIDs {
+			nearbyArgs = append(nearbyArgs, id)
+		}
+		nearbyWhere := "ps.station_id IN (" + boundPlaceholders(len(nearbyIDs)) + ") " +
+			"AND ps.recorded_at = (SELECT MAX(newest.recorded_at) FROM price_snapshots newest " +
+			"WHERE newest.station_id = ps.station_id)"
+		specs = append(specs, dashboardQuerySpec{
+			name:    "nearby_latest",
+			purpose: "the current price at each of the nearest stations (loadNearbyPrices)",
+			sql: "SELECT ps.station_id, ps.recorded_at, ps.is_open, " +
+				raisedNinePriceSQL("ps.e5") + " AS e5, " +
+				raisedNinePriceSQL("ps.e10") + " AS e10, " +
+				raisedNinePriceSQL("ps.diesel") + " AS diesel " +
+				"FROM price_snapshots ps WHERE " + nearbyWhere,
+			args:  nearbyArgs,
+			table: "price_snapshots",
+			alias: "ps",
+			probe: &doctorProbeSpec{
+				name:    "newest only",
+				purpose: "the correlated maximum on its own, so the difference is the row lookups",
+				sql:     "SELECT ps.station_id FROM price_snapshots ps WHERE " + nearbyWhere,
+				args:    nearbyArgs,
+				alias:   "ps",
+			},
 		})
 	}
 
@@ -598,6 +645,7 @@ func runDashboardChecks(ctx context.Context, db *sql.DB, d dialect, opts doctorO
 		}
 		dash.Scope.Candidates = candidates
 		dash.Scope.Stations = len(ids)
+		qc.ScopeStationIDs = ids
 		qc.StationIDs = intersectStationSelection(ids, filters.Stations)
 	} else {
 		// The unscoped view: the page loads the station list for the sidebar

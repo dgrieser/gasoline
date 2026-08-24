@@ -44,7 +44,8 @@ function extractFunction(string $source, string $name): string
 }
 
 $viewer = file_get_contents(__DIR__ . '/web/index.php');
-foreach (['raisedNinePrice', 'loadFilteredPredictions', 'gasolineCommandStatsSeries',
+foreach (['raisedNinePrice', 'raisedNinePriceSql', 'loadNearbyPrices', 'geocodeLabel',
+    'cacheGeocodedPlace', 'nowUTC', 'loadFilteredPredictions', 'gasolineCommandStatsSeries',
     'gasolineLeadBucketLabels', 'gasolineLeadBucketSql', 'gasolineBreakdownTables'] as $name) {
     eval(extractFunction($viewer, $name));
 }
@@ -376,6 +377,168 @@ check('the labels are the ones the client renders', $labels,
 check('an unlabelled bucket index is still reported',
     gasolineBreakdownTables([$brRow('high', 99, '08', 1, 0.1, 0.1, 7)])['by_lead'][0]['bucket'],
     'bucket 99');
+
+echo "web_picker_test: loadNearbyPrices\n";
+
+/**
+ * A snapshot table holding the given rows, each [station, recorded_at, is_open,
+ * e5, e10, diesel]. Only the columns loadNearbyPrices reads are created.
+ */
+function seedSnapshots(array $rows): PDO
+{
+    $pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    $pdo->exec('CREATE TABLE price_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, station_id TEXT NOT NULL,
+        recorded_at TEXT NOT NULL, is_open INTEGER NOT NULL, e5 REAL, e10 REAL, diesel REAL)');
+    $stmt = $pdo->prepare('INSERT INTO price_snapshots (station_id, recorded_at, is_open, e5, e10, diesel)
+        VALUES (?, ?, ?, ?, ?, ?)');
+    foreach ($rows as $row) {
+        $stmt->execute($row);
+    }
+    return $pdo;
+}
+
+/** The scope-station shape loadNearbyPrices takes, nearest first. */
+function scopeStations(array $ids): array
+{
+    return array_map(static fn (string $id): array => ['id' => $id], $ids);
+}
+
+// Three stations, each repriced twice; only the later reading is current. The
+// station list is already in distance order and the result has to keep it,
+// rather than falling back to whatever order the database returned rows in.
+$pdo = seedSnapshots([
+    ['far',    '2026-08-21T08:00:00Z', 1, 1.909, 1.859, 1.789],
+    ['far',    '2026-08-21T11:00:00Z', 1, 1.919, 1.869, 1.799],
+    ['near',   '2026-08-21T08:00:00Z', 1, 1.709, 1.659, 1.589],
+    ['near',   '2026-08-21T11:00:00Z', 0, 1.719, 1.669, 1.599],
+    ['middle', '2026-08-21T10:00:00Z', 1, 1.809, 1.759, 1.689],
+]);
+$out = loadNearbyPrices($pdo, scopeStations(['near', 'middle', 'far']),
+    ['near' => 0.4, 'middle' => 2.25, 'far' => 4.0], 10);
+
+check('rows keep the distance order they were handed in',
+    array_column($out, 's'), ['near', 'middle', 'far']);
+check('each station reports its newest reading',
+    array_column($out, 't'),
+    ['2026-08-21T11:00:00Z', '2026-08-21T10:00:00Z', '2026-08-21T11:00:00Z']);
+check('the price is the newest one, not the first stored',
+    array_column($out, 'diesel'), [1.599, 1.689, 1.799]);
+check('the distance rides along, rounded to metres',
+    array_column($out, 'dist'), [0.4, 2.25, 4.0]);
+check('the open flag comes from that same newest row',
+    array_column($out, 'o'), [false, true, true]);
+
+// The board price is normalized in the projection, exactly as the snapshot
+// query does it, so the card cannot quote a different number than the chart.
+$pdo = seedSnapshots([['a', '2026-08-21T11:00:00Z', 1, 1.712, 1.650, null]]);
+$out = loadNearbyPrices($pdo, scopeStations(['a']), ['a' => 1.0], 10);
+check('prices are raised to the board style', [$out[0]['e5'], $out[0]['e10']], [1.719, 1.659]);
+check('a fuel the station does not sell stays null', $out[0]['diesel'], null);
+
+// The cap is applied to the station list before the query runs, so a dense
+// radius costs the cap's worth of seeks and not the whole area's.
+$pdo = seedSnapshots([
+    ['a', '2026-08-21T11:00:00Z', 1, 1.709, null, null],
+    ['b', '2026-08-21T11:00:00Z', 1, 1.719, null, null],
+    ['c', '2026-08-21T11:00:00Z', 1, 1.729, null, null],
+]);
+check('the cap keeps the nearest stations and drops the rest',
+    array_column(loadNearbyPrices($pdo, scopeStations(['a', 'b', 'c']), [], 2), 's'), ['a', 'b']);
+check('a cap of zero asks the database nothing',
+    loadNearbyPrices($pdo, scopeStations(['a', 'b', 'c']), [], 0), []);
+
+// Two update targets can cover one station and record it in the same sweep.
+// That is one price, not two rows.
+$pdo = seedSnapshots([
+    ['a', '2026-08-21T11:00:00Z', 1, 1.709, null, null],
+    ['a', '2026-08-21T11:00:00Z', 1, 1.709, null, null],
+]);
+check('a station recorded twice at the same instant yields one row',
+    count(loadNearbyPrices($pdo, scopeStations(['a']), [], 10)), 1);
+
+// A station with no snapshot at all is left out rather than rendered as a row
+// with no price in it.
+$pdo = seedSnapshots([['a', '2026-08-21T11:00:00Z', 1, 1.709, null, null]]);
+check('a station without any snapshot is dropped',
+    array_column(loadNearbyPrices($pdo, scopeStations(['a', 'ghost']), [], 10), 's'), ['a']);
+check('a station without a measured distance still lists, with a null distance',
+    loadNearbyPrices($pdo, scopeStations(['a']), [], 10)[0]['dist'], null);
+
+echo "web_picker_test: geocodeLabel / cacheGeocodedPlace\n";
+
+// The label is the cache key and what the filter input shows, so what matters
+// is that it folds Nominatim's verbose answer down deterministically.
+check('a house number folds to street, postcode, place',
+    geocodeLabel([
+        'display_name' => '5, Hauptstraße, Mitte, Berlin, 10115, Deutschland',
+        'address' => ['house_number' => '5', 'road' => 'Hauptstraße', 'suburb' => 'Mitte',
+            'city' => 'Berlin', 'postcode' => '10115'],
+    ]),
+    'Hauptstraße 5, 10115 Berlin');
+check('a street without a number keeps the street',
+    geocodeLabel(['address' => ['road' => 'Hauptstraße', 'city' => 'Berlin', 'postcode' => '10115']]),
+    'Hauptstraße, 10115 Berlin');
+check('a plain city folds to the city, matching what the CLI caches',
+    geocodeLabel(['display_name' => 'Berlin, Deutschland', 'address' => ['city' => 'Berlin']]),
+    'Berlin');
+check('a village stands in for a city',
+    geocodeLabel(['address' => ['village' => 'Kleinkleckersdorf', 'postcode' => '12345']]),
+    '12345 Kleinkleckersdorf');
+check('no structured address falls back to the leading free-text parts',
+    geocodeLabel(['display_name' => 'Steinhuder Meer, Wunstorf, Region Hannover, Deutschland']),
+    'Steinhuder Meer, Wunstorf');
+check('and to the bare name when there is not even that',
+    geocodeLabel(['name' => 'Nirgendwo']), 'Nirgendwo');
+// cities.name is VARCHAR(255) and the label is its primary key.
+check('an absurd label is cut to fit the key column',
+    mb_strlen(geocodeLabel(['display_name' => str_repeat('a', 400) . ', x'])), 200);
+
+/** An empty cities cache, as `gasoline migrate` creates it. */
+function seedCities(array $rows): PDO
+{
+    $pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    $pdo->exec('CREATE TABLE cities (name TEXT PRIMARY KEY, normalized_name TEXT NOT NULL,
+        normalized_lower TEXT NOT NULL DEFAULT \'\', display_name TEXT NOT NULL,
+        lat REAL NOT NULL, lng REAL NOT NULL, created_at TEXT NOT NULL)');
+    $stmt = $pdo->prepare('INSERT INTO cities (name, normalized_name, normalized_lower, display_name,
+        lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    foreach ($rows as $row) {
+        $stmt->execute($row);
+    }
+    return $pdo;
+}
+
+$pdo = seedCities([]);
+$key = cacheGeocodedPlace($pdo, 'sqlite', ['label' => 'Hauptstraße 5, 10115 Berlin', 'lat' => 52.5, 'lng' => 13.4]);
+check('the key handed back is the label the filter carries', $key, 'Hauptstraße 5, 10115 Berlin');
+$row = $pdo->query('SELECT * FROM cities')->fetch();
+check('the row is keyed by that label on every name column',
+    [$row['name'], $row['normalized_name'], $row['display_name']],
+    ['Hauptstraße 5, 10115 Berlin', 'Hauptstraße 5, 10115 Berlin', 'Hauptstraße 5, 10115 Berlin']);
+// The typeahead's prefix range only matches rows folded the way citySearchKey
+// folds them on the Go side; plain strtolower would leave the ß's neighbours be.
+check('the search column is folded so the typeahead can find it again',
+    $row['normalized_lower'], 'hauptstraße 5, 10115 berlin');
+check('the coordinates are the ones the radius will measure from',
+    [$row['lat'], $row['lng']], [52.5, 13.4]);
+
+// Searching the same address again must not grow the cache.
+cacheGeocodedPlace($pdo, 'sqlite', ['label' => 'Hauptstraße 5, 10115 Berlin', 'lat' => 52.5, 'lng' => 13.4]);
+check('resolving the same address twice keeps one row',
+    (int) $pdo->query('SELECT COUNT(*) AS n FROM cities')->fetch()['n'], 1);
+
+// A place the CLI already cached under its own query name is left alone: one
+// dropdown entry, and the coordinates stay the ones the CLI maintains.
+$pdo = seedCities([['Berlin, Germany', 'Berlin', 'berlin', 'Berlin', 52.52, 13.405, '2026-01-01T00:00:00Z']]);
+$key = cacheGeocodedPlace($pdo, 'sqlite', ['label' => 'Berlin', 'lat' => 52.4, 'lng' => 13.3]);
+check('a place the cache already answers for is reused, not duplicated',
+    [(int) $pdo->query('SELECT COUNT(*) AS n FROM cities')->fetch()['n'], $key], [1, 'Berlin']);
+check('and the row the CLI owns keeps its own coordinates',
+    array_map('floatval', [$pdo->query('SELECT lat, lng FROM cities')->fetch()['lat'],
+        $pdo->query('SELECT lat, lng FROM cities')->fetch()['lng']]),
+    [52.52, 13.405]);
 
 if ($failures > 0) {
     printf("web_picker_test: %d failed\n", $failures);

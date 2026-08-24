@@ -67,6 +67,9 @@ The PHP viewer requires a login (see [Web viewer & user accounts](#web-viewer--u
 | `GASOLINE_SMTP_TLS` | `starttls` (default for port 587), `implicit` (SMTPS, default for 465), or `none`. |
 | `GASOLINE_SESSION_DAYS` | How long a signed-in browser stays signed in without retyping the password (default `30`, clamped to 1–365). |
 | `GASOLINE_SESSION_PATH` | Directory for PHP session files (default `<temp>/gasoline-sessions`). Falls back to PHP's own path when it cannot be created or written. |
+| `GASOLINE_GEOCODE` | Set to `false`/`off`/`0` to switch off the viewer's outbound address lookups. The location filter then offers only the places already cached in the database, and the locate button falls back to labelling the position by its coordinates. |
+| `GASOLINE_NOMINATIM_URL` | Base URL of the geocoder the viewer asks (default `https://nominatim.openstreetmap.org`). Point it at your own Nominatim instance to keep the lookups in-house. |
+| `GASOLINE_USER_AGENT` | `User-Agent` the viewer sends with those lookups (default `gasoline-web/1.0 (viewer)`), the web-side twin of the CLI's `--user-agent`. |
 
 ### Migrating an existing SQLite database to MySQL
 
@@ -514,13 +517,14 @@ Read the verdict against the noise band in the same run, not on its own. Across 
 
 #### Why the dashboard is slow (`doctor dashboard`)
 
-The dashboard is slow for different reasons than the accuracy page, so it gets its own mirror of its own SQL. A load issues five queries, and `doctor dashboard` reproduces all of them — including the station list the page inlines into `IN (...)`, because the length of that list is part of the cost:
+The dashboard is slow for different reasons than the accuracy page, so it gets its own mirror of its own SQL. A load issues six queries, and `doctor dashboard` reproduces all of them — including the station list the page inlines into `IN (...)`, because the length of that list is part of the cost:
 
 | query | what the page does with it |
 | --- | --- |
 | `city` | resolves the selected city (`resolveCity`) |
 | `city_search` | the city dropdown's typeahead, measured with the first three letters of the selected city |
 | `scope_stations` | the stations inside the radius that are still being fed (`loadScopeStations`) |
+| `nearby_latest` | the current price at each of the 40 nearest stations, for the Nearby card (`loadNearbyPrices`) |
 | `snapshots` | the price history the chart and table are drawn from (`buildSnapshotQuery`) |
 | `predictions_grid` | the future forecast windows for the scope, reduced to the newest run per station in PHP (`loadFilteredPredictions`) |
 
@@ -536,7 +540,7 @@ gasoline doctor dashboard --explain --sql                  # plans and SQL per q
 gasoline doctor dashboard -o json | jq '.dashboard'        # machine-readable
 ```
 
-With no `--city` it measures the city with the most stations in scope, which is the slowest dashboard anyone can load, and says which one it picked. `--radius` accepts only the radii the dropdown offers (5, 10, 20) and `--fuel` defaults to the page's own `all`, which expands to three fuels and so to three times the prediction rows. `--no-city` reproduces the unscoped view, where the page loads the station list for the sidebar and skips the snapshot and prediction queries entirely — `doctor` skips them with it rather than inventing a load the page never issues.
+With no `--city` it measures the city with the most stations in scope, which is the slowest dashboard anyone can load, and says which one it picked. `--radius` accepts only the radii the dropdown offers (5, 10, 20) and `--fuel` defaults to the page's own `all`, which expands to three fuels and so to three times the prediction rows. `--no-city` reproduces the unscoped view, where the page loads the station list for the sidebar and skips the surroundings, snapshot and prediction queries entirely — `doctor` skips them with it rather than inventing a load the page never issues.
 
 The output shows how the scope narrowed, then one line per query:
 
@@ -554,7 +558,7 @@ dashboard queries: city=Lübbecke (auto), radius=5 km, fuel=all (e5+e10+diesel),
     probe/keys only       52.5 ms    40290 rows  covering idx_price_predictions_station_fuel_target
 ```
 
-Those are real numbers from a production MySQL 8.4, taken **before** the fixes below, and they are the reason the probes exist. One query was 99.87% of the load — and the probe beside it showed that reading its 610,978 rows took 256 ms, so the row count was *not* what cost three minutes. The same report is now 257 ms in total: `predictions_latest` no longer exists and neither of the `cities` scans does. See [what this found](#what-doctor-dashboard-found-and-what-was-done-about-it).
+Those are real numbers from a production MySQL 8.4, taken **before** the fixes below and before the Nearby card existed, and they are the reason the probes exist. One query was 99.87% of the load — and the probe beside it showed that reading its 610,978 rows took 256 ms, so the row count was *not* what cost three minutes. The same report is now 257 ms in total: `predictions_latest` no longer exists and neither of the `cities` scans does. See [what this found](#what-doctor-dashboard-found-and-what-was-done-about-it).
 
 ##### Probes: what a query's time is actually spent on
 
@@ -652,10 +656,15 @@ The viewer lives in `web/index.php`. It reads `GASOLINE_DB_PATH` when set; other
 Features:
 
 - filter by date range
-- filter by city
+- filter by location — a city, a full street address, or the browser's own position
 - filter by fuel type
 - compare multiple stations
+- see what the stations around that location cost right now, nearest first
 - inspect summary stats and historical price points
+
+The location filter's typeahead searches the places already cached in the database and never leaves the host, because Nominatim's usage policy rules out a lookup per keystroke. Two things go out, and only when asked for explicitly: the dropdown's closing **Search address "…"** row, and the locate button next to the field, which takes one position fix from the browser and turns it into an address. Either answer is written back into that cache, so the address is a plain typeahead hit afterwards, and the last selection rides along in the filter cookie — the browser is not asked for a position a second time on the next visit. `GASOLINE_GEOCODE=false` switches both paths off; the locate button then still works and labels the position by its coordinates.
+
+The **Nearby** card (German: *Umgebung*) sits under the recommended fill-ups and lists the stations that location and radius admit, nearest first, with the price each is showing right now. Unlike the cards above it, it is not narrowed by the date range or by the station picker: it reads the newest snapshot per station directly, for up to the 40 nearest of them, and says so when the radius holds more. Tapping a row opens the same station detail dialog as the other cards, navigation link included.
 
 The station list, the price rows and the recommended fill-ups card all cover the **stations currently being fed** — the same 48-hour freshness rule the CLI applies (`GASOLINE_STATION_FRESHNESS_HOURS` mirrors Go's `stationFreshness`). A station whose update target was removed therefore disappears from the dashboard instead of showing its last known price as though it were current; its snapshots stay in the database and reappear if the station is collected again.
 
@@ -700,7 +709,7 @@ Pushing a tag that matches `v*` triggers the GitHub Actions release workflow. It
 
 ## Notes
 
-- City geocoding is cached in the database, so Nominatim is only queried once per place unless the cached row is cleared or refreshed.
+- City geocoding is cached in the database, so Nominatim is only queried once per place unless the cached row is cleared or refreshed. The viewer writes into that same cache when a reader resolves an address or their position, keyed by the folded label (`Hauptstraße 5, 10115 Berlin`); `clear cities` drops those rows along with the rest.
 - `update` stores only changed snapshots plus the adjacent unchanged snapshots needed to preserve price graphs.
 - A station inside two update targets' radii belongs to the nearest one, and `price_snapshots.city_name` records that owner. It is provenance: `gasoline stations --city` filters on it, and `suggest`/`check` use it to report a distance when nothing better is available. Notifications do not — a subscriber's distance is measured from their own location.
 - The `cities` table is a **geocode cache**, nothing more. `update` needs a city's coordinates for the Tankerkönig call and caches them there; the web UI reads it as an autocomplete source when a user or visitor picks a city, resolving the coordinates once at that moment. Neither the notification path nor the forecast reads it at run time. `gasoline import cities <CC>` fills it in bulk so the autocomplete covers a whole country.
