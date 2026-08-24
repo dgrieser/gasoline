@@ -6930,101 +6930,10 @@ function renderDocumentHead(string $titleSuffix): void
         }
 
         /* ── Surroundings card ─────────────────────────────────── */
-        /* A list, not the three-column fuel grid the other cards use: the
-           question here is which pump is nearest, so distance leads the row and
-           every fuel in scope sits on it. */
-        .nearby-list {
-            display: grid;
-            gap: 1px;
-            background: var(--border);
-        }
-
-        .nearby-btn {
-            appearance: none;
-            width: 100%;
-            border: none;
-            background: var(--surface);
-            color: inherit;
-            font: inherit;
-            text-align: left;
-            cursor: pointer;
-            padding: 0.7rem 1.25rem;
-            display: grid;
-            grid-template-columns: 4.4rem minmax(0, 1fr) auto;
-            align-items: center;
-            gap: 0.15rem 0.9rem;
-            transition: background 0.15s ease;
-        }
-
-        .nearby-btn:hover { background: var(--surface-hi); }
-
-        .nearby-btn:focus-visible {
-            outline: 2px solid var(--amber);
-            outline-offset: -2px;
-            background: var(--surface-hi);
-        }
-
-        /* Every cell is placed by hand: a row whose address or price list is
-           empty must not let the rest of it reflow into the gap. */
-        .nearby-dist {
-            grid-column: 1;
-            grid-row: 1 / span 2;
-            font-family: var(--mono);
-            font-size: 0.85rem;
-            font-weight: 500;
-            color: var(--amber);
-            white-space: nowrap;
-        }
-
-        .nearby-name {
-            grid-column: 2;
-            grid-row: 1;
-            display: flex;
-            align-items: center;
-            min-width: 0;
-            font-family: var(--mono);
-            font-size: 0.8rem;
-            color: var(--ink);
-        }
-
-        .nearby-addr {
-            grid-column: 2;
-            grid-row: 2;
-            font-family: var(--mono);
-            font-size: 0.7rem;
-            color: var(--muted);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .nearby-prices {
-            grid-column: 3;
-            grid-row: 1 / span 2;
-            display: flex;
-            align-items: baseline;
-            gap: 0.9rem;
-            font-family: var(--mono);
-            white-space: nowrap;
-        }
-
-        .nearby-price {
-            display: inline-flex;
-            align-items: baseline;
-            gap: 0.3rem;
-            font-size: 0.95rem;
-            font-weight: 500;
-        }
-
-        .nearby-price-label {
-            font-size: 0.6rem;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            opacity: 0.75;
-        }
-
-        .nearby-price.empty { color: var(--muted); opacity: 0.5; }
-
+        /* Built out of the same cells as the cards above it — fuel label, big
+           price, station block, ranked rows — so the page reads as one thing.
+           What it ranks by is distance rather than price, which is what the
+           right-hand distance column is for. */
         .nearby-closed {
             flex-shrink: 0;
             margin-left: 0.45rem;
@@ -7050,6 +6959,42 @@ function renderDocumentHead(string $titleSuffix): void
             font-size: 0.66rem;
             color: var(--muted);
         }
+
+        /* ── The distance column ───────────────────────────────── */
+        /* Every row that knows how far away a station is ends with it, in the
+           same accent, and it never shrinks: the station name or the address
+           beside it ellipsizes instead. Before this the distance sat inside the
+           name's text run, so a long name swallowed the one number the row was
+           there to place. */
+        .row-dist {
+            flex-shrink: 0;
+            margin-left: auto;
+            padding-left: 0.6rem;
+            font-family: var(--mono);
+            color: var(--amber);
+            white-space: nowrap;
+        }
+
+        /* The address line shares its row with the distance. The address gives
+           way; the distance keeps the right edge and its own full colour, so it
+           stays out of the address line's dimming. */
+        .sd-meta-line {
+            display: flex;
+            align-items: baseline;
+            min-width: 0;
+        }
+
+        .sd-meta-line .sd-addr-line {
+            flex: 1;
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* The block button resets to `font: inherit`, so the distance needs the
+           address line's size named explicitly to sit level with it. */
+        .sd-meta-line .row-dist { font-size: 0.75rem; }
 
         /* ── Clickable station references inside the price cards ─── */
         /* Every station mentioned in the four cards is a button opening the
@@ -7687,10 +7632,6 @@ function renderDocumentHead(string $titleSuffix): void
             .brand-icon,
             .brand-icon img { width: 40px; height: 40px; }
             h1 { font-size: 1.4rem; }
-            /* Too narrow for three columns: the prices drop to their own row
-               under the address, still left-aligned with the station. */
-            .nearby-btn { grid-template-columns: 3.6rem minmax(0, 1fr); }
-            .nearby-prices { grid-column: 1 / -1; grid-row: 3; gap: 0.75rem; margin-top: 0.35rem; }
             /* Give the plot itself more width on phones. */
             .chart-body { padding: 0.75rem 0.5rem; }
             .chart-legend { padding: 0.75rem; gap: 0.5rem 0.85rem; }
@@ -10453,16 +10394,27 @@ function stationDot(stationName, fuel, extra) {
 // Big station block of a card cell: name line plus the optional address line,
 // wrapped in one button that opens the station dialog. `addressHtml` arrives
 // as markup, since the distance in it carries a sized-down separator.
-function stationBlock(stationId, stationName, fuel, addressHtml) {
+function stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {
     const t = translations[currentLang];
+    const distText = fmtDistanceKm(distKm);
+    const distHtml = fmtDistanceKmHtml(distKm);
+    const spoken = [stationName, distText].filter(Boolean).join(' — ');
     return `<button type="button" class="station-btn" data-station-id="${h(stationId)}"` +
-        ` title="${h(t.sdHint)}" aria-label="${h(t.sdHint + ': ' + stationName)}">` +
+        ` title="${h(t.sdHint)}" aria-label="${h(t.sdHint + ': ' + spoken)}">` +
         `<span class="cheapest-station sd-name-line">` +
             stationDot(stationName, fuel) +
             `<span class="sd-name-text">${h(stationName)}</span>` +
             ICON_STATION_INFO +
+            (trailingHtml || '') +
         `</span>` +
-        (addressHtml ? `<span class="cheapest-station sd-addr-line">${addressHtml}</span>` : '') +
+        // The address and the distance share a line but not a text run: the
+        // address ellipsizes, the distance holds the right edge.
+        (addressHtml || distHtml !== null
+            ? `<span class="sd-meta-line">` +
+                  `<span class="cheapest-station sd-addr-line">${addressHtml || ''}</span>` +
+                  (distHtml === null ? '' : `<span class="row-dist">${distHtml}</span>`) +
+              `</span>`
+            : '') +
     `</button>`;
 }
 
@@ -10475,14 +10427,18 @@ function stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtm
     const t = translations[currentLang];
     const distText = fmtDistanceKm(distKm);
     const distHtml = fmtDistanceKmHtml(distKm);
-    const label = stationName + (distText === null ? '' : ` (${distText})`);
-    const labelHtml = h(stationName) + (distHtml === null ? '' : ` (${distHtml})`);
+    const label = stationName + (distText === null ? '' : ` — ${distText}`);
+    // The distance used to ride inside the name, which meant a long station
+    // name ellipsized the one number the row exists to place: "Markant
+    // Tankautomat Hüllhorst (4,3…". It is its own column now, and the name is
+    // what gives way.
     return `<button type="button" class="rank-row station-rank-btn" data-station-id="${h(stationId)}"` +
         ` title="${h(titleText ? titleText + ' — ' + t.sdHint : t.sdHint)}"` +
         ` aria-label="${h(t.sdHint + ': ' + fmtPriceText(price) + ' — ' + label)}">` +
         `<span class="rank-price" style="color:${FUEL_CSS_COLORS[fuel]}">${fmtPriceHtml(price)}</span>` +
-        `<span class="rank-station">${stationDot(stationName, fuel)}${labelHtml}</span>` +
+        `<span class="rank-station">${stationDot(stationName, fuel)}${h(stationName)}</span>` +
         (trailingHtml || '') +
+        (distHtml === null ? '' : `<span class="row-dist">${distHtml}</span>`) +
     `</button>`;
 }
 
@@ -10521,18 +10477,14 @@ function renderPriceCard(el, rows, title, better, icon, emptyMsg) {
             ? `<div class="cheapest-empty">${emptyMsg}</div>`
             : `<div class="cheapest-grid${colClass ? ' ' + colClass : ''}">` +
                 results.map(({ fuel, price, station_id, station, street, place, recorded_at }) => {
-                    // Address line as markup: text parts escaped here, the
-                    // distance already formatted with its smaller separator.
-                    const addressParts = [street, place].filter(Boolean).map(h);
-                    const selectedDistKm = stationDistancesById[station_id] ?? null;
-                    if (selectedDistKm !== null) {
-                        addressParts.push(fmtDistanceKmHtml(selectedDistKm));
-                    }
-                    const address = addressParts.length ? addressParts.join(', ') : '';
+                    // Address line as markup: text parts escaped here. The
+                    // distance is not part of it — stationBlock gives it its
+                    // own column so it survives a long address.
+                    const address = [street, place].filter(Boolean).map(h).join(', ');
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
                         `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(price)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                        stationBlock(station_id, station, fuel, address) +
+                        stationBlock(station_id, station, fuel, address, stationDistancesById[station_id] ?? null) +
                         `<div class="cheapest-time">${h(formatDateTime(recorded_at))}</div>` +
                     `</div>`;
                 }).join('') +
@@ -10580,9 +10532,7 @@ function renderCheapest() {
             : `<div class="cheapest-grid${colClass}">` +
                 results.map(({ fuel, top }) => {
                     const best = top[0];
-                    const addressParts = [best.street, best.place].filter(Boolean).map(h);
-                    const bestDist = stationDistancesById[best.station_id] ?? null;
-                    if (bestDist !== null) addressParts.push(fmtDistanceKmHtml(bestDist));
+                    const bestAddress = [best.street, best.place].filter(Boolean).map(h).join(', ');
                     const runnersUp = top.slice(1).map((row) => stationRankRow(
                         row.station_id,
                         row.station_name,
@@ -10595,7 +10545,8 @@ function renderCheapest() {
                     return `<div class="cheapest-cell">` +
                         `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
                         `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(best[fuel])} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                        stationBlock(best.station_id, best.station_name, fuel, addressParts.join(', ')) +
+                        stationBlock(best.station_id, best.station_name, fuel, bestAddress,
+                            stationDistancesById[best.station_id] ?? null) +
                         `<div class="cheapest-time">${h(formatDateTime(best.recorded_at))}</div>` +
                         (runnersUp ? `<div class="rank-list">${runnersUp}</div>` : '') +
                     `</div>`;
@@ -10631,15 +10582,12 @@ function renderPredictions() {
 
     const nameById = (id) => (predictionStationMeta[id] && predictionStationMeta[id].name) || id;
     const distById = (id) => stationDistancesById[id] ?? null;
-    // Address line for the top station, mirroring the top-5 card: street, place,
-    // then distance. Distance moves out of the name and into this line. Markup,
-    // so the distance keeps its sized-down separator.
+    // Address line for the top station, mirroring the top-5 card: street then
+    // place. The distance is not in it — stationBlock puts that in its own
+    // column, at the right edge, where it cannot be ellipsized away.
     const addressHtmlById = (id) => {
         const meta = predictionStationMeta[id] || {};
-        const parts = [meta.street, meta.place].filter(Boolean).map(h);
-        const dist = distById(id);
-        if (dist !== null) parts.push(fmtDistanceKmHtml(dist));
-        return parts.join(', ');
+        return [meta.street, meta.place].filter(Boolean).map(h).join(', ');
     };
     // Day bucket key + header in the displayed timezone/locale so grouping
     // matches the visible date (recomputed on language change).
@@ -10692,7 +10640,7 @@ function renderPredictions() {
                         return `<div class="pred-day">${h(dayLabel(best.start))}</div>` +
                             `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(best.price)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
                             `<div class="cheapest-time">${h(windowLabel(best))}</div>` +
-                            stationBlock(best.s, bestName, fuel, bestAddr) +
+                            stationBlock(best.s, bestName, fuel, bestAddr, distById(best.s)) +
                             (runners ? `<div class="rank-list">${runners}</div>` : '');
                     }).join('');
 
@@ -10717,66 +10665,54 @@ const nearbyCard = document.getElementById('nearby-card');
 
 const ICON_PIN = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>`;
 
-function nearbyRowHtml(row, fuels) {
-    const t = translations[currentLang];
-    const meta = predictionStationMeta[row.s] || {};
-    const name = meta.name || row.s;
-    const distHtml = fmtDistanceKmHtml(row.dist);
-    const distText = fmtDistanceKm(row.dist);
-    const address = [meta.street, meta.place].filter(Boolean).map(h).join(', ');
-
-    const prices = fuels.map((fuel) => {
-        const value = row[fuel];
-        const has = value !== null && value !== undefined;
-        return `<span class="nearby-price${has ? '' : ' empty'}"${has ? ` style="color:${FUEL_CSS_COLORS[fuel]}"` : ''}>` +
-            `<span class="nearby-price-label">${fuelConfig[fuel].label}</span>` +
-            (has ? fmtPriceHtml(value) : '—') +
-        `</span>`;
-    }).join('');
-
-    // Spoken label: distance, station, then each price — the same reading order
-    // the row has visually, which the grid's column spans would otherwise lose.
-    const spokenPrices = fuels
-        .map((fuel) => `${fuelConfig[fuel].label} ${fmtPriceText(row[fuel], '—')}`)
-        .join(', ');
-    const spoken = [distText, name, spokenPrices].filter(Boolean).join(' — ');
-
-    return `<button type="button" class="nearby-btn" data-station-id="${h(row.s)}"` +
-        ` title="${h(t.sdHint)}" aria-label="${h(t.sdHint + ': ' + spoken)}">` +
-        `<span class="nearby-dist">${distHtml === null ? '' : distHtml}</span>` +
-        `<span class="nearby-name">` +
-            stationDot(name, fuels[0]) +
-            `<span class="sd-name-text">${h(name)}</span>` +
-            (row.o ? '' : `<span class="nearby-closed">${h(t.openNo)}</span>`) +
-            ICON_STATION_INFO +
-        `</span>` +
-        `<span class="nearby-addr">${address}</span>` +
-        `<span class="nearby-prices">${prices}</span>` +
-    `</button>`;
+// A closed station still lists — its price is the one it will reopen with —
+// but it says so, next to the name in both the big cell and the ranked rows.
+function nearbyClosedTag(row) {
+    return row.o ? '' : `<span class="nearby-closed">${h(translations[currentLang].openNo)}</span>`;
 }
 
 function renderNearby() {
     const t = translations[currentLang];
     if (!nearbyCard) return;
-    const fuels = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
+    const fuels      = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
+    const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
 
+    // The radius alone. Where the reader is says itself in the filter, and
+    // spelling their street address across the top of a card they screenshot
+    // is not something to do on their behalf.
     const scope = locationLabel === ''
         ? ''
-        : `<span class="cheapest-scope">${h(locationLabel + ' · ' + locationRadiusKm + ' km')}</span>`;
+        : `<span class="cheapest-scope">${h(locationRadiusKm + ' km')}</span>`;
     const header = `<div class="cheapest-header">${ICON_PIN}<span class="cheapest-title">${h(t.nearbyTitle)}</span>${scope}</div>`;
 
     if (locationLabel === '') {
         nearbyCard.innerHTML = header + `<div class="cheapest-empty">${h(t.nearbyNoLocation)}</div>`;
         return;
     }
-    if (nearbyRows.length === 0) {
+
+    // One column per fuel, nearest first, like every other card on the page:
+    // the leading station gets the big price and the rest follow as ranked
+    // rows. What ranks them here is distance, not price — that is the whole
+    // question the card answers — so the order is the payload's own.
+    const results = [];
+    for (const fuel of fuels) {
+        const near = nearbyRows.filter((row) => row[fuel] !== null && row[fuel] !== undefined);
+        if (near.length) results.push({ fuel, near });
+    }
+
+    if (results.length === 0) {
         nearbyCard.innerHTML = header + `<div class="cheapest-empty">${h(t.nearbyNoData)}</div>`;
         return;
     }
 
-    const visible = nearbyExpanded ? nearbyRows : nearbyRows.slice(0, NEARBY_PREVIEW_ROWS);
-    const hidden = nearbyRows.length - visible.length;
-    // Say when the radius holds more than the card asked the server for, so a
+    const colClass = results.length === 1 ? ' single' : results.length === 2 ? ' two-col' : '';
+    const shown = nearbyExpanded ? Infinity : NEARBY_PREVIEW_ROWS;
+    const longest = Math.max(...results.map(({ near }) => near.length));
+    const hidden = Math.max(0, longest - shown);
+
+    const nameById = (id) => (predictionStationMeta[id] || {}).name || id;
+
+    // Says when the radius holds more than the card asked the server for, so a
     // short list never reads as "that is all there is".
     const capped = nearbyTotal > nearbyRows.length
         ? `<div class="nearby-foot">${h(t.nearbyCapped
@@ -10785,7 +10721,30 @@ function renderNearby() {
         : '';
 
     nearbyCard.innerHTML = header +
-        `<div class="nearby-list">${visible.map((row) => nearbyRowHtml(row, fuels)).join('')}</div>` +
+        `<div class="cheapest-grid${colClass}">` +
+            results.map(({ fuel, near }) => {
+                const visible = near.slice(0, shown);
+                const first = visible[0];
+                const meta = predictionStationMeta[first.s] || {};
+                const address = [meta.street, meta.place].filter(Boolean).map(h).join(', ');
+                const rest = visible.slice(1).map((row) => stationRankRow(
+                    row.s,
+                    nameById(row.s),
+                    row.dist,
+                    fuel,
+                    row[fuel],
+                    nearbyClosedTag(row),
+                    formatDateTime(row.t)
+                )).join('');
+                return `<div class="cheapest-cell">` +
+                    `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
+                    `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(first[fuel])} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                    stationBlock(first.s, nameById(first.s), fuel, address, first.dist, nearbyClosedTag(first)) +
+                    `<div class="cheapest-time">${h(formatDateTime(first.t))}</div>` +
+                    (rest ? `<div class="rank-list">${rest}</div>` : '') +
+                `</div>`;
+            }).join('') +
+        `</div>` +
         (hidden > 0
             ? `<div class="nearby-more"><button type="button" class="btn-small" id="nearby-more">${h(t.showMore)} (${hidden})</button></div>`
             : '') +

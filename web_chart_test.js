@@ -585,24 +585,27 @@ function reportedRate(legendEl, index = 0) {
     check('the fuel that has prices is unaffected', reportedRate(mixed.legendEl), 1.19);
 }
 
-/* ── The surroundings card ──────────────────────────────────────── */
-// renderNearby answers "what does fuel cost around here", so what is tested is
-// the order it lists stations in, that it shows the price the payload carries,
-// and that a radius holding more than it can show says so instead of reading as
-// a complete list. Lifted the same way renderChart is.
+/* ── The price cards' shared rows ───────────────────────────────── */
+// stationBlock and stationRankRow build every station reference on the page, so
+// they are what "the cards look like one thing" means in practice. What is
+// tested is the distance: that it is its own column rather than a tail on the
+// station's name, which is what used to let a long name ellipsize it away.
 
-const nearbySource = [
-    lift('\nfunction nearbyRowHtml(row, fuels) {'),
+const ROW_DEPS = [
+    'translations', 'currentLang', 'fuelConfig', 'FUEL_CSS_COLORS', 'ICON_STATION_INFO',
+    'ICON_PIN', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
+    'fmtPriceHtml', 'fmtPriceText', 'formatDateTime',
+    'nearbyCard', 'selectedFuel', 'locationLabel', 'locationRadiusKm',
+    'nearbyRows', 'nearbyTotal', 'nearbyExpanded', 'NEARBY_PREVIEW_ROWS',
+    'predictionStationMeta',
+];
+
+const rowSource = [
+    lift('\nfunction stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {'),
+    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {'),
+    lift('\nfunction nearbyClosedTag(row) {'),
     lift('\nfunction renderNearby() {'),
 ].join('\n');
-
-const NEARBY_DEPS = [
-    'nearbyCard', 'translations', 'currentLang', 'selectedFuel', 'locationLabel',
-    'locationRadiusKm', 'nearbyRows', 'nearbyTotal', 'nearbyExpanded', 'NEARBY_PREVIEW_ROWS',
-    'predictionStationMeta', 'fuelConfig', 'FUEL_CSS_COLORS', 'ICON_PIN', 'ICON_STATION_INFO',
-    'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml', 'fmtPriceHtml', 'fmtPriceText',
-];
-const compiledNearby = new Function(...NEARBY_DEPS, `${nearbySource}\nreturn renderNearby;`);
 
 // The distance formatters read currentLang the same way the price ones do.
 const makeDistance = new Function('currentLang', [
@@ -615,6 +618,73 @@ const makeDistance = new Function('currentLang', [
     lift('function fmtDistanceKmHtml(v) {'),
     'return { fmtDistanceKm, fmtDistanceKmHtml };',
 ].join('\n'));
+
+/** Compile the row builders and the card against one set of stand-ins. */
+function compileRows({
+    lang = 'en', card = null, fuel = 'all', label = 'Berlin', radiusKm = 5,
+    rows = [], total = null, expanded = false, meta = {},
+} = {}) {
+    const locale = makeLocale(lang);
+    const distance = makeDistance(lang);
+    return new Function(...ROW_DEPS,
+        `${rowSource}\nreturn { stationBlock, stationRankRow, renderNearby };`)(
+        translations, lang, fuelConfig,
+        { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' }, '<info/>',
+        '<pin/>', (name) => `<dot ${name}>`, h, distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
+        locale.fmtPriceHtml, locale.fmtPriceText, (iso) => iso,
+        card, fuel, label, radiusKm,
+        rows, total === null ? rows.length : total, expanded, 8,
+        meta,
+    );
+}
+
+/** The text of one rendered row, markup stripped. */
+function rowText(html) {
+    return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+{
+    const { stationBlock, stationRankRow } = compileRows();
+
+    // The name that broke the old rows: long enough that the distance behind it
+    // fell off the end.
+    const long = 'Markant Tankautomat Hüllhorst';
+    const rank = stationRankRow('s1', long, 4.3, 'diesel', 1.709, '', '');
+    check('the distance is its own element, not a tail on the name',
+        rank.includes(`<span class="row-dist">4<span class="price-sep">.</span>3 km</span>`), true);
+    check('so the name is not carrying it any more', rank.includes(`${long} (`), false);
+    // The name is what gives way when the row runs out of width.
+    check('the name sits in the column that ellipsizes',
+        rank.includes(`<span class="rank-station"><dot ${long}>${long}</span>`), true);
+    check('the row still leads with the price',
+        rank.indexOf('rank-price') < rank.indexOf('rank-station'), true);
+    check('and the distance comes last', rank.lastIndexOf('row-dist') > rank.indexOf('rank-station'), true);
+    check('a reader without a location gets a row with no distance at all',
+        stationRankRow('s1', long, null, 'diesel', 1.709, '', '').includes('row-dist'), false);
+    // Spoken order matches the visual one.
+    check('the spoken label names the price, the station and the distance',
+        /1\.70.*Markant Tankautomat Hüllhorst — 4\.3 km/.test(rank), true);
+
+    // The big cell says it the same way: address ellipsizes, distance holds the
+    // right edge, and it keeps its own colour outside the address line's dimming.
+    const block = stationBlock('s1', long, 'diesel', 'Hauptstraße 77, Lübbecke', 2.0);
+    check('the big cell puts the distance beside the address, not inside it',
+        block.includes('<span class="sd-meta-line">'), true);
+    check('the address is the part that ellipsizes',
+        block.includes('<span class="cheapest-station sd-addr-line">Hauptstraße 77, Lübbecke</span>'), true);
+    check('and the distance follows it in its own column',
+        block.includes('<span class="row-dist">2<span class="price-sep">.</span>0 km</span>'), true);
+    check('a station with no address still shows how far away it is',
+        stationBlock('s1', long, 'diesel', '', 2.0).includes('row-dist'), true);
+    check('one with neither gets no meta line',
+        stationBlock('s1', long, 'diesel', '', null).includes('sd-meta-line'), false);
+}
+
+/* ── The surroundings card ──────────────────────────────────────── */
+// It is built out of the same cells as the cards above it — fuel label, big
+// price, station block, ranked rows — so what is tested is that it really uses
+// them, that distance and not price is what orders it, and that a radius
+// holding more than it shows says so instead of reading as a complete list.
 
 /** One payload row: station id, distance, and a price per fuel. */
 function nearbyRow(id, distKm, prices = {}, open = true) {
@@ -633,75 +703,69 @@ function nearbyRow(id, distKm, prices = {}, open = true) {
  * Render the card and hand back its markup plus the pieces the tests read out
  * of it. `label` empty stands for "no location picked yet".
  */
-function renderNearbyCard(rows, {
-    label = 'Berlin', radiusKm = 5, total = null, expanded = false,
-    fuel = 'all', lang = 'en', meta = {},
-} = {}) {
+function renderNearbyCard(rows, options = {}) {
     const card = makeElement('div');
-    const locale = makeLocale(lang);
-    const distance = makeDistance(lang);
-    compiledNearby(
-        card, translations, lang, fuel, label,
-        radiusKm, rows, total === null ? rows.length : total, expanded, 8,
-        meta, fuelConfig, { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' }, '<pin/>', '<info/>',
-        (name) => `<dot ${name}>`, h, distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
-        locale.fmtPriceHtml, locale.fmtPriceText,
-    )();
+    compileRows({ ...options, card, rows }).renderNearby();
     const html = card.innerHTML;
     return {
         html,
         // Station ids in the order the rows were emitted.
         listed: [...html.matchAll(/data-station-id="([^"]+)"/g)].map((m) => m[1]),
-        // Text of the card with markup stripped, for the empty-state messages.
-        text: html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(),
+        text: rowText(html),
     };
 }
 
 const nearbyMeta = {
     a: { name: 'Aral Mitte', street: 'Hauptstraße 1', place: 'Berlin' },
     b: { name: 'Shell Nord', street: 'Nordstraße 12', place: 'Berlin' },
+    c: { name: 'Esso West', street: 'Weststraße 7', place: 'Berlin' },
 };
 
 {
     const rows = [
         nearbyRow('a', 0.42, { e5: 1.789, e10: 1.729, diesel: 1.659 }),
         nearbyRow('b', 3.1, { e5: 1.819, diesel: 1.689 }),
+        // c sells all three; b has no e10, so that column is one station shorter.
+        nearbyRow('c', 4.4, { e5: 1.799, e10: 1.739, diesel: 1.679 }),
     ];
     const out = renderNearbyCard(rows, { meta: nearbyMeta });
 
-    check('the card lists the payload rows in the order they arrive', out.listed, ['a', 'b']);
-    check('the header names the location and the radius it covers',
-        out.html.includes('Berlin · 5 km'), true);
-    check('the nearest station leads with its distance',
-        out.html.includes('<span class="nearby-dist">0<span class="price-sep">.</span>4 km</span>'), true);
-    check('a station name reaches the row', out.text.includes('Aral Mitte'), true);
-    check('so does its address', out.text.includes('Hauptstraße 1, Berlin'), true);
-    // 1.789 renders as 1.78 with the last digit raised, which is what the
-    // pump board shows; five prices are quoted across the two rows.
-    check('the price is rendered in the board style',
-        (out.html.match(/<span class="price-milli">/g) || []).length, 5);
-    check('and it is the payload price, not a rounded one',
+    // Three fuels in scope, so three cells, like every other card.
+    check('one cell per fuel in scope', (out.html.match(/cheapest-cell/g) || []).length, 3);
+    check('each names its fuel', (out.html.match(/cheapest-fuel-label/g) || []).length, 3);
+    check('and leads with a big price', (out.html.match(/cheapest-price/g) || []).length, 3);
+    check('the rest follow as ranked rows', (out.html.match(/class="rank-list"/g) || []).length, 3);
+
+    // Distance orders it, not price: b is dearer than c and still comes first.
+    check('the nearest station leads each column, however it is priced',
+        out.listed.slice(0, 3), ['a', 'b', 'c']);
+    check('the big price is the nearest station one',
         out.html.includes('1<span class="price-sep">.</span>78<span class="price-milli">9</span>'), true);
-    check('a fuel the station does not sell shows a dash, not a zero',
-        (out.html.match(/nearby-price empty/g) || []).length, 1);
-    check('every row opens the station dialog',
-        (out.html.match(/class="nearby-btn"/g) || []).length, 2);
+    check('the header covers the radius', out.html.includes('>5 km<'), true);
+    // The reader's own address is theirs; the card is not the place to publish it.
+    check('and not where the reader lives', out.html.includes('Berlin ·'), false);
+    check('a station missing a fuel is left out of that column',
+        (out.html.match(/data-station-id="b"/g) || []).length, 2);
 }
 
 {
-    // The fuel filter narrows the row to that fuel alone, like every other card.
+    // The fuel filter narrows to one column, like every other card.
     const out = renderNearbyCard([nearbyRow('a', 0.4, { e5: 1.789, diesel: 1.659 })],
         { fuel: 'diesel', meta: nearbyMeta });
-    check('one fuel selected renders one price',
-        (out.html.match(/class="nearby-price"/g) || []).length, 1);
+    check('one fuel selected renders one cell', (out.html.match(/cheapest-cell/g) || []).length, 1);
     check('and it is the selected one', out.text.includes('Diesel'), true);
+    check('showing that fuel price', out.text.includes('1 . 65 9'), true);
 }
 
 {
     // A closed station still lists — its price is the one it will reopen with —
-    // but it says so.
-    const out = renderNearbyCard([nearbyRow('a', 0.4, { diesel: 1.659 }, false)], { meta: nearbyMeta });
-    check('a closed station is marked', out.html.includes('nearby-closed'), true);
+    // but it says so, in the big cell and in the ranked rows alike.
+    const closedFirst = renderNearbyCard([
+        nearbyRow('a', 0.4, { diesel: 1.659 }, false),
+        nearbyRow('b', 1.4, { diesel: 1.669 }, false),
+    ], { meta: nearbyMeta });
+    check('a closed station is marked wherever it appears',
+        (closedFirst.html.match(/nearby-closed/g) || []).length, 2);
     const open = renderNearbyCard([nearbyRow('a', 0.4, { diesel: 1.659 }, true)], { meta: nearbyMeta });
     check('an open one is not', open.html.includes('nearby-closed'), false);
 }
@@ -710,12 +774,12 @@ const nearbyMeta = {
     // More rows than the preview holds: eight are shown and the rest wait
     // behind a button that names how many they are.
     const rows = Array.from({ length: 11 }, (_, i) => nearbyRow(`s${i}`, i * 0.5, { diesel: 1.6 + i / 1000 }));
-    const collapsed = renderNearbyCard(rows);
-    check('the preview stops at eight rows', collapsed.listed.length, 8);
+    const collapsed = renderNearbyCard(rows, { fuel: 'diesel' });
+    check('the preview stops at eight stations', collapsed.listed.length, 8);
     check('and offers the remainder by count', collapsed.text.includes('Show more (3)'), true);
 
-    const expanded = renderNearbyCard(rows, { expanded: true });
-    check('expanded shows every row', expanded.listed.length, 11);
+    const expanded = renderNearbyCard(rows, { fuel: 'diesel', expanded: true });
+    check('expanded shows every station', expanded.listed.length, 11);
     check('and drops the button', expanded.html.includes('nearby-more'), false);
 }
 
@@ -723,10 +787,10 @@ const nearbyMeta = {
     // The server caps how many stations it prices. Saying so is what keeps a
     // capped list from reading as "that is all there is in range".
     const rows = Array.from({ length: 9 }, (_, i) => nearbyRow(`s${i}`, i, { diesel: 1.6 }));
-    const capped = renderNearbyCard(rows, { total: 23, expanded: true });
+    const capped = renderNearbyCard(rows, { fuel: 'diesel', total: 23, expanded: true });
     check('a capped list says how much of the radius it covers',
         capped.text.includes('The 9 nearest of 23 stations in range.'), true);
-    const whole = renderNearbyCard(rows, { total: 9, expanded: true });
+    const whole = renderNearbyCard(rows, { fuel: 'diesel', total: 9, expanded: true });
     check('an uncapped one does not', whole.html.includes('nearby-foot'), false);
 }
 
@@ -737,6 +801,7 @@ const nearbyMeta = {
     check('no location asks for one',
         none.text.endsWith(translations.en.nearbyNoLocation), true);
     check('and shows no rows', none.listed, []);
+    check('nor a radius it is not measuring from', none.html.includes('cheapest-scope'), false);
 
     const empty = renderNearbyCard([], { label: 'Nowhere' });
     check('a location with nothing in range says that instead',
@@ -744,11 +809,13 @@ const nearbyMeta = {
 }
 
 {
-    // German is not a copy of the English card: the title is the one the
-    // page ships, and the numbers carry the German separators.
-    const out = renderNearbyCard([nearbyRow('a', 0.42, { diesel: 1.659 })], { lang: 'de', meta: nearbyMeta });
+    // German is not a copy of the English card: the title is the one the page
+    // ships, and the numbers carry the German separators.
+    const out = renderNearbyCard([nearbyRow('a', 0.42, { diesel: 1.659 })],
+        { fuel: 'diesel', lang: 'de', meta: nearbyMeta });
     check('the German card is titled Umgebung', out.text.includes('Umgebung'), true);
-    check('and writes the distance with a comma', out.html.includes('0<span class="price-sep">,</span>4'), true);
+    check('and writes the distance with a comma',
+        out.html.includes('0<span class="price-sep">,</span>4 km'), true);
 }
 
 if (failures > 0) {
