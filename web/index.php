@@ -474,6 +474,48 @@ function gasolineBreakdownTables(array $rows): array
     return $out;
 }
 
+/**
+ * The fuel the accuracy page opens on: the first that has anything evaluated,
+ * preferring diesel.
+ *
+ * Three index probes rather than one aggregate. The page used to decide this by
+ * grouping every evaluated prediction by fuel and taking the largest group,
+ * which reads the whole table: a covering-index scan plus a sort, whose cost
+ * grows with the grid — 10 ms over 54,000 rows and 105 ms over 594,000 on a
+ * cold cache here — and it ran ahead of the first byte of HTML.
+ *
+ * "Which fuel has the most" was never the question anyway; "which fuel has
+ * some" is, and idx_price_predictions_accuracy answers that directly: fuel
+ * leads the index and actual_price is in it, so each probe is index-only.
+ * Within a fuel the index is ordered by target_start, so the oldest rows come
+ * first and those are the evaluated ones — the unevaluated grid lies in the
+ * future, at the far end. The scan stops on the first row it reads.
+ *
+ * Falls back to diesel on any error, including a database with no prediction
+ * table yet: the caller has an empty result to render either way.
+ */
+function accuracyDefaultFuel(PDO $pdo): string
+{
+    try {
+        $stmt = $pdo->prepare(
+            'SELECT 1 FROM price_predictions WHERE fuel = :fuel AND actual_price IS NOT NULL LIMIT 1'
+        );
+        foreach (['diesel', 'e5', 'e10'] as $fuel) {
+            $stmt->bindValue(':fuel', $fuel);
+            $stmt->execute();
+            $found = $stmt->fetch() !== false;
+            $stmt->closeCursor();
+            if ($found) {
+                return $fuel;
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('gasoline accuracy default fuel error: ' . $e->getMessage());
+    }
+
+    return 'diesel';
+}
+
 // gasolineAccuracyIndexHint returns the index hint the accuracy page's aggregate
 // queries carry, or '' when it must not be used.
 //
@@ -2475,22 +2517,16 @@ function renderAdminStationsPage(PDO $pdo, array $user): never
     renderPageEnd();
 }
 
-function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): never
+function renderAdminPredictionsPage(array $user): never
 {
-
-    // Default the fuel picker to whichever fuel has the most evaluated predictions,
-    // so the page lands on data instead of an empty set.
+    // This page asks the database nothing before it paints. It used to open by
+    // grouping every evaluated prediction by fuel to decide which one to select
+    // — an aggregate over the whole table, ahead of the first byte of HTML, so
+    // a click on Prediction accuracy sat on the previous page for seconds and
+    // then arrived at a screen that still had to fetch its data. The picker
+    // starts on diesel and ?action=prediction_accuracy answers with the fuel it
+    // actually read, which the page adopts when its first payload lands.
     $defaultFuel = 'diesel';
-    try {
-        $fuelRow = $pdo->query(
-            "SELECT fuel FROM price_predictions WHERE actual_price IS NOT NULL GROUP BY fuel ORDER BY COUNT(*) DESC"
-        )->fetch();
-        if ($fuelRow !== false && in_array((string) $fuelRow['fuel'], ['diesel', 'e5', 'e10'], true)) {
-            $defaultFuel = (string) $fuelRow['fuel'];
-        }
-    } catch (Throwable $e) {
-        // Ignore — keep the diesel default.
-    }
 
     $fuelLabels = ['diesel' => 'Diesel', 'e5' => 'E5', 'e10' => 'E10'];
     $fuelI18n = ['diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10'];
@@ -2658,6 +2694,11 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             range: document.getElementById('pred-range'),
             conf:  document.getElementById('pred-conf'),
         };
+        // The picker starts on diesel because the page renders before anything
+        // has been read, not because diesel is known to have data. Until either
+        // the first payload or the reader settles that, the request names no
+        // fuel and the server picks one that does.
+        let fuelKnown = false;
         const loadingEl  = document.getElementById('pred-chart-loading');
         const chartEl    = document.getElementById('pred-chart');
         const legendEl   = document.getElementById('pred-legend');
@@ -2709,7 +2750,7 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
         function buildUrl() {
             const u = new URL(location.origin + location.pathname);
             u.searchParams.set('action', 'prediction_accuracy');
-            u.searchParams.set('fuel', cfg.fuel.value);
+            if (fuelKnown) u.searchParams.set('fuel', cfg.fuel.value);
             u.searchParams.set('range', cfg.range.value);
             u.searchParams.set('confidence', cfg.conf.value);
             return u.toString();
@@ -2756,6 +2797,13 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 const payload = await res.json();
                 if (payload.errors && payload.errors.length) { showError(payload.errors[0]); return; }
+                // Adopt the fuel the server read, unless the reader has since
+                // picked one themselves — then theirs is already in flight.
+                const served = payload.filters && payload.filters.fuel;
+                if (!fuelKnown && served) {
+                    fuelKnown = true;
+                    if (cfg.fuel && cfg.fuel.value !== served) cfg.fuel.value = served;
+                }
                 data = payload;
                 render();
             } catch (e) {
@@ -3225,7 +3273,15 @@ function renderAdminPredictionsPage(PDO $pdo, string $driver, array $user): neve
             }
         }
 
-        [cfg.fuel, cfg.range, cfg.conf].forEach((el) => { if (el) el.addEventListener('change', load); });
+        [cfg.fuel, cfg.range, cfg.conf].forEach((el) => {
+            if (!el) return;
+            el.addEventListener('change', () => {
+                // Whatever the picker says from here on is the reader's, so
+                // every request names it.
+                fuelKnown = true;
+                load();
+            });
+        });
         if (moreBtn) moreBtn.addEventListener('click', renderMore);
         if (viewTogl) viewTogl.querySelectorAll('[data-view]').forEach((btn) => btn.addEventListener('click', () => {
             view = btn.dataset.view;
@@ -4020,7 +4076,7 @@ switch ($requestedPage) {
         if ((int) $currentUser['is_admin'] !== 1) {
             redirectTo('');
         }
-        renderAdminPredictionsPage($authPdo, $dbDriver, $currentUser);
+        renderAdminPredictionsPage($currentUser);
         // no break
     case 'admin_stats':
         if ((int) $currentUser['is_admin'] !== 1) {
@@ -4318,10 +4374,13 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
     $rawTableLimit = 1000;
 
     // Filters ------------------------------------------------------------------
-    $paFuel = trim((string) ($_GET['fuel'] ?? 'diesel'));
-    if (!in_array($paFuel, ['diesel', 'e5', 'e10'], true)) {
-        $paFuel = 'diesel';
-    }
+    // No fuel named means a first load: the page paints before it knows which
+    // fuel has anything to show, so the choice is made here and handed back in
+    // `filters` for the picker to adopt.
+    $paFuelRaw = trim((string) ($_GET['fuel'] ?? ''));
+    $paFuel = in_array($paFuelRaw, ['diesel', 'e5', 'e10'], true)
+        ? $paFuelRaw
+        : accuracyDefaultFuel($authPdo);
     $paConfidence = trim((string) ($_GET['confidence'] ?? 'all')); // 'all' | 'medium_high'
 
     // Date range on the target hour. Default: last 14 days. target_start is an
@@ -6948,8 +7007,32 @@ function renderDocumentHead(string $titleSuffix): void
 
         .nearby-more {
             background: var(--surface);
-            padding: 0.75rem 1.25rem;
+            padding: 0.6rem 1.25rem 0.9rem;
             text-align: center;
+        }
+
+        /* A quiet link rather than a button: expanding the list is a small
+           aside to the card, not an action worth a border and a box. */
+        .nearby-more-link {
+            appearance: none;
+            border: none;
+            background: none;
+            padding: 0.15rem 0.3rem;
+            font-family: var(--mono);
+            font-size: 0.7rem;
+            letter-spacing: 0.04em;
+            color: var(--muted);
+            cursor: pointer;
+            border-radius: 5px;
+            transition: color 0.15s ease;
+        }
+
+        .nearby-more-link:hover { color: var(--amber); }
+
+        .nearby-more-link:focus-visible {
+            outline: 2px solid var(--amber);
+            outline-offset: 1px;
+            color: var(--amber);
         }
 
         .nearby-foot {
@@ -10746,7 +10829,7 @@ function renderNearby() {
             }).join('') +
         `</div>` +
         (hidden > 0
-            ? `<div class="nearby-more"><button type="button" class="btn-small" id="nearby-more">${h(t.showMore)} (${hidden})</button></div>`
+            ? `<div class="nearby-more"><button type="button" class="nearby-more-link" id="nearby-more">${h(t.showMore)} (${hidden})</button></div>`
             : '') +
         capped;
 }
