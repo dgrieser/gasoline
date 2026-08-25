@@ -5944,7 +5944,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
         'predictions' => [],
         'predictions_as_of' => [],
         'nearby' => [],
-        'nearby_total' => 0,
         'errors' => $errors,
     ];
 
@@ -5979,16 +5978,17 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
             ];
         }
 
-        // Stations card: the stations around the selected location with
-        // their current price, independent of the date range and the station
-        // picker. Only with a location — without one there is no "around here"
-        // and $stations is every station being fed.
+        // The current price at the nearest stations, read straight from the
+        // newest snapshot per station and so narrowed by neither the date range
+        // nor the picker. Nothing on the page is drawn from it: it is what lets
+        // the detail dialog answer for a station those two filters kept out of
+        // the snapshot rows — one the predictions card named, say. Only with a
+        // location, since without one there is no "around here" and $stations
+        // is every station being fed.
         if ($cityRow !== null) {
-            $out['nearby_total'] = count($stations);
             $out['nearby'] = loadNearbyPrices($pdo, $stations, $distances, NEARBY_STATION_LIMIT);
-            // Its stations are not the chart's: the date range or the picker
-            // can leave them out of the snapshot rows entirely, and without
-            // their metadata the card would list bare station ids.
+            // Those stations are not necessarily the chart's, and without their
+            // metadata the dialog would open on a bare station id.
             foreach ($out['nearby'] as $nearbyRow) {
                 $nearbyId = (string) $nearbyRow['s'];
                 if (isset($metaById[$nearbyId])) {
@@ -7096,8 +7096,8 @@ function renderDocumentHead(string $titleSuffix): void
         /* ── Stations card: the parts only it needs ─────────────── */
         /* The card is built out of the same cells as every other one — fuel
            label, big price, station block, ranked rows — so the page reads as
-           one thing. These two are what its own roster adds: whether a station
-           is open, and how much of the radius the list actually covers. */
+           one thing. These two are what it adds: the tag on a station that is
+           shut, and a note under the list for what the cells cannot say. */
         .nearby-closed {
             flex-shrink: 0;
             margin-left: 0.45rem;
@@ -8466,15 +8466,12 @@ const translations = {
         invalidToDate: 'Invalid to date.',
         noSnapshots: 'No snapshots match the current filters.',
         cheapestNow: 'Cheapest right now',
-        cheapestNoData: 'No price data available.',
         cheapestPrefix: 'Lowest',
         cheapestRangeNoData: 'No price data available.',
         highestPrefix: 'Highest price',
         highestNoData: 'No price data available.',
         rangeScopeHint: 'in range',
         nearbyTitle: 'Nearby',
-        nearbyNoData: 'No stations with current prices within this radius.',
-        nearbyCapped: 'The {shown} nearest of {total} stations in range.',
         sortBy: 'Sort by',
         sortByPrice: 'Price',
         sortByDistance: 'Distance',
@@ -8798,15 +8795,12 @@ const translations = {
         invalidToDate: 'Ungültiges Bis-Datum.',
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
         cheapestNow: 'Jetzt am günstigsten',
-        cheapestNoData: 'Keine Preisdaten vorhanden.',
         cheapestPrefix: 'Tiefstpreis',
         cheapestRangeNoData: 'Keine Preisdaten vorhanden.',
         highestPrefix: 'Höchstpreis',
         highestNoData: 'Keine Preisdaten vorhanden.',
         rangeScopeHint: 'im Zeitraum',
         nearbyTitle: 'Umgebung',
-        nearbyNoData: 'Keine Stationen mit aktuellen Preisen in diesem Umkreis.',
-        nearbyCapped: 'Die {shown} nächsten von {total} Stationen im Umkreis.',
         sortBy: 'Sortieren nach',
         sortByPrice: 'Preis',
         sortByDistance: 'Entfernung',
@@ -9873,12 +9867,10 @@ let predictionData = [];
 let predictionAsOf = {};
 let predictionStationMeta = {};
 let dataLoaded = false;
-// Stations card: the nearest stations with their current price
-// (payload.nearby) and the count the radius actually holds.
-let nearbyRows = [];
-let nearbyTotal = 0;
-// Current price per station id from that same block, which is what lets the
-// detail dialog answer for a station the date filter left out of the chart.
+// Current price per station id, straight from the newest snapshot per station
+// (payload.nearby). Nothing is drawn from it — the cards all read the filtered
+// snapshot rows — but it is what lets the detail dialog answer for a station
+// the date range or the picker left out of those.
 let nearbyLatestById = new Map();
 // How many ranked stations the card lists before the rest wait behind "show
 // more", and whether the reader has asked for the rest.
@@ -10687,49 +10679,28 @@ function latestRows() {
 // them is currently ranking it. They used to be two cards, which meant reading
 // the same stations twice to answer either.
 //
-// The roster is payload.nearby: the stations the selected location and radius
-// admit, each with the price it shows right now, read server-side straight from
-// the newest snapshot per station — so unlike the cards further down the page
-// it is narrowed by neither the date range nor the station picker. Without a
-// location there is no such roster, so the card falls back to the chart
-// snapshot, which carries no distances and can only be ranked by price. The
-// distance toggle greys out rather than vanishing, so the choice is still
-// visibly there for a reader who has yet to pick a location.
+// The roster is the filtered snapshot rows the chart is drawn from, reduced to
+// the newest one each station has: every filter in the sidebar — the location
+// and its radius, the date range, the station picker, the fuel — therefore
+// reaches this card exactly as it reaches the chart. Distance comes with the
+// location scope, so without a location there is none to rank by; the toggle
+// greys out rather than vanishing, and a note says what would enable it.
 
 const ICON_PIN = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>`;
 
 // A closed station still lists — its price is the one it will reopen with —
 // but it says so, next to the name in both the big cell and the ranked rows.
-// Only the nearby payload knows whether a station is open; a snapshot row
-// is silent rather than open, so an unmeasured station is not called either.
 function stationClosedTag(row) {
-    if (row.open === undefined || row.open === null) return '';
     return row.open ? '' : `<span class="nearby-closed">${h(translations[currentLang].openNo)}</span>`;
 }
 
-// Every station the card can list, in one shape whichever payload it came from:
-// { id, name, street, place, ts, dist, open, e5, e10, diesel }. Normalising
-// here is what lets one renderer serve both — the two payloads name nothing the
-// same way — and it is built once per render rather than once per fuel, because
-// the snapshot branch has to walk the whole chart payload to find it.
+// Every station the card lists, in the shape the cells want:
+// { id, name, street, place, ts, dist, open, e5, e10, diesel }. One row per
+// station — the newest snapshot it has inside the current filters — and one
+// distance, the one the location scope measured. Built once per render rather
+// than once per fuel, because reducing the snapshot rows means walking all of
+// them.
 function stationCardRoster() {
-    if (locationLabel !== '') {
-        return nearbyRows.map((row) => {
-            const meta = predictionStationMeta[row.s] || {};
-            return {
-                id: row.s,
-                name: meta.name || row.s,
-                street: meta.street,
-                place: meta.place,
-                ts: row.t,
-                dist: row.dist,
-                open: row.o,
-                e5: row.e5,
-                e10: row.e10,
-                diesel: row.diesel,
-            };
-        });
-    }
     return latestRows().map((row) => ({
         id: row.station_id,
         name: row.station_name,
@@ -10737,7 +10708,7 @@ function stationCardRoster() {
         place: row.place,
         ts: row.recorded_at,
         dist: stationDistancesById[row.station_id] ?? null,
-        open: undefined,
+        open: row.is_open,
         e5: row.e5,
         e10: row.e10,
         diesel: row.diesel,
@@ -10778,9 +10749,11 @@ function renderStations() {
         // filter() hands back a fresh array per fuel, so sorting one column is
         // not sorting the roster out from under the next.
         const rows = roster.filter((row) => row[fuel] !== null && row[fuel] !== undefined);
-        // The nearby payload already arrives nearest-first, so distance is the
-        // order it came in; price is the one that has to be applied.
-        if (sort === 'price') rows.sort((a, b) => a[fuel] - b[fuel]);
+        // A station with no distance sorts last rather than first: an unknown
+        // distance is not a short one.
+        rows.sort(sort === 'price'
+            ? (a, b) => a[fuel] - b[fuel]
+            : (a, b) => (a.dist ?? Infinity) - (b.dist ?? Infinity));
         if (rows.length) results.push({ fuel, rows });
     }
 
@@ -10797,7 +10770,7 @@ function renderStations() {
 
     if (results.length === 0) {
         stationsCard.innerHTML = header +
-            `<div class="cheapest-empty">${h(located ? t.nearbyNoData : t.cheapestNoData)}</div>`;
+            `<div class="cheapest-empty">${h(t.noSnapshots)}</div>`;
         return;
     }
 
@@ -10809,16 +10782,9 @@ function renderStations() {
     const longest = Math.max(...results.map(({ rows }) => rows.length));
     const hidden = Math.max(0, longest - shown);
 
-    // At most one footnote applies. Either the server capped the radius, and a
-    // short list would otherwise read as "that is all there is"; or there is no
-    // location yet, and the card should say what would unlock the other sort.
-    const foot = !located
-        ? `<div class="nearby-foot">${h(t.sortNeedsLocation)}</div>`
-        : nearbyTotal > nearbyRows.length
-            ? `<div class="nearby-foot">${h(t.nearbyCapped
-                .replace('{shown}', String(nearbyRows.length))
-                .replace('{total}', String(nearbyTotal)))}</div>`
-            : '';
+    // Without a location half the toggle is unavailable, so the card says what
+    // would change that rather than leaving a dead pill unexplained.
+    const foot = located ? '' : `<div class="nearby-foot">${h(t.sortNeedsLocation)}</div>`;
 
     stationsCard.innerHTML = header +
         `<div class="cheapest-grid${colClass}">` +
@@ -11471,12 +11437,10 @@ function applyData(payload) {
     predictionData = payload.predictions || [];
     predictionAsOf = payload.predictions_as_of || {};
     predictionStationMeta = meta;
-    nearbyRows = payload.nearby || [];
-    nearbyTotal = payload.nearby_total || nearbyRows.length;
     cardExpanded = false;
-    // Same row, re-shaped to what the detail dialog reads, so a station the
-    // date filter kept out of the chart still opens with a current price.
-    nearbyLatestById = new Map(nearbyRows.map((row) => [row.s, {
+    // Re-shaped to what the detail dialog reads, so a station the date range or
+    // the picker kept out of the chart still opens with a current price.
+    nearbyLatestById = new Map((payload.nearby || []).map((row) => [row.s, {
         recorded_at: row.t,
         is_open: !!row.o,
         e5: row.e5 ?? null,
