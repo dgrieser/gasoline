@@ -593,7 +593,7 @@ function reportedRate(legendEl, index = 0) {
 
 const CARD_DEPS = [
     'translations', 'currentLang', 'fuelConfig', 'FUEL_CSS_COLORS', 'ICON_STATION_INFO',
-    'ICON_PIN', 'ICON_DOWN', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
+    'ICON_SORT_PRICE', 'ICON_SORT_DISTANCE', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
     'fmtPriceHtml', 'fmtPriceText', 'formatDateTime',
     'stationsCard', 'selectedFuel', 'locationLabel', 'locationRadiusKm',
     'chartData', 'stationDistancesById',
@@ -634,7 +634,7 @@ function compileCard({
         `${cardSource}\nreturn { stationBlock, stationRankRow, renderStations };`)(
         translations, lang, fuelConfig,
         { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' }, '<info/>',
-        '<pin/>', '<down/>', (name) => `<dot ${name}>`, h,
+        '<price-mark/>', '<distance-mark/>', (name) => `<dot ${name}>`, h,
         distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
         locale.fmtPriceHtml, locale.fmtPriceText, (iso) => iso,
         card, fuel, label, radiusKm,
@@ -793,12 +793,17 @@ const distances = { a: 0.42, b: 3.1, c: 4.4 };
     const near = renderStationsCard(rows, { distances, sort: 'distance' });
     check('ordered by distance the card is the surroundings one',
         near.text.startsWith(translations.en.nearbyTitle), true);
-    check('and carries the map pin', near.html.includes('<pin/>'), true);
 
     const cheap = renderStationsCard(rows, { distances, sort: 'price' });
     check('ordered by price it is the cheapest-now one',
         cheap.text.startsWith(translations.en.cheapestNow), true);
-    check('and carries the falling-price arrow', cheap.html.includes('<down/>'), true);
+
+    // The heading used to be preceded by the same mark the pressed pill draws.
+    // Two copies of one glyph is what the narrow header could not afford.
+    check('the heading no longer repeats the pressed pill\'s mark',
+        cheap.html.indexOf('<price-mark/>'), cheap.html.lastIndexOf('<price-mark/>'));
+    check('each order is drawn once, on its own pill',
+        [cheap.html.includes('<price-mark/>'), cheap.html.includes('<distance-mark/>')], [true, true]);
 }
 
 {
@@ -814,6 +819,14 @@ const distances = { a: 0.42, b: 3.1, c: 4.4 };
         out.html.includes('data-card-sort="distance" aria-pressed="false"'), true);
     check('with a location, sorting by distance is offered for real',
         out.html.includes('disabled'), false);
+    // The pills draw a mark and no word, so the word has to be spoken instead —
+    // an unlabelled button is not a button anybody without sight can press.
+    check('the price pill is named even though it shows no word',
+        out.html.includes(`aria-label="${translations.en.sortByPrice}"`), true);
+    check('and so is the distance one',
+        out.html.includes(`aria-label="${translations.en.sortByDistance}"`), true);
+    check('the same words are the hover titles', (out.html.match(/title="(Price|Distance)"/g) || []).length, 2);
+    check('and no word is drawn', out.text.includes('Price'), false);
 }
 
 {
@@ -874,7 +887,12 @@ const distances = { a: 0.42, b: 3.1, c: 4.4 };
     check('so the heading is the cheapest-now one',
         out.text.startsWith(translations.en.cheapestNow), true);
     check('and sorting by distance is offered but not available',
-        out.html.includes('data-card-sort="distance" aria-pressed="false" disabled'), true);
+        out.html.includes('data-card-sort="distance" aria-pressed="false"'), true);
+    check('the pill that cannot be pressed says so', out.html.includes('disabled'), true);
+    // With no word on it, the reason has to reach a screen reader through the
+    // one thing the button does say.
+    check('and says why in its own name',
+        out.html.includes(`aria-label="${translations.en.sortByDistance} — ${translations.en.sortNeedsLocation}"`), true);
     check('with the card saying what would make it available',
         out.text.endsWith(translations.en.sortNeedsLocation), true);
     check('nor a radius it is not measuring from', out.html.includes('cheapest-scope'), false);
@@ -916,11 +934,15 @@ const distances = { a: 0.42, b: 3.1, c: 4.4 };
     check('the German card is titled Umgebung', out.text.includes('Umgebung'), true);
     check('and writes the distance with a comma',
         out.html.includes('0<span class="price-sep">,</span>4 km'), true);
-    check('its toggle is in German too', out.text.includes('Entfernung'), true);
+    check('its toggle is named in German too',
+        out.html.includes('aria-label="Entfernung"'), true);
 
     const byPrice = renderStationsCard(rows, { fuel: 'diesel', lang: 'de', distances, sort: 'price' });
-    check('and by price it is Jetzt am günstigsten',
-        byPrice.text.includes('Jetzt am günstigsten'), true);
+    check('and by price it is Günstigste', byPrice.text.includes('Günstigste'), true);
+    // The heading the toggle sits beside is the one that has to stay short: the
+    // German it replaced was 180px of a 254px header on a narrow phone.
+    check('which is short enough to leave the toggle its line',
+        translations.de.cheapestNow.length <= translations.en.cheapestNow.length, true);
 }
 
 /* ── The recommendations card ───────────────────────────────────── */
