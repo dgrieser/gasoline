@@ -6975,8 +6975,18 @@ function renderDocumentHead(string $titleSuffix): void
             border-top: none;
         }
 
+        /* The day name and the window's hours are what the card is read for,
+           so they take the accent colour the distances carry; the calendar
+           date next to the day name stays in the muted tone. */
+        .pred-accent { color: var(--amber); }
+
+        .cheapest-time.pred-window {
+            color: var(--amber);
+            opacity: 1;
+        }
+
         .pred-time {
-            color: var(--muted);
+            color: var(--amber);
             flex-shrink: 0;
             white-space: nowrap;
         }
@@ -10677,9 +10687,16 @@ function renderPredictions() {
     const dayKey = (iso) => new Date(iso).toLocaleDateString(_loc(), {
         timeZone: _tz(), year: 'numeric', month: '2-digit', day: '2-digit',
     });
-    const dayLabel = (iso) => new Date(iso).toLocaleDateString(_loc(), {
+    // The header reads "Dienstag, 25.08.26". The weekday is the part a reader
+    // scans a column of days for, so it carries the accent colour the
+    // distances use while the calendar date behind it stays muted.
+    // formatToParts keeps the locale's own order and separators; only the
+    // weekday run is wrapped.
+    const dayLabelHtml = (iso) => new Intl.DateTimeFormat(_loc(), {
         timeZone: _tz(), weekday: 'long', day: '2-digit', month: '2-digit', year: '2-digit',
-    });
+    }).formatToParts(new Date(iso)).map((part) => (part.type === 'weekday'
+        ? `<span class="pred-accent">${h(part.value)}</span>`
+        : h(part.value))).join('');
     const windowLabel = (p) => `${formatTimeOnly(p.start)}–${formatTimeOnly(p.end)}`;
 
     const results = [];
@@ -10720,9 +10737,9 @@ function renderPredictions() {
                             p.price,
                             `<span class="pred-time">${h(windowLabel(p))}</span>`
                         )).join('');
-                        return `<div class="pred-day">${h(dayLabel(best.start))}</div>` +
+                        return `<div class="pred-day">${dayLabelHtml(best.start)}</div>` +
                             `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(best.price)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                            `<div class="cheapest-time">${h(windowLabel(best))}</div>` +
+                            `<div class="cheapest-time pred-window">${h(windowLabel(best))}</div>` +
                             stationBlock(best.s, bestName, fuel, bestAddr, distById(best.s)) +
                             (runners ? `<div class="rank-list">${runners}</div>` : '');
                     }).join('');

@@ -818,6 +818,89 @@ const nearbyMeta = {
         out.html.includes('0<span class="price-sep">,</span>4 km'), true);
 }
 
+/* ── The recommendations card ───────────────────────────────────── */
+// The card exists to answer "when should I fill up": the day and the hours are
+// the part a reader scans for, so they carry the accent colour the distances
+// use, while the calendar date behind the day name stays muted. What is tested
+// is that split — in both languages, since the weekday sits in a different
+// place in each locale's date.
+
+const PRED_DEPS = [
+    'translations', 'currentLang', 'fuelConfig', 'FUEL_CSS_COLORS', 'ICON_STATION_INFO',
+    'ICON_CLOCK', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
+    'fmtPriceHtml', 'fmtPriceText', '_loc', '_tz', 'formatDateTime', 'formatTimeOnly',
+    'predictionsCard', 'selectedFuel', 'predictionData', 'predictionAsOf',
+    'predictionStationMeta', 'stationDistancesById',
+];
+
+const predictionSource = [
+    lift('\nfunction stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {'),
+    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {'),
+    lift('\nfunction renderPredictions() {'),
+].join('\n');
+
+// The clock helpers read currentLang the same way the price ones do, so the
+// card is dated in the locale and timezone the page really shows.
+const makeClock = new Function('currentLang', [
+    lift('function _tz() {'),
+    lift('function _loc() {'),
+    lift('function formatDateTime(isoString) {'),
+    lift('function formatTimeOnly(isoString) {'),
+    'return { _tz, _loc, formatDateTime, formatTimeOnly };',
+].join('\n'));
+
+/** One prediction window: station, fuel, price and the hours it covers. */
+function predWindow(id, fuel, start, end, price) {
+    return { s: id, fuel, start, end, price };
+}
+
+/** Render the card and hand back its markup. */
+function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, asOf = {} } = {}) {
+    const card = makeElement('div');
+    const locale = makeLocale(lang);
+    const distance = makeDistance(lang);
+    const clock = makeClock(lang);
+    new Function(...PRED_DEPS, `${predictionSource}\nreturn renderPredictions;`)(
+        translations, lang, fuelConfig,
+        { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' }, '<info/>',
+        '<clock/>', (name) => `<dot ${name}>`, h, distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
+        locale.fmtPriceHtml, locale.fmtPriceText, clock._loc, clock._tz,
+        clock.formatDateTime, clock.formatTimeOnly,
+        card, fuel, windows, asOf, meta, {},
+    )();
+    return card.innerHTML;
+}
+
+{
+    // Midday windows, so the day is the same one in UTC and in Berlin.
+    const windows = [
+        predWindow('a', 'diesel', '2026-08-25T12:00:00Z', '2026-08-25T13:00:00Z', 1.659),
+        predWindow('b', 'diesel', '2026-08-25T15:00:00Z', '2026-08-25T16:00:00Z', 1.669),
+    ];
+    const html = renderPredictionsCard(windows, { fuel: 'diesel', meta: nearbyMeta });
+
+    check('the day name carries the accent the distances use',
+        html.includes('<span class="pred-accent">Tuesday</span>'), true);
+    check('and the date beside it does not', /pred-accent">Tuesday<\/span>, 25\/08\/26/.test(html), true);
+    check('the leading window’s hours are accented too',
+        html.includes('<div class="cheapest-time pred-window">12:00–13:00</div>'), true);
+    check('as are the hours on the ranked windows',
+        html.includes('<span class="pred-time">15:00–16:00</span>'), true);
+}
+
+{
+    // German puts the weekday in the same leading position but writes both the
+    // day and the date differently, so the split is asserted there too.
+    const html = renderPredictionsCard(
+        [predWindow('a', 'diesel', '2026-08-25T12:00:00Z', '2026-08-25T13:00:00Z', 1.659)],
+        { fuel: 'diesel', lang: 'de', meta: nearbyMeta });
+    check('the German card accents the German day name',
+        /pred-accent">Dienstag<\/span>, 25\.08\.26/.test(html), true);
+    check('and the German hours with it',
+        html.includes('<div class="cheapest-time pred-window">14:00–15:00</div>'), true);
+}
+
+
 if (failures > 0) {
     console.log(`web_chart_test: ${failures} failed`);
     process.exit(1);
