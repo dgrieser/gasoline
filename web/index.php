@@ -6958,21 +6958,38 @@ function renderDocumentHead(string $titleSuffix): void
         /* ── Predictions card ──────────────────────────────────── */
         /* Reuses the .cheapest-* / .rank-* structure; these add the per-day
            header, the window time column, and the "as of" run note. */
-        .pred-day {
+        /* One block per day: the price, then a line naming the day and the
+           hours to fill up in, then the station. The divider between days sits
+           on the block, so the day line itself can be a flex row. */
+        .pred-day-block {
             margin-top: 1rem;
             padding-top: 0.7rem;
             border-top: 1px solid var(--border);
+        }
+
+        /* The first day sits flush under the fuel label (no divider). */
+        .cheapest-fuel-label + .pred-day-block {
+            margin-top: 0.5rem;
+            padding-top: 0;
+            border-top: none;
+        }
+
+        .pred-day {
+            display: flex;
+            align-items: baseline;
+            gap: 0.6rem;
             font-family: var(--mono);
             font-size: 0.68rem;
             color: var(--muted);
             letter-spacing: 0.04em;
         }
 
-        /* The first day sits flush under the fuel label (no divider). */
-        .cheapest-fuel-label + .pred-day {
-            margin-top: 0.5rem;
-            padding-top: 0;
-            border-top: none;
+        /* The day gives way when the line runs out of width; the hours do not. */
+        .pred-day-label {
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         /* The day name and the window's hours are what the card is read for,
@@ -6980,9 +6997,13 @@ function renderDocumentHead(string $titleSuffix): void
            date next to the day name stays in the muted tone. */
         .pred-accent { color: var(--amber); }
 
-        .cheapest-time.pred-window {
+        /* Every window in the card says its hours at the right edge: the
+           leading one on the day line, the ranked ones past the distance. */
+        .pred-window {
+            margin-left: auto;
+            flex-shrink: 0;
+            white-space: nowrap;
             color: var(--amber);
-            opacity: 1;
         }
 
         .pred-time {
@@ -10516,7 +10537,10 @@ function stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailin
 // that label when the reader has picked a location, `price` is the raw number
 // to render. The label is built twice over: as markup for the row, as text for
 // the aria label, which cannot carry the sized-down separator.
-function stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {
+// Two slots for the callers' own markup: `trailingHtml` rides with the station
+// name (the surroundings card's closed tag), `endHtml` holds the right edge
+// past the distance (the predictions card's window hours).
+function stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText, endHtml) {
     const t = translations[currentLang];
     const distText = fmtDistanceKm(distKm);
     const distHtml = fmtDistanceKmHtml(distKm);
@@ -10532,6 +10556,7 @@ function stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtm
         `<span class="rank-station">${stationDot(stationName, fuel)}${h(stationName)}</span>` +
         (trailingHtml || '') +
         (distHtml === null ? '' : `<span class="row-dist">${distHtml}</span>`) +
+        (endHtml || '') +
     `</button>`;
 }
 
@@ -10735,13 +10760,22 @@ function renderPredictions() {
                             distById(p.s),
                             fuel,
                             p.price,
+                            '',
+                            '',
                             `<span class="pred-time">${h(windowLabel(p))}</span>`
                         )).join('');
-                        return `<div class="pred-day">${dayLabelHtml(best.start)}</div>` +
+                        // The day and the hours share one line under the price:
+                        // the day names the block, the hours hold the right edge
+                        // the ranked windows below them line up on.
+                        return `<div class="pred-day-block">` +
                             `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(best.price)} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                            `<div class="cheapest-time pred-window">${h(windowLabel(best))}</div>` +
+                            `<div class="pred-day">` +
+                                `<span class="pred-day-label">${dayLabelHtml(best.start)}</span>` +
+                                `<span class="pred-window">${h(windowLabel(best))}</span>` +
+                            `</div>` +
                             stationBlock(best.s, bestName, fuel, bestAddr, distById(best.s)) +
-                            (runners ? `<div class="rank-list">${runners}</div>` : '');
+                            (runners ? `<div class="rank-list">${runners}</div>` : '') +
+                        `</div>`;
                     }).join('');
 
                     return `<div class="cheapest-cell">` +
