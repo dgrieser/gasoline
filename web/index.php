@@ -6865,19 +6865,27 @@ function renderDocumentHead(string $titleSuffix): void
             font-family: var(--mono);
         }
 
+        /* minmax(0, …) rather than a bare 1fr: a track's automatic minimum is
+           its content's min-content width, and the address lines inside a cell
+           never wrap — so a long one ("Ravensberger Straße 25,
+           Lübbecke-Nettelstedt") widened its column and pushed the whole card
+           past the viewport on a phone, taking the right-hand column of hours
+           off screen with it. Zero as the floor puts the cell back in charge of
+           its width, and the address ellipsizes as it was always meant to. */
         .cheapest-grid {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 1px;
             background: var(--border);
         }
 
-        .cheapest-grid.single   { grid-template-columns: 1fr; }
-        .cheapest-grid.two-col  { grid-template-columns: repeat(2, 1fr); }
+        .cheapest-grid.single   { grid-template-columns: minmax(0, 1fr); }
+        .cheapest-grid.two-col  { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
         .cheapest-cell {
             background: var(--surface);
             padding: 1.1rem 1.25rem;
+            min-width: 0;
         }
 
         .cheapest-fuel-label {
@@ -7007,6 +7015,8 @@ function renderDocumentHead(string $titleSuffix): void
         }
 
         .pred-time {
+            margin-left: auto;
+            padding-left: 0.6rem;
             color: var(--amber);
             flex-shrink: 0;
             white-space: nowrap;
@@ -10537,10 +10547,9 @@ function stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailin
 // that label when the reader has picked a location, `price` is the raw number
 // to render. The label is built twice over: as markup for the row, as text for
 // the aria label, which cannot carry the sized-down separator.
-// Two slots for the callers' own markup: `trailingHtml` rides with the station
-// name (the surroundings card's closed tag), `endHtml` holds the right edge
-// past the distance (the predictions card's window hours).
-function stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText, endHtml) {
+// `trailingHtml` is the callers' own markup after the station name: the
+// surroundings card's closed tag, the predictions card's window hours.
+function stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {
     const t = translations[currentLang];
     const distText = fmtDistanceKm(distKm);
     const distHtml = fmtDistanceKmHtml(distKm);
@@ -10556,7 +10565,6 @@ function stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtm
         `<span class="rank-station">${stationDot(stationName, fuel)}${h(stationName)}</span>` +
         (trailingHtml || '') +
         (distHtml === null ? '' : `<span class="row-dist">${distHtml}</span>`) +
-        (endHtml || '') +
     `</button>`;
 }
 
@@ -10699,10 +10707,9 @@ function renderPredictions() {
     const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
 
     const nameById = (id) => (predictionStationMeta[id] && predictionStationMeta[id].name) || id;
-    const distById = (id) => stationDistancesById[id] ?? null;
     // Address line for the top station, mirroring the top-5 card: street then
-    // place. The distance is not in it — stationBlock puts that in its own
-    // column, at the right edge, where it cannot be ellipsized away.
+    // place. No distance anywhere in this card: what it answers is when to
+    // fill up, and the hours are what its right edge is for.
     const addressHtmlById = (id) => {
         const meta = predictionStationMeta[id] || {};
         return [meta.street, meta.place].filter(Boolean).map(h).join(', ');
@@ -10757,11 +10764,9 @@ function renderPredictions() {
                         const runners = dayWindows.slice(1).map((p) => stationRankRow(
                             p.s,
                             nameById(p.s),
-                            distById(p.s),
+                            null,
                             fuel,
                             p.price,
-                            '',
-                            '',
                             `<span class="pred-time">${h(windowLabel(p))}</span>`
                         )).join('');
                         // The day and the hours share one line under the price:
@@ -10773,7 +10778,7 @@ function renderPredictions() {
                                 `<span class="pred-day-label">${dayLabelHtml(best.start)}</span>` +
                                 `<span class="pred-window">${h(windowLabel(best))}</span>` +
                             `</div>` +
-                            stationBlock(best.s, bestName, fuel, bestAddr, distById(best.s)) +
+                            stationBlock(best.s, bestName, fuel, bestAddr, null) +
                             (runners ? `<div class="rank-list">${runners}</div>` : '') +
                         `</div>`;
                     }).join('');
