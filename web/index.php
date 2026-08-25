@@ -7548,6 +7548,24 @@ function renderDocumentHead(string $titleSuffix): void
             cursor: default;
         }
 
+        /* A pill holding a mark rather than a word needs its own box: line-height
+           would otherwise reserve a text line under the icon, and the padding the
+           labelled pills use would leave a target too small to hit with a thumb. */
+        .card-sort-pill {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 2.4rem;
+            min-height: 1.9rem;
+            padding: 0 0.5rem;
+            line-height: 0;
+            color: var(--muted);
+        }
+
+        .card-sort-pill.active {
+            color: var(--amber);
+        }
+
         .chart-body {
             padding: 1rem 1.25rem;
         }
@@ -8465,7 +8483,7 @@ const translations = {
         invalidFromDate: 'Invalid from date.',
         invalidToDate: 'Invalid to date.',
         noSnapshots: 'No snapshots match the current filters.',
-        cheapestNow: 'Cheapest right now',
+        cheapestNow: 'Cheapest now',
         cheapestPrefix: 'Lowest',
         cheapestRangeNoData: 'No price data available.',
         highestPrefix: 'Highest price',
@@ -8794,7 +8812,7 @@ const translations = {
         invalidFromDate: 'Ungültiges Von-Datum.',
         invalidToDate: 'Ungültiges Bis-Datum.',
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
-        cheapestNow: 'Jetzt am günstigsten',
+        cheapestNow: 'Günstigste',
         cheapestPrefix: 'Tiefstpreis',
         cheapestRangeNoData: 'Keine Preisdaten vorhanden.',
         highestPrefix: 'Höchstpreis',
@@ -10537,8 +10555,21 @@ if (!chartEl) {
 /* ── i18n ── (translations + applyLang live in the shared script) ── */
 
 /* ── Price cards (cheapest / highest) ──────────────────────────── */
-const ICON_DOWN = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 16 16 12"/><line x1="12" y1="8" x2="12" y2="16"/></svg>`;
-const ICON_UP   = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 8 16 12"/><line x1="12" y1="16" x2="12" y2="8"/></svg>`;
+// The two marks the page draws an order with: a falling price, and a place on
+// a map. Each is used twice at different sizes and colours — large and amber
+// as a card's own heading icon, small and inheriting as a sort pill — so the
+// path data is written once and the wrapper says which of the two it is.
+const MARK_CHEAPER = '<circle cx="12" cy="12" r="10"/><polyline points="8 12 12 16 16 12"/><line x1="12" y1="8" x2="12" y2="16"/>';
+const MARK_NEARBY  = '<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/>';
+
+function markSvg(marks, size, extraStyle) {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor"` +
+        ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"` +
+        ` style="flex-shrink:0${extraStyle || ''}">${marks}</svg>`;
+}
+
+const ICON_DOWN = markSvg(MARK_CHEAPER, 13, ';color:var(--amber)');
+const ICON_UP   = markSvg('<circle cx="12" cy="12" r="10"/><polyline points="8 12 12 8 16 12"/><line x1="12" y1="16" x2="12" y2="8"/>', 13, ';color:var(--amber)');
 
 const stationsCard      = document.getElementById('stations-card');
 const cheapestRangeCard = document.getElementById('cheapest-range-card');
@@ -10686,7 +10717,14 @@ function latestRows() {
 // location scope, so without a location there is none to rank by; the toggle
 // greys out rather than vanishing, and a note says what would enable it.
 
-const ICON_PIN = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>`;
+// The sort pills wear these rather than the words they used to: "Preis" and
+// "Entfernung" together are 159px, more than a 320px phone has left once the
+// heading and the radius have had theirs, and a toggle that wraps costs the
+// card a whole row. They inherit the pill's colour, so the order that is not
+// showing is as muted as its label was, and the words live on as the buttons'
+// accessible names.
+const ICON_SORT_PRICE    = markSvg(MARK_CHEAPER, 14);
+const ICON_SORT_DISTANCE = markSvg(MARK_NEARBY, 14);
 
 // A closed station still lists — its price is the one it will reopen with —
 // but it says so, next to the name in both the big cell and the ranked rows.
@@ -10721,14 +10759,19 @@ function stationCardRoster() {
 // rather than by a listener on a node the next render throws away.
 function cardSortToggle(sort, distanceAvailable) {
     const t = translations[currentLang];
-    const pill = (value, label, disabled) =>
-        `<button type="button" class="range-toggle${value === sort ? ' active' : ''}"` +
-        ` data-card-sort="${value}" aria-pressed="${value === sort ? 'true' : 'false'}"` +
-        (disabled ? ` disabled title="${h(t.sortNeedsLocation)}"` : '') +
-        `>${h(label)}</button>`;
+    // Nothing but a mark is drawn, so the label has to be spoken instead — and
+    // a pill that cannot be pressed says why in the same breath.
+    const pill = (value, label, icon, disabled) => {
+        const name = disabled ? label + ' — ' + t.sortNeedsLocation : label;
+        return `<button type="button" class="range-toggle card-sort-pill${value === sort ? ' active' : ''}"` +
+            ` data-card-sort="${value}" aria-pressed="${value === sort ? 'true' : 'false'}"` +
+            ` title="${h(name)}" aria-label="${h(name)}"` +
+            (disabled ? ' disabled' : '') +
+            `>${icon}</button>`;
+    };
     return `<div class="card-sort range-toggles" role="group" aria-label="${h(t.sortBy)}">` +
-        pill('price', t.sortByPrice, false) +
-        pill('distance', t.sortByDistance, !distanceAvailable) +
+        pill('price', t.sortByPrice, ICON_SORT_PRICE, false) +
+        pill('distance', t.sortByDistance, ICON_SORT_DISTANCE, !distanceAvailable) +
     `</div>`;
 }
 
@@ -10761,8 +10804,9 @@ function renderStations() {
     // spelling their street address across the top of a card they screenshot is
     // not something to do on their behalf.
     const scope = located ? `<span class="cheapest-scope">${h(locationRadiusKm + ' km')}</span>` : '';
+    // No leading icon: it drew the same mark the pressed pill draws, and two
+    // copies of one glyph on one line is not what the width is for.
     const header = `<div class="cheapest-header">` +
-        (sort === 'distance' ? ICON_PIN : ICON_DOWN) +
         `<span class="cheapest-title">${h(sort === 'distance' ? t.nearbyTitle : t.cheapestNow)}</span>` +
         scope +
         cardSortToggle(sort, located) +
