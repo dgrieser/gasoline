@@ -523,8 +523,8 @@ The dashboard is slow for different reasons than the accuracy page, so it gets i
 | --- | --- |
 | `city_search` | the location field's typeahead, measured with the first three letters of the named place |
 | `scope_stations` | the stations inside the radius that are still being fed (`loadScopeStations`) |
-| `nearby_latest` | the current price at each of the 40 nearest stations, for the Nearby card (`loadNearbyPrices`) |
-| `snapshots` | the price history the chart and table are drawn from (`buildSnapshotQuery`) |
+| `nearby_latest` | the current price at each of the 40 nearest stations, prefetched for the station dialog (`loadNearbyPrices`) |
+| `snapshots` | the price history every card, the chart and the table are drawn from (`buildSnapshotQuery`) |
 | `predictions_grid` | the future forecast windows for the scope, reduced to the newest run per station in PHP (`loadFilteredPredictions`) |
 
 The reader's stored filters are the sixth thing a load reads and the one query not listed: it is a single primary-key row out of `user_filters`, and timing it would tell an operator nothing. Because the location comes off that row already resolved, `--city` is doctor's own stand-in for it — a name an operator can type, resolved to the coordinates the filter row would have held.
@@ -541,7 +541,7 @@ gasoline doctor dashboard --explain --sql                  # plans and SQL per q
 gasoline doctor dashboard -o json | jq '.dashboard'        # machine-readable
 ```
 
-With no `--city` it measures the city with the most stations in scope, which is the slowest dashboard anyone can load, and says which one it picked. `--radius` accepts only the radii the dropdown offers (5, 10, 20) and `--fuel` defaults to the page's own `all`, which expands to three fuels and so to three times the prediction rows. `--no-city` reproduces the unscoped view, where the page loads the station list for the sidebar and skips the surroundings, snapshot and prediction queries entirely — `doctor` skips them with it rather than inventing a load the page never issues.
+With no `--city` it measures the city with the most stations in scope, which is the slowest dashboard anyone can load, and says which one it picked. `--radius` accepts only the radii the dropdown offers (5, 10, 20) and `--fuel` defaults to the page's own `all`, which expands to three fuels and so to three times the prediction rows. `--no-city` reproduces the unscoped view, where the page loads the station list for the sidebar and skips the nearby, snapshot and prediction queries entirely — `doctor` skips them with it rather than inventing a load the page never issues.
 
 The output shows how the scope narrowed, then one line per query:
 
@@ -559,7 +559,7 @@ dashboard queries: city=Lübbecke (auto), radius=5 km, fuel=all (e5+e10+diesel),
     probe/keys only       52.5 ms    40290 rows  covering idx_price_predictions_station_fuel_target
 ```
 
-Those are real numbers from a production MySQL 8.4, taken **before** the fixes below — and before the Nearby card existed or the filters moved onto the account, which is why a `city` lookup appears that no load performs any more — and they are the reason the probes exist. One query was 99.87% of the load — and the probe beside it showed that reading its 610,978 rows took 256 ms, so the row count was *not* what cost three minutes. The same report is now 257 ms in total: `predictions_latest` no longer exists and neither of the `cities` scans does. See [what this found](#what-doctor-dashboard-found-and-what-was-done-about-it).
+Those are real numbers from a production MySQL 8.4, taken **before** the fixes below — and before the nearby read existed or the filters moved onto the account, which is why a `city` lookup appears that no load performs any more — and they are the reason the probes exist. One query was 99.87% of the load — and the probe beside it showed that reading its 610,978 rows took 256 ms, so the row count was *not* what cost three minutes. The same report is now 257 ms in total: `predictions_latest` no longer exists and neither of the `cities` scans does. See [what this found](#what-doctor-dashboard-found-and-what-was-done-about-it).
 
 ##### Probes: what a query's time is actually spent on
 
@@ -660,14 +660,18 @@ Features:
 - filter by location — a city, a postal code, a street with a house number, or the browser's own position
 - filter by fuel type
 - compare multiple stations
-- see what the stations around that location cost right now, nearest first
+- see what the stations around that location cost, ordered by price or by distance
 - inspect summary stats and historical price points
 
 **The filters belong to the account.** They are stored in `user_filters`, one row per user, written whenever the sidebar changes and read back on every load — so signing in from a second browser, or from a phone, lands on the same dashboard. Nothing in the URL selects data any more: a dashboard link is just a link to the dashboard, and two people sharing a browser no longer share a view. **Reset** deletes the row and returns to the defaults.
 
 **Entering a location.** Typing searches the database and never leaves the host, because Nominatim's usage policy rules out a lookup per keystroke; it answers from two sources, the cities the CLI has geocoded and the postal codes read off the station addresses themselves (`10115` offers *10115 Berlin*, centred on the mean of its filling stations). A street with a house number is in neither, so the dropdown ends with a **Search address "…"** row that spends one geocoder lookup, and the locate button beside the field takes one position fix from the browser and reverse-geocodes it. Both apply immediately and both leave an ordinary editable label behind — a reverse-geocoded house number that came back wrong is corrected by typing over it and pressing Enter. What they resolve is stored on the reader's own filter row as a label and a point; the `cities` table stays what the CLI made it, one row per place it collects. `GASOLINE_GEOCODE=false` switches the outbound lookups off, and the locate button then labels the position by its coordinates.
 
-The **Nearby** card (German: *Umgebung*) sits under the recommended fill-ups and is built like the cards above it — a column per fuel, the leading station's price large, the rest as ranked rows — except that what ranks it is distance rather than price. Its header names the radius and not the location: where the reader lives is theirs, and a card gets screenshotted. Every row across every card ends with the distance, in its own column at the right edge, so a long station name ellipsizes rather than swallowing it. Unlike the cards above it, it is not narrowed by the date range or by the station picker: it reads the newest snapshot per station directly, for up to the 40 nearest of them, and says so when the radius holds more. That lookup is bounded to the same 48-hour freshness window the station scope uses — the stations it covers are known to have been fed inside it, so it never has to walk a station's full price history. Tapping a row opens the same station detail dialog as the other cards, navigation link included.
+The **stations card** leads the page and answers the two questions a reader arrives with — what is cheapest, and what is close — with a toggle in its top right corner naming which of them is currently ranking it. It is built like every other card: a column per fuel, the leading station's price large, the rest as ranked rows, eight before a **Show more**. Sorting by price titles it *Cheapest right now* (German: *Jetzt am günstigsten*); sorting by distance titles it *Nearby* (*Umgebung*) and names the radius beside it — the radius and not the location, because where the reader lives is theirs and a card gets screenshotted. The choice is kept in a `gasoline_card_sort` cookie, like the collapsed filter panel: it belongs to the browser in the reader's hand rather than to the account, so a phone and a desktop can each keep the order that suits them.
+
+Both orders rank one roster, and that roster is the same filtered snapshot history the chart is drawn from — so the location and its radius, the date range, the station picker and the fuel all narrow this card exactly as they narrow the chart. Each station appears once, at the newest price the filters admit, with the distance the location scope measured for it; a station that is shut still lists, since its price is the one it will reopen with, and says so next to its name. Every row across every card ends with the distance in its own column at the right edge, so a long station name ellipsizes rather than swallowing it. Without a location there are no distances to rank by: the card falls back to price, greys the distance half of the toggle out rather than hiding it, and says under the list what would make it available. Tapping a row opens the station detail dialog, navigation link included.
+
+That dialog is why the viewer still reads the current price at the nearest stations separately, bounded to the same 48-hour freshness window the station scope uses, for up to the 40 nearest: nothing on the page draws it, but a station the date range or the picker kept out of the snapshot rows — one the recommended fill-ups card named, say — has to open with a price all the same. `gasoline doctor dashboard` times that read with the rest and says whose cost it is.
 
 The station list, the price rows and the recommended fill-ups card all cover the **stations currently being fed** — the same 48-hour freshness rule the CLI applies (`GASOLINE_STATION_FRESHNESS_HOURS` mirrors Go's `stationFreshness`). A station whose update target was removed therefore disappears from the dashboard instead of showing its last known price as though it were current; its snapshots stay in the database and reappear if the station is collected again.
 

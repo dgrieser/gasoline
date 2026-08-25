@@ -1127,7 +1127,7 @@ const NEARBY_STATION_LIMIT = 40;
 function stationFreshnessCutoff(): string
 {
     // Resolved once per request. Several queries in one page load apply this
-    // bound — the station scope and the surroundings prices among them — and a
+    // bound — the station scope and the nearby prices among them — and a
     // station whose newest snapshot sits within a second of the boundary must
     // not be in scope for one of them and out of scope for the next.
     static $cutoff = null;

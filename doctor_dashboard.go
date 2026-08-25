@@ -29,6 +29,14 @@ import (
 // list the page would have inlined into IN(...) — the length of that list is
 // part of the cost, so guessing it would defeat the point.
 //
+// Only three of those four are drawn. The page's cards all read the snapshot
+// rows now — the stations card that replaced the old surroundings one included,
+// which is what put every sidebar filter in front of it — so loadNearbyPrices
+// renders nothing: it is a prefetch, so that the station detail dialog can
+// answer for a station the date range or the picker kept out of those rows.
+// Paid on every load with a location all the same, which is why doctor times it
+// with the rest and says whose cost it is.
+//
 // The filter read itself is not among them: it is one primary-key row out of
 // user_filters, and timing that would tell an operator nothing. It is why the
 // page no longer resolves a city on load, though, which is why --city is now
@@ -44,8 +52,8 @@ import (
 var dashboardRadiusOptions = []int{5, 10, 20}
 
 // dashboardNearbyLimit mirrors NEARBY_STATION_LIMIT in web/index.php: how many
-// of the nearest stations the surroundings card reads a current price for, and
-// so how many correlated seeks that query costs at most.
+// of the nearest stations the dialog prefetch reads a current price for, and so
+// how many correlated seeks that query costs at most.
 const dashboardNearbyLimit = 40
 
 // dashboardFuels expands the page's fuel filter: "all" loads three fuels, which
@@ -126,9 +134,10 @@ type dashboardQueryContext struct {
 	// unscoped view.
 	BBox *dashboardBBox
 	// ScopeStationIDs is every station the radius admits, before the picker
-	// narrows it. The surroundings card reads a current price for the nearest
-	// of them and is deliberately not narrowed by the picker, so it is that
-	// list — not StationIDs — that sizes its query.
+	// narrows it. loadNearbyPrices reads a current price for the nearest of
+	// them and is deliberately not narrowed by the picker — the dialog it backs
+	// has to answer for a station the picker dropped — so it is that list, not
+	// StationIDs, that sizes its query.
 	ScopeStationIDs []string
 	// CityMissing marks a named city the cities table does not hold. doctor
 	// cannot place a bounding box without one, so there is no scope query to
@@ -245,10 +254,12 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 		})
 	}
 
-	// ── surroundings ──────────────────────────────────────────────────────
+	// ── dialog prefetch ───────────────────────────────────────────────────
 	// loadNearbyPrices: the current price at each of the nearest stations. Its
 	// scope is the radius alone, so it runs whenever a location is selected —
-	// including when the picker has narrowed everything below it away.
+	// including when the picker has narrowed everything below it away, which is
+	// the case it exists for: the dialog has to answer for a station the
+	// picker dropped, and the drawn queries no longer cover one.
 	//
 	// Both halves are bounded by the freshness window, which is the point of
 	// its shape: the station list is already known to have been fed inside that
@@ -271,7 +282,7 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 			"WHERE station_id IN (" + nearbyIn + ") AND recorded_at >= ? GROUP BY station_id"
 		specs = append(specs, dashboardQuerySpec{
 			name:    "nearby_latest",
-			purpose: "the current price at each of the nearest stations (loadNearbyPrices)",
+			purpose: "the current price at each of the nearest stations, prefetched for the station dialog (loadNearbyPrices)",
 			sql: "SELECT ps.station_id, ps.recorded_at, ps.is_open, " +
 				raisedNinePriceSQL("ps.e5") + " AS e5, " +
 				raisedNinePriceSQL("ps.e10") + " AS e10, " +
@@ -321,7 +332,7 @@ func dashboardQuerySpecsFor(qc dashboardQueryContext) []dashboardQuerySpec {
 	snapOrder := " ORDER BY ps.recorded_at ASC, ps.station_id ASC"
 	specs = append(specs, dashboardQuerySpec{
 		name:    "snapshots",
-		purpose: "the price history the chart and table are drawn from (buildSnapshotQuery)",
+		purpose: "the price history every card, the chart and the table are drawn from (buildSnapshotQuery)",
 		sql: "SELECT ps.station_id, ps.recorded_at, ps.is_open, " +
 			raisedNinePriceSQL("ps.e5") + " AS e5, " +
 			raisedNinePriceSQL("ps.e10") + " AS e10, " +
@@ -802,6 +813,7 @@ func doctorDashboardFindings(dash *doctorDashboard, tables []doctorTable, opts d
 		}
 	}
 
+	findings = append(findings, dashboardNearbyFindings(byName, total)...)
 	findings = append(findings, dashboardSnapshotFindings(byName, opts)...)
 	findings = append(findings, dashboardPredictionFindings(byName, opts)...)
 
@@ -814,10 +826,40 @@ func doctorDashboardFindings(dash *doctorDashboard, tables []doctorTable, opts d
 	return findings
 }
 
+// dashboardNearbyFindings prices the one query on the page whose result nothing
+// on the page draws. loadNearbyPrices fed the surroundings card until the
+// stations card replaced it and started reading the snapshot rows like every
+// other card; what is left of it is a prefetch, so the station detail dialog can
+// answer for a station the date range or the picker kept out of those rows. That
+// is worth knowing when it is a real share of the load, because it is the only
+// query here a reader can finish with the page without ever having needed.
+//
+// Same rule the lookup shares follow: both an absolute floor and a share have to
+// be crossed, since a fifth of a seven-millisecond page is still nothing.
+func dashboardNearbyFindings(byName map[string]doctorQuery, total float64) []doctorFinding {
+	q, ok := byName["nearby_latest"]
+	if !ok || q.Error != "" || total <= 0 {
+		return nil
+	}
+	if q.DurationMS < doctorLookupNoteMS || q.DurationMS < total*dashboardNearbyShare {
+		return nil
+	}
+	return []doctorFinding{{
+		Severity: "info",
+		Message: fmt.Sprintf("nearby_latest is %.0f ms of the page's %.0f ms and nothing on the page draws it: the cards all read the snapshot rows, and this only prefetches what the station dialog would need for a station the date filter or the picker left out of them. Opening it lazily would take that off every load",
+			q.DurationMS, total),
+	}}
+}
+
+// dashboardNearbyShare is the share of a page's SQL time at which a query that
+// renders nothing stops being a rounding error and starts being a thing to move.
+const dashboardNearbyShare = 0.2
+
 // dashboardSnapshotFindings prices the snapshot history read, which is the query
-// whose cost scales with the date filter. Its index stops at
-// (station_id, recorded_at); every price column comes from a table row, and the
-// probe says what those lookups cost.
+// whose cost scales with the date filter and the one everything visible waits
+// on: the chart, the table and all four cards are drawn from its rows. Its index
+// stops at (station_id, recorded_at); every price column comes from a table row,
+// and the probe says what those lookups cost.
 func dashboardSnapshotFindings(byName map[string]doctorQuery, opts doctorOptions) []doctorFinding {
 	q, ok := byName["snapshots"]
 	if !ok || q.Error != "" {
