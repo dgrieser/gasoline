@@ -591,20 +591,24 @@ function reportedRate(legendEl, index = 0) {
 // tested is the distance: that it is its own column rather than a tail on the
 // station's name, which is what used to let a long name ellipsize it away.
 
-const ROW_DEPS = [
+const CARD_DEPS = [
     'translations', 'currentLang', 'fuelConfig', 'FUEL_CSS_COLORS', 'ICON_STATION_INFO',
-    'ICON_PIN', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
+    'ICON_PIN', 'ICON_DOWN', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
     'fmtPriceHtml', 'fmtPriceText', 'formatDateTime',
-    'nearbyCard', 'selectedFuel', 'locationLabel', 'locationRadiusKm',
-    'nearbyRows', 'nearbyTotal', 'nearbyExpanded', 'CARD_PREVIEW_ROWS',
-    'predictionStationMeta',
+    'stationsCard', 'selectedFuel', 'locationLabel', 'locationRadiusKm',
+    'chartData', 'stationDistancesById', 'predictionStationMeta',
+    'nearbyRows', 'nearbyTotal', 'cardExpanded', 'cardSort', 'CARD_PREVIEW_ROWS',
 ];
 
-const rowSource = [
+const cardSource = [
     lift('\nfunction stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {'),
     lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {'),
-    lift('\nfunction nearbyClosedTag(row) {'),
-    lift('\nfunction renderNearby() {'),
+    lift('\nfunction latestRowById() {'),
+    lift('\nfunction latestRows() {'),
+    lift('\nfunction stationClosedTag(row) {'),
+    lift('\nfunction stationCardRoster() {'),
+    lift('\nfunction cardSortToggle(sort, distanceAvailable) {'),
+    lift('\nfunction renderStations() {'),
 ].join('\n');
 
 // The distance formatters read currentLang the same way the price ones do.
@@ -620,21 +624,23 @@ const makeDistance = new Function('currentLang', [
 ].join('\n'));
 
 /** Compile the row builders and the card against one set of stand-ins. */
-function compileRows({
+function compileCard({
     lang = 'en', card = null, fuel = 'all', label = 'Berlin', radiusKm = 5,
     rows = [], total = null, expanded = false, meta = {},
+    sort = 'distance', chartRows = [], distances = {},
 } = {}) {
     const locale = makeLocale(lang);
     const distance = makeDistance(lang);
-    return new Function(...ROW_DEPS,
-        `${rowSource}\nreturn { stationBlock, stationRankRow, renderNearby };`)(
+    return new Function(...CARD_DEPS,
+        `${cardSource}\nreturn { stationBlock, stationRankRow, renderStations };`)(
         translations, lang, fuelConfig,
         { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' }, '<info/>',
-        '<pin/>', (name) => `<dot ${name}>`, h, distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
+        '<pin/>', '<down/>', (name) => `<dot ${name}>`, h,
+        distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
         locale.fmtPriceHtml, locale.fmtPriceText, (iso) => iso,
         card, fuel, label, radiusKm,
-        rows, total === null ? rows.length : total, expanded, 8,
-        meta,
+        chartRows, distances, meta,
+        rows, total === null ? rows.length : total, expanded, sort, 8,
     );
 }
 
@@ -644,7 +650,7 @@ function rowText(html) {
 }
 
 {
-    const { stationBlock, stationRankRow } = compileRows();
+    const { stationBlock, stationRankRow } = compileCard();
 
     // The name that broke the old rows: long enough that the distance behind it
     // fell off the end.
@@ -680,13 +686,29 @@ function rowText(html) {
         stationBlock('s1', long, 'diesel', '', null).includes('sd-meta-line'), false);
 }
 
-/* ── The top-price card ─────────────────────────────────────────── */
-// It lists the cheapest stations right now, and it lists as many of them as the
-// surroundings card below it does — one preview length for the page, with the
-// rest behind a "show more" that names how many are waiting. What is tested is
-// that length, the button's count, and that expanding really drops the cap.
+/* ── The stations card ──────────────────────────────────────────── */
+// One card, one roster, two orders. It used to be two cards — "cheapest right
+// now" over the chart snapshot and "Umgebung" over the nearby payload — and
+// what is tested now is that the toggle really is a re-ranking of one list:
+// the same stations, the same cells, in whichever order the reader asked for.
+// Then the parts each order owns: the radius note and the closed tags on one
+// side, and on the other the fallback a reader gets before picking a location,
+// where distance is not a question the data can answer.
 
-/** One chart row: a station and a price per fuel at a fixed instant. */
+/** One nearby-payload row: station id, distance, and a price per fuel. */
+function nearbyRow(id, distKm, prices = {}, open = true) {
+    return {
+        s: id,
+        dist: distKm,
+        t: '2026-08-01T09:00:00Z',
+        o: open,
+        e5: prices.e5 ?? null,
+        e10: prices.e10 ?? null,
+        diesel: prices.diesel ?? null,
+    };
+}
+
+/** One chart-snapshot row: a station and a price per fuel at a fixed instant. */
 function chartRow(id, name, prices = {}) {
     return {
         station_id: id,
@@ -701,108 +723,13 @@ function chartRow(id, name, prices = {}) {
     };
 }
 
-const CHEAPEST_DEPS = [
-    'translations', 'currentLang', 'fuelConfig', 'FUEL_CSS_COLORS', 'ICON_STATION_INFO',
-    'ICON_DOWN', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
-    'fmtPriceHtml', 'fmtPriceText', 'formatDateTime',
-    'cheapestCard', 'selectedFuel', 'chartData', 'stationDistancesById',
-    'cheapestExpanded', 'CARD_PREVIEW_ROWS',
-];
-
-const cheapestSource = [
-    lift('\nfunction stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {'),
-    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {'),
-    lift('\nfunction latestRowById() {'),
-    lift('\nfunction latestRows() {'),
-    lift('\nfunction renderCheapest() {'),
-].join('\n');
-
-/** Render the card and hand back its markup plus the stations it listed. */
-function renderCheapestCard(rows, { lang = 'en', fuel = 'all', expanded = false } = {}) {
-    const card = makeElement('div');
-    const locale = makeLocale(lang);
-    const distance = makeDistance(lang);
-    new Function(...CHEAPEST_DEPS, `${cheapestSource}\nreturn renderCheapest;`)(
-        translations, lang, fuelConfig,
-        { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' }, '<info/>',
-        '<down/>', (name) => `<dot ${name}>`, h, distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
-        locale.fmtPriceHtml, locale.fmtPriceText, (iso) => iso,
-        card, fuel, rows, {}, expanded, 8,
-    )();
-    const html = card.innerHTML;
-    return {
-        html,
-        listed: [...html.matchAll(/data-station-id="([^"]+)"/g)].map((m) => m[1]),
-        text: rowText(html),
-    };
-}
-
-{
-    // Eleven stations priced, so three more than the preview holds — the same
-    // arithmetic the surroundings card is checked with, since the two now show
-    // the same number of rows.
-    const rows = Array.from({ length: 11 }, (_, i) => chartRow(`s${i}`, `Station ${i}`, { diesel: 1.6 + i / 1000 }));
-    const collapsed = renderCheapestCard(rows, { fuel: 'diesel' });
-    check('the preview stops at eight stations, like the card below it', collapsed.listed.length, 8);
-    check('cheapest first', collapsed.listed.slice(0, 3), ['s0', 's1', 's2']);
-    check('the leading one gets the big price',
-        collapsed.html.includes('1<span class="price-sep">.</span>60<span class="price-milli">0</span>'), true);
-    check('and the remainder waits behind a button that counts it',
-        collapsed.text.includes('Show more (3)'), true);
-
-    const expanded = renderCheapestCard(rows, { fuel: 'diesel', expanded: true });
-    check('expanded lists every station', expanded.listed.length, 11);
-    check('and drops the button', expanded.html.includes('card-more'), false);
-}
-
-{
-    // Fewer stations than the preview: nothing is held back, so there is
-    // nothing to offer.
-    const rows = Array.from({ length: 4 }, (_, i) => chartRow(`s${i}`, `Station ${i}`, { diesel: 1.6 + i / 1000 }));
-    const out = renderCheapestCard(rows, { fuel: 'diesel' });
-    check('a short list shows all of itself', out.listed.length, 4);
-    check('with no button on it', out.html.includes('card-more'), false);
-}
-
-{
-    // One button expands all three columns, so its count is what the longest
-    // of them still holds back — not a per-column number that would be wrong
-    // for the other two.
-    const rows = [
-        ...Array.from({ length: 10 }, (_, i) => chartRow(`d${i}`, `Diesel ${i}`, { diesel: 1.6 + i / 1000 })),
-        ...Array.from({ length: 9 }, (_, i) => chartRow(`e${i}`, `E5 ${i}`, { e5: 1.7 + i / 1000 })),
-    ];
-    const out = renderCheapestCard(rows, { fuel: 'all' });
-    check('two fuels priced render two cells', (out.html.match(/cheapest-cell/g) || []).length, 2);
-    check('the count comes from the longest column', out.text.includes('Show more (2)'), true);
-}
-
-/* ── The surroundings card ──────────────────────────────────────── */
-// It is built out of the same cells as the cards above it — fuel label, big
-// price, station block, ranked rows — so what is tested is that it really uses
-// them, that distance and not price is what orders it, and that a radius
-// holding more than it shows says so instead of reading as a complete list.
-
-/** One payload row: station id, distance, and a price per fuel. */
-function nearbyRow(id, distKm, prices = {}, open = true) {
-    return {
-        s: id,
-        dist: distKm,
-        t: '2026-08-01T09:00:00Z',
-        o: open,
-        e5: prices.e5 ?? null,
-        e10: prices.e10 ?? null,
-        diesel: prices.diesel ?? null,
-    };
-}
-
 /**
  * Render the card and hand back its markup plus the pieces the tests read out
  * of it. `label` empty stands for "no location picked yet".
  */
-function renderNearbyCard(rows, options = {}) {
+function renderStationsCard(rows, options = {}) {
     const card = makeElement('div');
-    compileRows({ ...options, card, rows }).renderNearby();
+    compileCard({ ...options, card, rows }).renderStations();
     const html = card.innerHTML;
     return {
         html,
@@ -825,7 +752,7 @@ const nearbyMeta = {
         // c sells all three; b has no e10, so that column is one station shorter.
         nearbyRow('c', 4.4, { e5: 1.799, e10: 1.739, diesel: 1.679 }),
     ];
-    const out = renderNearbyCard(rows, { meta: nearbyMeta });
+    const out = renderStationsCard(rows, { meta: nearbyMeta });
 
     // Three fuels in scope, so three cells, like every other card.
     check('one cell per fuel in scope', (out.html.match(/cheapest-cell/g) || []).length, 3);
@@ -834,7 +761,7 @@ const nearbyMeta = {
     check('the rest follow as ranked rows', (out.html.match(/class="rank-list"/g) || []).length, 3);
 
     // Distance orders it, not price: b is dearer than c and still comes first.
-    check('the nearest station leads each column, however it is priced',
+    check('sorted by distance the nearest station leads each column, however it is priced',
         out.listed.slice(0, 3), ['a', 'b', 'c']);
     check('the big price is the nearest station one',
         out.html.includes('1<span class="price-sep">.</span>78<span class="price-milli">9</span>'), true);
@@ -843,11 +770,49 @@ const nearbyMeta = {
     check('and not where the reader lives', out.html.includes('Berlin ·'), false);
     check('a station missing a fuel is left out of that column',
         (out.html.match(/data-station-id="b"/g) || []).length, 2);
+
+    // The same rows, the other way up. b is nearer than c and dearer than it,
+    // so price is the only order that can drop it below.
+    const byPrice = renderStationsCard(rows, { meta: nearbyMeta, sort: 'price' });
+    check('sorted by price the same roster reorders', byPrice.listed.slice(0, 3), ['a', 'c', 'b']);
+    check('and nothing joins or leaves it',
+        [...new Set(byPrice.listed)].sort(), [...new Set(out.listed)].sort());
+    check('the radius note survives the flip', byPrice.html.includes('>5 km<'), true);
+}
+
+{
+    // The heading is the card's answer to "what am I looking at", so it follows
+    // the sort rather than naming one of the two orders permanently.
+    const rows = [nearbyRow('a', 0.4, { diesel: 1.659 })];
+    const near = renderStationsCard(rows, { meta: nearbyMeta, sort: 'distance' });
+    check('ordered by distance the card is the surroundings one',
+        near.text.startsWith(translations.en.nearbyTitle), true);
+    check('and carries the map pin', near.html.includes('<pin/>'), true);
+
+    const cheap = renderStationsCard(rows, { meta: nearbyMeta, sort: 'price' });
+    check('ordered by price it is the cheapest-now one',
+        cheap.text.startsWith(translations.en.cheapestNow), true);
+    check('and carries the falling-price arrow', cheap.html.includes('<down/>'), true);
+}
+
+{
+    // Both orders are always offered, and the pill says which one is showing.
+    const out = renderStationsCard([nearbyRow('a', 0.4, { diesel: 1.659 })],
+        { meta: nearbyMeta, sort: 'price' });
+    check('the toggle sits in the header',
+        out.html.indexOf('card-sort') < out.html.indexOf('cheapest-grid'), true);
+    check('it offers both orders', (out.html.match(/data-card-sort=/g) || []).length, 2);
+    check('the one showing is pressed',
+        out.html.includes('data-card-sort="price" aria-pressed="true"'), true);
+    check('and the other is not',
+        out.html.includes('data-card-sort="distance" aria-pressed="false"'), true);
+    check('with a location, sorting by distance is offered for real',
+        out.html.includes('disabled'), false);
 }
 
 {
     // The fuel filter narrows to one column, like every other card.
-    const out = renderNearbyCard([nearbyRow('a', 0.4, { e5: 1.789, diesel: 1.659 })],
+    const out = renderStationsCard([nearbyRow('a', 0.4, { e5: 1.789, diesel: 1.659 })],
         { fuel: 'diesel', meta: nearbyMeta });
     check('one fuel selected renders one cell', (out.html.match(/cheapest-cell/g) || []).length, 1);
     check('and it is the selected one', out.text.includes('Diesel'), true);
@@ -857,13 +822,13 @@ const nearbyMeta = {
 {
     // A closed station still lists — its price is the one it will reopen with —
     // but it says so, in the big cell and in the ranked rows alike.
-    const closedFirst = renderNearbyCard([
+    const closedFirst = renderStationsCard([
         nearbyRow('a', 0.4, { diesel: 1.659 }, false),
         nearbyRow('b', 1.4, { diesel: 1.669 }, false),
     ], { meta: nearbyMeta });
     check('a closed station is marked wherever it appears',
         (closedFirst.html.match(/nearby-closed/g) || []).length, 2);
-    const open = renderNearbyCard([nearbyRow('a', 0.4, { diesel: 1.659 }, true)], { meta: nearbyMeta });
+    const open = renderStationsCard([nearbyRow('a', 0.4, { diesel: 1.659 }, true)], { meta: nearbyMeta });
     check('an open one is not', open.html.includes('nearby-closed'), false);
 }
 
@@ -871,48 +836,98 @@ const nearbyMeta = {
     // More rows than the preview holds: eight are shown and the rest wait
     // behind a button that names how many they are.
     const rows = Array.from({ length: 11 }, (_, i) => nearbyRow(`s${i}`, i * 0.5, { diesel: 1.6 + i / 1000 }));
-    const collapsed = renderNearbyCard(rows, { fuel: 'diesel' });
+    const collapsed = renderStationsCard(rows, { fuel: 'diesel' });
     check('the preview stops at eight stations', collapsed.listed.length, 8);
     check('and offers the remainder by count', collapsed.text.includes('Show more (3)'), true);
 
-    const expanded = renderNearbyCard(rows, { fuel: 'diesel', expanded: true });
+    const expanded = renderStationsCard(rows, { fuel: 'diesel', expanded: true });
     check('expanded shows every station', expanded.listed.length, 11);
     check('and drops the button', expanded.html.includes('card-more'), false);
+
+    // One button expands every column, so its count is the longest column's
+    // remainder rather than any one column's own.
+    const uneven = renderStationsCard([
+        ...Array.from({ length: 10 }, (_, i) => nearbyRow(`d${i}`, i, { diesel: 1.6 + i / 1000 })),
+        nearbyRow('e', 0.1, { e5: 1.7 }),
+    ]);
+    check('two fuels priced render two cells', (uneven.html.match(/cheapest-cell/g) || []).length, 2);
+    check('the count comes from the longest column', uneven.text.includes('Show more (2)'), true);
 }
 
 {
     // The server caps how many stations it prices. Saying so is what keeps a
     // capped list from reading as "that is all there is in range".
     const rows = Array.from({ length: 9 }, (_, i) => nearbyRow(`s${i}`, i, { diesel: 1.6 }));
-    const capped = renderNearbyCard(rows, { fuel: 'diesel', total: 23, expanded: true });
+    const capped = renderStationsCard(rows, { fuel: 'diesel', total: 23, expanded: true });
     check('a capped list says how much of the radius it covers',
         capped.text.includes('The 9 nearest of 23 stations in range.'), true);
-    const whole = renderNearbyCard(rows, { fuel: 'diesel', total: 9, expanded: true });
+    const whole = renderStationsCard(rows, { fuel: 'diesel', total: 9, expanded: true });
     check('an uncapped one does not', whole.html.includes('nearby-foot'), false);
 }
 
 {
-    // Without a location there is no "around here" to answer, and the card says
-    // where to set one rather than looking broken.
-    const none = renderNearbyCard([], { label: '' });
-    check('no location asks for one',
-        none.text.endsWith(translations.en.nearbyNoLocation), true);
-    check('and shows no rows', none.listed, []);
-    check('nor a radius it is not measuring from', none.html.includes('cheapest-scope'), false);
+    // Without a location there is no "around here" and no distance to sort by,
+    // so the card falls back to the chart snapshot — which it can still rank by
+    // price — and says what would unlock the other order.
+    const snapshot = [
+        chartRow('x', 'Station X', { diesel: 1.699 }),
+        chartRow('y', 'Station Y', { diesel: 1.649 }),
+    ];
+    const out = renderStationsCard([], { label: '', chartRows: snapshot, fuel: 'diesel' });
+    check('no location falls back to the chart snapshot', out.listed, ['y', 'x']);
+    check('which only price can rank', out.text.startsWith(translations.en.cheapestNow), true);
+    check('so sorting by distance is offered but not available',
+        out.html.includes('data-card-sort="distance" aria-pressed="false" disabled'), true);
+    check('and the card says what would make it available',
+        out.text.endsWith(translations.en.sortNeedsLocation), true);
+    check('nor a radius it is not measuring from', out.html.includes('cheapest-scope'), false);
+    // The snapshot carries no open state, so the card claims none.
+    check('a snapshot row is never called closed', out.html.includes('nearby-closed'), false);
 
-    const empty = renderNearbyCard([], { label: 'Nowhere' });
-    check('a location with nothing in range says that instead',
-        empty.text.includes(translations.en.nearbyNoData), true);
+    // A stored preference for distance cannot outvote the missing location.
+    const stored = renderStationsCard([], {
+        label: '', chartRows: snapshot, fuel: 'diesel', sort: 'distance',
+    });
+    check('a stored distance sort falls back rather than showing an empty card',
+        stored.listed, ['y', 'x']);
+    check('and the heading follows the order actually used',
+        stored.text.startsWith(translations.en.cheapestNow), true);
+
+    // A distance the chart payload happens to know still shows in the fallback.
+    const withDist = renderStationsCard([], {
+        label: '', chartRows: [chartRow('x', 'Station X', { diesel: 1.699 })],
+        fuel: 'diesel', distances: { x: 2 },
+    });
+    check('a snapshot station with a known distance still shows it',
+        withDist.html.includes('<span class="row-dist">2<span class="price-sep">.</span>0 km</span>'), true);
 }
 
 {
-    // German is not a copy of the English card: the title is the one the page
+    // Nothing to rank, in either of the two ways that can happen.
+    const inRange = renderStationsCard([], { label: 'Nowhere' });
+    check('a location with nothing in range says so',
+        inRange.text.includes(translations.en.nearbyNoData), true);
+    check('and still offers the toggle', inRange.html.includes('card-sort'), true);
+
+    const nothing = renderStationsCard([], { label: '', chartRows: [] });
+    check('no location and no snapshot says there is no price data',
+        nothing.text.includes(translations.en.cheapestNoData), true);
+}
+
+{
+    // German is not a copy of the English card: the titles are the ones the page
     // ships, and the numbers carry the German separators.
-    const out = renderNearbyCard([nearbyRow('a', 0.42, { diesel: 1.659 })],
+    const out = renderStationsCard([nearbyRow('a', 0.42, { diesel: 1.659 })],
         { fuel: 'diesel', lang: 'de', meta: nearbyMeta });
     check('the German card is titled Umgebung', out.text.includes('Umgebung'), true);
     check('and writes the distance with a comma',
         out.html.includes('0<span class="price-sep">,</span>4 km'), true);
+    check('its toggle is in German too', out.text.includes('Entfernung'), true);
+
+    const byPrice = renderStationsCard([nearbyRow('a', 0.42, { diesel: 1.659 })],
+        { fuel: 'diesel', lang: 'de', meta: nearbyMeta, sort: 'price' });
+    check('and by price it is Jetzt am günstigsten',
+        byPrice.text.includes('Jetzt am günstigsten'), true);
 }
 
 /* ── The recommendations card ───────────────────────────────────── */
