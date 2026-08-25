@@ -1117,7 +1117,7 @@ const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
 const GASOLINE_STATION_FRESHNESS_HOURS = 48;
 
 /**
- * How many of the nearest stations the surroundings card reads a current price
+ * How many of the nearest stations the stations card reads a current price
  * for. A radius that admits more than this many stations has long stopped being
  * a neighbourhood, and the cap is what bounds that query's cost.
  */
@@ -1127,7 +1127,7 @@ const NEARBY_STATION_LIMIT = 40;
 function stationFreshnessCutoff(): string
 {
     // Resolved once per request. Several queries in one page load apply this
-    // bound — the station scope and the surroundings prices among them — and a
+    // bound — the station scope and the nearby prices among them — and a
     // station whose newest snapshot sits within a second of the boundary must
     // not be in scope for one of them and out of scope for the next.
     static $cutoff = null;
@@ -1223,7 +1223,7 @@ function normalizeTimeList(array $times): ?string
  * They used to be query parameters kept alive by a cookie. That made a filtered
  * dashboard a link, but it also meant one account saw different filters in
  * every browser it signed in from, and the reader's own location — the thing
- * the surroundings card is about — lived in a cookie that any cache clear threw
+ * the stations card is about — lived in a cookie that any cache clear threw
  * away.
  *
  * The location is stored as the label the reader sees plus the coordinates it
@@ -5436,7 +5436,7 @@ function loadScopeStations(PDO $pdo, ?array $cityRow, int $radiusKm): array
 }
 
 /**
- * The current price at each of the nearest stations, for the surroundings card.
+ * The current price at each of the nearest stations, for the stations card.
  *
  * Deliberately not derived from the snapshot payload the chart is drawn from.
  * That one is cut by the date filter and by the station picker, and the card
@@ -5944,7 +5944,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
         'predictions' => [],
         'predictions_as_of' => [],
         'nearby' => [],
-        'nearby_total' => 0,
         'errors' => $errors,
     ];
 
@@ -5979,16 +5978,17 @@ if (isset($_GET['action']) && $_GET['action'] === 'data') {
             ];
         }
 
-        // Surroundings card: the stations around the selected location with
-        // their current price, independent of the date range and the station
-        // picker. Only with a location — without one there is no "around here"
-        // and $stations is every station being fed.
+        // The current price at the nearest stations, read straight from the
+        // newest snapshot per station and so narrowed by neither the date range
+        // nor the picker. Nothing on the page is drawn from it: it is what lets
+        // the detail dialog answer for a station those two filters kept out of
+        // the snapshot rows — one the predictions card named, say. Only with a
+        // location, since without one there is no "around here" and $stations
+        // is every station being fed.
         if ($cityRow !== null) {
-            $out['nearby_total'] = count($stations);
             $out['nearby'] = loadNearbyPrices($pdo, $stations, $distances, NEARBY_STATION_LIMIT);
-            // Its stations are not the chart's: the date range or the picker
-            // can leave them out of the snapshot rows entirely, and without
-            // their metadata the card would list bare station ids.
+            // Those stations are not necessarily the chart's, and without their
+            // metadata the dialog would open on a bare station id.
             foreach ($out['nearby'] as $nearbyRow) {
                 $nearbyId = (string) $nearbyRow['s'];
                 if (isset($metaById[$nearbyId])) {
@@ -6202,6 +6202,23 @@ function renderDocumentHead(string $titleSuffix): void
                 (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
             document.documentElement.setAttribute('data-theme', t);
         })();
+
+        // Per-device UI preferences — the collapsed filter panel, the stations
+        // card's sort order. They are properties of the browser in the reader's
+        // hand rather than of the account, so they ride in cookies instead of
+        // the user_filters row, and both go through this pair so the two can
+        // never disagree about the cookie's scope or lifetime. Declared in the
+        // head because a page script reads its preference while initialising,
+        // which is before the shared script at the foot of the page has run.
+        function readUiCookie(name) {
+            const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+            return match ? decodeURIComponent(match[1]) : '';
+        }
+
+        function writeUiCookie(name, value) {
+            document.cookie = name + '=' + encodeURIComponent(value)
+                + '; path=/; max-age=31536000; samesite=Lax';
+        }
     </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -6831,7 +6848,7 @@ function renderDocumentHead(string $titleSuffix): void
             font-size: 0.7em;
         }
 
-        /* ── Cheapest card ─────────────────────────────────────── */
+        /* ── Price cards ───────────────────────────────────────── */
         .cheapest-card {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -6842,9 +6859,18 @@ function renderDocumentHead(string $titleSuffix): void
         .cheapest-header {
             display: flex;
             align-items: center;
+            /* The sort toggle drops below the title on a narrow card rather
+               than squeezing it: the title is what names the card. */
+            flex-wrap: wrap;
             gap: 0.5rem;
             padding: 0.9rem 1.25rem;
             border-bottom: 1px solid var(--border);
+        }
+
+        /* The sort toggle holds the header's right edge whatever the title
+           and the radius note in front of it come to. */
+        .card-sort {
+            margin-left: auto;
         }
 
         .cheapest-title {
@@ -6931,7 +6957,7 @@ function renderDocumentHead(string $titleSuffix): void
             text-align: center;
         }
 
-        /* Runners-up inside the cheapest-now card */
+        /* Runners-up under a card's leading station */
         .rank-list {
             margin-top: 0.8rem;
             padding-top: 0.7rem;
@@ -6964,9 +6990,9 @@ function renderDocumentHead(string $titleSuffix): void
         }
 
         /* ── "Show more" under a ranked list ───────────────────── */
-        /* Both the top-price card and the surroundings card show a preview of
-           their ranked rows and keep the rest behind this, so it lives with
-           the rows rather than in either card's own section. */
+        /* The stations card shows a preview of its ranked rows and keeps the
+           rest behind this, so it lives with the rows rather than in the
+           card's own section. */
         .card-more {
             background: var(--surface);
             padding: 0.6rem 1.25rem 0.9rem;
@@ -7067,11 +7093,11 @@ function renderDocumentHead(string $titleSuffix): void
             color: var(--muted);
         }
 
-        /* ── Surroundings card ─────────────────────────────────── */
-        /* Built out of the same cells as the cards above it — fuel label, big
-           price, station block, ranked rows — so the page reads as one thing.
-           What it ranks by is distance rather than price, which is what the
-           right-hand distance column is for. */
+        /* ── Stations card: the parts only it needs ─────────────── */
+        /* The card is built out of the same cells as every other one — fuel
+           label, big price, station block, ranked rows — so the page reads as
+           one thing. These two are what it adds: the tag on a station that is
+           shut, and a note under the list for what the cells cannot say. */
         .nearby-closed {
             flex-shrink: 0;
             margin-left: 0.45rem;
@@ -7515,6 +7541,13 @@ function renderDocumentHead(string $titleSuffix): void
             background: rgba(245,166,35,0.1);
         }
 
+        /* Sorting by distance stays visible without a location so the reader
+           can see the choice exists; it just cannot be taken yet. */
+        .range-toggle:disabled {
+            opacity: 0.4;
+            cursor: default;
+        }
+
         .chart-body {
             padding: 1rem 1.25rem;
         }
@@ -7734,19 +7767,17 @@ function renderDocumentHead(string $titleSuffix): void
         /* ── Responsive ────────────────────────────────────────── */
         @media (max-width: 900px) {
             /* Single column: promote the content cards to layout children so
-               the cheapest-now card can sit above the filters (order: -1) while the
+               the stations card can sit above the filters (order: -1) while the
                rest keeps its DOM order below them. */
             /* align-items: stretch overrides the desktop grid's `start`, which
                would let wide cards (the snapshot table) blow out the viewport. */
             .layout { display: flex; flex-direction: column; gap: 1.25rem; align-items: stretch; }
             .content { display: contents; }
             .content > .error-box { order: -2; }
-            #cheapest-card { order: -1; }
-            /* Keep the predictions card directly beneath the cheapest-now card (equal
+            #stations-card { order: -1; }
+            /* Keep the predictions card directly beneath the stations card (equal
                order preserves DOM sequence) and above the filters on mobile. */
             #predictions-card { order: -1; }
-            /* Same for the surroundings card, which follows it in the DOM. */
-            #nearby-card { order: -1; }
             .sidebar { position: static; }
             .sidebar-head { cursor: pointer; }
             .sidebar-chevron { display: inline-flex; }
@@ -8435,16 +8466,16 @@ const translations = {
         invalidToDate: 'Invalid to date.',
         noSnapshots: 'No snapshots match the current filters.',
         cheapestNow: 'Cheapest right now',
-        cheapestNoData: 'No price data available.',
         cheapestPrefix: 'Lowest',
         cheapestRangeNoData: 'No price data available.',
         highestPrefix: 'Highest price',
         highestNoData: 'No price data available.',
         rangeScopeHint: 'in range',
         nearbyTitle: 'Nearby',
-        nearbyNoLocation: 'Pick a location in the filters: a city, an address, or your current position.',
-        nearbyNoData: 'No stations with current prices within this radius.',
-        nearbyCapped: 'The {shown} nearest of {total} stations in range.',
+        sortBy: 'Sort by',
+        sortByPrice: 'Price',
+        sortByDistance: 'Distance',
+        sortNeedsLocation: 'Pick a location in the filters — a city, an address, or your current position — to sort by distance.',
         predictionsTitle: 'Recommended fill-ups',
         predictionsNoData: 'No upcoming predictions in the database for these stations.',
         predictionsAsOf: 'as of {time}',
@@ -8764,16 +8795,16 @@ const translations = {
         invalidToDate: 'Ungültiges Bis-Datum.',
         noSnapshots: 'Keine Einträge für die aktuellen Filter.',
         cheapestNow: 'Jetzt am günstigsten',
-        cheapestNoData: 'Keine Preisdaten vorhanden.',
         cheapestPrefix: 'Tiefstpreis',
         cheapestRangeNoData: 'Keine Preisdaten vorhanden.',
         highestPrefix: 'Höchstpreis',
         highestNoData: 'Keine Preisdaten vorhanden.',
         rangeScopeHint: 'im Zeitraum',
         nearbyTitle: 'Umgebung',
-        nearbyNoLocation: 'Standort links auswählen: Stadt, Adresse oder aktuelle Position.',
-        nearbyNoData: 'Keine Stationen mit aktuellen Preisen in diesem Umkreis.',
-        nearbyCapped: 'Die {shown} nächsten von {total} Stationen im Umkreis.',
+        sortBy: 'Sortieren nach',
+        sortByPrice: 'Preis',
+        sortByDistance: 'Entfernung',
+        sortNeedsLocation: 'Standort in den Filtern wählen — Stadt, Adresse oder aktuelle Position — um nach Entfernung zu sortieren.',
         predictionsTitle: 'Tankempfehlungen',
         predictionsNoData: 'Keine kommenden Vorhersagen für diese Tankstellen in der Datenbank.',
         predictionsAsOf: 'Stand {time}',
@@ -9675,14 +9706,12 @@ renderDocumentHead('Price History');
                 ><?= h((string) $error['message']) ?></div>
             <?php endforeach; ?>
 
-            <!-- Cheapest now -->
-            <div class="cheapest-card" id="cheapest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
+            <!-- The stations in scope, ordered by price or by distance —
+                 the reader's own choice, kept in a cookie -->
+            <div class="cheapest-card" id="stations-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Upcoming predictions (only those a suggest notification would send) -->
             <div class="cheapest-card" id="predictions-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
-
-            <!-- The stations around the selected location, nearest first -->
-            <div class="cheapest-card" id="nearby-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Chart -->
             <div class="chart-card">
@@ -9774,8 +9803,7 @@ renderDocumentHead('Price History');
         if (!mobileLayout.matches) return;
         const collapsed = sidebar.classList.toggle('collapsed');
         toggle.setAttribute('aria-expanded', String(!collapsed));
-        document.cookie = 'gasoline_filters_collapsed=' + (collapsed ? '1' : '0')
-            + '; path=/; max-age=31536000; samesite=Lax';
+        writeUiCookie('gasoline_filters_collapsed', collapsed ? '1' : '0');
     };
     toggle.addEventListener('click', toggleFilters);
     toggle.addEventListener('keydown', (e) => {
@@ -9839,24 +9867,20 @@ let predictionData = [];
 let predictionAsOf = {};
 let predictionStationMeta = {};
 let dataLoaded = false;
-// Surroundings card: the nearest stations with their current price
-// (payload.nearby), the count the radius actually holds, and whether the reader
-// has expanded past the preview.
-let nearbyRows = [];
-let nearbyTotal = 0;
-let nearbyExpanded = false;
-// Current price per station id from that same block, which is what lets the
-// detail dialog answer for a station the date filter left out of the chart.
+// Current price per station id, straight from the newest snapshot per station
+// (payload.nearby). Nothing is drawn from it — the cards all read the filtered
+// snapshot rows — but it is what lets the detail dialog answer for a station
+// the date range or the picker left out of those.
 let nearbyLatestById = new Map();
-// How many ranked stations a card lists before the rest wait behind "show
-// more". One number for both the top-price and the surroundings card: they sit
-// on the same page out of the same rows, so a reader comparing them is
-// comparing lists of the same length.
+// How many ranked stations the card lists before the rest wait behind "show
+// more", and whether the reader has asked for the rest.
 const CARD_PREVIEW_ROWS = 8;
-// Whether the top-price card has been expanded past that preview. Its own flag
-// rather than the surroundings card's: expanding one list is not a statement
-// about the other.
-let cheapestExpanded = false;
+let cardExpanded = false;
+// What ranks the stations card: 'price' or 'distance'. Both orders answer a
+// real question over the same roster, so which one is showing is the reader's
+// call, remembered per device like the collapsed filter panel. Price is the
+// default because it is the only one that also works without a location.
+let cardSort = readUiCookie('gasoline_card_sort') === 'distance' ? 'distance' : 'price';
 // In-memory, non-persistent chart-only filter: null = all stations shown,
 // otherwise a Set of visible station_ids (strings). Reset on fresh data.
 let stationFilter = null;
@@ -9891,8 +9915,9 @@ const hasDataScope = <?= json_encode($selectedLocation !== '' || $selectedStatio
 // ?action=geocode writes to the cities cache, so it is token-checked like a
 // form post even though it is fetched with GET.
 const geocodeCsrf = <?= json_encode(csrfToken(), JSON_THROW_ON_ERROR) ?>;
-// The selected location, as the surroundings card names it in its header. Empty
-// when no city, address or position has been picked.
+// The selected location: what gives the stations card a radius to name in its
+// header and a distance to sort by. Empty when no city, address or position
+// has been picked.
 const locationLabel = <?= json_encode($selectedLocation, JSON_THROW_ON_ERROR) ?>;
 const locationRadiusKm = <?= json_encode($selectedRadiusKm, JSON_THROW_ON_ERROR) ?>;
 
@@ -10515,7 +10540,7 @@ if (!chartEl) {
 const ICON_DOWN = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 16 16 12"/><line x1="12" y1="8" x2="12" y2="16"/></svg>`;
 const ICON_UP   = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 8 16 12"/><line x1="12" y1="16" x2="12" y2="8"/></svg>`;
 
-const cheapestCard      = document.getElementById('cheapest-card');
+const stationsCard      = document.getElementById('stations-card');
 const cheapestRangeCard = document.getElementById('cheapest-range-card');
 const highestCard       = document.getElementById('highest-card');
 const predictionsCard   = document.getElementById('predictions-card');
@@ -10523,7 +10548,7 @@ const predictionsCard   = document.getElementById('predictions-card');
 const FUEL_CSS_COLORS = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
 
 /* ── Clickable station references ──────────────────────────────── */
-// Every station named in the four price cards opens the detail dialog, so the
+// Every station named in the price cards opens the detail dialog, so the
 // name lines and the ranked runner-up rows are rendered as buttons.
 const ICON_STATION_INFO = `<svg class="station-btn-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>`;
 
@@ -10564,7 +10589,7 @@ function stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailin
 // to render. The label is built twice over: as markup for the row, as text for
 // the aria label, which cannot carry the sized-down separator.
 // `trailingHtml` is the callers' own markup after the station name: the
-// surroundings card's closed tag, the predictions card's window hours.
+// stations card's closed tag, the predictions card's window hours.
 function stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {
     const t = translations[currentLang];
     const distText = fmtDistanceKm(distKm);
@@ -10648,64 +10673,147 @@ function latestRows() {
     return [...latestRowById().values()];
 }
 
-// The cheapest stations right now, per fuel: the best price rendered like the
-// other cards, followed by a compact ranked list of the runners-up. It lists
-// the same number of stations as the surroundings card — the two sit on the
-// same page over the same roster, so a reader looking from one to the other is
-// looking at lists of one length — and keeps the rest behind "show more".
-function renderCheapest() {
+/* ── Stations card ─────────────────────────────────────────────── */
+// One card for the two questions a reader arrives with — what is cheapest, and
+// what is close — over one roster, with a toggle in the header naming which of
+// them is currently ranking it. They used to be two cards, which meant reading
+// the same stations twice to answer either.
+//
+// The roster is the filtered snapshot rows the chart is drawn from, reduced to
+// the newest one each station has: every filter in the sidebar — the location
+// and its radius, the date range, the station picker, the fuel — therefore
+// reaches this card exactly as it reaches the chart. Distance comes with the
+// location scope, so without a location there is none to rank by; the toggle
+// greys out rather than vanishing, and a note says what would enable it.
+
+const ICON_PIN = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>`;
+
+// A closed station still lists — its price is the one it will reopen with —
+// but it says so, next to the name in both the big cell and the ranked rows.
+function stationClosedTag(row) {
+    return row.open ? '' : `<span class="nearby-closed">${h(translations[currentLang].openNo)}</span>`;
+}
+
+// Every station the card lists, in the shape the cells want:
+// { id, name, street, place, ts, dist, open, e5, e10, diesel }. One row per
+// station — the newest snapshot it has inside the current filters — and one
+// distance, the one the location scope measured. Built once per render rather
+// than once per fuel, because reducing the snapshot rows means walking all of
+// them.
+function stationCardRoster() {
+    return latestRows().map((row) => ({
+        id: row.station_id,
+        name: row.station_name,
+        street: row.street,
+        place: row.place,
+        ts: row.recorded_at,
+        dist: stationDistancesById[row.station_id] ?? null,
+        open: row.is_open,
+        e5: row.e5,
+        e10: row.e10,
+        diesel: row.diesel,
+    }));
+}
+
+// The header's sort toggle, built out of the same pills the chart's range
+// toggles use so the two read as one control. It is re-created on every render,
+// which is why its clicks are caught by the document-level delegation below
+// rather than by a listener on a node the next render throws away.
+function cardSortToggle(sort, distanceAvailable) {
     const t = translations[currentLang];
-    if (!cheapestCard) return;
+    const pill = (value, label, disabled) =>
+        `<button type="button" class="range-toggle${value === sort ? ' active' : ''}"` +
+        ` data-card-sort="${value}" aria-pressed="${value === sort ? 'true' : 'false'}"` +
+        (disabled ? ` disabled title="${h(t.sortNeedsLocation)}"` : '') +
+        `>${h(label)}</button>`;
+    return `<div class="card-sort range-toggles" role="group" aria-label="${h(t.sortBy)}">` +
+        pill('price', t.sortByPrice, false) +
+        pill('distance', t.sortByDistance, !distanceAvailable) +
+    `</div>`;
+}
+
+function renderStations() {
+    const t = translations[currentLang];
+    if (!stationsCard) return;
     const fuels      = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
     const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
-    const rows = latestRows();
 
+    // Distance can only rank rows that carry one, so without a location the
+    // stored choice is honoured as far as it goes and no further.
+    const located = locationLabel !== '';
+    const sort    = located ? cardSort : 'price';
+
+    const roster = stationCardRoster();
     const results = [];
     for (const fuel of fuels) {
-        const ranked = rows.filter((r) => r[fuel] !== null).sort((a, b) => a[fuel] - b[fuel]);
-        if (ranked.length) results.push({ fuel, ranked });
+        // filter() hands back a fresh array per fuel, so sorting one column is
+        // not sorting the roster out from under the next.
+        const rows = roster.filter((row) => row[fuel] !== null && row[fuel] !== undefined);
+        // A station with no distance sorts last rather than first: an unknown
+        // distance is not a short one.
+        rows.sort(sort === 'price'
+            ? (a, b) => a[fuel] - b[fuel]
+            : (a, b) => (a.dist ?? Infinity) - (b.dist ?? Infinity));
+        if (rows.length) results.push({ fuel, rows });
+    }
+
+    // The radius alone. Where the reader is says itself in the filter, and
+    // spelling their street address across the top of a card they screenshot is
+    // not something to do on their behalf.
+    const scope = located ? `<span class="cheapest-scope">${h(locationRadiusKm + ' km')}</span>` : '';
+    const header = `<div class="cheapest-header">` +
+        (sort === 'distance' ? ICON_PIN : ICON_DOWN) +
+        `<span class="cheapest-title">${h(sort === 'distance' ? t.nearbyTitle : t.cheapestNow)}</span>` +
+        scope +
+        cardSortToggle(sort, located) +
+    `</div>`;
+
+    if (results.length === 0) {
+        stationsCard.innerHTML = header +
+            `<div class="cheapest-empty">${h(t.noSnapshots)}</div>`;
+        return;
     }
 
     const colClass = results.length === 1 ? ' single' : results.length === 2 ? ' two-col' : '';
-    const shown = cheapestExpanded ? Infinity : CARD_PREVIEW_ROWS;
+    const shown = cardExpanded ? Infinity : CARD_PREVIEW_ROWS;
     // The count on the button is what the longest column still holds back: one
     // button expands every column, so a per-column number would be wrong for
     // all but one of them.
-    const longest = Math.max(0, ...results.map(({ ranked }) => ranked.length));
+    const longest = Math.max(...results.map(({ rows }) => rows.length));
     const hidden = Math.max(0, longest - shown);
 
-    cheapestCard.innerHTML =
-        `<div class="cheapest-header">${ICON_DOWN}<span class="cheapest-title">${t.cheapestNow}</span></div>` +
-        (results.length === 0
-            ? `<div class="cheapest-empty">${t.cheapestNoData}</div>`
-            : `<div class="cheapest-grid${colClass}">` +
-                results.map(({ fuel, ranked }) => {
-                    const top = ranked.slice(0, shown);
-                    const best = top[0];
-                    const bestAddress = [best.street, best.place].filter(Boolean).map(h).join(', ');
-                    const runnersUp = top.slice(1).map((row) => stationRankRow(
-                        row.station_id,
-                        row.station_name,
-                        stationDistancesById[row.station_id] ?? null,
-                        fuel,
-                        row[fuel],
-                        '',
-                        formatDateTime(row.recorded_at)
-                    )).join('');
-                    return `<div class="cheapest-cell">` +
-                        `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
-                        `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(best[fuel])} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                        stationBlock(best.station_id, best.station_name, fuel, bestAddress,
-                            stationDistancesById[best.station_id] ?? null) +
-                        `<div class="cheapest-time">${h(formatDateTime(best.recorded_at))}</div>` +
-                        (runnersUp ? `<div class="rank-list">${runnersUp}</div>` : '') +
-                    `</div>`;
-                }).join('') +
-              `</div>` +
-              (hidden > 0
-                ? `<div class="card-more"><button type="button" class="card-more-link" id="cheapest-more">${h(t.showMore)} (${hidden})</button></div>`
-                : '')
-        );
+    // Without a location half the toggle is unavailable, so the card says what
+    // would change that rather than leaving a dead pill unexplained.
+    const foot = located ? '' : `<div class="nearby-foot">${h(t.sortNeedsLocation)}</div>`;
+
+    stationsCard.innerHTML = header +
+        `<div class="cheapest-grid${colClass}">` +
+            results.map(({ fuel, rows }) => {
+                const visible = rows.slice(0, shown);
+                const first = visible[0];
+                const address = [first.street, first.place].filter(Boolean).map(h).join(', ');
+                const rest = visible.slice(1).map((row) => stationRankRow(
+                    row.id,
+                    row.name,
+                    row.dist,
+                    fuel,
+                    row[fuel],
+                    stationClosedTag(row),
+                    formatDateTime(row.ts)
+                )).join('');
+                return `<div class="cheapest-cell">` +
+                    `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
+                    `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(first[fuel])} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
+                    stationBlock(first.id, first.name, fuel, address, first.dist, stationClosedTag(first)) +
+                    `<div class="cheapest-time">${h(formatDateTime(first.ts))}</div>` +
+                    (rest ? `<div class="rank-list">${rest}</div>` : '') +
+                `</div>`;
+            }).join('') +
+        `</div>` +
+        (hidden > 0
+            ? `<div class="card-more"><button type="button" class="card-more-link" id="stations-more">${h(t.showMore)} (${hidden})</button></div>`
+            : '') +
+        foot;
 }
 
 function renderCheapestRange() {
@@ -10734,7 +10842,7 @@ function renderPredictions() {
     const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
 
     const nameById = (id) => (predictionStationMeta[id] && predictionStationMeta[id].name) || id;
-    // Address line for the top station, mirroring the cheapest-now card: street then
+    // Address line for the top station, mirroring the stations card: street then
     // place. No distance anywhere in this card: what it answers is when to
     // fill up, and the hours are what its right edge is for.
     const addressHtmlById = (id) => {
@@ -10820,118 +10928,26 @@ function renderPredictions() {
         );
 }
 
-/* ── Surroundings card ─────────────────────────────────────────── */
-// The stations the selected location and radius admit, nearest first, each with
-// the price it is showing right now. Its rows come from payload.nearby, which
-// the server reads straight from the newest snapshot per station — so unlike
-// the cards above it, this one is not narrowed by the date range or by the
-// station picker. Pick a location in the filters (a city, an address, or the
-// locate button) and this is what is around it.
-const nearbyCard = document.getElementById('nearby-card');
-
-const ICON_PIN = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--amber);flex-shrink:0"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>`;
-
-// A closed station still lists — its price is the one it will reopen with —
-// but it says so, next to the name in both the big cell and the ranked rows.
-function nearbyClosedTag(row) {
-    return row.o ? '' : `<span class="nearby-closed">${h(translations[currentLang].openNo)}</span>`;
-}
-
-function renderNearby() {
-    const t = translations[currentLang];
-    if (!nearbyCard) return;
-    const fuels      = selectedFuel === 'all' ? ['e5', 'e10', 'diesel'] : [selectedFuel];
-    const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
-
-    // The radius alone. Where the reader is says itself in the filter, and
-    // spelling their street address across the top of a card they screenshot
-    // is not something to do on their behalf.
-    const scope = locationLabel === ''
-        ? ''
-        : `<span class="cheapest-scope">${h(locationRadiusKm + ' km')}</span>`;
-    const header = `<div class="cheapest-header">${ICON_PIN}<span class="cheapest-title">${h(t.nearbyTitle)}</span>${scope}</div>`;
-
-    if (locationLabel === '') {
-        nearbyCard.innerHTML = header + `<div class="cheapest-empty">${h(t.nearbyNoLocation)}</div>`;
-        return;
-    }
-
-    // One column per fuel, nearest first, like every other card on the page:
-    // the leading station gets the big price and the rest follow as ranked
-    // rows. What ranks them here is distance, not price — that is the whole
-    // question the card answers — so the order is the payload's own.
-    const results = [];
-    for (const fuel of fuels) {
-        const near = nearbyRows.filter((row) => row[fuel] !== null && row[fuel] !== undefined);
-        if (near.length) results.push({ fuel, near });
-    }
-
-    if (results.length === 0) {
-        nearbyCard.innerHTML = header + `<div class="cheapest-empty">${h(t.nearbyNoData)}</div>`;
-        return;
-    }
-
-    const colClass = results.length === 1 ? ' single' : results.length === 2 ? ' two-col' : '';
-    const shown = nearbyExpanded ? Infinity : CARD_PREVIEW_ROWS;
-    const longest = Math.max(...results.map(({ near }) => near.length));
-    const hidden = Math.max(0, longest - shown);
-
-    const nameById = (id) => (predictionStationMeta[id] || {}).name || id;
-
-    // Says when the radius holds more than the card asked the server for, so a
-    // short list never reads as "that is all there is".
-    const capped = nearbyTotal > nearbyRows.length
-        ? `<div class="nearby-foot">${h(t.nearbyCapped
-            .replace('{shown}', String(nearbyRows.length))
-            .replace('{total}', String(nearbyTotal)))}</div>`
-        : '';
-
-    nearbyCard.innerHTML = header +
-        `<div class="cheapest-grid${colClass}">` +
-            results.map(({ fuel, near }) => {
-                const visible = near.slice(0, shown);
-                const first = visible[0];
-                const meta = predictionStationMeta[first.s] || {};
-                const address = [meta.street, meta.place].filter(Boolean).map(h).join(', ');
-                const rest = visible.slice(1).map((row) => stationRankRow(
-                    row.s,
-                    nameById(row.s),
-                    row.dist,
-                    fuel,
-                    row[fuel],
-                    nearbyClosedTag(row),
-                    formatDateTime(row.t)
-                )).join('');
-                return `<div class="cheapest-cell">` +
-                    `<div class="cheapest-fuel-label" style="color:${fuelColors[fuel]}">${fuelConfig[fuel].label}</div>` +
-                    `<div class="cheapest-price" style="color:${fuelColors[fuel]}">${fmtPriceHtml(first[fuel])} <span style="font-size:1rem;opacity:0.7">€</span></div>` +
-                    stationBlock(first.s, nameById(first.s), fuel, address, first.dist, nearbyClosedTag(first)) +
-                    `<div class="cheapest-time">${h(formatDateTime(first.t))}</div>` +
-                    (rest ? `<div class="rank-list">${rest}</div>` : '') +
-                `</div>`;
-            }).join('') +
-        `</div>` +
-        (hidden > 0
-            ? `<div class="card-more"><button type="button" class="card-more-link" id="nearby-more">${h(t.showMore)} (${hidden})</button></div>`
-            : '') +
-        capped;
-}
-
-// Both "show more" buttons are rendered into their card's markup, so the
-// listener sits on the document rather than on a node a re-render replaces.
+// The stations card's own controls are rendered into its markup, so their
+// listener sits on the document rather than on nodes a re-render replaces.
 document.addEventListener('click', (e) => {
     if (!(e.target instanceof Element)) return;
-    if (e.target.closest('#nearby-more')) {
-        nearbyExpanded = true;
-        renderNearby();
-    } else if (e.target.closest('#cheapest-more')) {
-        cheapestExpanded = true;
-        renderCheapest();
+    const sortBtn = e.target.closest('[data-card-sort]');
+    if (sortBtn) {
+        if (sortBtn.dataset.cardSort === cardSort) return;
+        cardSort = sortBtn.dataset.cardSort;
+        writeUiCookie('gasoline_card_sort', cardSort);
+        // The expansion survives the flip: it is the same roster either way,
+        // and collapsing a list the reader opened would punish the toggle.
+        renderStations();
+    } else if (e.target.closest('#stations-more')) {
+        cardExpanded = true;
+        renderStations();
     }
 });
 
 /* ── Station detail dialog ─────────────────────────────────────── */
-// Clicking/tapping any station in the four price cards opens this dialog: the
+// Clicking/tapping any station in the price cards opens this dialog: the
 // full record for that station (current prices, address, open state, upcoming
 // windows) plus a Google Maps navigation link built here in the UI — the link
 // is derived from the station's coordinates (or address) and never persisted.
@@ -10959,7 +10975,7 @@ function stationDialogHtml(stationId) {
     const t       = translations[currentLang];
     const meta    = predictionStationMeta[stationId] || {};
     const name    = meta.name || stationId;
-    // The chart payload first; the surroundings card's current price is the
+    // The chart payload first; the nearby payload's current price is the
     // fallback for a station the date range or the station picker excluded.
     const latest  = latestRowById().get(stationId) || nearbyLatestById.get(stationId) || null;
     const dist    = stationDistancesById[stationId] ?? null;
@@ -11049,7 +11065,7 @@ function closeStationDialog() {
 }
 
 if (stationDialog) {
-    // Open: any station reference inside one of the four price cards.
+    // Open: any station reference inside one of the price cards.
     document.addEventListener('click', (e) => {
         const trigger = e.target instanceof Element
             ? e.target.closest('.cheapest-card [data-station-id]')
@@ -11421,13 +11437,10 @@ function applyData(payload) {
     predictionData = payload.predictions || [];
     predictionAsOf = payload.predictions_as_of || {};
     predictionStationMeta = meta;
-    nearbyRows = payload.nearby || [];
-    nearbyTotal = payload.nearby_total || nearbyRows.length;
-    nearbyExpanded = false;
-    cheapestExpanded = false;
-    // Same row, re-shaped to what the detail dialog reads, so a station the
-    // date filter kept out of the chart still opens with a current price.
-    nearbyLatestById = new Map(nearbyRows.map((row) => [row.s, {
+    cardExpanded = false;
+    // Re-shaped to what the detail dialog reads, so a station the date range or
+    // the picker kept out of the chart still opens with a current price.
+    nearbyLatestById = new Map((payload.nearby || []).map((row) => [row.s, {
         recorded_at: row.t,
         is_open: !!row.o,
         e5: row.e5 ?? null,
@@ -11444,9 +11457,8 @@ function applyData(payload) {
     setStatDate('stat-first', sum.first_recorded_at || '');
     setStatDate('stat-last',  sum.last_recorded_at  || '');
 
-    renderCheapest();
+    renderStations();
     renderPredictions();
-    renderNearby();
     renderCheapestRange();
     renderHighest();
     if (chartEl) renderChart();
@@ -11519,9 +11531,8 @@ if (retryBtn) retryBtn.addEventListener('click', () => { resetLoadingUI(); loadD
 /* Shared-script hooks: the dashboard re-renders on language/theme change. */
 window.onLangChange = () => {
     if (dataLoaded) {
-        renderCheapest();
+        renderStations();
         renderPredictions();
-        renderNearby();
         renderCheapestRange();
         renderHighest();
         if (chartEl) renderChart();

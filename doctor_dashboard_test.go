@@ -303,6 +303,62 @@ func TestDashboardFindingsNameTheStructuralCosts(t *testing.T) {
 	}
 }
 
+func TestDashboardFindingsNameTheQueryNothingDraws(t *testing.T) {
+	opts := dashboardOptions(doctorDashboardFilters{City: "berlin", RadiusKM: 5, Fuel: "all"})
+	opts.SlowMS = 1000
+	// nearby_latest is a third of the page and the page shows none of it: the
+	// cards read the snapshot rows, and this only prefetches what the station
+	// dialog might want. Below the slow threshold, so nothing else reports it —
+	// which is the point, since an operator would otherwise read it as a cost
+	// the render was waiting on.
+	dash := &doctorDashboard{
+		Filters: opts.Dashboard,
+		Scope:   doctorDashboardScope{Candidates: 60, Stations: 40, Selected: 40, CityFound: true},
+		Queries: []doctorQuery{
+			{Name: "nearby_latest", Table: "price_snapshots", DurationMS: 300, Rows: 40,
+				UsesIndex: "idx_price_snapshots_station_recorded"},
+			{Name: "snapshots", Table: "price_snapshots", DurationMS: 600, Rows: 9000,
+				UsesIndex: "idx_price_snapshots_station_recorded"},
+		},
+	}
+	joined := renderFindings(doctorDashboardFindings(dash, []doctorTable{{Name: "price_snapshots", Rows: 900_000}}, opts))
+	for _, want := range []string{
+		"nearby_latest is 300 ms of the page's 900 ms and nothing on the page draws it",
+		"the cards all read the snapshot rows",
+		"Opening it lazily would take that off every load",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("findings are missing %q:\n%s", want, joined)
+		}
+	}
+
+	// A share without an absolute floor reports every fast page as a problem,
+	// and an absolute floor without a share reports a query that is a rounding
+	// error next to the ones the reader is actually waiting on.
+	tiny := &doctorDashboard{
+		Filters: opts.Dashboard,
+		Scope:   dash.Scope,
+		Queries: []doctorQuery{
+			{Name: "nearby_latest", Table: "price_snapshots", DurationMS: 2, Rows: 40},
+			{Name: "snapshots", Table: "price_snapshots", DurationMS: 3, Rows: 90},
+		},
+	}
+	if got := renderFindings(doctorDashboardFindings(tiny, nil, opts)); strings.Contains(got, "nothing on the page draws it") {
+		t.Errorf("2 ms is nothing to move, whatever share of the page it is:\n%s", got)
+	}
+	small := &doctorDashboard{
+		Filters: opts.Dashboard,
+		Scope:   dash.Scope,
+		Queries: []doctorQuery{
+			{Name: "nearby_latest", Table: "price_snapshots", DurationMS: 20, Rows: 40},
+			{Name: "snapshots", Table: "price_snapshots", DurationMS: 4000, Rows: 900000},
+		},
+	}
+	if got := renderFindings(doctorDashboardFindings(small, nil, opts)); strings.Contains(got, "nothing on the page draws it") {
+		t.Errorf("20 ms beside a four-second query is not what is wrong with the page:\n%s", got)
+	}
+}
+
 func TestDashboardFindingsCallOutSeekLatency(t *testing.T) {
 	opts := dashboardOptions(doctorDashboardFilters{City: "berlin", RadiusKM: 5, Fuel: "all"})
 	// A lookup-bound read where each lookup costs a seek rather than a cache
@@ -627,9 +683,9 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 		}
 	}
 
-	// The surroundings card reads the radius, not the picker: its query has to
-	// cover the station the picker dropped, or doctor is timing a smaller page
-	// than the reader loaded.
+	// The prefetch reads the radius, not the picker: its query has to cover the
+	// station the picker dropped — that is the case it exists for — or doctor is
+	// timing a smaller page than the reader loaded.
 	// Three stations in scope, bound twice, with the cutoff after each list.
 	if got := len(specs["nearby_latest"].args); got != 8 {
 		t.Errorf("doctor's nearby_latest query binds %d values, want the 3 in-scope stations and the cutoff on each half", got)
@@ -639,7 +695,7 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	for _, gone := range []string{"MAX(newest.recorded_at)", "ps.recorded_at = ("} {
 		if strings.Contains(php, gone) {
 			t.Errorf("web/index.php has regrown the correlated newest-snapshot subquery (%q); "+
-				"the surroundings prices come from a grouped lookup bounded to the freshness window", gone)
+				"the nearby prices come from a grouped lookup bounded to the freshness window", gone)
 		}
 		if strings.Contains(specs["nearby_latest"].sql, gone) {
 			t.Errorf("doctor's nearby_latest query has regrown %q", gone)
@@ -647,6 +703,19 @@ func TestDoctorDashboardQueriesMatchViewer(t *testing.T) {
 	}
 	if want := fmt.Sprintf("const NEARBY_STATION_LIMIT = %d;", dashboardNearbyLimit); !strings.Contains(php, want) {
 		t.Errorf("web/index.php no longer mirrors dashboardNearbyLimit: %q missing", want)
+	}
+	// doctor tells the operator that nearby_latest draws nothing, and offers
+	// deferring it on that basis. That is only true while the stations card
+	// builds its roster out of the snapshot rows, so the claim is anchored to
+	// the line that makes it true rather than left to go quietly stale.
+	if !strings.Contains(php, "function stationCardRoster() {\n    return latestRows()") {
+		t.Error("the stations card no longer builds its roster from the snapshot rows; " +
+			"doctor still reports nearby_latest as drawing nothing, and one of the two is now wrong")
+	}
+	for _, drawn := range []string{"nearbyRows", "payload.nearby_total"} {
+		if strings.Contains(php, drawn) {
+			t.Errorf("web/index.php reads %q again, which doctor's \"nothing draws nearby_latest\" finding assumes it does not", drawn)
+		}
 	}
 	// The page's fuel filter expands to three fuels, which is three times the
 	// prediction rows; both prediction queries must carry the expansion.
