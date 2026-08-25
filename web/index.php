@@ -6931,7 +6931,7 @@ function renderDocumentHead(string $titleSuffix): void
             text-align: center;
         }
 
-        /* Runners-up (ranks 2-5) inside the top-5 cheapest card */
+        /* Runners-up inside the cheapest-now card */
         .rank-list {
             margin-top: 0.8rem;
             padding-top: 0.7rem;
@@ -6963,6 +6963,40 @@ function renderDocumentHead(string $titleSuffix): void
             text-overflow: ellipsis;
         }
 
+        /* ── "Show more" under a ranked list ───────────────────── */
+        /* Both the top-price card and the surroundings card show a preview of
+           their ranked rows and keep the rest behind this, so it lives with
+           the rows rather than in either card's own section. */
+        .card-more {
+            background: var(--surface);
+            padding: 0.6rem 1.25rem 0.9rem;
+            text-align: center;
+        }
+
+        /* A quiet link rather than a button: expanding the list is a small
+           aside to the card, not an action worth a border and a box. */
+        .card-more-link {
+            appearance: none;
+            border: none;
+            background: none;
+            padding: 0.15rem 0.3rem;
+            font-family: var(--mono);
+            font-size: 0.7rem;
+            letter-spacing: 0.04em;
+            color: var(--muted);
+            cursor: pointer;
+            border-radius: 5px;
+            transition: color 0.15s ease;
+        }
+
+        .card-more-link:hover { color: var(--amber); }
+
+        .card-more-link:focus-visible {
+            outline: 2px solid var(--amber);
+            outline-offset: 1px;
+            color: var(--amber);
+        }
+
         /* ── Predictions card ──────────────────────────────────── */
         /* Reuses the .cheapest-* / .rank-* structure; these add the per-day
            header, the window time column, and the "as of" run note. */
@@ -6982,6 +7016,9 @@ function renderDocumentHead(string $titleSuffix): void
             border-top: none;
         }
 
+        /* The margin is what keeps the day line off the station name under it:
+           the station block pulls itself up by its own hover padding, so
+           without this the date and the name all but touch. */
         .pred-day {
             display: flex;
             align-items: baseline;
@@ -6990,6 +7027,7 @@ function renderDocumentHead(string $titleSuffix): void
             font-size: 0.68rem;
             color: var(--muted);
             letter-spacing: 0.04em;
+            margin-bottom: 0.45rem;
         }
 
         /* The day gives way when the line runs out of width; the hours do not. */
@@ -7044,36 +7082,6 @@ function renderDocumentHead(string $titleSuffix): void
             text-transform: uppercase;
             letter-spacing: 0.08em;
             color: var(--muted);
-        }
-
-        .nearby-more {
-            background: var(--surface);
-            padding: 0.6rem 1.25rem 0.9rem;
-            text-align: center;
-        }
-
-        /* A quiet link rather than a button: expanding the list is a small
-           aside to the card, not an action worth a border and a box. */
-        .nearby-more-link {
-            appearance: none;
-            border: none;
-            background: none;
-            padding: 0.15rem 0.3rem;
-            font-family: var(--mono);
-            font-size: 0.7rem;
-            letter-spacing: 0.04em;
-            color: var(--muted);
-            cursor: pointer;
-            border-radius: 5px;
-            transition: color 0.15s ease;
-        }
-
-        .nearby-more-link:hover { color: var(--amber); }
-
-        .nearby-more-link:focus-visible {
-            outline: 2px solid var(--amber);
-            outline-offset: 1px;
-            color: var(--amber);
         }
 
         .nearby-foot {
@@ -7726,7 +7734,7 @@ function renderDocumentHead(string $titleSuffix): void
         /* ── Responsive ────────────────────────────────────────── */
         @media (max-width: 900px) {
             /* Single column: promote the content cards to layout children so
-               the top-5 card can sit above the filters (order: -1) while the
+               the cheapest-now card can sit above the filters (order: -1) while the
                rest keeps its DOM order below them. */
             /* align-items: stretch overrides the desktop grid's `start`, which
                would let wide cards (the snapshot table) blow out the viewport. */
@@ -7734,7 +7742,7 @@ function renderDocumentHead(string $titleSuffix): void
             .content { display: contents; }
             .content > .error-box { order: -2; }
             #cheapest-card { order: -1; }
-            /* Keep the predictions card directly beneath the top-5 card (equal
+            /* Keep the predictions card directly beneath the cheapest-now card (equal
                order preserves DOM sequence) and above the filters on mobile. */
             #predictions-card { order: -1; }
             /* Same for the surroundings card, which follows it in the DOM. */
@@ -9667,7 +9675,7 @@ renderDocumentHead('Price History');
                 ><?= h((string) $error['message']) ?></div>
             <?php endforeach; ?>
 
-            <!-- Top 5 cheapest now -->
+            <!-- Cheapest now -->
             <div class="cheapest-card" id="cheapest-card"><div class="cheapest-empty" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only" data-i18n="loading">Loading…</span></div></div>
 
             <!-- Upcoming predictions (only those a suggest notification would send) -->
@@ -9840,7 +9848,15 @@ let nearbyExpanded = false;
 // Current price per station id from that same block, which is what lets the
 // detail dialog answer for a station the date filter left out of the chart.
 let nearbyLatestById = new Map();
-const NEARBY_PREVIEW_ROWS = 8;
+// How many ranked stations a card lists before the rest wait behind "show
+// more". One number for both the top-price and the surroundings card: they sit
+// on the same page out of the same rows, so a reader comparing them is
+// comparing lists of the same length.
+const CARD_PREVIEW_ROWS = 8;
+// Whether the top-price card has been expanded past that preview. Its own flag
+// rather than the surroundings card's: expanding one list is not a statement
+// about the other.
+let cheapestExpanded = false;
 // In-memory, non-persistent chart-only filter: null = all stations shown,
 // otherwise a Set of visible station_ids (strings). Reset on fresh data.
 let stationFilter = null;
@@ -10632,8 +10648,11 @@ function latestRows() {
     return [...latestRowById().values()];
 }
 
-// Top 5 cheapest stations right now, per fuel: the best price rendered like
-// the other cards, followed by a compact ranked list of the runners-up.
+// The cheapest stations right now, per fuel: the best price rendered like the
+// other cards, followed by a compact ranked list of the runners-up. It lists
+// the same number of stations as the surroundings card — the two sit on the
+// same page over the same roster, so a reader looking from one to the other is
+// looking at lists of one length — and keeps the rest behind "show more".
 function renderCheapest() {
     const t = translations[currentLang];
     if (!cheapestCard) return;
@@ -10643,20 +10662,25 @@ function renderCheapest() {
 
     const results = [];
     for (const fuel of fuels) {
-        const top = rows.filter((r) => r[fuel] !== null)
-            .sort((a, b) => a[fuel] - b[fuel])
-            .slice(0, 6);
-        if (top.length) results.push({ fuel, top });
+        const ranked = rows.filter((r) => r[fuel] !== null).sort((a, b) => a[fuel] - b[fuel]);
+        if (ranked.length) results.push({ fuel, ranked });
     }
 
     const colClass = results.length === 1 ? ' single' : results.length === 2 ? ' two-col' : '';
+    const shown = cheapestExpanded ? Infinity : CARD_PREVIEW_ROWS;
+    // The count on the button is what the longest column still holds back: one
+    // button expands every column, so a per-column number would be wrong for
+    // all but one of them.
+    const longest = Math.max(0, ...results.map(({ ranked }) => ranked.length));
+    const hidden = Math.max(0, longest - shown);
 
     cheapestCard.innerHTML =
         `<div class="cheapest-header">${ICON_DOWN}<span class="cheapest-title">${t.cheapestNow}</span></div>` +
         (results.length === 0
             ? `<div class="cheapest-empty">${t.cheapestNoData}</div>`
             : `<div class="cheapest-grid${colClass}">` +
-                results.map(({ fuel, top }) => {
+                results.map(({ fuel, ranked }) => {
+                    const top = ranked.slice(0, shown);
                     const best = top[0];
                     const bestAddress = [best.street, best.place].filter(Boolean).map(h).join(', ');
                     const runnersUp = top.slice(1).map((row) => stationRankRow(
@@ -10677,7 +10701,10 @@ function renderCheapest() {
                         (runnersUp ? `<div class="rank-list">${runnersUp}</div>` : '') +
                     `</div>`;
                 }).join('') +
-              `</div>`
+              `</div>` +
+              (hidden > 0
+                ? `<div class="card-more"><button type="button" class="card-more-link" id="cheapest-more">${h(t.showMore)} (${hidden})</button></div>`
+                : '')
         );
 }
 
@@ -10707,7 +10734,7 @@ function renderPredictions() {
     const fuelColors = { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' };
 
     const nameById = (id) => (predictionStationMeta[id] && predictionStationMeta[id].name) || id;
-    // Address line for the top station, mirroring the top-5 card: street then
+    // Address line for the top station, mirroring the cheapest-now card: street then
     // place. No distance anywhere in this card: what it answers is when to
     // fill up, and the hours are what its right edge is for.
     const addressHtmlById = (id) => {
@@ -10845,7 +10872,7 @@ function renderNearby() {
     }
 
     const colClass = results.length === 1 ? ' single' : results.length === 2 ? ' two-col' : '';
-    const shown = nearbyExpanded ? Infinity : NEARBY_PREVIEW_ROWS;
+    const shown = nearbyExpanded ? Infinity : CARD_PREVIEW_ROWS;
     const longest = Math.max(...results.map(({ near }) => near.length));
     const hidden = Math.max(0, longest - shown);
 
@@ -10885,15 +10912,21 @@ function renderNearby() {
             }).join('') +
         `</div>` +
         (hidden > 0
-            ? `<div class="nearby-more"><button type="button" class="nearby-more-link" id="nearby-more">${h(t.showMore)} (${hidden})</button></div>`
+            ? `<div class="card-more"><button type="button" class="card-more-link" id="nearby-more">${h(t.showMore)} (${hidden})</button></div>`
             : '') +
         capped;
 }
 
+// Both "show more" buttons are rendered into their card's markup, so the
+// listener sits on the document rather than on a node a re-render replaces.
 document.addEventListener('click', (e) => {
-    if (e.target instanceof Element && e.target.closest('#nearby-more')) {
+    if (!(e.target instanceof Element)) return;
+    if (e.target.closest('#nearby-more')) {
         nearbyExpanded = true;
         renderNearby();
+    } else if (e.target.closest('#cheapest-more')) {
+        cheapestExpanded = true;
+        renderCheapest();
     }
 });
 
@@ -11391,6 +11424,7 @@ function applyData(payload) {
     nearbyRows = payload.nearby || [];
     nearbyTotal = payload.nearby_total || nearbyRows.length;
     nearbyExpanded = false;
+    cheapestExpanded = false;
     // Same row, re-shaped to what the detail dialog reads, so a station the
     // date filter kept out of the chart still opens with a current price.
     nearbyLatestById = new Map(nearbyRows.map((row) => [row.s, {

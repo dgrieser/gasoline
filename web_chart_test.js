@@ -596,7 +596,7 @@ const ROW_DEPS = [
     'ICON_PIN', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
     'fmtPriceHtml', 'fmtPriceText', 'formatDateTime',
     'nearbyCard', 'selectedFuel', 'locationLabel', 'locationRadiusKm',
-    'nearbyRows', 'nearbyTotal', 'nearbyExpanded', 'NEARBY_PREVIEW_ROWS',
+    'nearbyRows', 'nearbyTotal', 'nearbyExpanded', 'CARD_PREVIEW_ROWS',
     'predictionStationMeta',
 ];
 
@@ -678,6 +678,103 @@ function rowText(html) {
         stationBlock('s1', long, 'diesel', '', 2.0).includes('row-dist'), true);
     check('one with neither gets no meta line',
         stationBlock('s1', long, 'diesel', '', null).includes('sd-meta-line'), false);
+}
+
+/* ── The top-price card ─────────────────────────────────────────── */
+// It lists the cheapest stations right now, and it lists as many of them as the
+// surroundings card below it does — one preview length for the page, with the
+// rest behind a "show more" that names how many are waiting. What is tested is
+// that length, the button's count, and that expanding really drops the cap.
+
+/** One chart row: a station and a price per fuel at a fixed instant. */
+function chartRow(id, name, prices = {}) {
+    return {
+        station_id: id,
+        station_name: name,
+        street: 'Hauptstraße 1',
+        place: 'Berlin',
+        recorded_at: '2026-08-01T09:00:00Z',
+        _ts: T0,
+        e5: prices.e5 ?? null,
+        e10: prices.e10 ?? null,
+        diesel: prices.diesel ?? null,
+    };
+}
+
+const CHEAPEST_DEPS = [
+    'translations', 'currentLang', 'fuelConfig', 'FUEL_CSS_COLORS', 'ICON_STATION_INFO',
+    'ICON_DOWN', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
+    'fmtPriceHtml', 'fmtPriceText', 'formatDateTime',
+    'cheapestCard', 'selectedFuel', 'chartData', 'stationDistancesById',
+    'cheapestExpanded', 'CARD_PREVIEW_ROWS',
+];
+
+const cheapestSource = [
+    lift('\nfunction stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {'),
+    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {'),
+    lift('\nfunction latestRowById() {'),
+    lift('\nfunction latestRows() {'),
+    lift('\nfunction renderCheapest() {'),
+].join('\n');
+
+/** Render the card and hand back its markup plus the stations it listed. */
+function renderCheapestCard(rows, { lang = 'en', fuel = 'all', expanded = false } = {}) {
+    const card = makeElement('div');
+    const locale = makeLocale(lang);
+    const distance = makeDistance(lang);
+    new Function(...CHEAPEST_DEPS, `${cheapestSource}\nreturn renderCheapest;`)(
+        translations, lang, fuelConfig,
+        { e5: 'var(--e5)', e10: 'var(--e10)', diesel: 'var(--diesel)' }, '<info/>',
+        '<down/>', (name) => `<dot ${name}>`, h, distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
+        locale.fmtPriceHtml, locale.fmtPriceText, (iso) => iso,
+        card, fuel, rows, {}, expanded, 8,
+    )();
+    const html = card.innerHTML;
+    return {
+        html,
+        listed: [...html.matchAll(/data-station-id="([^"]+)"/g)].map((m) => m[1]),
+        text: rowText(html),
+    };
+}
+
+{
+    // Eleven stations priced, so three more than the preview holds — the same
+    // arithmetic the surroundings card is checked with, since the two now show
+    // the same number of rows.
+    const rows = Array.from({ length: 11 }, (_, i) => chartRow(`s${i}`, `Station ${i}`, { diesel: 1.6 + i / 1000 }));
+    const collapsed = renderCheapestCard(rows, { fuel: 'diesel' });
+    check('the preview stops at eight stations, like the card below it', collapsed.listed.length, 8);
+    check('cheapest first', collapsed.listed.slice(0, 3), ['s0', 's1', 's2']);
+    check('the leading one gets the big price',
+        collapsed.html.includes('1<span class="price-sep">.</span>60<span class="price-milli">0</span>'), true);
+    check('and the remainder waits behind a button that counts it',
+        collapsed.text.includes('Show more (3)'), true);
+
+    const expanded = renderCheapestCard(rows, { fuel: 'diesel', expanded: true });
+    check('expanded lists every station', expanded.listed.length, 11);
+    check('and drops the button', expanded.html.includes('card-more'), false);
+}
+
+{
+    // Fewer stations than the preview: nothing is held back, so there is
+    // nothing to offer.
+    const rows = Array.from({ length: 4 }, (_, i) => chartRow(`s${i}`, `Station ${i}`, { diesel: 1.6 + i / 1000 }));
+    const out = renderCheapestCard(rows, { fuel: 'diesel' });
+    check('a short list shows all of itself', out.listed.length, 4);
+    check('with no button on it', out.html.includes('card-more'), false);
+}
+
+{
+    // One button expands all three columns, so its count is what the longest
+    // of them still holds back — not a per-column number that would be wrong
+    // for the other two.
+    const rows = [
+        ...Array.from({ length: 10 }, (_, i) => chartRow(`d${i}`, `Diesel ${i}`, { diesel: 1.6 + i / 1000 })),
+        ...Array.from({ length: 9 }, (_, i) => chartRow(`e${i}`, `E5 ${i}`, { e5: 1.7 + i / 1000 })),
+    ];
+    const out = renderCheapestCard(rows, { fuel: 'all' });
+    check('two fuels priced render two cells', (out.html.match(/cheapest-cell/g) || []).length, 2);
+    check('the count comes from the longest column', out.text.includes('Show more (2)'), true);
 }
 
 /* ── The surroundings card ──────────────────────────────────────── */
@@ -780,7 +877,7 @@ const nearbyMeta = {
 
     const expanded = renderNearbyCard(rows, { fuel: 'diesel', expanded: true });
     check('expanded shows every station', expanded.listed.length, 11);
-    check('and drops the button', expanded.html.includes('nearby-more'), false);
+    check('and drops the button', expanded.html.includes('card-more'), false);
 }
 
 {
