@@ -602,7 +602,7 @@ const ROW_DEPS = [
 
 const rowSource = [
     lift('\nfunction stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {'),
-    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {'),
+    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText, endHtml) {'),
     lift('\nfunction nearbyClosedTag(row) {'),
     lift('\nfunction renderNearby() {'),
 ].join('\n');
@@ -835,7 +835,7 @@ const PRED_DEPS = [
 
 const predictionSource = [
     lift('\nfunction stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {'),
-    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {'),
+    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText, endHtml) {'),
     lift('\nfunction renderPredictions() {'),
 ].join('\n');
 
@@ -855,7 +855,7 @@ function predWindow(id, fuel, start, end, price) {
 }
 
 /** Render the card and hand back its markup. */
-function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, asOf = {} } = {}) {
+function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, asOf = {}, distances = {} } = {}) {
     const card = makeElement('div');
     const locale = makeLocale(lang);
     const distance = makeDistance(lang);
@@ -866,7 +866,7 @@ function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, 
         '<clock/>', (name) => `<dot ${name}>`, h, distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
         locale.fmtPriceHtml, locale.fmtPriceText, clock._loc, clock._tz,
         clock.formatDateTime, clock.formatTimeOnly,
-        card, fuel, windows, asOf, meta, {},
+        card, fuel, windows, asOf, meta, distances,
     )();
     return card.innerHTML;
 }
@@ -883,9 +883,36 @@ function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, 
         html.includes('<span class="pred-accent">Tuesday</span>'), true);
     check('and the date beside it does not', /pred-accent">Tuesday<\/span>, 25\/08\/26/.test(html), true);
     check('the leading window’s hours are accented too',
-        html.includes('<div class="cheapest-time pred-window">12:00–13:00</div>'), true);
+        html.includes('<span class="pred-window">12:00–13:00</span>'), true);
     check('as are the hours on the ranked windows',
         html.includes('<span class="pred-time">15:00–16:00</span>'), true);
+
+    // The day names its block from under the price, and every window's hours
+    // hold the right edge of the line they sit on.
+    check('the price leads the day block',
+        html.indexOf('cheapest-price') < html.indexOf('pred-day-label'), true);
+    check('the day is named on the line the hours are on',
+        html.indexOf('pred-day-label') < html.indexOf('pred-window'), true);
+    check('and the hours after it, on the same line',
+        /<div class="pred-day">.*?<span class="pred-window">12:00–13:00<\/span><\/div>/.test(html), true);
+    check('each day is one block, dividers and all',
+        (html.match(/class="pred-day-block"/g) || []).length, 1);
+}
+
+{
+    // With a location picked, the ranked rows carry a distance too. The hours
+    // still hold the right edge: they are what the card is read for, so they
+    // are the last thing on the row rather than the distance.
+    const html = renderPredictionsCard([
+        predWindow('a', 'diesel', '2026-08-25T12:00:00Z', '2026-08-25T13:00:00Z', 1.659),
+        predWindow('b', 'diesel', '2026-08-25T15:00:00Z', '2026-08-25T16:00:00Z', 1.669),
+    ], { fuel: 'diesel', meta: nearbyMeta, distances: { a: 0.4, b: 4.3 } });
+
+    check('a ranked window still shows how far away it is',
+        html.includes('<span class="row-dist">4<span class="price-sep">.</span>3 km</span>'), true);
+    check('with the hours past it, at the right edge',
+        /row-dist">4<span class="price-sep">\.<\/span>3 km<\/span><span class="pred-time">15:00–16:00<\/span>/
+            .test(html), true);
 }
 
 {
@@ -897,7 +924,7 @@ function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, 
     check('the German card accents the German day name',
         /pred-accent">Dienstag<\/span>, 25\.08\.26/.test(html), true);
     check('and the German hours with it',
-        html.includes('<div class="cheapest-time pred-window">14:00–15:00</div>'), true);
+        html.includes('<span class="pred-window">14:00–15:00</span>'), true);
 }
 
 
