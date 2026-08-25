@@ -602,7 +602,7 @@ const ROW_DEPS = [
 
 const rowSource = [
     lift('\nfunction stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {'),
-    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText, endHtml) {'),
+    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {'),
     lift('\nfunction nearbyClosedTag(row) {'),
     lift('\nfunction renderNearby() {'),
 ].join('\n');
@@ -830,12 +830,12 @@ const PRED_DEPS = [
     'ICON_CLOCK', 'stationDot', 'h', 'fmtDistanceKm', 'fmtDistanceKmHtml',
     'fmtPriceHtml', 'fmtPriceText', '_loc', '_tz', 'formatDateTime', 'formatTimeOnly',
     'predictionsCard', 'selectedFuel', 'predictionData', 'predictionAsOf',
-    'predictionStationMeta', 'stationDistancesById',
+    'predictionStationMeta',
 ];
 
 const predictionSource = [
     lift('\nfunction stationBlock(stationId, stationName, fuel, addressHtml, distKm, trailingHtml) {'),
-    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText, endHtml) {'),
+    lift('\nfunction stationRankRow(stationId, stationName, distKm, fuel, price, trailingHtml, titleText) {'),
     lift('\nfunction renderPredictions() {'),
 ].join('\n');
 
@@ -855,7 +855,7 @@ function predWindow(id, fuel, start, end, price) {
 }
 
 /** Render the card and hand back its markup. */
-function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, asOf = {}, distances = {} } = {}) {
+function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, asOf = {} } = {}) {
     const card = makeElement('div');
     const locale = makeLocale(lang);
     const distance = makeDistance(lang);
@@ -866,7 +866,7 @@ function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, 
         '<clock/>', (name) => `<dot ${name}>`, h, distance.fmtDistanceKm, distance.fmtDistanceKmHtml,
         locale.fmtPriceHtml, locale.fmtPriceText, clock._loc, clock._tz,
         clock.formatDateTime, clock.formatTimeOnly,
-        card, fuel, windows, asOf, meta, distances,
+        card, fuel, windows, asOf, meta,
     )();
     return card.innerHTML;
 }
@@ -900,19 +900,20 @@ function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, 
 }
 
 {
-    // With a location picked, the ranked rows carry a distance too. The hours
-    // still hold the right edge: they are what the card is read for, so they
-    // are the last thing on the row rather than the distance.
+    // The card answers when to fill up, not how far away it is, and on a phone
+    // its cell is one column wide: a distance in it costs the hours their room
+    // for nothing. So it carries none, even with a location picked — the other
+    // three cards are where distances belong.
     const html = renderPredictionsCard([
         predWindow('a', 'diesel', '2026-08-25T12:00:00Z', '2026-08-25T13:00:00Z', 1.659),
         predWindow('b', 'diesel', '2026-08-25T15:00:00Z', '2026-08-25T16:00:00Z', 1.669),
-    ], { fuel: 'diesel', meta: nearbyMeta, distances: { a: 0.4, b: 4.3 } });
+    ], { fuel: 'diesel', meta: nearbyMeta });
 
-    check('a ranked window still shows how far away it is',
-        html.includes('<span class="row-dist">4<span class="price-sep">.</span>3 km</span>'), true);
-    check('with the hours past it, at the right edge',
-        /row-dist">4<span class="price-sep">\.<\/span>3 km<\/span><span class="pred-time">15:00–16:00<\/span>/
-            .test(html), true);
+    check('no distance anywhere in the card', html.includes('row-dist'), false);
+    check('the address still has the line to itself',
+        html.includes('<span class="cheapest-station sd-addr-line">Hauptstraße 1, Berlin</span>'), true);
+    check('and the hours are the row’s right edge',
+        /<span class="pred-time">15:00–16:00<\/span><\/button>/.test(html), true);
 }
 
 {
