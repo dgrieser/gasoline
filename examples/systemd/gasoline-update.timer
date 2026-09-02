@@ -3,8 +3,12 @@ Description=Run gasoline update every 5 minutes
 
 [Timer]
 # First run 1 min after boot, then every 5 minutes after the last run finishes.
+# OnUnitInactiveSec, not OnUnitActiveSec: the latter counts from when the run
+# *started*, so a sweep that takes longer than the interval would re-fire the
+# moment it ends. A wide --radius is collected as several paced requests and can
+# take a minute or more, which is exactly when that difference bites.
 OnBootSec=1min
-OnUnitActiveSec=5min
+OnUnitInactiveSec=5min
 # Catch up on a missed run if the machine was asleep/off at the scheduled time.
 Persistent=true
 AccuracySec=30s

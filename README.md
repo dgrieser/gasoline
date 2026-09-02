@@ -131,12 +131,41 @@ Useful `update` flags:
 
 - `--fuel all|diesel|e5|e10`
 - `--sort dist|price`
+- `--radius` in km, up to 50 (see [Radii wider than the API serves](#radii-wider-than-the-api-serves))
+- `--request-delay` and `--request-burst` pace the requests a wide radius needs
 - `--user-agent "your-app/1.0"`
 - `--output json` or `-o json`
 
 `--city` is repeatable, and cities with overlapping radii are handled as one sweep: every target is fetched first, then a station reported by more than one of them is stored **once**, owned by the target whose centre is nearest. The prices stored are the freshest ones seen in that sweep, even if a farther target observed them — targets are fetched one after another, so a price can change mid-sweep. Per-city output reports both `fetched_count` (what the API returned) and `stored_count` (what that city wrote); the text output notes when a target lost stations to a nearer one. This keeps a shared station from defeating snapshot compaction — without it, overlapping targets add a row per city on every run even when prices never change.
 
 Ownership is compared against the city that already owns a station, not only against the targets in the current run, so a station stays with its nearest city when you update a single city, when a nearer target's fetch fails, or when cities are updated in separate invocations. It moves only when a strictly nearer city fetches it, or when the owning city is no longer cached.
+
+#### Radii wider than the API serves
+
+Tankerkönig's station list serves a radius of at most **25 km**. `--radius` accepts up to **50**, and anything above 25 is covered internally by several overlapping 25 km queries — a query on the city centre plus one ring around it, sized so the ring's tiles overlap each other and still reach back to the centre tile. There are no gaps, and every tile is placed with about 750 m to spare so a station sitting on a seam is returned by at least one query rather than by none.
+
+What that costs, since it is a request budget and not just a wait:
+
+| `--radius` | API requests | added time per sweep |
+| --- | --- | --- |
+| up to 25 | 1 | none |
+| up to 28 | 4 | none |
+| up to 34 | 5 | 30 s |
+| up to 41 | 6 | 30 s |
+| up to 48 | 7 | 60 s |
+| up to 50 | 8 | 60 s |
+
+The requests are paced at `--request-burst` (default 3) per `--request-delay` (default 30s), so they go out in bursts of three a window apart. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
+
+Three things make a wide radius behave like a single narrow one:
+
+- **One snapshot per station.** The tiles overlap, so most stations are reported several times; they are de-duplicated by station id, and the query nearest the city centre is the one that wins.
+- **One timestamp per city.** The requests are deliberately spread over minutes, so stamping each station with the query that happened to see it would spread one city's readings across that window and read like a price history. Every station of a tiled city therefore carries the instant its first request went out.
+- **The radius you asked for.** The overlapping tiles bulge slightly past it; stations in the bulge are dropped, so `search_radius_km` stays honest and station ownership does not drift between sweeps.
+
+If a query other than the centre one fails, it is retried once and then given up on: the city is still stored with everything the other queries saw, `tiles_failed` reports the loss, and the run is recorded as `partial`. The stations only that query could see go unrefreshed until the next sweep, which is well inside the 48-hour window the model already tolerates. A failing **centre** query fails the city, because that failure is almost always systemic — a rejected key, no network — and a city assembled purely out of its own edges is worse than no update.
+
+A 50 km target covers four times the area of a 25 km one. `suggest`, `check` and `notify` cover every station still being fed, and `suggest --persist` stores the full forecast grid per station per fuel, so that multiplies `price_predictions` growth and `suggest` runtime too — see [Diagnosing a slow database](#diagnosing-a-slow-database-gasoline-doctor).
 
 Compact existing snapshots in place:
 
@@ -242,11 +271,11 @@ The normal suggestion output is unchanged; a one-line summary (`persist: stored 
 
 ### Server-stored configuration (admin settings)
 
-Administrators configure two things in the web UI (hamburger menu → Settings): the **update targets** (city + radius pairs) that decide which stations are collected, and the **notification texts**. A target's radius is editable in place — each row has its own radius field and save button, and the change takes effect on the next `gasoline update`. The city is the target's identity and is not editable: changing it means removing the target and adding the new city.
+Administrators configure two things in the web UI (hamburger menu → Settings): the **update targets** (city + radius pairs) that decide which stations are collected, and the **notification texts**. A target's radius is editable in place — each row has its own radius field and save button, up to 50 km, and the change takes effect on the next `gasoline update`. The city is the target's identity and is not editable: changing it means removing the target and adding the new city.
 
 That is deliberately all of it. The station scope, the fuels, the model parameters and the delivery limits used to be settings and are now fixed, because none of them had a per-install answer:
 
-- `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius, as a single de-duplicated sweep: targets whose radii overlap share stations, and each shared station is stored once under its nearest target. Passing explicit flags ignores the targets entirely. `radius_km` is the only radius in the system.
+- `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius, as a single de-duplicated sweep: targets whose radii overlap share stations, and each shared station is stored once under its nearest target. Passing explicit flags ignores the targets entirely. `radius_km` is the only radius in the system, and may be up to 50 km — a target over 25 km costs several paced API requests per sweep, see [Radii wider than the API serves](#radii-wider-than-the-api-serves).
 - `gasoline suggest`, `gasoline check` and `notify` take no scope or fuel arguments. They cover every station still being fed and compute all three fuels, so nothing that gets delivered goes unmeasured. Each user picks the one fuel they are notified about (see below).
 - The fixed parameters are 30 days of history, a 3-day forecast horizon, 3 suggestions per day, 5 check rows, a flat 2 ct price margin, a 48-hour station freshness window, and a baseline reset at local midnight. The per-user notification schedule defaults (every day, 07:00–21:00, suggestions at 08:00 and 13:00) apply only until a user sets their own.
 
@@ -382,7 +411,9 @@ systemctl --user enable --now gasoline-update.timer
 
 The service runs `gasoline update --radius 25 --city 'Luebbecke'`; edit the `ExecStart` line to change city/radius. Check status and the next scheduled run with `systemctl --user list-timers gasoline-update.timer` and see past runs with `journalctl --user -u gasoline-update.service`. For a system-wide timer under `/etc/systemd/system/` use `systemctl` without `--user`.
 
-Prefer cron? `examples/cron/gasoline-update.cron` holds a ready-to-use line — add it with `crontab -e`. Unlike systemd, cron starts with an empty environment, so the line sources the env file first (`set -a` exports every variable it defines).
+The timer uses `OnUnitInactiveSec`, which counts the interval from when a run *finishes*. `OnUnitActiveSec` counts from when it started, so any sweep longer than the interval re-fires the instant it ends — a busy loop rather than a schedule. That matters once a target's radius is wide enough to be collected as several paced requests (see [Radii wider than the API serves](#radii-wider-than-the-api-serves)).
+
+Prefer cron? `examples/cron/gasoline-update.cron` holds a ready-to-use line — add it with `crontab -e`. Unlike systemd, cron starts with an empty environment, so the line sources the env file first (`set -a` exports every variable it defines). It also wraps the command in `flock -n`: cron fires on its schedule whether the previous run finished or not, and two sweeps at once would race each other for the API rate limit and for the database write lock.
 
 Use `--limit 0` with `list stations` or `list history` to return all matching rows.
 

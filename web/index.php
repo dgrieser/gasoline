@@ -256,8 +256,8 @@ function flashText(string $key): string
         'targetAdded' => 'Update target added.',
         'targetUpdated' => 'Update target radius saved.',
         'targetRemoved' => 'Update target removed.',
-        'invalidTarget' => 'Invalid city or radius (1-25 km).',
-        'invalidTargetRadius' => 'Invalid radius (1-25 km).',
+        'invalidTarget' => 'Invalid city or radius (1-50 km).',
+        'invalidTargetRadius' => 'Invalid radius (1-50 km).',
         'targetExists' => 'This city is already an update target.',
         'stationRenamed' => 'Station renamed.',
         'renameCleared' => 'Rename removed. The original name is used again.',
@@ -1097,13 +1097,22 @@ function formatRadiusKm(float $radiusKm): string
 }
 
 /**
- * Largest notification radius a user may pick, in km. Generous compared with an
- * update target's collection radius, because a user can sit between two targets
- * and legitimately care about stations from both — and it matches the ceiling the
- * old admin-wide range_km allowed, so any radius the migration carried over from
- * it can still be saved from this form.
+ * Largest notification radius a user may pick, in km. Still generous compared
+ * with an update target's collection radius, because a user can sit between two
+ * targets and legitimately care about stations from both — and it matches the
+ * ceiling the old admin-wide range_km allowed, so any radius the migration
+ * carried over from it can still be saved from this form.
  */
 const GASOLINE_MAX_NOTIFY_RADIUS_KM = 100;
+
+/**
+ * Largest radius an update target may collect, in km, mirroring Go's
+ * maxRequestRadiusKM (tiling.go). Tankerkönig itself serves at most 25 km, so
+ * `gasoline update` covers anything wider with several overlapping 25 km
+ * queries paced to stay under the rate limit — which costs a target over 25 km
+ * a handful of requests and about a minute per sweep instead of one request.
+ */
+const GASOLINE_MAX_TARGET_RADIUS_KM = 50;
 
 /** The suggest/check fuel types, in canonical display order. */
 const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
@@ -1801,7 +1810,7 @@ function handlePost(PDO $pdo, string $driver): void
         case 'add_target':
             $city = trim((string) ($_POST['city'] ?? ''));
             $radius = (string) ($_POST['radius_km'] ?? '');
-            if ($city === '' || !ctype_digit($radius) || (int) $radius < 1 || (int) $radius > 25) {
+            if ($city === '' || !ctype_digit($radius) || (int) $radius < 1 || (int) $radius > GASOLINE_MAX_TARGET_RADIUS_KM) {
                 setFlash('error', 'invalidTarget');
                 redirectTo('?page=admin_settings');
             }
@@ -1824,7 +1833,7 @@ function handlePost(PDO $pdo, string $driver): void
             // so changing it would be an add plus a remove, not an edit.
             $targetId = (int) ($_POST['target_id'] ?? 0);
             $radius = (string) ($_POST['radius_km'] ?? '');
-            if (!ctype_digit($radius) || (int) $radius < 1 || (int) $radius > 25) {
+            if (!ctype_digit($radius) || (int) $radius < 1 || (int) $radius > GASOLINE_MAX_TARGET_RADIUS_KM) {
                 setFlash('error', 'invalidTargetRadius');
                 redirectTo('?page=admin_settings');
             }
@@ -3954,7 +3963,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
 
         <div class="settings-card">
             <h2 data-i18n="updateTargets">Automatic updates</h2>
-            <p class="auth-note" data-i18n="updateTargetsHint">These cities are collected automatically by `gasoline update` when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately.</p>
+            <p class="auth-note" data-i18n="updateTargetsHint">These cities are collected automatically by `gasoline update` when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately. A radius over 25 km is more than the price API serves in one request, so it is collected as several overlapping queries: expect a handful of requests and about a minute per sweep for that target.</p>
             <div class="table-scroll">
             <table class="stack-table">
                 <thead>
@@ -3964,7 +3973,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                     <?php foreach ($targets as $target) { ?>
                     <tr>
                         <td class="stack-primary"><?= h($target['city']) ?></td>
-                        <td class="radius-cell" data-label="Radius (km)" data-i18n-label="targetRadius"><form method="post" action="" class="radius-form"><?= csrfField() ?><input type="hidden" name="action" value="update_target"><input type="hidden" name="target_id" value="<?= (int) $target['id'] ?>"><input type="number" name="radius_km" min="1" max="25" step="1" value="<?= h((string) (int) round((float) $target['radius_km'])) ?>" required aria-label="Radius (km)" data-i18n-aria-label="targetRadius"><button type="submit" class="btn-icon" aria-label="Save" title="Save" data-i18n-aria-label="save" data-i18n-title="save"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></button></form></td>
+                        <td class="radius-cell" data-label="Radius (km)" data-i18n-label="targetRadius"><form method="post" action="" class="radius-form"><?= csrfField() ?><input type="hidden" name="action" value="update_target"><input type="hidden" name="target_id" value="<?= (int) $target['id'] ?>"><input type="number" name="radius_km" min="1" max="<?= GASOLINE_MAX_TARGET_RADIUS_KM ?>" step="1" value="<?= h((string) (int) round((float) $target['radius_km'])) ?>" required aria-label="Radius (km)" data-i18n-aria-label="targetRadius"><button type="submit" class="btn-icon" aria-label="Save" title="Save" data-i18n-aria-label="save" data-i18n-title="save"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></button></form></td>
                         <td class="actions-cell"><form method="post" action="" class="table-form"><?= csrfField() ?><input type="hidden" name="action" value="delete_target"><input type="hidden" name="target_id" value="<?= (int) $target['id'] ?>"><button type="submit" class="btn-small danger" data-i18n="removeTarget">Remove</button></form></td>
                     </tr>
                     <?php } ?>
@@ -3978,7 +3987,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                 <?= csrfField() ?>
                 <input type="hidden" name="action" value="add_target">
                 <input type="text" name="city" data-i18n-placeholder="targetCity" placeholder="City" required>
-                <input type="number" name="radius_km" min="1" max="25" value="5" required>
+                <input type="number" name="radius_km" min="1" max="<?= GASOLINE_MAX_TARGET_RADIUS_KM ?>" value="5" required>
                 <button type="submit" class="btn-primary" data-i18n="addTarget">Add</button>
             </form>
         </div>
@@ -8655,7 +8664,7 @@ const translations = {
         cannotActOnSelf: 'You cannot perform this action on your own account.',
         notFound: 'The requested item was not found.',
         updateTargets: 'Automatic updates',
-        updateTargetsHint: 'These cities are collected automatically by gasoline update when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately.',
+        updateTargetsHint: 'These cities are collected automatically by gasoline update when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately. A radius over 25 km is more than the price API serves in one request, so it is collected as several overlapping queries: expect a handful of requests and about a minute per sweep for that target.',
         targetCity: 'City',
         targetRadius: 'Radius (km)',
         addTarget: 'Add',
@@ -8664,8 +8673,8 @@ const translations = {
         targetAdded: 'Update target added.',
         targetUpdated: 'Update target radius saved.',
         targetRemoved: 'Update target removed.',
-        invalidTarget: 'Invalid city or radius (1-25 km).',
-        invalidTargetRadius: 'Invalid radius (1-25 km).',
+        invalidTarget: 'Invalid city or radius (1-50 km).',
+        invalidTargetRadius: 'Invalid radius (1-50 km).',
         targetExists: 'This city is already an update target.',
         renameStation: 'Rename a station',
         renameStationHint: 'The new name replaces the Tankerkönig name everywhere — dashboard, CLI output, and notifications. The original name is kept and can be restored at any time.',
@@ -8986,7 +8995,7 @@ const translations = {
         cannotActOnSelf: 'Diese Aktion ist auf dem eigenen Konto nicht möglich.',
         notFound: 'Der angeforderte Eintrag wurde nicht gefunden.',
         updateTargets: 'Automatische Updates',
-        updateTargetsHint: 'Diese Städte werden von gasoline update automatisch erfasst, wenn die CLI ohne --city/--radius aufgerufen wird. Sie bestimmen, welche Tankstellen es gibt; das Gebiet für Benachrichtigungen wählt jeder Nutzer separat.',
+        updateTargetsHint: 'Diese Städte werden von gasoline update automatisch erfasst, wenn die CLI ohne --city/--radius aufgerufen wird. Sie bestimmen, welche Tankstellen es gibt; das Gebiet für Benachrichtigungen wählt jeder Nutzer separat. Ein Radius über 25 km ist mehr, als die Preis-API in einer Anfrage liefert, und wird daher aus mehreren überlappenden Abfragen zusammengesetzt: rechne für dieses Ziel mit einigen Anfragen und etwa einer Minute pro Durchlauf.',
         targetCity: 'Stadt',
         targetRadius: 'Radius (km)',
         addTarget: 'Hinzufügen',
@@ -8995,8 +9004,8 @@ const translations = {
         targetAdded: 'Update-Ziel hinzugefügt.',
         targetUpdated: 'Radius des Update-Ziels gespeichert.',
         targetRemoved: 'Update-Ziel entfernt.',
-        invalidTarget: 'Ungültige Stadt oder ungültiger Radius (1-25 km).',
-        invalidTargetRadius: 'Ungültiger Radius (1-25 km).',
+        invalidTarget: 'Ungültige Stadt oder ungültiger Radius (1-50 km).',
+        invalidTargetRadius: 'Ungültiger Radius (1-50 km).',
         targetExists: 'Diese Stadt ist bereits ein Update-Ziel.',
         renameStation: 'Tankstelle umbenennen',
         renameStationHint: 'Der neue Name ersetzt den Tankerkönig-Namen überall — Dashboard, CLI-Ausgabe und Benachrichtigungen. Der Originalname bleibt erhalten und kann jederzeit wiederhergestellt werden.',

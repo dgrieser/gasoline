@@ -98,7 +98,11 @@ type updateResult struct {
 	CacheStatus string     `json:"cache_status"`
 	StoredCount int        `json:"stored_count"`
 	RecordedAt  string     `json:"recorded_at"`
-	DBPath      string     `json:"db_path"`
+	// TilesQueried and TilesFailed are omitted for a radius the API served in
+	// one request, so the shape of an untiled run's output is unchanged.
+	TilesQueried int    `json:"tiles_queried,omitempty"`
+	TilesFailed  int    `json:"tiles_failed,omitempty"`
+	DBPath       string `json:"db_path"`
 }
 
 // cityUpdateResult is one target's outcome. FetchedCount is what the API
@@ -114,7 +118,12 @@ type cityUpdateResult struct {
 	FetchedCount int        `json:"fetched_count"`
 	StoredCount  int        `json:"stored_count"`
 	RecordedAt   string     `json:"recorded_at,omitempty"`
-	Error        string     `json:"error,omitempty"`
+	// TilesQueried is how many API requests this target took and TilesFailed
+	// how many of them never answered. Both are omitted for a target the API
+	// could serve in one request, which is every target below 25 km.
+	TilesQueried int    `json:"tiles_queried,omitempty"`
+	TilesFailed  int    `json:"tiles_failed,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 type multiUpdateResult struct {
@@ -613,6 +622,7 @@ Database:
 Examples:
   gasoline update --city "Berlin, Germany" --radius 5
   gasoline update --radius 10 --city Berlin --city "Lübbecke" --radius 25 --city Pforzheim
+  gasoline update --city "Lübbecke" --radius 50   # tiled: several paced 25 km queries
   gasoline update --city Berlin --db-driver mysql --mysql-dsn "gas:secret@tcp(db.example.com:3306)/gasoline"
   gasoline compact
   gasoline migrate
@@ -759,8 +769,8 @@ func validateCityQueries(queries []cityQuery) error {
 		if queries[i].name == "" {
 			return errors.New("--city must not be empty")
 		}
-		if queries[i].radius <= 0 || queries[i].radius > 25 {
-			return fmt.Errorf("--radius for %q must be > 0 and <= 25", queries[i].name)
+		if queries[i].radius <= 0 || queries[i].radius > maxRequestRadiusKM {
+			return fmt.Errorf("--radius for %q must be > 0 and <= %.0f", queries[i].name, maxRequestRadiusKM)
 		}
 		key := strings.ToLower(queries[i].name)
 		if seen[key] {
@@ -776,9 +786,11 @@ func runUpdate(args []string) (err error) {
 	dbf := addDBFlags(fs)
 	var events []updateArg
 	fs.Var(cityFlag{&events}, "city", "City or place to geocode (repeatable)")
-	fs.Var(radiusFlag{&events}, "radius", "Search radius in km, repeatable; default 5, max 25")
+	fs.Var(radiusFlag{&events}, "radius", "Search radius in km, repeatable; default 5, max 50 (over 25 is fetched as several 25 km queries)")
 	fuelType := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
 	sortBy := fs.String("sort", "dist", "Sort order: dist or price")
+	requestDelay := fs.Duration("request-delay", defaultRequestDelay, "Window the Tankerkönig requests of a tiled radius are paced over")
+	requestBurst := fs.Int("request-burst", defaultRequestBurst, "Tankerkönig requests allowed inside one --request-delay window")
 	userAgent := fs.String("user-agent", defaultUserAgent, "User-Agent for Nominatim and API calls")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
@@ -797,6 +809,12 @@ func runUpdate(args []string) (err error) {
 	}
 	if !isValidSort(*sortBy) {
 		return errors.New("--sort must be one of: dist, price")
+	}
+	if *requestDelay < 0 {
+		return errors.New("--request-delay must not be negative")
+	}
+	if *requestBurst < 1 {
+		return errors.New("--request-burst must be at least 1")
 	}
 	if *fuelType == "all" {
 		*sortBy = "dist"
@@ -824,11 +842,19 @@ func runUpdate(args []string) (err error) {
 	// of the fetch loop below without reaching the end of the function, and it
 	// has to report the same names as a full sweep or cities_failed undercounts
 	// exactly the failure a one-target install hits most.
-	recordSweep := func(cities, failed, fetched, stored int) {
+	recordSweep := func(cities, failed, fetched, stored, tiles, tilesFailed int) {
 		stats.set("cities", float64(cities))
 		stats.set("cities_failed", float64(failed))
 		stats.set("stations_fetched", float64(fetched))
 		stats.set("snapshots_stored", float64(stored))
+		// Only a sweep that actually tiled reports the tile counters. A sweep
+		// where every target fitted in one request issued exactly one query per
+		// city, so the numbers would say nothing, and the statistics page
+		// averages a metric only over the runs that reported it.
+		if tiles > cities {
+			stats.set("tiles", float64(tiles))
+			stats.set("tiles_failed", float64(tilesFailed))
+		}
 	}
 
 	queries := buildCityQueries(events)
@@ -847,6 +873,19 @@ func runUpdate(args []string) (err error) {
 		return err
 	}
 
+	// The pace is a property of the API key, so once anything in this sweep has
+	// to be tiled every request it makes is spaced — including the seam between
+	// one city's last tile and the next city's first. A sweep with nothing to
+	// tile keeps a zero delay and never waits, exactly as before.
+	delay := time.Duration(0)
+	for _, q := range queries {
+		if q.radius > maxAPIRadiusKM {
+			delay = *requestDelay
+			break
+		}
+	}
+	limiter := &tankerLimiter{delay: delay, burst: *requestBurst}
+
 	// Fetch every target before writing anything: targets with overlapping
 	// radii report the same station, and a sweep has to see all of them at
 	// once to keep exactly one snapshot per station. Each city is geocoded,
@@ -857,11 +896,11 @@ func runUpdate(args []string) (err error) {
 	fetchErrs := make([]string, len(queries))
 	failures := 0
 	for i, q := range queries {
-		f, err := fetchCityStations(ctx, db, cfg, q, *fuelType, *sortBy)
+		f, err := fetchCityStations(ctx, db, cfg, limiter, q, *fuelType, *sortBy)
 		if err != nil {
 			// Single city: preserve the original error shape.
 			if len(queries) == 1 {
-				recordSweep(1, 1, 0, 0)
+				recordSweep(1, 1, 0, 0, 0, 0)
 				return err
 			}
 			failures++
@@ -896,6 +935,8 @@ func runUpdate(args []string) (err error) {
 
 	results := make([]cityUpdateResult, 0, len(queries))
 	totalFetched := 0
+	totalTiles := 0
+	totalTilesFailed := 0
 	for i, q := range queries {
 		if fetched[i] == nil {
 			results = append(results, cityUpdateResult{Query: q.name, RadiusKm: q.radius, Error: fetchErrs[i]})
@@ -907,7 +948,9 @@ func runUpdate(args []string) (err error) {
 			cacheStatus = "loaded from cache"
 		}
 		totalFetched += len(f.Stations)
-		results = append(results, cityUpdateResult{
+		totalTiles += f.Tiles
+		totalTilesFailed += f.TilesFailed
+		res := cityUpdateResult{
 			Query:        q.name,
 			City:         f.City,
 			CacheStatus:  cacheStatus,
@@ -915,13 +958,23 @@ func runUpdate(args []string) (err error) {
 			FetchedCount: len(f.Stations),
 			StoredCount:  stored[i],
 			RecordedAt:   f.RecordedAt.Format(time.RFC3339),
-		})
+		}
+		// Reported only for a target that was actually tiled, so the output of
+		// a sweep the API could serve one request per city is unchanged.
+		if f.Tiles > 1 {
+			res.TilesQueried = f.Tiles
+			res.TilesFailed = f.TilesFailed
+		}
+		results = append(results, res)
 	}
 
-	recordSweep(len(queries), failures, totalFetched, len(observations))
+	recordSweep(len(queries), failures, totalFetched, len(observations), totalTiles, totalTilesFailed)
 	// A sweep that lost some cities but stored the rest is degraded, not
-	// failed; one that lost every city is a failure like any other.
-	if failures > 0 && failures < len(queries) {
+	// failed; one that lost every city is a failure like any other. A city that
+	// lost only some of its tiles is degraded the same way: it stored what the
+	// rest of them saw, and the stations behind the missing tile go
+	// unrefreshed until the next sweep.
+	if (failures > 0 && failures < len(queries)) || totalTilesFailed > 0 {
 		stats.markPartial()
 	}
 
@@ -930,15 +983,23 @@ func runUpdate(args []string) (err error) {
 		res := results[0]
 		if output == outputJSON {
 			return writeJSON(updateResult{
-				City:        res.City,
-				CacheStatus: res.CacheStatus,
-				StoredCount: res.StoredCount,
-				RecordedAt:  res.RecordedAt,
-				DBPath:      dbCfg.Description(),
+				City:         res.City,
+				CacheStatus:  res.CacheStatus,
+				StoredCount:  res.StoredCount,
+				RecordedAt:   res.RecordedAt,
+				TilesQueried: res.TilesQueried,
+				TilesFailed:  res.TilesFailed,
+				DBPath:       dbCfg.Description(),
 			})
 		}
 		printCityUpdate(res)
-		fmt.Fprintf(stdout, "stored %d station snapshots at %s in %s\n", res.StoredCount, res.RecordedAt, dbCfg.Description())
+		if phrase := tileQueryPhrase(res); phrase != "" {
+			fmt.Fprintf(stdout, "stored %d station snapshots from %s at %s in %s\n",
+				res.StoredCount, phrase, res.RecordedAt, dbCfg.Description())
+		} else {
+			fmt.Fprintf(stdout, "stored %d station snapshots at %s in %s\n",
+				res.StoredCount, res.RecordedAt, dbCfg.Description())
+		}
 		return nil
 	}
 
@@ -959,11 +1020,16 @@ func runUpdate(args []string) (err error) {
 				continue
 			}
 			printCityUpdate(res)
+			queries := ""
+			if phrase := tileQueryPhrase(res); phrase != "" {
+				queries = " in " + phrase
+			}
 			if shared := res.FetchedCount - res.StoredCount; shared > 0 {
-				fmt.Fprintf(stdout, "  radius %.2f km, stored %d of %d snapshots at %s (%d shared with a nearer city)\n\n",
-					res.RadiusKm, res.StoredCount, res.FetchedCount, res.RecordedAt, shared)
+				fmt.Fprintf(stdout, "  radius %.2f km%s, stored %d of %d snapshots at %s (%d shared with a nearer city)\n\n",
+					res.RadiusKm, queries, res.StoredCount, res.FetchedCount, res.RecordedAt, shared)
 			} else {
-				fmt.Fprintf(stdout, "  radius %.2f km, stored %d snapshots at %s\n\n", res.RadiusKm, res.StoredCount, res.RecordedAt)
+				fmt.Fprintf(stdout, "  radius %.2f km%s, stored %d snapshots at %s\n\n",
+					res.RadiusKm, queries, res.StoredCount, res.RecordedAt)
 			}
 		}
 		fmt.Fprintf(stdout, "updated %d of %d cities, stored %d station snapshots in %s\n",
@@ -984,28 +1050,50 @@ type cityFetch struct {
 	Cached     bool
 	Stations   []tankerStation
 	RecordedAt time.Time
+	// Tiles is how many API queries this target took, 1 unless its radius is
+	// wider than the API serves; TilesFailed is how many of those never
+	// answered, which leaves the stations only they could see unrefreshed.
+	Tiles       int
+	TilesFailed int
 }
 
 // fetchCityStations geocodes one target and fetches its stations. It writes no
 // snapshots, so a whole sweep can be de-duplicated before it touches
 // price_snapshots. (Geocoding still caches the city itself, as before.)
-func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, q cityQuery, fuelType, sortBy string) (cityFetch, error) {
+func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, lim *tankerLimiter, q cityQuery, fuelType, sortBy string) (cityFetch, error) {
 	location, cached, err := getOrCreateCity(ctx, db, q.name, cfg.UserAgent)
 	if err != nil {
 		return cityFetch{}, err
 	}
-	stations, err := fetchStations(ctx, cfg, location.Lat, location.Lng, q.radius, fuelType, sortBy)
+	tiles, err := planSearchTiles(location.Lat, location.Lng, q.radius)
 	if err != nil {
 		return cityFetch{}, err
 	}
-	// Stamp after the data is fetched so the snapshot reflects when it was
-	// observed, not when the (possibly multi-city) run began.
+	stations, observedAt, tilesFailed, err := fetchTiledStations(ctx, cfg, lim, location, tiles, q.radius, fuelType, sortBy)
+	if err != nil {
+		return cityFetch{}, err
+	}
+	// A single request is stamped after the data is fetched, so the snapshot
+	// reflects when it was observed rather than when the (possibly multi-city)
+	// run began. A tiled target cannot do that: its requests are deliberately
+	// spread over minutes, and stamping each station with the tile that
+	// happened to see it would spread one city's readings across that window
+	// and make them look like a price history. The whole city therefore shares
+	// the instant its first request went out — which the fetch has to report,
+	// because the pacing can hold that request back for a whole window after
+	// this target's turn came up.
+	recordedAt := nowFn().UTC()
+	if len(tiles) > 1 {
+		recordedAt = observedAt.UTC()
+	}
 	return cityFetch{
-		Query:      q,
-		City:       location,
-		Cached:     cached,
-		Stations:   stations,
-		RecordedAt: time.Now().UTC(),
+		Query:       q,
+		City:        location,
+		Cached:      cached,
+		Stations:    stations,
+		RecordedAt:  recordedAt,
+		Tiles:       len(tiles),
+		TilesFailed: tilesFailed,
 	}, nil
 }
 
@@ -1165,6 +1253,20 @@ func loadStationAliases(ctx context.Context, tx *sql.Tx) (map[string]string, err
 		}
 	}
 	return aliases, rows.Err()
+}
+
+// tileQueryPhrase names the API requests a target took, and is empty for a
+// target the API served in one — which is what every radius up to 25 km is.
+// The callers supply the preposition, since the two output shapes read it
+// differently.
+func tileQueryPhrase(res cityUpdateResult) string {
+	if res.TilesQueried <= 1 {
+		return ""
+	}
+	if res.TilesFailed > 0 {
+		return fmt.Sprintf("%d queries (%d failed)", res.TilesQueried, res.TilesFailed)
+	}
+	return fmt.Sprintf("%d queries", res.TilesQueried)
 }
 
 func printCityUpdate(res cityUpdateResult) {
@@ -4898,13 +5000,17 @@ func fetchStations(ctx context.Context, cfg config, lat, lng, radius float64, fu
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		// The request never landed, so trying again is worth a pacing window.
+		return nil, &tankerRequestError{err: err, retryable: true}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, fmt.Errorf("tankerkönig request failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, &tankerRequestError{
+			err:       fmt.Errorf("tankerkönig request failed: %s: %s", resp.Status, strings.TrimSpace(string(body))),
+			retryable: retryableStatus(resp.StatusCode),
+		}
 	}
 
 	var payload tankerListResponse
@@ -5378,7 +5484,6 @@ func suggestFuelColumn(fuel string) (string, error) {
 }
 
 func haversineKM(lat1, lng1, lat2, lng2 float64) float64 {
-	const earthRadiusKM = 6371.0088
 	lat1Rad := degreesToRadians(lat1)
 	lat2Rad := degreesToRadians(lat2)
 	deltaLat := degreesToRadians(lat2 - lat1)
