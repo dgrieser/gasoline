@@ -154,9 +154,13 @@ type tankerLimiter struct {
 	recent []time.Time
 }
 
-func (l *tankerLimiter) wait() {
+// wait blocks until this request's turn in the pace comes up, and returns the
+// instant it goes out. That is not necessarily the instant wait was called: a
+// caller whose window is already full is held back, so anything that wants to
+// record when a request was actually made has to take it from here.
+func (l *tankerLimiter) wait() time.Time {
 	if l == nil || l.delay <= 0 || l.burst < 1 {
-		return
+		return nowFn()
 	}
 	now := nowFn()
 	if len(l.recent) >= l.burst {
@@ -170,6 +174,7 @@ func (l *tankerLimiter) wait() {
 		l.recent = l.recent[1:]
 	}
 	l.recent = append(l.recent, now)
+	return now
 }
 
 // tankerRequestError carries whether retrying a failed Tankerkönig request can
@@ -202,28 +207,34 @@ func retryableStatus(code int) bool {
 
 // fetchTiledStations queries every tile, paced by lim, and returns the union of
 // what they reported: one entry per station id, restricted to radiusKM of the
-// centre, with Dist restated as the distance from that centre.
+// centre, with Dist restated as the distance from that centre. It also reports
+// when the first request went out, which the caller stamps the whole city with.
 //
 // The first tile is the city centre and is treated as the load-bearing one: if
 // it fails even on retry the whole city fails, because the cause is almost
 // always systemic (a rejected key, no network) and the alternative is reporting
-// a city assembled entirely out of its own edges. A later tile failing costs
-// only the stations that tile alone could see, which is a gap the next sweep
-// closes well inside the 48-hour freshness window — so those are counted and
-// the city is still stored.
-func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, centre cachedCity, tiles []searchTile, radiusKM float64, fuelType, sortBy string) ([]tankerStation, int, error) {
+// a city assembled entirely out of its own edges. That also makes it the first
+// request that answered, so it is the one observedAt comes from. A later tile
+// failing costs only the stations that tile alone could see, which is a gap the
+// next sweep closes well inside the 48-hour freshness window — so those are
+// counted and the city is still stored.
+func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, centre cachedCity, tiles []searchTile, radiusKM float64, fuelType, sortBy string) ([]tankerStation, time.Time, int, error) {
 	merged := make(map[string]tankerStation)
 	order := make([]string, 0, len(tiles)*64)
 	tilesFailed := 0
+	var observedAt time.Time
 
 	for i, tile := range tiles {
-		stations, err := fetchTileStations(ctx, cfg, lim, tile, fuelType, sortBy)
+		stations, sentAt, err := fetchTileStations(ctx, cfg, lim, tile, fuelType, sortBy)
 		if err != nil {
 			if i == 0 {
-				return nil, 0, err
+				return nil, time.Time{}, 0, err
 			}
 			tilesFailed++
 			continue
+		}
+		if i == 0 {
+			observedAt = sentAt
 		}
 		for _, station := range stations {
 			if _, seen := merged[station.ID]; seen {
@@ -245,7 +256,7 @@ func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, cen
 		for _, id := range order {
 			stations = append(stations, merged[id])
 		}
-		return stations, tilesFailed, nil
+		return stations, observedAt, tilesFailed, nil
 	}
 
 	stations := make([]tankerStation, 0, len(order))
@@ -266,28 +277,30 @@ func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, cen
 		stations = append(stations, station)
 	}
 	sortStations(stations, fuelType, sortBy)
-	return stations, tilesFailed, nil
+	return stations, observedAt, tilesFailed, nil
 }
 
 // fetchTileStations fetches one tile, waiting for its slot in the pace first and
-// retrying once if the failure looks transient.
-func fetchTileStations(ctx context.Context, cfg config, lim *tankerLimiter, tile searchTile, fuelType, sortBy string) ([]tankerStation, error) {
+// retrying once if the failure looks transient. It reports when the attempt that
+// answered went out: an attempt that failed saw nothing, so a retried tile is
+// anchored to the retry rather than to the try that came back empty.
+func fetchTileStations(ctx context.Context, cfg config, lim *tankerLimiter, tile searchTile, fuelType, sortBy string) ([]tankerStation, time.Time, error) {
 	var err error
 	for attempt := 0; attempt <= maxTileRetries; attempt++ {
-		lim.wait()
+		sentAt := lim.wait()
 		var stations []tankerStation
 		stations, err = fetchStations(ctx, cfg, tile.Lat, tile.Lng, tile.RadiusKM, fuelType, sortBy)
 		if err == nil {
-			return stations, nil
+			return stations, sentAt, nil
 		}
 		if !retryableTankerError(err) {
-			return nil, err
+			return nil, time.Time{}, err
 		}
 		if ctx.Err() != nil {
-			return nil, err
+			return nil, time.Time{}, err
 		}
 	}
-	return nil, err
+	return nil, time.Time{}, err
 }
 
 // sortStations restores the order a single fetch would have come back in: each

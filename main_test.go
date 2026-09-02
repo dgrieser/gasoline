@@ -4422,3 +4422,85 @@ func TestRunUpdateTiledTextOutput(t *testing.T) {
 		t.Fatalf("untiled target's line changed:\n%s", multi)
 	}
 }
+
+// A city's first request can be held back by the pacing when an earlier city
+// filled the current window, and the snapshot instant has to be the moment that
+// request actually went out — not the moment the city's turn came up.
+func TestRunUpdateTiledStampsFirstRequestAcrossCities(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "twocities.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	clock := stubTileClock(t)
+
+	// 40 km is 6 tiles, and the defaults pace 3 requests per 30 s window. So
+	// the first city's six requests leave the window full at its 30 s mark,
+	// and the second city's very first request has to wait for the next one.
+	const radius = "40"
+	if tiles, err := planSearchTiles(52.5, 13.4, 40); err != nil || len(tiles) != 6 {
+		t.Fatalf("40 km planned %d tiles (err %v), want 6 — the pacing timeline below assumes it", len(tiles), err)
+	}
+
+	calls := 0
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			if strings.Contains(u.Query().Get("q"), "Uchte") {
+				return jsonResponse(http.StatusOK, `[{"name":"Uchte","display_name":"Uchte, DE","lat":"52.480000","lon":"8.930000"}]`), nil
+			}
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.500000","lon":"13.400000"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			lat, _ := strconv.ParseFloat(u.Query().Get("lat"), 64)
+			lng, _ := strconv.ParseFloat(u.Query().Get("lng"), 64)
+			calls++
+			return tileListResponse(tileStation(fmt.Sprintf("s-%d", calls), lat, lng, 2, 0)), nil
+		}
+		return nil, fmt.Errorf("unexpected URL: %s", u)
+	})
+	defer restore()
+
+	if err := run([]string{"update", "--db", dbPath, "--radius", radius, "--city", "Berlin", "--city", "Uchte", "--output", "json"}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if calls != 12 {
+		t.Fatalf("%d API requests, want 12 (6 per city)", calls)
+	}
+
+	db, err := openDatabase(context.Background(), dbConfig{Driver: dialectSQLite, Path: dbPath})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	stamps := map[string]string{}
+	rows, err := db.Query(`SELECT city_name, recorded_at, COUNT(*) FROM price_snapshots GROUP BY city_name, recorded_at`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var city, recordedAt string
+		var count int
+		if err := rows.Scan(&city, &recordedAt, &count); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if previous, seen := stamps[city]; seen {
+			t.Fatalf("%s has two snapshot instants: %s and %s", city, previous, recordedAt)
+		}
+		stamps[city] = recordedAt
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	// The first city starts on an empty window, so its first request goes out
+	// immediately.
+	if want := clock.start.UTC().Format(time.RFC3339); stamps["Berlin"] != want {
+		t.Errorf("Berlin recorded_at = %q, want %q (its first request went out at once)", stamps["Berlin"], want)
+	}
+	// The second city's first request is held for the next window, and that is
+	// the instant its stations were observed.
+	if want := clock.start.Add(60 * time.Second).UTC().Format(time.RFC3339); stamps["Uchte"] != want {
+		t.Errorf("Uchte recorded_at = %q, want %q (the instant its first request actually went out)", stamps["Uchte"], want)
+	}
+}

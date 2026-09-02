@@ -395,7 +395,7 @@ func TestFetchTiledStationsDedupe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist")
+	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist")
 	if err != nil {
 		t.Fatalf("fetchTiledStations: %v", err)
 	}
@@ -457,7 +457,7 @@ func TestFetchTiledStationsFiltersOvershoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist")
+	stations, _, _, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist")
 	if err != nil {
 		t.Fatalf("fetchTiledStations: %v", err)
 	}
@@ -493,7 +493,7 @@ func TestFetchTiledStationsPartialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{delay: 30 * time.Second, burst: 3}, centre, tiles, 50, "all", "dist")
+	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{delay: 30 * time.Second, burst: 3}, centre, tiles, 50, "all", "dist")
 	if err != nil {
 		t.Fatalf("a failing tile must not fail the city: %v", err)
 	}
@@ -527,7 +527,7 @@ func TestFetchTiledStationsFirstTileFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	_, _, err = fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist")
+	_, _, _, err = fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist")
 	if err == nil {
 		t.Fatal("a failing centre tile must fail the whole city")
 	}
@@ -556,7 +556,7 @@ func TestFetchTiledStationsDoesNotRetryPermanentFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	if _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist"); err != nil || failed != 1 {
+	if _, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist"); err != nil || failed != 1 {
 		t.Fatalf("failed = %d, err = %v", failed, err)
 	}
 	if attempts != len(tiles) {
@@ -594,5 +594,73 @@ func TestTileStationPayloadDecodes(t *testing.T) {
 	}
 	if len(payload.Stations) != 1 || payload.Stations[0].ID != "x" || !payload.Stations[0].IsOpen {
 		t.Fatalf("decoded %+v", payload.Stations)
+	}
+}
+
+// wait's return value is the contract the snapshot instant rests on, so it is
+// asserted directly: the requests that fit in the current window go out now,
+// and the one that does not goes out when the window rolls over.
+func TestTankerLimiterWaitReportsSlot(t *testing.T) {
+	clock := stubTileClock(t)
+
+	lim := &tankerLimiter{delay: 30 * time.Second, burst: 3}
+	for i := 0; i < 3; i++ {
+		if got := lim.wait(); !got.Equal(clock.start) {
+			t.Fatalf("request %d went out at %v, want %v", i+1, got, clock.start)
+		}
+	}
+	if got, want := lim.wait(), clock.start.Add(30*time.Second); !got.Equal(want) {
+		t.Fatalf("the request past the window went out at %v, want %v", got, want)
+	}
+
+	// A disarmed limiter reports the current instant and never sleeps, so an
+	// untiled sweep is stamped exactly as it always was.
+	for _, disarmed := range []*tankerLimiter{
+		nil,
+		{delay: 0, burst: 3},
+		{delay: 30 * time.Second, burst: 0},
+	} {
+		before := len(clock.slept)
+		if got := disarmed.wait(); !got.Equal(clock.now) {
+			t.Fatalf("a disarmed limiter reported %v, want the current instant %v", got, clock.now)
+		}
+		if len(clock.slept) != before {
+			t.Fatalf("a disarmed limiter slept")
+		}
+	}
+}
+
+// An attempt that failed observed nothing, so the instant the city is stamped
+// with has to come from the attempt that actually answered.
+func TestFetchTiledStationsObservedAtSkipsFailedAttempt(t *testing.T) {
+	clock := stubTileClock(t)
+	centre := cachedCity{QueryName: "Berlin", Name: "Berlin", Lat: 52.5, Lng: 13.4}
+
+	calls := 0
+	stubTankerTiles(t, func(index int, lat, lng, rad float64) (*http.Response, error) {
+		calls++
+		if calls == 1 { // the centre tile's first attempt, retryably
+			return jsonResponse(http.StatusBadGateway, `{"ok":false,"message":"upstream"}`), nil
+		}
+		return tileListResponse(tileStation(fmt.Sprintf("s-%d", calls), lat, lng, 1, 0)), nil
+	})
+
+	tiles, err := planSearchTiles(centre.Lat, centre.Lng, 50)
+	if err != nil {
+		t.Fatalf("planSearchTiles: %v", err)
+	}
+	// burst 1 makes every request wait, so the retry lands a window after the
+	// attempt it replaces and the two instants cannot be confused.
+	lim := &tankerLimiter{delay: 30 * time.Second, burst: 1}
+	_, observedAt, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, lim, centre, tiles, 50, "all", "dist")
+	if err != nil {
+		t.Fatalf("a retryable centre failure that then succeeds must not fail the city: %v", err)
+	}
+	if failed != 0 {
+		t.Fatalf("tilesFailed = %d, want 0 — the retry answered", failed)
+	}
+	// The first attempt went out at start; the retry a window later.
+	if want := clock.start.Add(30 * time.Second); !observedAt.Equal(want) {
+		t.Fatalf("observedAt = %v, want %v (the retry, not the attempt that came back empty)", observedAt, want)
 	}
 }

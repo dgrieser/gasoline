@@ -1069,8 +1069,7 @@ func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, lim *tankerL
 	if err != nil {
 		return cityFetch{}, err
 	}
-	startedAt := nowFn().UTC()
-	stations, tilesFailed, err := fetchTiledStations(ctx, cfg, lim, location, tiles, q.radius, fuelType, sortBy)
+	stations, observedAt, tilesFailed, err := fetchTiledStations(ctx, cfg, lim, location, tiles, q.radius, fuelType, sortBy)
 	if err != nil {
 		return cityFetch{}, err
 	}
@@ -1080,10 +1079,12 @@ func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, lim *tankerL
 	// spread over minutes, and stamping each station with the tile that
 	// happened to see it would spread one city's readings across that window
 	// and make them look like a price history. The whole city therefore shares
-	// the instant its first request went out.
+	// the instant its first request went out — which the fetch has to report,
+	// because the pacing can hold that request back for a whole window after
+	// this target's turn came up.
 	recordedAt := nowFn().UTC()
 	if len(tiles) > 1 {
-		recordedAt = startedAt
+		recordedAt = observedAt.UTC()
 	}
 	return cityFetch{
 		Query:       q,
