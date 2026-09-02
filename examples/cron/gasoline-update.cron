@@ -4,5 +4,11 @@
 # Cron starts with an empty environment, so source the env file first; `set -a`
 # exports every KEY=value it defines (TANKER_KOENIG_API_KEY, storage settings).
 # See examples/systemd/gasoline.env for the file this expects at /etc/gasoline/gasoline.env.
+#
+# `flock -n` keeps the runs from overlapping: cron fires on a fixed schedule
+# whether the last run finished or not, and two sweeps at once would race each
+# other for the API rate limit and for the database write lock. A radius over
+# 25 km is collected as several paced requests and can take a minute or more, so
+# the lock is what keeps that safe on a 5-minute schedule.
 
-*/5 * * * * set -a; . /etc/gasoline/gasoline.env; set +a; /usr/local/bin/gasoline update --radius 25 --city 'Luebbecke'
+*/5 * * * * set -a; . /etc/gasoline/gasoline.env; set +a; flock -n /tmp/gasoline-update.lock /usr/local/bin/gasoline update --radius 25 --city 'Luebbecke'

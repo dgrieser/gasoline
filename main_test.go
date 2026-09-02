@@ -1298,6 +1298,11 @@ func TestValidateCityQueries(t *testing.T) {
 		t.Fatalf("valid: %v", err)
 	}
 
+	// The widest radius the tiled fetch covers.
+	if err := validateCityQueries([]cityQuery{{"Berlin", maxRequestRadiusKM}}); err != nil {
+		t.Fatalf("max radius: %v", err)
+	}
+
 	// Names are trimmed in place.
 	qs := []cityQuery{{"  Berlin  ", 5}}
 	if err := validateCityQueries(qs); err != nil {
@@ -1314,8 +1319,8 @@ func TestValidateCityQueries(t *testing.T) {
 	}{
 		{"empty", nil, "requires --city"},
 		{"empty_name", []cityQuery{{"   ", 5}}, "must not be empty"},
-		{"radius_zero", []cityQuery{{"Berlin", 0}}, "> 0 and <= 25"},
-		{"radius_too_big", []cityQuery{{"Berlin", 26}}, "> 0 and <= 25"},
+		{"radius_zero", []cityQuery{{"Berlin", 0}}, "> 0 and <= 50"},
+		{"radius_too_big", []cityQuery{{"Berlin", 51}}, "> 0 and <= 50"},
 		{"duplicate", []cityQuery{{"Berlin", 5}, {"Berlin", 10}}, "given more than once"},
 		{"duplicate_case_insensitive", []cityQuery{{"Berlin", 5}, {"berlin", 10}}, "given more than once"},
 	}
@@ -4094,5 +4099,326 @@ func TestCityWritePathsStoreTheSearchKey(t *testing.T) {
 		if got != want {
 			t.Errorf("%s stored normalized_lower %q, want %q", name, got, want)
 		}
+	}
+}
+
+// A tiled target has to look like one city to everything downstream: one
+// snapshot per station, one recorded_at for the whole city, and the radius that
+// was asked for on every row.
+func TestRunUpdateTiled(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tiled.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	// A real pacing window, on a clock that only moves when the code waits: the
+	// fetch spans minutes of clock time without costing the test any, which is
+	// what makes the single-timestamp assertion below mean something.
+	clock := stubTileClock(t)
+
+	const centreLat, centreLng = 52.5, 13.4
+	var rads []string
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.500000","lon":"13.400000"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			lat, _ := strconv.ParseFloat(u.Query().Get("lat"), 64)
+			lng, _ := strconv.ParseFloat(u.Query().Get("lng"), 64)
+			rads = append(rads, u.Query().Get("rad"))
+			index := len(rads) - 1
+			// Every tile also reports the station in the middle, so the merge
+			// has real duplicates to fold.
+			return tileListResponse(
+				tileStation("shared", centreLat, centreLng, 1, 0),
+				tileStation(fmt.Sprintf("own-%d", index), lat, lng, 2, 0),
+			), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	output := captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--radius", "50", "--output", "json"})
+	})
+
+	var result updateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+
+	// The fetch really was spread over the pacing windows, so stamping each
+	// tile separately would have produced visibly different timestamps.
+	if len(clock.slept) == 0 {
+		t.Fatal("the tiled fetch never waited, so the timestamp check below proves nothing")
+	}
+	if spanned := clock.now.Sub(clock.start); spanned < time.Minute {
+		t.Fatalf("the fetch spanned only %v of clock time, too little to tell one stamp from many", spanned)
+	}
+
+	wantTiles, err := planSearchTiles(centreLat, centreLng, 50)
+	if err != nil {
+		t.Fatalf("planSearchTiles: %v", err)
+	}
+	if len(rads) != len(wantTiles) {
+		t.Fatalf("%d API requests, want %d", len(rads), len(wantTiles))
+	}
+	for i, rad := range rads {
+		if rad != "25.00" {
+			t.Fatalf("request %d asked for rad=%q, want 25.00", i, rad)
+		}
+	}
+	if result.TilesQueried != len(wantTiles) {
+		t.Fatalf("tiles_queried = %d, want %d", result.TilesQueried, len(wantTiles))
+	}
+	if result.TilesFailed != 0 {
+		t.Fatalf("tiles_failed = %d, want 0", result.TilesFailed)
+	}
+	// One station per tile plus the one they all share.
+	if want := len(wantTiles) + 1; result.StoredCount != want {
+		t.Fatalf("stored_count = %d, want %d", result.StoredCount, want)
+	}
+
+	db, err := openDatabase(context.Background(), dbConfig{Driver: dialectSQLite, Path: dbPath})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	var snapshots, stations, instants int
+	var radius float64
+	if err := db.QueryRow(`
+		SELECT COUNT(*), COUNT(DISTINCT station_id), COUNT(DISTINCT recorded_at), MAX(search_radius_km)
+		FROM price_snapshots
+	`).Scan(&snapshots, &stations, &instants, &radius); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if snapshots != stations {
+		t.Fatalf("%d snapshots for %d stations: the tiles were not de-duplicated by id", snapshots, stations)
+	}
+	if instants != 1 {
+		t.Fatalf("%d distinct recorded_at values, want 1 for a tiled city", instants)
+	}
+	// And that one instant is when the first request went out, not when the
+	// last one came back.
+	var recordedAt string
+	if err := db.QueryRow(`SELECT recorded_at FROM price_snapshots LIMIT 1`).Scan(&recordedAt); err != nil {
+		t.Fatalf("recorded_at: %v", err)
+	}
+	if want := clock.start.UTC().Format(time.RFC3339); recordedAt != want {
+		t.Fatalf("recorded_at = %q, want %q (the first request's instant)", recordedAt, want)
+	}
+	if radius != 50 {
+		t.Fatalf("search_radius_km = %v, want the 50 that was asked for", radius)
+	}
+
+	// One city, not one per tile centre.
+	var cities int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM cities`).Scan(&cities); err != nil {
+		t.Fatalf("cities: %v", err)
+	}
+	if cities != 1 {
+		t.Fatalf("%d cities rows, want 1", cities)
+	}
+}
+
+// A tile that never answers costs only its own stations: the city is still
+// stored, and the run says it was degraded.
+func TestRunUpdateTiledPartial(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "partial.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	stubTileClock(t)
+
+	calls := 0
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.500000","lon":"13.400000"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			lat, _ := strconv.ParseFloat(u.Query().Get("lat"), 64)
+			lng, _ := strconv.ParseFloat(u.Query().Get("lng"), 64)
+			calls++
+			if calls == 3 || calls == 4 { // one tile, both of its attempts
+				return jsonResponse(http.StatusBadGateway, `{"ok":false,"message":"upstream"}`), nil
+			}
+			return tileListResponse(tileStation(fmt.Sprintf("s-%d", calls), lat, lng, 1, 0)), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	output := captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--radius", "50", "--request-delay", "0", "--output", "json"})
+	})
+
+	var result updateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	if result.TilesFailed != 1 {
+		t.Fatalf("tiles_failed = %d, want 1", result.TilesFailed)
+	}
+	if result.StoredCount == 0 {
+		t.Fatal("a single failed tile threw the whole city away")
+	}
+
+	db, err := openDatabase(context.Background(), dbConfig{Driver: dialectSQLite, Path: dbPath})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	var status string
+	if err := db.QueryRow(`SELECT status FROM command_runs WHERE command = 'update' ORDER BY id DESC LIMIT 1`).Scan(&status); err != nil {
+		t.Fatalf("command_runs: %v", err)
+	}
+	if status != "partial" {
+		t.Fatalf("run status = %q, want partial", status)
+	}
+
+	metrics := map[string]float64{}
+	rows, err := db.Query(`
+		SELECT m.name, m.value FROM command_run_metrics m
+		JOIN command_runs r ON r.id = m.run_id
+		WHERE r.command = 'update' ORDER BY r.id DESC
+	`)
+	if err != nil {
+		t.Fatalf("metrics: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var value float64
+		if err := rows.Scan(&name, &value); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		metrics[name] = value
+	}
+	if metrics["tiles_failed"] != 1 {
+		t.Fatalf("tiles_failed metric = %v, want 1", metrics["tiles_failed"])
+	}
+	if metrics["tiles"] < 2 {
+		t.Fatalf("tiles metric = %v, want the tile count of a tiled sweep", metrics["tiles"])
+	}
+}
+
+// The contract that keeps every existing install untouched: a radius the API
+// serves is one request, with no pacing at all.
+func TestRunUpdateUntiledIssuesOneRequestAndNeverWaits(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "untiled.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	clock := stubTileClock(t)
+
+	calls := 0
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.500000","lon":"13.400000"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			calls++
+			if rad := u.Query().Get("rad"); rad != "25.00" {
+				return nil, fmt.Errorf("rad = %q, want 25.00", rad)
+			}
+			return tileListResponse(tileStation("only", 52.5, 13.4, 1, 0)), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	output := captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--radius", "25", "--output", "json"})
+	})
+
+	if calls != 1 {
+		t.Fatalf("%d API requests for a 25 km radius, want 1", calls)
+	}
+	if len(clock.slept) != 0 {
+		t.Fatalf("an untiled sweep waited %v", clock.slept)
+	}
+
+	var result updateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	// The tile counters stay out of an untiled run's output entirely.
+	if result.TilesQueried != 0 || result.TilesFailed != 0 {
+		t.Fatalf("tiles_queried = %d, tiles_failed = %d, want both absent", result.TilesQueried, result.TilesFailed)
+	}
+	if strings.Contains(output, "tiles_queried") || strings.Contains(output, "tiles_failed") {
+		t.Fatalf("untiled JSON mentions the tile counters:\n%s", output)
+	}
+}
+
+func TestRunUpdateRejectsBadPacingFlags(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "pacing.db")
+	t.Setenv(envAPIKeyName, "test-key")
+
+	for _, args := range [][]string{
+		{"update", "--db", dbPath, "--city", "Berlin", "--request-delay", "-1s"},
+		{"update", "--db", dbPath, "--city", "Berlin", "--request-burst", "0"},
+	} {
+		if err := run(args); err == nil {
+			t.Fatalf("%v was accepted", args)
+		}
+	}
+}
+
+// The text output names the queries a tiled target took, and says nothing about
+// them for a target the API served in one.
+func TestRunUpdateTiledTextOutput(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envAPIKeyName, "test-key")
+	stubTileClock(t)
+
+	calls := 0
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			if strings.Contains(u.Query().Get("q"), "Uchte") {
+				return jsonResponse(http.StatusOK, `[{"name":"Uchte","display_name":"Uchte, DE","lat":"52.480000","lon":"8.930000"}]`), nil
+			}
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.500000","lon":"13.400000"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			lat, _ := strconv.ParseFloat(u.Query().Get("lat"), 64)
+			lng, _ := strconv.ParseFloat(u.Query().Get("lng"), 64)
+			calls++
+			if calls == 5 || calls == 6 { // one tile, both attempts
+				return jsonResponse(http.StatusBadGateway, `{"ok":false,"message":"upstream"}`), nil
+			}
+			return tileListResponse(tileStation(fmt.Sprintf("s-%d", calls), lat, lng, 2, 0)), nil
+		}
+		return nil, fmt.Errorf("unexpected URL: %s", u)
+	})
+	defer restore()
+
+	single := captureStdout(t, func() error {
+		return run([]string{"update", "--db", filepath.Join(dir, "a.db"), "--city", "Berlin", "--radius", "50"})
+	})
+	if !strings.Contains(single, "from 8 queries (1 failed)") {
+		t.Fatalf("single-city output does not name the queries:\n%s", single)
+	}
+	// One "in" clause, naming the database — not two.
+	if strings.Count(single, " in ") != 1 {
+		t.Fatalf("single-city output reads awkwardly:\n%s", single)
+	}
+
+	calls = 0
+	multi := captureStdout(t, func() error {
+		return run([]string{"update", "--db", filepath.Join(dir, "b.db"), "--radius", "50", "--city", "Berlin", "--city", "Uchte", "--radius", "5"})
+	})
+	if !strings.Contains(multi, "radius 50.00 km in 8 queries (1 failed), stored") {
+		t.Fatalf("tiled target is not reported:\n%s", multi)
+	}
+	// The 5 km target fitted in one request, so its line is unchanged.
+	if !strings.Contains(multi, "radius 5.00 km, stored") {
+		t.Fatalf("untiled target's line changed:\n%s", multi)
 	}
 }
