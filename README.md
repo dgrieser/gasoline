@@ -242,7 +242,7 @@ The normal suggestion output is unchanged; a one-line summary (`persist: stored 
 
 ### Server-stored configuration (admin settings)
 
-Administrators configure two things in the web UI (hamburger menu → Settings): the **update targets** (city + radius pairs) that decide which stations are collected, and the **notification texts**.
+Administrators configure two things in the web UI (hamburger menu → Settings): the **update targets** (city + radius pairs) that decide which stations are collected, and the **notification texts**. A target's radius is editable in place — each row has its own radius field and save button, and the change takes effect on the next `gasoline update`. The city is the target's identity and is not editable: changing it means removing the target and adding the new city.
 
 That is deliberately all of it. The station scope, the fuels, the model parameters and the delivery limits used to be settings and are now fixed, because none of them had a per-install answer:
 

@@ -254,8 +254,10 @@ function flashText(string $key): string
         'settingsSaved' => 'Settings saved.',
         'invalidSettings' => 'Invalid settings. Please check the highlighted values.',
         'targetAdded' => 'Update target added.',
+        'targetUpdated' => 'Update target radius saved.',
         'targetRemoved' => 'Update target removed.',
         'invalidTarget' => 'Invalid city or radius (1-25 km).',
+        'invalidTargetRadius' => 'Invalid radius (1-25 km).',
         'targetExists' => 'This city is already an update target.',
         'stationRenamed' => 'Station renamed.',
         'renameCleared' => 'Rename removed. The original name is used again.',
@@ -1814,6 +1816,32 @@ function handlePost(PDO $pdo, string $driver): void
                 redirectTo('?page=admin_settings');
             }
             setFlash('success', 'targetAdded');
+            redirectTo('?page=admin_settings');
+            // no break
+
+        case 'update_target':
+            // Only the radius is editable: the city is the target's identity,
+            // so changing it would be an add plus a remove, not an edit.
+            $targetId = (int) ($_POST['target_id'] ?? 0);
+            $radius = (string) ($_POST['radius_km'] ?? '');
+            if (!ctype_digit($radius) || (int) $radius < 1 || (int) $radius > 25) {
+                setFlash('error', 'invalidTargetRadius');
+                redirectTo('?page=admin_settings');
+            }
+            // Existence is checked separately: an UPDATE that stores the value
+            // already there affects no rows on MySQL, which is not "not found".
+            $stmt = $pdo->prepare('SELECT id FROM update_targets WHERE id = :id');
+            $stmt->bindValue(':id', $targetId, PDO::PARAM_INT);
+            $stmt->execute();
+            if ($stmt->fetchColumn() === false) {
+                setFlash('error', 'notFound');
+                redirectTo('?page=admin_settings');
+            }
+            $stmt = $pdo->prepare('UPDATE update_targets SET radius_km = :radius WHERE id = :id');
+            $stmt->bindValue(':radius', (int) $radius, PDO::PARAM_INT);
+            $stmt->bindValue(':id', $targetId, PDO::PARAM_INT);
+            $stmt->execute();
+            setFlash('success', 'targetUpdated');
             redirectTo('?page=admin_settings');
             // no break
 
@@ -3936,7 +3964,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                     <?php foreach ($targets as $target) { ?>
                     <tr>
                         <td class="stack-primary"><?= h($target['city']) ?></td>
-                        <td data-label="Radius (km)" data-i18n-label="targetRadius"><?= h((string) round((float) $target['radius_km'], 1)) ?></td>
+                        <td class="radius-cell" data-label="Radius (km)" data-i18n-label="targetRadius"><form method="post" action="" class="radius-form"><?= csrfField() ?><input type="hidden" name="action" value="update_target"><input type="hidden" name="target_id" value="<?= (int) $target['id'] ?>"><input type="number" name="radius_km" min="1" max="25" step="1" value="<?= h((string) (int) round((float) $target['radius_km'])) ?>" required aria-label="Radius (km)" data-i18n-aria-label="targetRadius"><button type="submit" class="btn-icon" aria-label="Save" title="Save" data-i18n-aria-label="save" data-i18n-title="save"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></button></form></td>
                         <td class="actions-cell"><form method="post" action="" class="table-form"><?= csrfField() ?><input type="hidden" name="action" value="delete_target"><input type="hidden" name="target_id" value="<?= (int) $target['id'] ?>"><button type="submit" class="btn-small danger" data-i18n="removeTarget">Remove</button></form></td>
                     </tr>
                     <?php } ?>
@@ -8183,6 +8211,20 @@ function renderDocumentHead(string $titleSuffix): void
             font-family: var(--mono);
             font-size: 0.8rem;
         }
+        /* Inline radius editor inside the update-targets table: the number
+           input and its save button share one compact line. */
+        .radius-form { display: flex; align-items: center; gap: 0.15rem; }
+        .radius-form input[type="number"] {
+            width: 4.5rem;
+            padding: 0.45rem 0.6rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-hi);
+            background: var(--bg);
+            color: var(--ink);
+            font-family: var(--mono);
+            font-size: 0.8rem;
+            text-align: right;
+        }
         /* Two-line station suggestions in the autocomplete dropdown */
         .station-ac-item .ac-name { display: block; overflow: hidden; text-overflow: ellipsis; }
         .station-ac-item .ac-sub {
@@ -8620,8 +8662,10 @@ const translations = {
         removeTarget: 'Remove',
         noTargets: 'No update targets configured yet.',
         targetAdded: 'Update target added.',
+        targetUpdated: 'Update target radius saved.',
         targetRemoved: 'Update target removed.',
         invalidTarget: 'Invalid city or radius (1-25 km).',
+        invalidTargetRadius: 'Invalid radius (1-25 km).',
         targetExists: 'This city is already an update target.',
         renameStation: 'Rename a station',
         renameStationHint: 'The new name replaces the Tankerkönig name everywhere — dashboard, CLI output, and notifications. The original name is kept and can be restored at any time.',
@@ -8949,8 +8993,10 @@ const translations = {
         removeTarget: 'Entfernen',
         noTargets: 'Noch keine Update-Ziele konfiguriert.',
         targetAdded: 'Update-Ziel hinzugefügt.',
+        targetUpdated: 'Radius des Update-Ziels gespeichert.',
         targetRemoved: 'Update-Ziel entfernt.',
         invalidTarget: 'Ungültige Stadt oder ungültiger Radius (1-25 km).',
+        invalidTargetRadius: 'Ungültiger Radius (1-25 km).',
         targetExists: 'Diese Stadt ist bereits ein Update-Ziel.',
         renameStation: 'Tankstelle umbenennen',
         renameStationHint: 'Der neue Name ersetzt den Tankerkönig-Namen überall — Dashboard, CLI-Ausgabe und Benachrichtigungen. Der Originalname bleibt erhalten und kann jederzeit wiederhergestellt werden.',
