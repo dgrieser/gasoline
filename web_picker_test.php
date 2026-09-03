@@ -58,7 +58,9 @@ foreach (['raisedNinePrice', 'raisedNinePriceSql', 'loadNearbyPrices', 'geocodeL
     'postalCodeMatches', 'nowUTC', 'validISODate', 'defaultDashboardFilters',
     'normalizeDashboardFilters', 'normalizeDashboardStationIds', 'loadDashboardFilters',
     'saveDashboardFilters', 'clearDashboardFilters', 'loadFilteredPredictions',
-    'gasolineCommandStatsSeries', 'gasolineLeadBucketLabels', 'gasolineLeadBucketSql',
+    'gasolineCommandStatsSeries', 'gasolineCommandStatsPercentile',
+    'gasolineCommandStatsRowFilter', 'gasolineCommandStatsRows',
+    'gasolineLeadBucketLabels', 'gasolineLeadBucketSql',
     'gasolineBreakdownTables'] as $name) {
     eval(extractFunction($viewer, $name));
 }
@@ -711,6 +713,174 @@ clearDashboardFilters($pdo, 7);
 check('reset drops the row', loadDashboardFilters($pdo, 7), defaultDashboardFilters());
 check('and leaves the other accounts alone',
     (int) $pdo->query('SELECT COUNT(*) AS n FROM user_filters')->fetch()['n'], 1);
+
+echo "web_picker_test: gasolineCommandStatsPercentile\n";
+
+check('the median of an odd count is a value that was measured',
+    gasolineCommandStatsPercentile([10, 20, 30], 0.5), 20);
+check('p95 is nearest-rank, never interpolated',
+    gasolineCommandStatsPercentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95), 9);
+check('a single run is its own percentile',
+    gasolineCommandStatsPercentile([42], 0.95), 42);
+// Nothing finished, so there is no duration to report and none to compare an
+// outlier against either.
+check('no measured duration has no percentile',
+    gasolineCommandStatsPercentile([], 0.5), null);
+
+echo "web_picker_test: gasolineCommandStatsRowFilter\n";
+
+// The recent-runs table's column filters. These decide which runs an
+// administrator looking for a failure is shown, so a filter that silently
+// stopped applying would read as "nothing is wrong".
+$filter = gasolineCommandStatsRowFilter([], null);
+check('no filters narrow nothing', [$filter['sql'], $filter['params']], ['', []]);
+check('and report themselves as unset', $filter['filters'],
+    ['status' => 'all', 'duration' => 'all', 'host' => '', 'q' => '']);
+
+$filter = gasolineCommandStatsRowFilter(['status' => 'error'], null);
+check('a status filter binds the status', [$filter['sql'], $filter['params']],
+    [' AND cr.status = :rf_status', [':rf_status' => 'error']]);
+
+$filter = gasolineCommandStatsRowFilter(['status' => 'flooded'], null);
+check('a status the page does not offer falls back to all',
+    [$filter['filters']['status'], $filter['sql']], ['all', '']);
+
+$filter = gasolineCommandStatsRowFilter(['duration' => '10s'], null);
+check('a duration threshold is the milliseconds it names',
+    [$filter['sql'], $filter['params']],
+    [' AND cr.duration_ms >= :rf_duration', [':rf_duration' => 10000]]);
+
+// "Outliers" has to mean on the table what it means on the tile above it.
+$filter = gasolineCommandStatsRowFilter(['duration' => 'outlier'], 4321);
+check('outliers compare against the p95 they are given',
+    $filter['params'], [':rf_duration' => 4321]);
+$filter = gasolineCommandStatsRowFilter(['duration' => 'outlier'], null);
+check('outliers narrow nothing when nothing finished',
+    [$filter['filters']['duration'], $filter['sql']], ['outlier', '']);
+
+$filter = gasolineCommandStatsRowFilter(['host' => 'box-a'], null);
+check('a host filter is an exact match', [$filter['sql'], $filter['params']],
+    [' AND cr.host = :rf_host', [':rf_host' => 'box-a']]);
+$filter = gasolineCommandStatsRowFilter(['host' => 'all'], null);
+check('the host select\'s own "any" option is not a hostname',
+    [$filter['filters']['host'], $filter['sql']], ['', '']);
+$filter = gasolineCommandStatsRowFilter(['host' => str_repeat('h', 300)], null);
+check('a hostname longer than the column is not searched for', $filter['sql'], '');
+
+$filter = gasolineCommandStatsRowFilter(['q' => 'timeout'], null);
+check('an error search is a contains match',
+    [$filter['sql'], $filter['params']],
+    [" AND cr.error LIKE :rf_error ESCAPE '!'", [':rf_error' => '%timeout%']]);
+
+// A LIKE wildcard typed into the box is a character to find, not syntax. The
+// escape character is '!' because MySQL would read ESCAPE '\\' as an
+// unterminated string literal.
+$filter = gasolineCommandStatsRowFilter(['q' => '100% _done_ !'], null);
+check('wildcards in the search term are escaped, not honoured',
+    $filter['params'][':rf_error'], '%100!% !_done!_ !!%');
+
+$filter = gasolineCommandStatsRowFilter(['q' => str_repeat('x', 400)], null);
+check('an overlong search term is cut to the column search limit',
+    strlen((string) $filter['params'][':rf_error']), 202);
+
+// Filters compose: "the failures on this host, over a second" is one query.
+$filter = gasolineCommandStatsRowFilter(
+    ['status' => 'partial', 'duration' => '1s', 'host' => 'box-b', 'q' => 'upstream'],
+    9999
+);
+check('every filter that is set is joined onto the same WHERE',
+    $filter['sql'],
+    " AND cr.status = :rf_status AND cr.duration_ms >= :rf_duration"
+    . " AND cr.host = :rf_host AND cr.error LIKE :rf_error ESCAPE '!'");
+check('and each binds its own parameter', $filter['params'], [
+    ':rf_status' => 'partial',
+    ':rf_duration' => 1000,
+    ':rf_host' => 'box-b',
+    ':rf_error' => '%upstream%',
+]);
+
+echo "web_picker_test: gasolineCommandStatsRows\n";
+
+/** A database holding the given runs, each row [command, started, duration, status, error, host]. */
+function seedCommandRuns(array $runs): PDO
+{
+    $pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]);
+    $pdo->exec('CREATE TABLE command_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, command TEXT NOT NULL,
+        started_at TEXT NOT NULL, finished_at TEXT, duration_ms INTEGER, status TEXT NOT NULL,
+        error TEXT, host TEXT NOT NULL, version TEXT NOT NULL)');
+    $pdo->exec('CREATE TABLE command_run_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL, name TEXT NOT NULL, value REAL NOT NULL)');
+    $stmt = $pdo->prepare('INSERT INTO command_runs (command, started_at, finished_at, duration_ms,
+        status, error, host, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    foreach ($runs as $run) {
+        $stmt->execute([$run[0], $run[1], $run[2] === null ? null : $run[1], $run[2], $run[3],
+            $run[4], $run[5], 'v1']);
+    }
+
+    return $pdo;
+}
+
+$runsPdo = seedCommandRuns([
+    ['update', '2026-08-21T09:00:00Z', 500, 'ok', null, 'box-a'],
+    ['update', '2026-08-21T10:00:00Z', 90000, 'partial', null, 'box-b'],
+    ['suggest', '2026-08-21T11:00:00Z', null, 'running', null, 'box-a'],
+    ['check', '2026-08-21T12:00:00Z', 2500, 'error', 'tankerkoenig: 503 upstream', 'box-b'],
+]);
+$runsPdo->exec("INSERT INTO command_run_metrics (run_id, name, value) VALUES (1, 'stations_seen', 40)");
+$runsPdo->exec("INSERT INTO command_run_metrics (run_id, name, value) VALUES (1, 'prices_written', 12)");
+
+$where = 'cr.started_at >= :from';
+$params = [':from' => '2026-08-21T00:00:00Z'];
+
+$page = gasolineCommandStatsRows($runsPdo, $where, $params, 10);
+check('the rows come back newest first',
+    array_column($page['rows'], 'started_at'),
+    ['2026-08-21T12:00:00Z', '2026-08-21T11:00:00Z', '2026-08-21T10:00:00Z', '2026-08-21T09:00:00Z']);
+check('a run under the cap is not called a sample', $page['truncated'], false);
+check('an unfinished run carries no duration', $page['rows'][1]['duration_ms'], null);
+check('a run\'s metrics are pivoted onto it', $page['rows'][3]['metrics'],
+    ['stations_seen' => 40.0, 'prices_written' => 12.0]);
+check('a run without metrics gets an empty set, not a missing key',
+    $page['rows'][0]['metrics'], []);
+check('an empty error reads as none', $page['rows'][1]['error'], null);
+
+// The cap is what makes the table a sample; the filters below are what make
+// the sample the right one.
+$page = gasolineCommandStatsRows($runsPdo, $where, $params, 2);
+check('the cap limits the rows', count($page['rows']), 2);
+check('and says the table is a sample', $page['truncated'], true);
+check('the sample is the newest end of the window',
+    array_column($page['rows'], 'status'), ['error', 'running']);
+
+// The point of filtering in SQL: the one failure is older than the newest two
+// runs, so a table capped at two rows only ever shows it because the filter
+// ran over the whole window first.
+$older = seedCommandRuns([
+    ['check', '2026-08-21T08:00:00Z', 2500, 'error', 'boom', 'box-a'],
+    ['update', '2026-08-21T09:00:00Z', 500, 'ok', null, 'box-a'],
+    ['update', '2026-08-21T10:00:00Z', 600, 'ok', null, 'box-a'],
+    ['update', '2026-08-21T11:00:00Z', 700, 'ok', null, 'box-a'],
+]);
+$filter = gasolineCommandStatsRowFilter(['status' => 'error'], null);
+$page = gasolineCommandStatsRows($older, $where . $filter['sql'],
+    array_merge($params, $filter['params']), 2);
+check('a failure outside the newest rows is still found',
+    array_column($page['rows'], 'error'), ['boom']);
+
+$filter = gasolineCommandStatsRowFilter(['q' => 'upstream'], null);
+$page = gasolineCommandStatsRows($runsPdo, $where . $filter['sql'],
+    array_merge($params, $filter['params']), 10);
+check('an error search matches on the error text',
+    array_column($page['rows'], 'command'), ['check']);
+
+// An unfinished run has no measured duration, so no threshold can select it:
+// it is not a slow run, it is an unmeasured one.
+$filter = gasolineCommandStatsRowFilter(['duration' => '1m'], null);
+$page = gasolineCommandStatsRows($runsPdo, $where . $filter['sql'],
+    array_merge($params, $filter['params']), 10);
+check('a duration threshold selects only measured runs',
+    array_column($page['rows'], 'duration_ms'), [90000]);
 
 if ($failures > 0) {
     printf("web_picker_test: %d failed\n", $failures);

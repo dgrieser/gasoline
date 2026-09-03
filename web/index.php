@@ -626,6 +626,181 @@ function gasolineCommandStatsSeries(array $rows, DateTimeImmutable $now, int $ho
     return $series;
 }
 
+// The percentile the statistics page reports, over a duration column already
+// sorted ascending. Nearest-rank rather than interpolated: every value it can
+// return is a duration some run really took.
+function gasolineCommandStatsPercentile(array $sorted, float $p): ?int
+{
+    if (count($sorted) === 0) {
+        return null;
+    }
+    $idx = (int) floor($p * (count($sorted) - 1));
+    return (int) $sorted[$idx];
+}
+
+// The finished runs' durations, ascending, which is what the percentiles above
+// and the outlier filter below both read. Only the one column is selected, so
+// this stays a narrow scan even over a month of runs.
+function gasolineCommandStatsDurations(PDO $pdo, string $where, array $params): array
+{
+    $stmt = $pdo->prepare(
+        "SELECT cr.duration_ms FROM command_runs cr
+         WHERE $where AND cr.duration_ms IS NOT NULL
+         ORDER BY cr.duration_ms ASC"
+    );
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value);
+    }
+    $stmt->execute();
+
+    return array_map('intval', $stmt->fetchAll(PDO::FETCH_COLUMN, 0));
+}
+
+// The recent-runs table's own column filters, normalized and turned into the
+// SQL that narrows the rows query.
+//
+// They narrow the rows and nothing else: the tiles, the chart and the two
+// aggregate tables stay scoped to the command and range the page as a whole is
+// filtered by, so the table reads as a drill-down into the numbers above it
+// rather than as a second, quietly disagreeing set of them. Filtering in SQL
+// rather than in the browser is what makes "failed only" answerable: the table
+// is capped at the newest few hundred runs, and a month of green runs can push
+// every failure out of that sample.
+//
+// $p95Ms is what 'outlier' compares against — the same p95 the tile shows, so
+// the word means one thing on the page. It is null when nothing in the window
+// finished, and the choice then narrows nothing: with no measured duration
+// there is nothing to call an outlier.
+function gasolineCommandStatsRowFilter(array $query, ?int $p95Ms): array
+{
+    $status = trim((string) ($query['status'] ?? 'all'));
+    if (!in_array($status, ['all', 'ok', 'partial', 'error', 'running'], true)) {
+        $status = 'all';
+    }
+
+    $duration = trim((string) ($query['duration'] ?? 'all'));
+    $thresholds = ['1s' => 1000, '10s' => 10000, '1m' => 60000, 'outlier' => $p95Ms];
+    if (!array_key_exists($duration, $thresholds)) {
+        $duration = 'all';
+    }
+
+    $host = trim((string) ($query['host'] ?? ''));
+    // 'all' is the select's own no-filter option, not a hostname.
+    if ($host === 'all' || strlen($host) > 255) {
+        $host = '';
+    }
+
+    $needle = trim((string) ($query['q'] ?? ''));
+    if (strlen($needle) > 200) {
+        $needle = substr($needle, 0, 200);
+    }
+
+    $sql = '';
+    $params = [];
+
+    if ($status !== 'all') {
+        $sql .= ' AND cr.status = :rf_status';
+        $params[':rf_status'] = $status;
+    }
+
+    // A run that never finished has no duration_ms, so every threshold here
+    // excludes it. That is the honest reading: an unfinished run is not a slow
+    // one, it is an unmeasured one, and the status filter is what finds those.
+    $minMs = $thresholds[$duration] ?? null;
+    if ($minMs !== null) {
+        $sql .= ' AND cr.duration_ms >= :rf_duration';
+        $params[':rf_duration'] = $minMs;
+    }
+
+    if ($host !== '') {
+        $sql .= ' AND cr.host = :rf_host';
+        $params[':rf_host'] = $host;
+    }
+
+    if ($needle !== '') {
+        // The wildcards belong to LIKE, not to the reader: a run whose error
+        // really contains a percent sign has to be findable by typing one. The
+        // escape character is '!' rather than the usual backslash because
+        // MySQL reads a backslash inside a string literal as an escape of its
+        // own, which would leave ESCAPE '\' an unterminated literal there.
+        $escaped = str_replace(['!', '%', '_'], ['!!', '!%', '!_'], $needle);
+        $sql .= " AND cr.error LIKE :rf_error ESCAPE '!'";
+        $params[':rf_error'] = '%' . $escaped . '%';
+    }
+
+    return [
+        'filters' => [
+            'status' => $status,
+            'duration' => $duration,
+            'host' => $host,
+            'q' => $needle,
+        ],
+        'sql' => $sql,
+        'params' => $params,
+    ];
+}
+
+// The runs themselves, newest first, each carrying the metrics it reported.
+// One row past the cap is read so the caller can say the table is a sample
+// without counting the whole window to find out.
+function gasolineCommandStatsRows(PDO $pdo, string $where, array $params, int $limit): array
+{
+    $stmt = $pdo->prepare(
+        "SELECT cr.id, cr.command, cr.started_at, cr.finished_at, cr.duration_ms,
+                cr.status, cr.error, cr.host, cr.version
+         FROM command_runs cr
+         WHERE $where
+         ORDER BY cr.started_at DESC, cr.id DESC
+         LIMIT " . ($limit + 1)
+    );
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value);
+    }
+    $stmt->execute();
+
+    $found = $stmt->fetchAll();
+    $truncated = count($found) > $limit;
+    if ($truncated) {
+        $found = array_slice($found, 0, $limit);
+    }
+
+    $byID = [];
+    foreach ($found as $row) {
+        $id = (int) $row['id'];
+        $byID[$id] = [
+            'id' => $id,
+            'command' => (string) $row['command'],
+            'started_at' => (string) $row['started_at'],
+            'finished_at' => $row['finished_at'] !== null ? (string) $row['finished_at'] : null,
+            'duration_ms' => $row['duration_ms'] !== null ? (int) $row['duration_ms'] : null,
+            'status' => (string) $row['status'],
+            'error' => $row['error'] !== null && $row['error'] !== '' ? (string) $row['error'] : null,
+            'host' => (string) $row['host'],
+            'version' => (string) $row['version'],
+            'metrics' => [],
+        ];
+    }
+
+    if (count($byID) > 0) {
+        // One query for every displayed run's metrics, pivoted in PHP: a query
+        // per row would make the table N+1 queries deep.
+        $ids = array_keys($byID);
+        $placeholders = implode(', ', array_fill(0, count($ids), '?'));
+        $mStmt = $pdo->prepare(
+            "SELECT run_id, name, value FROM command_run_metrics WHERE run_id IN ($placeholders)"
+        );
+        $mStmt->execute($ids);
+        foreach ($mStmt->fetchAll() as $row) {
+            $rid = (int) $row['run_id'];
+            if (isset($byID[$rid])) {
+                $byID[$rid]['metrics'][(string) $row['name']] = (float) $row['value'];
+            }
+        }
+    }
+
+    return ['rows' => array_values($byID), 'truncated' => $truncated];
+}
+
 // ── Auth: user helpers ────────────────────────────────────────────────────────
 
 function normalizeEmail(string $email): string
@@ -3354,10 +3529,60 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         'notify'  => 'notify',
     ];
 
+    // Every table's columns, in render order. The header cells, the sort
+    // select's options and the direction a column sorts by on first pick all
+    // come from this one list — including on the client, which is handed it as
+    // JSON — so a column cannot be sortable from the header and missing from
+    // the select on a phone, where the header is not shown at all.
+    //
+    // 'dir' is which way the column reads first: counts and durations are
+    // interesting at their largest, names and timestamps at their smallest.
+    $csColumns = [
+        'cmd' => [
+            ['key' => 'command', 'i18n' => 'statsColCommand', 'label' => 'Command', 'dir' => 'asc'],
+            ['key' => 'runs', 'i18n' => 'statsColRuns', 'label' => 'Runs', 'dir' => 'desc'],
+            ['key' => 'ok', 'i18n' => 'statsColOk', 'label' => 'OK', 'dir' => 'desc'],
+            ['key' => 'partial', 'i18n' => 'statsColPartial', 'label' => 'Partial', 'dir' => 'desc'],
+            ['key' => 'error', 'i18n' => 'statsColError', 'label' => 'Failed', 'dir' => 'desc'],
+            ['key' => 'avg_ms', 'i18n' => 'statsColAvg', 'label' => 'Avg duration', 'dir' => 'desc'],
+            ['key' => 'max_ms', 'i18n' => 'statsColMax', 'label' => 'Max duration', 'dir' => 'desc'],
+            ['key' => 'last_started_at', 'i18n' => 'statsColLast', 'label' => 'Last run', 'dir' => 'desc'],
+        ],
+        // Metric first: the counter is the subject of the row, the command
+        // that reported it the qualifier.
+        'metric' => [
+            ['key' => 'name', 'i18n' => 'statsColMetric', 'label' => 'Metric', 'dir' => 'asc'],
+            ['key' => 'command', 'i18n' => 'statsColCommand', 'label' => 'Command', 'dir' => 'asc'],
+            ['key' => 'total', 'i18n' => 'statsColTotal', 'label' => 'Total', 'dir' => 'desc'],
+            ['key' => 'per_run', 'i18n' => 'statsColPerRun', 'label' => 'Per run', 'dir' => 'desc'],
+        ],
+        'run' => [
+            ['key' => 'started_at', 'i18n' => 'statsColStarted', 'label' => 'Started', 'dir' => 'desc'],
+            ['key' => 'command', 'i18n' => 'statsColCommand', 'label' => 'Command', 'dir' => 'asc'],
+            ['key' => 'status', 'i18n' => 'statsColStatus', 'label' => 'Status', 'dir' => 'asc'],
+            ['key' => 'duration_ms', 'i18n' => 'statsColDuration', 'label' => 'Duration', 'dir' => 'desc'],
+            ['key' => 'host', 'i18n' => 'statsColHost', 'label' => 'Host', 'dir' => 'asc'],
+        ],
+    ];
+
+    // One sortable header cell. The label is a span of its own because the
+    // translator replaces a cell's whole text content, which would take the
+    // arrow with it.
+    $csTh = static function (array $col): string {
+        return '<th data-key="' . h($col['key']) . '">'
+            . '<button type="button" class="cs-sort-btn">'
+            . '<span data-i18n="' . h($col['i18n']) . '">' . h($col['label']) . '</span>'
+            . '<span class="cs-arrow" aria-hidden="true"></span>'
+            . '</button></th>';
+    };
+
     renderPageStart('Statistics', $user, 'admin_stats');
     ?>
     <style>
-        .cs-layout { max-width: 1180px; }
+        /* No reading-column cap here: the tables are wide, and the eight
+           summary tiles fit one row on a desktop that is allowed to use its
+           width. The page container's own width is the limit. */
+        .settings-layout.wide.cs-layout { max-width: none; }
         .cs-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0 1.1rem; }
         .cs-filters .field { margin-bottom: 0.6rem; }
         #cs-chart { width: 100%; display: block; height: auto; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
@@ -3371,6 +3596,108 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         .cs-legend-swatch { width: 16px; height: 10px; border-radius: 2px; display: inline-block; }
         .cs-legend-line { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
         .stat-value.cs-small { font-size: 1.15rem; }
+
+        /* Eight tiles need their own track count: the dashboard's row of four
+           would wrap them into two rows on a screen with room for one. */
+        .cs-layout .stats { grid-template-columns: repeat(4, 1fr); }
+        @media (min-width: 1180px) { .cs-layout .stats { grid-template-columns: repeat(8, 1fr); } }
+
+        /* A table's card head: what the table is, and how many rows it is
+           showing after its filters. */
+        .cs-card-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.3rem 0.8rem; }
+        .cs-card-head h2 { margin: 0; }
+        .cs-count { font-family: var(--mono); font-size: 0.7rem; color: var(--muted); margin-left: auto; }
+
+        /* The column controls: one row across the card on a desktop, two
+           columns of it on a phone. */
+        .cs-controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+            gap: 0.55rem 0.9rem;
+            align-items: end;
+            margin: 0.9rem 0 1.1rem;
+        }
+        /* A control does not grow past a readable width just because it is the
+           only one in the row. */
+        .cs-controls .field { margin-bottom: 0; min-width: 0; max-width: 18rem; }
+        .cs-controls .field select,
+        .cs-controls .field input { padding: 0.5rem 0.65rem; font-size: 0.78rem; }
+        .cs-sort-row { display: flex; gap: 0.35rem; }
+        .cs-sort-row select { flex: 1 1 auto; min-width: 0; }
+        .cs-dir { flex: 0 0 auto; min-width: 2.4rem; }
+        .cs-reset { justify-self: start; align-self: end; }
+
+        /* Sorting from the header: the button fills the cell so a tap anywhere
+           on the label sorts, and only the sorted column carries an arrow. */
+        .cs-sort-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            background: none;
+            border: 0;
+            padding: 0;
+            margin: 0;
+            font: inherit;
+            color: inherit;
+            letter-spacing: inherit;
+            text-transform: inherit;
+            cursor: pointer;
+        }
+        .cs-sort-btn:hover { color: var(--ink); }
+        th[aria-sort] .cs-sort-btn { color: var(--amber); }
+        .cs-arrow { font-size: 0.85em; }
+
+        /* The two aggregate tables sit side by side once the page is at its
+           full width, and stack below that. The threshold is the page's own
+           cap rather than a guess: at any narrower viewport the by-command
+           table's eight columns do not fit half of it — in German they need
+           every pixel of the larger share it gets here. */
+        .cs-columns { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.2rem; }
+        @media (min-width: 1400px) { .cs-columns { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); } }
+        /* Tighter cells, which is what lets eight columns fit half a page. */
+        .cs-tight th, .cs-tight td { padding-left: 0.6rem; padding-right: 0.6rem; }
+        /* The values stay on one line — "41 min ago" wrapping costs more room
+           than it saves — while the headers are allowed to wrap, which is what
+           keeps eight German column names inside half a page. */
+        .cs-tight td { white-space: nowrap; }
+        .cs-tight th { white-space: normal; }
+
+        @media (max-width: 640px) {
+            /* Two columns of tighter tiles: eight dashboard-sized ones would
+               be four screens of scrolling before the first table. */
+            .cs-layout .stats { grid-template-columns: repeat(2, 1fr); }
+            .cs-layout .stat { padding: 0.7rem 0.8rem; }
+            .cs-layout .stat-label { font-size: 0.62rem; letter-spacing: 0.06em; margin-bottom: 0.3rem; }
+            .cs-layout .stat-value { font-size: 1.15rem; }
+            .cs-layout .stat-value.cs-small { font-size: 0.95rem; }
+
+            /* A row is one card rather than a stack of full-width label/value
+               lines: the first cell names it, the short values share a line as
+               small label-over-value blocks, and only a run's detail — its
+               metrics or its error — takes the full width. */
+            .stack-table.cs-inline tr { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0 1.1rem; }
+            .stack-table.cs-inline td.stack-primary,
+            .stack-table.cs-inline td.cs-wide { flex: 1 1 100%; }
+            .stack-table.cs-inline td.cs-mini {
+                flex: 0 0 auto;
+                width: auto;
+                flex-direction: column;
+                align-items: flex-start;
+                justify-content: flex-start;
+                gap: 0.1rem;
+                padding: 0.35rem 0;
+            }
+            .stack-table.cs-inline td.cs-mini[data-label]::before { font-size: 0.58rem; }
+            .stack-table.cs-inline td.cs-wide { padding-top: 0.4rem; }
+            /* The metric list and the error text are the only values here
+               that can outrun the card, so they are the ones allowed to
+               break mid-token rather than push the row wider. */
+            .stack-table.cs-inline td.cs-wide > span {
+                flex: 1 1 auto;
+                min-width: 0;
+                overflow-wrap: anywhere;
+            }
+        }
     </style>
     <div id="price-tooltip" role="tooltip" aria-hidden="true"></div>
     <div class="settings-layout wide cs-layout">
@@ -3428,57 +3755,120 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             <div class="chart-empty" id="cs-chart-empty" data-i18n="statsNoData" role="status" hidden>No recorded runs match the current filters.</div>
         </div>
 
-        <div class="settings-card">
-            <h2 data-i18n="statsByCommand">By command</h2>
-            <div class="table-scroll">
-                <table class="stack-table">
-                    <thead>
-                        <tr>
-                            <th data-i18n="statsColCommand">Command</th>
-                            <th data-i18n="statsColRuns">Runs</th>
-                            <th data-i18n="statsColOk">OK</th>
-                            <th data-i18n="statsColPartial">Partial</th>
-                            <th data-i18n="statsColError">Failed</th>
-                            <th data-i18n="statsColAvg">Avg duration</th>
-                            <th data-i18n="statsColMax">Max duration</th>
-                            <th data-i18n="statsColLast">Last run</th>
-                        </tr>
-                    </thead>
-                    <tbody id="cs-cmd-tbody"><tr><td colspan="8" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
-                </table>
+        <div class="cs-columns">
+            <div class="settings-card">
+                <div class="cs-card-head">
+                    <h2 data-i18n="statsByCommand">By command</h2>
+                    <span class="cs-count" id="cs-cmd-count"></span>
+                </div>
+                <div class="cs-controls">
+                    <div class="field">
+                        <label for="cs-cmd-sort" data-i18n="statsSort">Sort by</label>
+                        <div class="cs-sort-row">
+                            <select id="cs-cmd-sort"></select>
+                            <button type="button" class="range-toggle cs-dir" id="cs-cmd-dir"></button>
+                        </div>
+                    </div>
+                </div>
+                <div class="table-scroll">
+                    <table class="stack-table cs-inline cs-tight" id="cs-cmd-table">
+                        <thead>
+                            <tr>
+                                <?php foreach ($csColumns['cmd'] as $col) { echo $csTh($col); } ?>
+                            </tr>
+                        </thead>
+                        <tbody id="cs-cmd-tbody"><tr><td colspan="8" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="settings-card">
+                <div class="cs-card-head">
+                    <h2 data-i18n="statsWork">Work done</h2>
+                    <span class="cs-count" id="cs-metric-count"></span>
+                </div>
+                <p class="auth-note" data-i18n="statsWorkHint">The counters the commands report, summed over the filtered runs. Per run averages only over the runs that reported the metric, so suggest’s persist counters are not diluted by runs without --persist.</p>
+                <div class="cs-controls">
+                    <div class="field">
+                        <label for="cs-metric-command" data-i18n="statsColCommand">Command</label>
+                        <select id="cs-metric-command"></select>
+                    </div>
+                    <div class="field">
+                        <label for="cs-metric-name" data-i18n="statsColMetric">Metric</label>
+                        <input type="search" id="cs-metric-name" data-i18n-placeholder="statsFilterContains" placeholder="contains…" autocomplete="off">
+                    </div>
+                    <div class="field">
+                        <label for="cs-metric-sort" data-i18n="statsSort">Sort by</label>
+                        <div class="cs-sort-row">
+                            <select id="cs-metric-sort"></select>
+                            <button type="button" class="range-toggle cs-dir" id="cs-metric-dir"></button>
+                        </div>
+                    </div>
+                    <button type="button" class="btn-small cs-reset" id="cs-metric-reset" data-i18n="statsClearFilters">Clear filters</button>
+                </div>
+                <div class="table-scroll">
+                    <table class="stack-table cs-inline" id="cs-metric-table">
+                        <thead>
+                            <tr>
+                                <?php foreach ($csColumns['metric'] as $col) { echo $csTh($col); } ?>
+                            </tr>
+                        </thead>
+                        <tbody id="cs-metric-tbody"><tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
+                    </table>
+                </div>
             </div>
         </div>
 
         <div class="settings-card">
-            <h2 data-i18n="statsWork">Work done</h2>
-            <p class="auth-note" data-i18n="statsWorkHint">The counters the commands report, summed over the filtered runs. Per run averages only over the runs that reported the metric, so suggest’s persist counters are not diluted by runs without --persist.</p>
-            <div class="table-scroll">
-                <table class="stack-table">
-                    <thead>
-                        <tr>
-                            <th data-i18n="statsColCommand">Command</th>
-                            <th data-i18n="statsColMetric">Metric</th>
-                            <th data-i18n="statsColTotal">Total</th>
-                            <th data-i18n="statsColPerRun">Per run</th>
-                        </tr>
-                    </thead>
-                    <tbody id="cs-metric-tbody"><tr><td colspan="4" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr></tbody>
-                </table>
+            <div class="cs-card-head">
+                <h2 data-i18n="statsRecent">Recent runs</h2>
+                <span class="cs-count" id="cs-run-count"></span>
             </div>
-        </div>
-
-        <div class="settings-card">
-            <h2 data-i18n="statsRecent">Recent runs</h2>
-            <div class="pred-note" id="cs-truncated" data-i18n="statsTruncated" hidden>Showing the most recent 200 runs; the statistics above cover the full filtered set.</div>
+            <p class="auth-note" data-i18n="statsRecentHint">These filters run over the whole selected range, so "Failed" finds the failures even in a month whose newest runs were all green.</p>
+            <div class="cs-controls">
+                <div class="field">
+                    <label for="cs-run-status" data-i18n="statsColStatus">Status</label>
+                    <select id="cs-run-status">
+                        <option value="all" data-i18n="statsFilterAny">Any</option>
+                        <option value="ok" data-i18n="statsStatus_ok">OK</option>
+                        <option value="partial" data-i18n="statsStatus_partial">Partial</option>
+                        <option value="error" data-i18n="statsStatus_error">Failed</option>
+                        <option value="running" data-i18n="statsStatus_running">Unfinished</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="cs-run-duration" data-i18n="statsColDuration">Duration</label>
+                    <select id="cs-run-duration">
+                        <option value="all" data-i18n="statsFilterAny">Any</option>
+                        <option value="1s" data-i18n="statsDur1s">1 s and up</option>
+                        <option value="10s" data-i18n="statsDur10s">10 s and up</option>
+                        <option value="1m" data-i18n="statsDur1m">1 min and up</option>
+                        <option value="outlier" data-i18n="statsDurOutlier">Outliers (p95 and up)</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="cs-run-host" data-i18n="statsColHost">Host</label>
+                    <select id="cs-run-host"><option value="all" data-i18n="statsFilterAny">Any</option></select>
+                </div>
+                <div class="field">
+                    <label for="cs-run-q" data-i18n="statsFilterError">Error</label>
+                    <input type="search" id="cs-run-q" data-i18n-placeholder="statsFilterContains" placeholder="contains…" autocomplete="off">
+                </div>
+                <div class="field">
+                    <label for="cs-run-sort" data-i18n="statsSort">Sort by</label>
+                    <div class="cs-sort-row">
+                        <select id="cs-run-sort"></select>
+                        <button type="button" class="range-toggle cs-dir" id="cs-run-dir"></button>
+                    </div>
+                </div>
+                <button type="button" class="btn-small cs-reset" id="cs-run-reset" data-i18n="statsClearFilters">Clear filters</button>
+            </div>
+            <div class="auth-note" id="cs-truncated" data-i18n="statsTruncated" hidden>Only the newest 200 matching runs are listed, and sorting reorders those; the tiles and tables above always cover the whole range.</div>
             <div class="table-scroll">
-                <table class="stack-table">
+                <table class="stack-table cs-inline" id="cs-run-table">
                     <thead>
                         <tr>
-                            <th data-i18n="statsColStarted">Started</th>
-                            <th data-i18n="statsColCommand">Command</th>
-                            <th data-i18n="statsColStatus">Status</th>
-                            <th data-i18n="statsColDuration">Duration</th>
-                            <th data-i18n="statsColHost">Host</th>
+                            <?php foreach ($csColumns['run'] as $col) { echo $csTh($col); } ?>
                             <th data-i18n="statsColDetail">Detail</th>
                         </tr>
                     </thead>
@@ -3510,6 +3900,40 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         const moreBtn     = document.getElementById('cs-more-btn');
         const truncEl     = document.getElementById('cs-truncated');
         const statIds     = ['cs-runs','cs-success','cs-partial','cs-failed','cs-interrupted','cs-p50','cs-p95','cs-last'];
+
+        // The same column list the header cells were built from.
+        const COLUMNS = <?= json_encode($csColumns, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG) ?>;
+
+        // A column whose own order is not the useful one. Statuses read
+        // worst-first: a table sorted by status is a table someone is looking
+        // for failures in, and 'error' before 'ok' is the alphabet agreeing
+        // with that only by accident.
+        const RANKS = { status: { error: 0, partial: 1, running: 2, ok: 3 } };
+
+        // Which column each table is sorted by, and the controls that say so.
+        // The rest of the fields are filled in once the DOM is looked up.
+        const tables = {
+            cmd:    { span: 8, sort: { key: 'runs', dir: 'desc' }, cols: COLUMNS.cmd },
+            metric: { span: 4, sort: { key: 'total', dir: 'desc' }, cols: COLUMNS.metric },
+            run:    { span: 6, sort: { key: 'started_at', dir: 'desc' }, cols: COLUMNS.run },
+        };
+
+        // The work table's own filters, applied in the browser: the server
+        // returns that aggregate whole, so nothing can be hidden behind a cap.
+        const metricCmdSel  = document.getElementById('cs-metric-command');
+        const metricNameEl  = document.getElementById('cs-metric-name');
+        const metricReset   = document.getElementById('cs-metric-reset');
+
+        // The runs table's filters, applied in SQL: the table is capped at the
+        // newest few hundred runs, and a month of green ones would push every
+        // failure out of a sample filtered in the browser.
+        const runFilterEls = {
+            status:   document.getElementById('cs-run-status'),
+            duration: document.getElementById('cs-run-duration'),
+            host:     document.getElementById('cs-run-host'),
+            q:        document.getElementById('cs-run-q'),
+        };
+        const runReset = document.getElementById('cs-run-reset');
 
         const NS = 'http://www.w3.org/2000/svg';
         // Status colours reused from the theme tokens the rest of the UI uses:
@@ -3571,11 +3995,147 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
 
         function setStat(id, val) { const el = document.getElementById(id); if (!el) return; el.textContent = val; el.classList.remove('skeleton'); el.removeAttribute('aria-busy'); }
 
-        function buildUrl() {
+        /* ── Sorting and filtering ─────────────────────────────── */
+
+        // Column order for values that may be missing. Numbers compare as
+        // numbers; everything else as text, which is also chronological for
+        // the RFC3339 timestamps the rows carry.
+        function csCompare(a, b) {
+            if (typeof a === 'number' && typeof b === 'number') return a - b;
+            const left = String(a), right = String(b);
+            return left < right ? -1 : (left > right ? 1 : 0);
+        }
+
+        // Rows ordered by one column, missing values last whichever way the
+        // column is sorted: a command with no measured duration is not the
+        // fastest one, it is one with nothing to compare. `rank` maps a value
+        // to its place for a column whose own order says nothing useful.
+        function csSortRows(rows, key, dir, rank) {
+            const value = (row) => (rank ? rank[row[key]] : row[key]);
+            const missing = (v) => v === null || v === undefined || v === '';
+            const known = [], unknown = [];
+            rows.forEach((row) => { (missing(value(row)) ? unknown : known).push(row); });
+            const sign = dir === 'asc' ? 1 : -1;
+            known.sort((a, b) => sign * csCompare(value(a), value(b)));
+            return known.concat(unknown);
+        }
+
+        // The work table narrowed by its two filters. Its rows are the whole
+        // aggregate — one per command and metric — so a filter here narrows
+        // what is shown without changing what was counted.
+        function csFilterMetricRows(rows, command, needle) {
+            const q = String(needle || '').trim().toLowerCase();
+            return rows.filter((row) =>
+                (command === 'all' || row.command === command)
+                && (q === '' || String(row.name).toLowerCase().indexOf(q) !== -1));
+        }
+
+        // Picking the column a table is already sorted by reverses it, which
+        // is what a second click on a header means everywhere else.
+        function setSort(spec, key) {
+            const col = spec.cols.filter((c) => c.key === key)[0];
+            if (!col) return;
+            if (spec.sort.key === key) spec.sort.dir = spec.sort.dir === 'asc' ? 'desc' : 'asc';
+            else spec.sort = { key: key, dir: col.dir };
+            syncSortControls(spec);
+            if (data) spec.render();
+        }
+
+        // The header arrows, the select and the direction button show the same
+        // state, whichever of the three was used to set it. Only the sorted
+        // column carries aria-sort, so assistive tech and the arrow agree.
+        function syncSortControls(spec) {
+            const asc = spec.sort.dir === 'asc';
+            const mark = asc ? '↑' : '↓';
+            if (spec.sortSel) spec.sortSel.value = spec.sort.key;
+            if (spec.dirBtn) {
+                const label = asc ? T().statsSortAsc : T().statsSortDesc;
+                spec.dirBtn.textContent = mark;
+                spec.dirBtn.setAttribute('aria-label', label);
+                spec.dirBtn.setAttribute('title', label);
+            }
+            if (!spec.tableEl) return;
+            spec.tableEl.querySelectorAll('th[data-key]').forEach((th) => {
+                const active = th.dataset.key === spec.sort.key;
+                if (active) th.setAttribute('aria-sort', asc ? 'ascending' : 'descending');
+                else th.removeAttribute('aria-sort');
+                const arrow = th.querySelector('.cs-arrow');
+                if (arrow) arrow.textContent = active ? mark : '';
+            });
+        }
+
+        // The sort select is the only sort control a phone has: the stacked
+        // card layout hides the header the arrows live in.
+        function fillSortOptions(spec) {
+            if (!spec.sortSel) return;
+            const t = T();
+            spec.sortSel.innerHTML = spec.cols.map((c) =>
+                '<option value="' + esc(c.key) + '">' + esc(t[c.i18n] || c.label) + '</option>').join('');
+            spec.sortSel.value = spec.sort.key;
+        }
+
+        // "12 of 48 rows" while a filter is narrowing the table, a plain count
+        // when it is not.
+        function setCount(spec, shown, total) {
+            if (!spec.countEl) return;
+            if (shown === null) { spec.countEl.textContent = ''; return; }
+            const t = T();
+            spec.countEl.textContent = (total !== undefined && total !== shown)
+                ? fmtInt(shown) + ' ' + t.statsOf + ' ' + fmtInt(total) + ' ' + t.statsRows
+                : fmtInt(shown) + ' ' + t.statsRows;
+        }
+
+        // The host filter offers the machines the window actually recorded. A
+        // selected host stays listed even once it drops out of the window, so
+        // the table cannot silently widen back to every host.
+        function fillHostOptions() {
+            const el = runFilterEls.host;
+            if (!el) return;
+            const chosen = el.value;
+            const hosts = ((data && data.hosts) || []).slice();
+            if (chosen && chosen !== 'all' && hosts.indexOf(chosen) === -1) hosts.push(chosen);
+            el.innerHTML = '<option value="all">' + esc(T().statsFilterAny) + '</option>'
+                + hosts.map((host) => '<option value="' + esc(host) + '">' + esc(host) + '</option>').join('');
+            el.value = chosen || 'all';
+        }
+
+        // Only the commands that reported a counter in this window, since the
+        // others would filter the work table down to nothing.
+        function fillMetricCommandOptions() {
+            if (!metricCmdSel) return;
+            const chosen = metricCmdSel.value;
+            const commands = [];
+            ((data && data.metric_totals) || []).forEach((row) => {
+                if (commands.indexOf(row.command) === -1) commands.push(row.command);
+            });
+            if (chosen && chosen !== 'all' && commands.indexOf(chosen) === -1) commands.push(chosen);
+            metricCmdSel.innerHTML = '<option value="all">' + esc(T().statsAllCommands) + '</option>'
+                + commands.map((c) => '<option value="' + esc(c) + '">' + esc(c) + '</option>').join('');
+            metricCmdSel.value = chosen || 'all';
+        }
+
+        // The runs table's filters as query parameters; 'all' is the absence
+        // of a filter, not a value to send.
+        function runFilterParams() {
+            const out = {};
+            Object.keys(runFilterEls).forEach((key) => {
+                const el = runFilterEls[key];
+                const value = el ? String(el.value || '').trim() : '';
+                if (value !== '' && value !== 'all') out[key] = value;
+            });
+            return out;
+        }
+
+        function buildUrl(rowsOnly) {
             const u = new URL(location.origin + location.pathname);
             u.searchParams.set('action', 'command_stats');
             u.searchParams.set('command', cfg.command.value);
             u.searchParams.set('range', cfg.range.value);
+            const filters = runFilterParams();
+            Object.keys(filters).forEach((key) => u.searchParams.set(key, filters[key]));
+            // The aggregates above the table do not depend on those filters,
+            // so a filter change asks for the rows alone.
+            if (rowsOnly) u.searchParams.set('rows_only', '1');
             return u.toString();
         }
 
@@ -3596,6 +4156,7 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             if (cmdTbody) cmdTbody.innerHTML = loadingRow(8);
             if (metricTbody) metricTbody.innerHTML = loadingRow(4);
             if (runTbody) runTbody.innerHTML = loadingRow(6);
+            Object.keys(tables).forEach((name) => setCount(tables[name], null));
             if (moreWrap) moreWrap.hidden = true;
             if (truncEl) truncEl.hidden = true;
         }
@@ -3633,11 +4194,55 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
 
         function render() {
             if (!data) return;
+            fillHostOptions();
+            fillMetricCommandOptions();
+            Object.keys(tables).forEach((name) => {
+                fillSortOptions(tables[name]);
+                syncSortControls(tables[name]);
+            });
             renderStats();
             renderByCommand();
             renderMetrics();
             renderChart();
             renderRuns();
+        }
+
+        // A column filter changes the runs table and nothing above it, so only
+        // the rows are re-read. The sequence number is what keeps a slow
+        // earlier request from painting over a later one's answer.
+        let rowsSeq = 0;
+        async function loadRows() {
+            const seq = ++rowsSeq;
+            runTbody.innerHTML = loadingRow(6);
+            setCount(tables.run, null);
+            moreWrap.hidden = true;
+            if (truncEl) truncEl.hidden = true;
+            try {
+                const res = await fetch(buildUrl(true), { headers: { Accept: 'application/json' } });
+                if (res.status === 401) { location.href = '?page=login'; return; }
+                if (res.status === 403) { location.href = '?'; return; }
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const payload = await res.json();
+                if (seq !== rowsSeq) return;
+                if (payload.errors && payload.errors.length) { showRowsError(payload.errors[0]); return; }
+                if (!data) data = {};
+                data.rows = payload.rows || [];
+                data.truncated = !!payload.truncated;
+                renderRuns();
+            } catch (e) {
+                if (seq === rowsSeq) showRowsError();
+            }
+        }
+
+        // The rows failed but the numbers above them did not, so only the
+        // table says so.
+        function showRowsError(err) {
+            const t = T();
+            const key = (err && err.key && t[err.key]) ? err.key : 'loadError';
+            runTbody.innerHTML = '<tr><td colspan="6" role="alert" style="text-align:center;color:var(--red);padding:2rem;font-family:var(--mono);font-size:.82rem" data-i18n="'
+                + key + '">' + esc(t[key] || t.loadError) + '</td></tr>';
+            setCount(tables.run, null);
+            moreWrap.hidden = true;
         }
 
         function renderStats() {
@@ -3656,34 +4261,45 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
 
         function renderByCommand() {
             if (!cmdTbody) return;
-            const rows = (data && data.by_command) || [];
+            const spec = tables.cmd;
+            const all = (data && data.by_command) || [];
+            const rows = csSortRows(all, spec.sort.key, spec.sort.dir);
+            setCount(spec, rows.length);
             const t = T();
-            if (rows.length === 0) { cmdTbody.innerHTML = emptyRow(8); return; }
+            if (rows.length === 0) { cmdTbody.innerHTML = emptyRow(spec.span); return; }
             cmdTbody.innerHTML = rows.map((r) =>
                 '<tr>'
-                + '<td class="stack-primary" data-label="' + esc(t.statsColCommand) + '" data-i18n-label="statsColCommand">' + esc(r.command) + '</td>'
-                + '<td data-label="' + esc(t.statsColRuns) + '" data-i18n-label="statsColRuns">' + fmtInt(r.runs) + '</td>'
-                + '<td class="cs-ok" data-label="' + esc(t.statsColOk) + '" data-i18n-label="statsColOk">' + fmtInt(r.ok) + '</td>'
-                + '<td class="cs-partial" data-label="' + esc(t.statsColPartial) + '" data-i18n-label="statsColPartial">' + fmtInt(r.partial) + '</td>'
-                + '<td class="cs-error" data-label="' + esc(t.statsColError) + '" data-i18n-label="statsColError">' + fmtInt(r.error) + '</td>'
-                + '<td data-label="' + esc(t.statsColAvg) + '" data-i18n-label="statsColAvg">' + esc(fmtDuration(r.avg_ms)) + '</td>'
-                + '<td data-label="' + esc(t.statsColMax) + '" data-i18n-label="statsColMax">' + esc(fmtDuration(r.max_ms)) + '</td>'
-                + '<td class="td-muted" data-label="' + esc(t.statsColLast) + '" data-i18n-label="statsColLast">' + esc(fmtAgo(r.last_started_at)) + '</td>'
+                + '<td class="stack-primary">' + esc(r.command) + '</td>'
+                + '<td class="cs-mini" data-label="' + esc(t.statsColRuns) + '" data-i18n-label="statsColRuns">' + fmtInt(r.runs) + '</td>'
+                + '<td class="cs-mini cs-ok" data-label="' + esc(t.statsColOk) + '" data-i18n-label="statsColOk">' + fmtInt(r.ok) + '</td>'
+                + '<td class="cs-mini cs-partial" data-label="' + esc(t.statsColPartial) + '" data-i18n-label="statsColPartial">' + fmtInt(r.partial) + '</td>'
+                + '<td class="cs-mini cs-error" data-label="' + esc(t.statsColError) + '" data-i18n-label="statsColError">' + fmtInt(r.error) + '</td>'
+                + '<td class="cs-mini" data-label="' + esc(t.statsColAvg) + '" data-i18n-label="statsColAvg">' + esc(fmtDuration(r.avg_ms)) + '</td>'
+                + '<td class="cs-mini" data-label="' + esc(t.statsColMax) + '" data-i18n-label="statsColMax">' + esc(fmtDuration(r.max_ms)) + '</td>'
+                + '<td class="cs-mini td-muted" data-label="' + esc(t.statsColLast) + '" data-i18n-label="statsColLast">' + esc(fmtAgo(r.last_started_at)) + '</td>'
                 + '</tr>'
             ).join('');
         }
 
         function renderMetrics() {
             if (!metricTbody) return;
-            const rows = (data && data.metric_totals) || [];
+            const spec = tables.metric;
+            const all = (data && data.metric_totals) || [];
+            const filtered = csFilterMetricRows(
+                all,
+                metricCmdSel ? metricCmdSel.value : 'all',
+                metricNameEl ? metricNameEl.value : ''
+            );
+            const rows = csSortRows(filtered, spec.sort.key, spec.sort.dir);
+            setCount(spec, rows.length, all.length);
             const t = T();
-            if (rows.length === 0) { metricTbody.innerHTML = emptyRow(4); return; }
+            if (rows.length === 0) { metricTbody.innerHTML = emptyRow(spec.span); return; }
             metricTbody.innerHTML = rows.map((r) =>
                 '<tr>'
-                + '<td class="stack-primary" data-label="' + esc(t.statsColCommand) + '" data-i18n-label="statsColCommand">' + esc(r.command) + '</td>'
-                + '<td data-label="' + esc(t.statsColMetric) + '" data-i18n-label="statsColMetric"><span class="cs-metrics">' + esc(r.name) + '</span></td>'
-                + '<td data-label="' + esc(t.statsColTotal) + '" data-i18n-label="statsColTotal">' + esc(fmtNumber(r.total)) + '</td>'
-                + '<td class="td-muted" data-label="' + esc(t.statsColPerRun) + '" data-i18n-label="statsColPerRun">' + esc(fmtNumber(r.per_run)) + '</td>'
+                + '<td class="stack-primary"><span class="cs-metrics">' + esc(r.name) + '</span></td>'
+                + '<td class="cs-mini" data-label="' + esc(t.statsColCommand) + '" data-i18n-label="statsColCommand">' + esc(r.command) + '</td>'
+                + '<td class="cs-mini" data-label="' + esc(t.statsColTotal) + '" data-i18n-label="statsColTotal">' + esc(fmtNumber(r.total)) + '</td>'
+                + '<td class="cs-mini td-muted" data-label="' + esc(t.statsColPerRun) + '" data-i18n-label="statsColPerRun">' + esc(fmtNumber(r.per_run)) + '</td>'
                 + '</tr>'
             ).join('');
         }
@@ -3701,30 +4317,36 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                 : metricsHtml(r.metrics);
             return '<tr>'
                 + '<td class="stack-primary" data-label="' + esc(t.statsColStarted) + '" data-i18n-label="statsColStarted">' + esc(fmtDateTime(r.started_at)) + '</td>'
-                + '<td data-label="' + esc(t.statsColCommand) + '" data-i18n-label="statsColCommand">' + esc(r.command) + '</td>'
-                + '<td class="' + statusClass(r.status) + '" data-label="' + esc(t.statsColStatus) + '" data-i18n-label="statsColStatus">' + esc(statusLabel(r.status)) + '</td>'
-                + '<td data-label="' + esc(t.statsColDuration) + '" data-i18n-label="statsColDuration">' + esc(fmtDuration(r.duration_ms)) + '</td>'
-                + '<td class="td-muted" data-label="' + esc(t.statsColHost) + '" data-i18n-label="statsColHost">' + esc(r.host || '—') + '</td>'
-                + '<td data-label="' + esc(t.statsColDetail) + '" data-i18n-label="statsColDetail">' + detail + '</td>'
+                + '<td class="cs-mini" data-label="' + esc(t.statsColCommand) + '" data-i18n-label="statsColCommand">' + esc(r.command) + '</td>'
+                + '<td class="cs-mini ' + statusClass(r.status) + '" data-label="' + esc(t.statsColStatus) + '" data-i18n-label="statsColStatus">' + esc(statusLabel(r.status)) + '</td>'
+                + '<td class="cs-mini" data-label="' + esc(t.statsColDuration) + '" data-i18n-label="statsColDuration">' + esc(fmtDuration(r.duration_ms)) + '</td>'
+                + '<td class="cs-mini td-muted" data-label="' + esc(t.statsColHost) + '" data-i18n-label="statsColHost">' + esc(r.host || '—') + '</td>'
+                + '<td class="cs-wide" data-label="' + esc(t.statsColDetail) + '" data-i18n-label="statsColDetail">' + detail + '</td>'
                 + '</tr>';
         }
 
+        // The page's rows in the order the table is sorted by, which is what
+        // the load-more button pages through: paging the server's own order
+        // and then sorting each page would interleave them.
+        let sortedRuns = [];
+
         function renderMore() {
-            const rows = data.rows || [];
-            const slice = rows.slice(rowsRendered, rowsRendered + PAGE);
+            const slice = sortedRuns.slice(rowsRendered, rowsRendered + PAGE);
             runTbody.insertAdjacentHTML('beforeend', slice.map(runRowHtml).join(''));
             rowsRendered += slice.length;
-            const remaining = rows.length - rowsRendered;
+            const remaining = sortedRuns.length - rowsRendered;
             if (remaining <= 0) { moreWrap.hidden = true; }
             else { moreWrap.hidden = false; moreBtn.textContent = T().showMore + ' (' + remaining + ')'; }
         }
 
         function renderRuns() {
+            const spec = tables.run;
             rowsRendered = 0;
             runTbody.innerHTML = '';
-            const rows = data.rows || [];
-            if (truncEl) truncEl.hidden = !data.truncated;
-            if (rows.length === 0) { runTbody.innerHTML = emptyRow(6); moreWrap.hidden = true; return; }
+            sortedRuns = csSortRows((data && data.rows) || [], spec.sort.key, spec.sort.dir, RANKS[spec.sort.key]);
+            setCount(spec, sortedRuns.length);
+            if (truncEl) truncEl.hidden = !(data && data.truncated);
+            if (sortedRuns.length === 0) { runTbody.innerHTML = emptyRow(spec.span); moreWrap.hidden = true; return; }
             renderMore();
         }
 
@@ -3936,14 +4558,88 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             }
         }
 
+        /* ── Controls ──────────────────────────────────────────── */
+
         [cfg.command, cfg.range].forEach((el) => { if (el) el.addEventListener('change', load); });
         if (moreBtn) moreBtn.addEventListener('click', renderMore);
+
+        // Each table's sort controls: the select and the direction button in
+        // the card's control row, and the header cells behind them.
+        tables.cmd.render = renderByCommand;
+        tables.metric.render = renderMetrics;
+        tables.run.render = renderRuns;
+        Object.keys(tables).forEach((name) => {
+            const spec = tables[name];
+            spec.sortSel = document.getElementById('cs-' + name + '-sort');
+            spec.dirBtn  = document.getElementById('cs-' + name + '-dir');
+            spec.countEl = document.getElementById('cs-' + name + '-count');
+            spec.tableEl = document.getElementById('cs-' + name + '-table');
+            if (spec.sortSel) spec.sortSel.addEventListener('change', () => {
+                // The select names a column, so picking the one already
+                // sorted by is not a request to reverse it.
+                const col = spec.cols.filter((c) => c.key === spec.sortSel.value)[0];
+                spec.sort = { key: spec.sortSel.value, dir: col ? col.dir : spec.sort.dir };
+                syncSortControls(spec);
+                if (data) spec.render();
+            });
+            if (spec.dirBtn) spec.dirBtn.addEventListener('click', () => {
+                spec.sort.dir = spec.sort.dir === 'asc' ? 'desc' : 'asc';
+                syncSortControls(spec);
+                if (data) spec.render();
+            });
+            if (spec.tableEl) spec.tableEl.querySelectorAll('th[data-key]').forEach((th) => {
+                const btn = th.querySelector('.cs-sort-btn');
+                if (btn) btn.addEventListener('click', () => setSort(spec, th.dataset.key));
+            });
+        });
+
+        // The work table's filters are local to the rows already in hand.
+        if (metricCmdSel) metricCmdSel.addEventListener('change', renderMetrics);
+        if (metricNameEl) metricNameEl.addEventListener('input', renderMetrics);
+        if (metricReset) metricReset.addEventListener('click', () => {
+            if (metricCmdSel) metricCmdSel.value = 'all';
+            if (metricNameEl) metricNameEl.value = '';
+            renderMetrics();
+        });
+
+        // The runs table's filters are answered by the server, so the typed
+        // one waits for a pause rather than firing per keystroke.
+        ['status', 'duration', 'host'].forEach((key) => {
+            const el = runFilterEls[key];
+            if (el) el.addEventListener('change', loadRows);
+        });
+        let qTimer = null;
+        if (runFilterEls.q) runFilterEls.q.addEventListener('input', () => {
+            if (qTimer !== null) clearTimeout(qTimer);
+            qTimer = setTimeout(loadRows, 300);
+        });
+        if (runReset) runReset.addEventListener('click', () => {
+            let changed = false;
+            Object.keys(runFilterEls).forEach((key) => {
+                const el = runFilterEls[key];
+                if (!el) return;
+                const cleared = key === 'q' ? '' : 'all';
+                if (el.value !== cleared) { el.value = cleared; changed = true; }
+            });
+            if (changed) loadRows();
+        });
 
         window.onLangChange = () => { if (data) render(); };
         window.onThemeChange = () => { if (data) renderChart(); };
 
-        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', load);
-        else load();
+        // The translation map lives in the page-wide script, which the browser
+        // has not reached while this one is being parsed, so the controls that
+        // carry translated labels are filled once the document is complete.
+        function boot() {
+            Object.keys(tables).forEach((name) => {
+                fillSortOptions(tables[name]);
+                syncSortControls(tables[name]);
+            });
+            load();
+        }
+
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+        else boot();
     })();
     </script>
     <?php } ?>
@@ -4789,6 +5485,12 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
     // within a day, so the bucket follows the range.
     $daily = $hours > 24;
 
+    // Changing one of the recent-runs table's column filters re-reads the rows
+    // and nothing else. The aggregates above the table do not depend on those
+    // filters, so re-running them would be a month-wide scan spent on numbers
+    // that cannot have moved.
+    $csRowsOnly = ((string) ($_GET['rows_only'] ?? '')) === '1';
+
     $utc = new DateTimeZone('UTC');
     $now = new DateTimeImmutable('now', $utc);
     // started_at is an RFC3339 UTC string, so lexicographic comparison against
@@ -4801,9 +5503,11 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
         'by_command' => [],
         'series' => [],
         'metric_totals' => [],
+        'hosts' => [],
         'rows' => [],
         'daily_buckets' => $daily,
         'filters' => ['command' => $csCommand, 'range' => $csRange, 'from' => $fromTs],
+        'row_filters' => [],
         'truncated' => false,
         'errors' => [],
     ];
@@ -4824,6 +5528,32 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
                 $stmt->bindValue($k, $v);
             }
         };
+
+        if ($csRowsOnly) {
+            // Only the outlier threshold needs the duration column, and only
+            // when the reader asked for outliers.
+            $p95 = ($_GET['duration'] ?? '') === 'outlier'
+                ? gasolineCommandStatsPercentile(
+                    gasolineCommandStatsDurations($pdo, $where, $params),
+                    0.95
+                )
+                : null;
+            $rowFilter = gasolineCommandStatsRowFilter($_GET, $p95);
+            $page = gasolineCommandStatsRows(
+                $pdo,
+                $where . $rowFilter['sql'],
+                array_merge($params, $rowFilter['params']),
+                $csRowLimit
+            );
+            echo json_encode([
+                'rows' => $page['rows'],
+                'truncated' => $page['truncated'],
+                'filters' => $out['filters'],
+                'row_filters' => $rowFilter['filters'],
+                'errors' => [],
+            ], $jsonFlags);
+            exit;
+        }
 
         // 1) Overall counts. duration_ms is NULL for a run that never
         //    finished, so the averages below already exclude those.
@@ -4850,23 +5580,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
         }
 
         // 2) Percentiles in PHP, not SQL: SQLite has no percentile function and
-        //    the supported MySQL/MariaDB floor rules out window functions. Only
-        //    the duration column is read, so this stays a narrow scan.
-        $durStmt = $pdo->prepare(
-            "SELECT cr.duration_ms FROM command_runs cr
-             WHERE $where AND cr.duration_ms IS NOT NULL
-             ORDER BY cr.duration_ms ASC"
-        );
-        $bind($durStmt);
-        $durStmt->execute();
-        $durations = array_map('intval', $durStmt->fetchAll(PDO::FETCH_COLUMN, 0));
-        $percentile = static function (array $sorted, float $p): ?int {
-            if (count($sorted) === 0) {
-                return null;
-            }
-            $idx = (int) floor($p * (count($sorted) - 1));
-            return $sorted[$idx];
-        };
+        //    the supported MySQL/MariaDB floor rules out window functions.
+        $durations = gasolineCommandStatsDurations($pdo, $where, $params);
+        $p95 = gasolineCommandStatsPercentile($durations, 0.95);
 
         $okish = (int) ($agg['ok'] ?? 0) + (int) ($agg['partial'] ?? 0);
         $out['summary'] = [
@@ -4878,8 +5594,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
             // A degraded run still did most of its work, so it counts as a
             // success here; the Failed tile is what separates them.
             'success_pct' => $runs > 0 ? round(($okish / $runs) * 100, 1) : null,
-            'p50_ms' => $percentile($durations, 0.5),
-            'p95_ms' => $percentile($durations, 0.95),
+            'p50_ms' => gasolineCommandStatsPercentile($durations, 0.5),
+            'p95_ms' => $p95,
             'last_started_at' => $agg['last_started_at'] !== null ? (string) $agg['last_started_at'] : null,
         ];
 
@@ -4960,56 +5676,32 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
             ];
         }
 
-        // 6) The recent runs themselves, newest first, with their metrics.
-        $rowStmt = $pdo->prepare(
-            "SELECT cr.id, cr.command, cr.started_at, cr.finished_at, cr.duration_ms,
-                    cr.status, cr.error, cr.host, cr.version
-             FROM command_runs cr
-             WHERE $where
-             ORDER BY cr.started_at DESC, cr.id DESC
-             LIMIT " . ($csRowLimit + 1)
+        // 6) The hosts the window saw, so the table's host filter can offer the
+        //    ones that exist rather than a free-text box. A handful of machines
+        //    at most; the cap is only there so a misconfigured fleet cannot
+        //    turn a select into a scroll.
+        $hostStmt = $pdo->prepare(
+            "SELECT DISTINCT cr.host FROM command_runs cr
+             WHERE $where AND cr.host <> ''
+             ORDER BY cr.host ASC
+             LIMIT 50"
         );
-        $bind($rowStmt);
-        $rowStmt->execute();
-        $runRows = $rowStmt->fetchAll();
-        if (count($runRows) > $csRowLimit) {
-            $out['truncated'] = true;
-            $runRows = array_slice($runRows, 0, $csRowLimit);
-        }
+        $bind($hostStmt);
+        $hostStmt->execute();
+        $out['hosts'] = array_map('strval', $hostStmt->fetchAll(PDO::FETCH_COLUMN, 0));
 
-        $byID = [];
-        foreach ($runRows as $row) {
-            $id = (int) $row['id'];
-            $byID[$id] = [
-                'id' => $id,
-                'command' => (string) $row['command'],
-                'started_at' => (string) $row['started_at'],
-                'finished_at' => $row['finished_at'] !== null ? (string) $row['finished_at'] : null,
-                'duration_ms' => $row['duration_ms'] !== null ? (int) $row['duration_ms'] : null,
-                'status' => (string) $row['status'],
-                'error' => $row['error'] !== null && $row['error'] !== '' ? (string) $row['error'] : null,
-                'host' => (string) $row['host'],
-                'version' => (string) $row['version'],
-                'metrics' => [],
-            ];
-        }
-        if (count($byID) > 0) {
-            // One query for every displayed run's metrics, pivoted in PHP:
-            // a row per metric would make the table N+1 queries deep.
-            $ids = array_keys($byID);
-            $placeholders = implode(', ', array_fill(0, count($ids), '?'));
-            $mStmt = $pdo->prepare(
-                "SELECT run_id, name, value FROM command_run_metrics WHERE run_id IN ($placeholders)"
-            );
-            $mStmt->execute($ids);
-            foreach ($mStmt->fetchAll() as $row) {
-                $rid = (int) $row['run_id'];
-                if (isset($byID[$rid])) {
-                    $byID[$rid]['metrics'][(string) $row['name']] = (float) $row['value'];
-                }
-            }
-        }
-        $out['rows'] = array_values($byID);
+        // 7) The recent runs themselves, newest first, narrowed by the table's
+        //    own column filters and by nothing above it.
+        $rowFilter = gasolineCommandStatsRowFilter($_GET, $p95);
+        $page = gasolineCommandStatsRows(
+            $pdo,
+            $where . $rowFilter['sql'],
+            array_merge($params, $rowFilter['params']),
+            $csRowLimit
+        );
+        $out['rows'] = $page['rows'];
+        $out['truncated'] = $page['truncated'];
+        $out['row_filters'] = $rowFilter['filters'];
 
         echo json_encode($out, $jsonFlags);
     } catch (Throwable $e) {
@@ -8726,7 +9418,21 @@ const translations = {
         statsWork: 'Work done',
         statsWorkHint: 'The counters the commands report, summed over the filtered runs. Per run averages only over the runs that reported the metric, so suggest\u2019s persist counters are not diluted by runs without --persist.',
         statsRecent: 'Recent runs',
-        statsTruncated: 'Showing the most recent 200 runs; the statistics above cover the full filtered set.',
+        statsRecentHint: 'These filters run over the whole selected range, so "Failed" finds the failures even in a month whose newest runs were all green.',
+        statsTruncated: 'Only the newest 200 matching runs are listed, and sorting reorders those; the tiles and tables above always cover the whole range.',
+        statsSort: 'Sort by',
+        statsSortAsc: 'Ascending',
+        statsSortDesc: 'Descending',
+        statsFilterAny: 'Any',
+        statsFilterContains: 'contains…',
+        statsFilterError: 'Error',
+        statsDur1s: '1 s and up',
+        statsDur10s: '10 s and up',
+        statsDur1m: '1 min and up',
+        statsDurOutlier: 'Outliers (p95 and up)',
+        statsClearFilters: 'Clear filters',
+        statsRows: 'rows',
+        statsOf: 'of',
         statsColCommand: 'Command',
         statsColRuns: 'Runs',
         statsColOk: 'OK',
@@ -9057,7 +9763,21 @@ const translations = {
         statsWork: 'Geleistete Arbeit',
         statsWorkHint: 'Die Zähler, die die Befehle melden, summiert über die gefilterten Läufe. „Pro Lauf“ mittelt nur über die Läufe, die den Zähler gemeldet haben — die Persist-Zähler von suggest werden also nicht durch Läufe ohne --persist verwässert.',
         statsRecent: 'Letzte Läufe',
-        statsTruncated: 'Es werden die letzten 200 Läufe angezeigt; die Statistiken oben umfassen die gesamte gefilterte Menge.',
+        statsRecentHint: 'Diese Filter laufen über den gesamten gewählten Zeitraum, „Fehlgeschlagen“ findet die Fehler also auch in einem Monat, dessen jüngste Läufe alle grün waren.',
+        statsTruncated: 'Aufgeführt sind nur die 200 jüngsten passenden Läufe, und das Sortieren ordnet diese um; die Kacheln und Tabellen oben umfassen immer den gesamten Zeitraum.',
+        statsSort: 'Sortieren nach',
+        statsSortAsc: 'Aufsteigend',
+        statsSortDesc: 'Absteigend',
+        statsFilterAny: 'Alle',
+        statsFilterContains: 'enthält …',
+        statsFilterError: 'Fehler',
+        statsDur1s: 'ab 1 s',
+        statsDur10s: 'ab 10 s',
+        statsDur1m: 'ab 1 min',
+        statsDurOutlier: 'Ausreißer (ab p95)',
+        statsClearFilters: 'Filter zurücksetzen',
+        statsRows: 'Zeilen',
+        statsOf: 'von',
         statsColCommand: 'Befehl',
         statsColRuns: 'Läufe',
         statsColOk: 'OK',

@@ -1063,6 +1063,86 @@ function renderPredictionsCard(windows, { lang = 'en', fuel = 'all', meta = {}, 
 }
 
 
+/* ── The statistics page's table sorting and filtering ──────────── */
+
+// Lifted from the statistics page, where they decide the order and the
+// membership of the three tables. Eight-space indentation picks them out of
+// that page's own script.
+const statsTable = new Function([
+    lift('\n        function csCompare(a, b) {'),
+    lift('\n        function csSortRows(rows, key, dir, rank) {'),
+    lift('\n        function csFilterMetricRows(rows, command, needle) {'),
+    'return { csCompare, csSortRows, csFilterMetricRows };',
+].join('\n'))();
+
+{
+    const { csSortRows, csFilterMetricRows } = statsTable;
+    const keys = (rows) => rows.map((r) => r.k);
+
+    const runs = [
+        { k: 'a', runs: 3, avg_ms: 900, status: 'ok' },
+        { k: 'b', runs: 12, avg_ms: 100, status: 'error' },
+        { k: 'c', runs: 7, avg_ms: null, status: 'running' },
+        { k: 'd', runs: 7, avg_ms: 400, status: 'partial' },
+    ];
+
+    check('descending puts the largest count first',
+        keys(csSortRows(runs, 'runs', 'desc')), ['b', 'c', 'd', 'a']);
+    check('ascending reverses it',
+        keys(csSortRows(runs, 'runs', 'asc')), ['a', 'c', 'd', 'b']);
+    // Two commands with the same count keep the order they came in, which is
+    // the server's, so a re-sort is not a reshuffle.
+    check('a tie keeps the incoming order',
+        keys(csSortRows(runs, 'runs', 'desc').filter((r) => r.runs === 7)), ['c', 'd']);
+    check('sorting does not disturb the rows it was given', keys(runs), ['a', 'b', 'c', 'd']);
+
+    // A command with nothing measured is not the fastest one. Sorting it to
+    // the top of "avg duration, ascending" would read as exactly that.
+    check('a missing value sorts last ascending',
+        keys(csSortRows(runs, 'avg_ms', 'asc')), ['b', 'd', 'a', 'c']);
+    check('and last descending too',
+        keys(csSortRows(runs, 'avg_ms', 'desc')), ['a', 'd', 'b', 'c']);
+
+    // Timestamps are RFC3339 strings, so text order is chronological order.
+    const stamped = [
+        { k: 'noon', started_at: '2026-08-21T12:00:00Z' },
+        { k: 'dawn', started_at: '2026-08-21T06:00:00Z' },
+        { k: 'night', started_at: '2026-08-21T23:00:00Z' },
+    ];
+    check('newest first is a plain text sort on the timestamp',
+        keys(csSortRows(stamped, 'started_at', 'desc')), ['night', 'noon', 'dawn']);
+
+    // A table sorted by status is a table someone is hunting failures in.
+    const rank = { error: 0, partial: 1, running: 2, ok: 3 };
+    check('status sorts worst first, not alphabetically',
+        keys(csSortRows(runs, 'status', 'asc', rank)), ['b', 'd', 'c', 'a']);
+    check('and best first the other way',
+        keys(csSortRows(runs, 'status', 'desc', rank)), ['a', 'c', 'd', 'b']);
+    check('a status the rank does not know sorts last',
+        keys(csSortRows([{ k: 'x', status: 'martian' }, { k: 'y', status: 'ok' }], 'status', 'asc', rank)),
+        ['y', 'x']);
+
+    const metrics = [
+        { command: 'update', name: 'stations_seen', total: 40 },
+        { command: 'update', name: 'prices_written', total: 12 },
+        { command: 'suggest', name: 'windows_persisted', total: 7 },
+    ];
+    check('no filter keeps every counter',
+        csFilterMetricRows(metrics, 'all', '').length, 3);
+    check('a command filter keeps that command',
+        csFilterMetricRows(metrics, 'update', '').map((r) => r.name),
+        ['stations_seen', 'prices_written']);
+    check('a name search is a contains match',
+        csFilterMetricRows(metrics, 'all', 'persist').map((r) => r.name), ['windows_persisted']);
+    check('and it ignores case and surrounding space',
+        csFilterMetricRows(metrics, 'all', '  PRICES ').map((r) => r.name), ['prices_written']);
+    check('the two filters compose',
+        csFilterMetricRows(metrics, 'update', 'seen').map((r) => r.name), ['stations_seen']);
+    check('a search matching nothing empties the table',
+        csFilterMetricRows(metrics, 'all', 'nope'), []);
+}
+
+
 if (failures > 0) {
     console.log(`web_chart_test: ${failures} failed`);
     process.exit(1);
