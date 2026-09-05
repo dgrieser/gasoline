@@ -44,16 +44,16 @@ const (
 	// tolerates best: the same budget spent evenly instead of three requests
 	// arriving back to back and then a minute of silence.
 	//
-	// 45 s apart, flat. Tankerkönig answers a paced sweep with 503s often
+	// 50 s apart, flat. Tankerkönig answers a paced sweep with 503s often
 	// enough that retries are routine rather than exceptional, and a retry is
 	// the API asking to be left alone — so the window is set as wide as the
 	// schedule allows rather than as narrow as the sweep needs. At six requests
-	// that is 3:45, which leaves a five-minute schedule room for one retry.
+	// that is 4:10 of the 4:50 a five-minute schedule affords.
 	//
 	// It replaces a 37 s window with an extra two seconds after every third
 	// request — an arrangement that bought a 1.7% lower request rate and three
 	// shapes of pacing to reason about instead of one.
-	defaultRequestDelay = 45 * time.Second
+	defaultRequestDelay = 50 * time.Second
 	defaultRequestBurst = 1
 
 	// sweepBudget is the wall clock a tiled sweep has to fit inside. The
@@ -64,15 +64,18 @@ const (
 	// at the end.
 	//
 	// The widest sweep is a 42 km target: 6 requests, the last going out at
-	// 3:45. What the rest of the budget buys is sweepRetryHeadroom.
+	// 4:10. What is left of the budget after that is sweepRetryHeadroom.
 	sweepBudget = 4*time.Minute + 50*time.Second
 
 	// sweepRetryHeadroom is how many retries the widest sweep can absorb and
-	// still finish inside the budget. This is what the window is traded
-	// against: every second added to the pace is more room for the API to be
-	// left alone and less room for it to be asked twice, and a sweep that
-	// overruns loses the next cycle to flock as well as running late.
-	sweepRetryHeadroom = 1
+	// still finish inside the budget, and at this pace it is none: a seventh
+	// request lands at 5:00, ten seconds past. That is the trade the window is
+	// on the other side of — every second added to the pace is more room for
+	// the API to be left alone and less room for it to be asked twice — and 48 s
+	// is the widest window that still fits a retry, if the balance ever wants
+	// moving back. A sweep that does retry finishes late and loses the next
+	// cycle to flock, so prices land ten minutes apart rather than five.
+	sweepRetryHeadroom = 0
 
 	// minRingTiles is the smallest ring either construction is defined for.
 	minRingTiles = 3

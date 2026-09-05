@@ -8,11 +8,12 @@
 # `flock -n` keeps the runs from overlapping: cron fires on a fixed schedule
 # whether the last run finished or not, and two sweeps at once would race each
 # other for the API rate limit and for the database write lock. A radius over
-# 25 km is collected as several requests paced one per 45 s, and the widest
-# target — 42 km, six requests — ends at 3:45, leaving room in the 5 minutes
-# below for one retried request and no more. A second retry, or a second tiled
-# city in the same sweep, runs past the tick; the lock then drops the next one
-# rather than letting two sweeps collide. See "Radii wider than the API serves"
-# in the README before putting more than one wide target on this schedule.
+# 25 km is collected as several requests paced one per 50 s, and the widest
+# target — 42 km, six requests — ends at 4:10 of the 5 minutes below. That
+# leaves no room for a retried request: a sweep that retries at all, or a
+# second tiled city in the same sweep, runs past the tick, and the lock then
+# drops the next one rather than letting two sweeps collide. See "Radii wider
+# than the API serves" in the README before putting more than one wide target
+# on this schedule.
 
 */5 * * * * set -a; . /etc/gasoline/gasoline.env; set +a; flock -n /tmp/gasoline-update.lock /usr/local/bin/gasoline update --radius 25 --city 'Luebbecke'

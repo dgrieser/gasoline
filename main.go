@@ -789,7 +789,7 @@ func runUpdate(args []string) (err error) {
 	fs.Var(radiusFlag{&events}, "radius", "Search radius in km, repeatable; default 5, max 42 (over 25 is fetched as several 25 km queries)")
 	fuelType := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
 	sortBy := fs.String("sort", "dist", "Sort order: dist or price")
-	requestDelay := fs.Duration("request-delay", defaultRequestDelay, "Window the Tankerkönig requests of a tiled radius are paced over (default 45s: a 42 km sweep is then 6 requests over 3:45)")
+	requestDelay := fs.Duration("request-delay", defaultRequestDelay, "Window the Tankerkönig requests of a tiled radius are paced over (default 50s: a 42 km sweep is then 6 requests over 4:10)")
 	requestBurst := fs.Int("request-burst", defaultRequestBurst, "Tankerkönig requests allowed inside one --request-delay window")
 	userAgent := fs.String("user-agent", defaultUserAgent, "User-Agent for Nominatim and API calls")
 	outputLong, outputShort := addOutputFlags(fs)

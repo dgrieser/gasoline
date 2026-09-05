@@ -7,7 +7,7 @@ Description=Run gasoline update every 5 minutes
 # *started*, so a sweep that takes longer than the interval would re-fire the
 # moment it ends. A wide --radius is collected as several paced requests and can
 # take minutes, which is exactly when that difference bites. Note the cost of
-# that choice: a 42 km target is six requests 45 s apart, so it paces to 3:45
+# that choice: a 42 km target is six requests 50 s apart, so it paces to 4:10
 # and sweeps land roughly every 9 minutes here rather than every 5 — longer
 # still when a request is retried. If you need the interval measured from the
 # start instead, use the cron entry in examples/cron/, which pairs a fixed
