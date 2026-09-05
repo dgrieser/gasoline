@@ -545,6 +545,26 @@ func schemaStatements(d dialect) []string {
 				INDEX idx_command_run_metrics_run (run_id, name),
 				FOREIGN KEY (run_id) REFERENCES command_runs(id)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			// One row per Tankerkönig request a tiled sweep actually made,
+			// retries included. The metrics table above can only hold one
+			// number per name per run, so the shape of a sweep — which tile was
+			// slow, which one had to be retried, how much of the wall clock was
+			// the pacing rather than the API — has nowhere to live there.
+			`CREATE TABLE IF NOT EXISTS command_run_tiles (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				run_id BIGINT NOT NULL,
+				seq INT NOT NULL,
+				city VARCHAR(255) NOT NULL DEFAULT '',
+				tile_index INT NOT NULL,
+				attempt INT NOT NULL,
+				sent_at VARCHAR(64) NOT NULL,
+				waited_ms BIGINT NOT NULL DEFAULT 0,
+				duration_ms BIGINT NOT NULL DEFAULT 0,
+				status VARCHAR(16) NOT NULL,
+				error TEXT,
+				INDEX idx_command_run_tiles_run (run_id, seq),
+				FOREIGN KEY (run_id) REFERENCES command_runs(id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 		}
 	}
 	return []string{
@@ -763,6 +783,25 @@ func schemaStatements(d dialect) []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_command_run_metrics_run
 			ON command_run_metrics(run_id, name)`,
+		// One row per Tankerkönig request a tiled sweep actually made, retries
+		// included — see the MySQL definition for why the metrics table cannot
+		// carry this.
+		`CREATE TABLE IF NOT EXISTS command_run_tiles (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id INTEGER NOT NULL,
+			seq INTEGER NOT NULL,
+			city TEXT NOT NULL DEFAULT '',
+			tile_index INTEGER NOT NULL,
+			attempt INTEGER NOT NULL,
+			sent_at TEXT NOT NULL,
+			waited_ms INTEGER NOT NULL DEFAULT 0,
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL,
+			error TEXT,
+			FOREIGN KEY (run_id) REFERENCES command_runs(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_command_run_tiles_run
+			ON command_run_tiles(run_id, seq)`,
 	}
 }
 

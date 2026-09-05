@@ -801,6 +801,60 @@ function gasolineCommandStatsRows(PDO $pdo, string $where, array $params, int $l
     return ['rows' => array_values($byID), 'truncated' => $truncated];
 }
 
+// One run's individual Tankerkönig requests, in the order they went out.
+//
+// This is read on demand for a single run rather than joined into the table
+// above: the runs table holds 200 rows and a tiled sweep is a request each,
+// which would be thousands of rows of drill-down shipped on every page load to
+// answer a question about one of them.
+//
+// A `waited_ms` of a whole pacing window is the normal case, not a problem — it
+// is the sweep obeying --request-delay — so the caller renders it apart from
+// `duration_ms`, which is the API's own latency and the only half worth
+// worrying about.
+function gasolineCommandStatsTiles(PDO $pdo, string $driver, int $runID, int $limit): array
+{
+    // The Go side creates this table, so a UI newer than the binary that writes
+    // the database finds it missing. That is an empty drill-down, not an error
+    // page: everything else on the page is still readable.
+    if (!gasolineTableExists($pdo, $driver, 'command_run_tiles')) {
+        return ['tiles' => [], 'truncated' => false, 'supported' => false];
+    }
+
+    $stmt = $pdo->prepare(
+        "SELECT seq, city, tile_index, attempt, sent_at, waited_ms, duration_ms, status, error
+         FROM command_run_tiles
+         WHERE run_id = :run
+         ORDER BY seq ASC
+         LIMIT " . ($limit + 1)
+    );
+    $stmt->bindValue(':run', $runID, PDO::PARAM_INT);
+    $stmt->execute();
+
+    $found = $stmt->fetchAll();
+    $truncated = count($found) > $limit;
+    if ($truncated) {
+        $found = array_slice($found, 0, $limit);
+    }
+
+    $tiles = [];
+    foreach ($found as $row) {
+        $tiles[] = [
+            'seq' => (int) $row['seq'],
+            'city' => (string) $row['city'],
+            'tile_index' => (int) $row['tile_index'],
+            'attempt' => (int) $row['attempt'],
+            'sent_at' => (string) $row['sent_at'],
+            'waited_ms' => (int) $row['waited_ms'],
+            'duration_ms' => (int) $row['duration_ms'],
+            'status' => (string) $row['status'],
+            'error' => $row['error'] !== null && $row['error'] !== '' ? (string) $row['error'] : null,
+        ];
+    }
+
+    return ['tiles' => $tiles, 'truncated' => $truncated, 'supported' => true];
+}
+
 // ── Auth: user helpers ────────────────────────────────────────────────────────
 
 function normalizeEmail(string $email): string
@@ -3593,6 +3647,55 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         /* The metric list inside a run row: name=value pairs, wrapping. */
         .cs-metrics { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
         .cs-err { font-family: var(--mono); font-size: 0.72rem; color: var(--red); word-break: break-word; }
+        /* A run's request drill-down. It is a table inside a row rather than
+           more columns on the row itself: the requests are a list per run, and
+           the outer table's own columns describe the run as a whole. */
+        .cs-tiles-toggle {
+            font-family: var(--mono);
+            font-size: 0.7rem;
+            padding: 0.1rem 0.45rem;
+            margin-left: 0.45rem;
+            border-radius: 5px;
+            border: 1px solid var(--border-hi);
+            background: transparent;
+            color: var(--muted);
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .cs-tiles-toggle:hover { border-color: var(--amber); color: var(--amber); }
+        .cs-tiles-toggle[aria-expanded="true"] { border-color: var(--amber); color: var(--amber); }
+        .cs-tiles-cell { padding: 0 0 0.5rem 0; }
+        .cs-tiles-panel {
+            border-left: 2px solid var(--border-hi);
+            padding: 0.35rem 0 0.2rem 0.6rem;
+            font-family: var(--mono);
+            font-size: 0.7rem;
+        }
+        .cs-tiles-panel table { width: 100%; border-collapse: collapse; }
+        .cs-tiles-panel th {
+            text-align: left;
+            font-weight: 400;
+            color: var(--muted);
+            font-size: 0.6rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            padding: 0.15rem 0.6rem 0.25rem 0;
+            white-space: nowrap;
+        }
+        .cs-tiles-panel td { padding: 0.12rem 0.6rem 0.12rem 0; white-space: nowrap; vertical-align: top; }
+        /* The API's own latency is the number worth reading; the pacing wait
+           next to it is the schedule we chose, so it stays quiet. */
+        .cs-tiles-panel td.cs-tile-dur { color: var(--ink); }
+        .cs-tiles-panel td.cs-tile-wait { color: var(--muted); }
+        .cs-tiles-panel td.cs-tile-why { white-space: normal; overflow-wrap: anywhere; color: var(--red); }
+        .cs-tiles-note { color: var(--muted); padding: 0.3rem 0 0 0; }
+        @media (max-width: 720px) {
+            /* The flex row layout the card view applies to the outer table
+               would tear this one apart, so it is put back to a table. */
+            .stack-table.cs-inline tr.cs-tiles-row { display: block; }
+            .stack-table.cs-inline tr.cs-tiles-row td.cs-tiles-cell { display: block; width: 100%; }
+            .cs-tiles-panel { overflow-x: auto; }
+        }
         .cs-legend-swatch { width: 16px; height: 10px; border-radius: 2px; display: inline-block; }
         .cs-legend-line { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
         .stat-value.cs-small { font-size: 1.15rem; }
@@ -3973,6 +4076,15 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             return n.toLocaleString(loc(), { maximumFractionDigits: Number.isInteger(n) ? 0 : 2 });
         }
         function fmtDateTime(iso) { if (!iso) return '—'; return new Date(iso).toLocaleString(loc(), { timeZone: tz(), year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }); }
+        // Seconds matter here and nowhere else on the page: the requests of one
+        // sweep are seconds or tens of seconds apart, and a minute-resolution
+        // clock would show several of them as the same instant.
+        function fmtTimeOfDay(iso) {
+            if (!iso) return '—';
+            return new Date(iso).toLocaleTimeString(loc(), {
+                timeZone: tz(), hour: '2-digit', minute: '2-digit', second: '2-digit',
+            });
+        }
         function fmtBucket(t, daily) {
             const d = new Date(daily ? t + 'T00:00:00Z' : t + ':00:00Z');
             return daily
@@ -4310,19 +4422,169 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             return '<span class="cs-metrics">' + names.map((n) => esc(n) + '=' + esc(fmtNumber(metrics[n]))).join('  ') + '</span>';
         }
 
+        /* ── A run's individual requests ───────────────────────── */
+
+        // Fetched per run, on the first expand, and kept for the rest of the
+        // page's life: the requests of a finished run cannot change, and a
+        // reader comparing two slow sweeps expands them more than once.
+        const tileCache = new Map();
+        const tilesOpen = new Set();
+
+        function tileStatusLabel(s) { return T()['statsTileStatus_' + s] || s; }
+        // A retried request is amber rather than red: the tile it belongs to
+        // may well have succeeded on the next try, and the row after it says so.
+        function tileStatusClass(s) {
+            if (s === 'ok') return 'cs-ok';
+            if (s === 'retried') return 'cs-partial';
+            return 'cs-error';
+        }
+
+        // The toggle only appears on runs that reported requests, and says how
+        // many and how many of those were retries — so the answer to "did this
+        // sweep have to retry" needs no expanding at all.
+        function tileToggleHtml(r) {
+            const metrics = r.metrics || {};
+            const requests = metrics.tile_requests;
+            if (requests === null || requests === undefined) return '';
+            const t = T();
+            const retries = Number(metrics.tile_retries || 0);
+            let label = fmtNumber(requests) + ' ' + t.statsTileRequests;
+            if (retries > 0) label += ', ' + fmtNumber(retries) + ' ' + t.statsTileRetries;
+            const open = tilesOpen.has(r.id);
+            return '<button type="button" class="cs-tiles-toggle" data-cs-tiles="' + r.id + '"'
+                + ' aria-expanded="' + (open ? 'true' : 'false') + '"'
+                + ' aria-label="' + esc(open ? t.statsTileHide : t.statsTileShow) + '">'
+                + (open ? '▾ ' : '▸ ') + esc(label)
+                + '</button>';
+        }
+
+        function tilesPanelHtml(runID) {
+            const t = T();
+            const entry = tileCache.get(runID);
+            if (!entry || entry.state === 'loading') {
+                return '<div class="cs-tiles-panel"><span class="spinner" aria-hidden="true"></span></div>';
+            }
+            if (entry.state === 'error') {
+                return '<div class="cs-tiles-panel"><span class="cs-err">' + esc(t.loadError) + '</span></div>';
+            }
+            if (entry.supported === false) {
+                return '<div class="cs-tiles-panel"><span class="cs-tiles-note">' + esc(t.statsTileUnsupported) + '</span></div>';
+            }
+            const tiles = entry.tiles || [];
+            if (tiles.length === 0) {
+                return '<div class="cs-tiles-panel"><span class="cs-tiles-note">' + esc(t.statsTileNone) + '</span></div>';
+            }
+            // The city column earns its place only in a sweep of several, which
+            // is the case where a slow request is otherwise unattributable.
+            const multiCity = new Set(tiles.map((x) => x.city)).size > 1;
+            const head = '<tr>'
+                + '<th>#</th>'
+                + (multiCity ? '<th>' + esc(t.statsTileColCity) + '</th>' : '')
+                + '<th>' + esc(t.statsTileColTile) + '</th>'
+                + '<th>' + esc(t.statsTileColAttempt) + '</th>'
+                + '<th>' + esc(t.statsTileColSent) + '</th>'
+                + '<th>' + esc(t.statsTileColRequest) + '</th>'
+                + '<th>' + esc(t.statsTileColWaited) + '</th>'
+                + '<th>' + esc(t.statsTileColStatus) + '</th>'
+                + '</tr>';
+            const body = tiles.map((x) =>
+                '<tr>'
+                + '<td class="td-muted">' + esc(fmtNumber(x.seq + 1)) + '</td>'
+                + (multiCity ? '<td>' + esc(x.city || '—') + '</td>' : '')
+                // Tile 0 is the city centre, which is the load-bearing one: if
+                // it fails the whole city fails, so it is named, not numbered.
+                + '<td>' + (x.tile_index === 0 ? esc(t.statsTileCentre) : esc(fmtNumber(x.tile_index))) + '</td>'
+                + '<td class="' + (x.attempt > 1 ? 'cs-partial' : 'td-muted') + '">' + esc(fmtNumber(x.attempt)) + '</td>'
+                + '<td class="td-muted">' + esc(fmtTimeOfDay(x.sent_at)) + '</td>'
+                + '<td class="cs-tile-dur">' + esc(fmtDuration(x.duration_ms)) + '</td>'
+                + '<td class="cs-tile-wait">' + esc(x.waited_ms > 0 ? '+' + fmtDuration(x.waited_ms) : '—') + '</td>'
+                + '<td class="' + tileStatusClass(x.status) + '">' + esc(tileStatusLabel(x.status)) + '</td>'
+                + '</tr>'
+                // The reason spans the rest of the row, indented past the
+                // sequence number: one column fewer than the header has, and
+                // the header is one wider when it is naming cities.
+                + (x.error
+                    ? '<tr><td></td><td class="cs-tile-why" colspan="' + (multiCity ? 7 : 6) + '">' + esc(x.error) + '</td></tr>'
+                    : '')
+            ).join('');
+            const note = entry.truncated
+                ? '<div class="cs-tiles-note">' + esc(t.statsTileTruncated) + '</div>'
+                : '';
+            return '<div class="cs-tiles-panel"><table><thead>' + head + '</thead><tbody>' + body + '</tbody></table>' + note + '</div>';
+        }
+
+        function tilesRowHtml(runID) {
+            return '<tr class="cs-tiles-row" data-cs-tiles-for="' + runID + '">'
+                + '<td class="cs-tiles-cell" colspan="6">' + tilesPanelHtml(runID) + '</td>'
+                + '</tr>';
+        }
+
+        function repaintTilesRow(runID) {
+            const row = runTbody.querySelector('tr[data-cs-tiles-for="' + runID + '"]');
+            if (row) row.innerHTML = '<td class="cs-tiles-cell" colspan="6">' + tilesPanelHtml(runID) + '</td>';
+        }
+
+        async function loadTiles(runID) {
+            tileCache.set(runID, { state: 'loading' });
+            try {
+                const u = new URL(location.origin + location.pathname);
+                u.searchParams.set('action', 'command_stats');
+                u.searchParams.set('tiles_for', String(runID));
+                const res = await fetch(u.toString(), { headers: { Accept: 'application/json' } });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const payload = await res.json();
+                if (payload.errors && payload.errors.length) throw new Error('payload');
+                tileCache.set(runID, {
+                    state: 'ok',
+                    tiles: payload.tiles || [],
+                    truncated: !!payload.truncated,
+                    supported: payload.supported !== false,
+                });
+            } catch (e) {
+                tileCache.set(runID, { state: 'error' });
+            }
+            // The reader may have collapsed the row while this was in flight,
+            // in which case the answer is kept for the next expand and nothing
+            // is painted.
+            if (tilesOpen.has(runID)) repaintTilesRow(runID);
+        }
+
+        function toggleTiles(runID, btn) {
+            const open = tilesOpen.has(runID);
+            const runRow = btn.closest('tr');
+            if (open) {
+                tilesOpen.delete(runID);
+                const row = runTbody.querySelector('tr[data-cs-tiles-for="' + runID + '"]');
+                if (row) row.remove();
+            } else {
+                tilesOpen.add(runID);
+                if (runRow) runRow.insertAdjacentHTML('afterend', tilesRowHtml(runID));
+                const cached = tileCache.get(runID);
+                if (!cached || cached.state === 'error') loadTiles(runID);
+            }
+            btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+            const t = T();
+            btn.setAttribute('aria-label', open ? t.statsTileShow : t.statsTileHide);
+            // The caret is the first character of the label.
+            btn.textContent = (open ? '▸ ' : '▾ ') + btn.textContent.slice(2);
+        }
+
         function runRowHtml(r) {
             const t = T();
             const detail = r.error
                 ? '<span class="cs-err">' + esc(r.error) + '</span>'
                 : metricsHtml(r.metrics);
-            return '<tr>'
+            const row = '<tr data-cs-run="' + r.id + '">'
                 + '<td class="stack-primary" data-label="' + esc(t.statsColStarted) + '" data-i18n-label="statsColStarted">' + esc(fmtDateTime(r.started_at)) + '</td>'
                 + '<td class="cs-mini" data-label="' + esc(t.statsColCommand) + '" data-i18n-label="statsColCommand">' + esc(r.command) + '</td>'
                 + '<td class="cs-mini ' + statusClass(r.status) + '" data-label="' + esc(t.statsColStatus) + '" data-i18n-label="statsColStatus">' + esc(statusLabel(r.status)) + '</td>'
                 + '<td class="cs-mini" data-label="' + esc(t.statsColDuration) + '" data-i18n-label="statsColDuration">' + esc(fmtDuration(r.duration_ms)) + '</td>'
                 + '<td class="cs-mini td-muted" data-label="' + esc(t.statsColHost) + '" data-i18n-label="statsColHost">' + esc(r.host || '—') + '</td>'
-                + '<td class="cs-wide" data-label="' + esc(t.statsColDetail) + '" data-i18n-label="statsColDetail">' + detail + '</td>'
+                + '<td class="cs-wide" data-label="' + esc(t.statsColDetail) + '" data-i18n-label="statsColDetail">' + detail + tileToggleHtml(r) + '</td>'
                 + '</tr>';
+            // A run left expanded through a re-sort stays expanded, and its
+            // requests come from the cache rather than a second request.
+            return tilesOpen.has(r.id) ? row + tilesRowHtml(r.id) : row;
         }
 
         // The page's rows in the order the table is sorted by, which is what
@@ -4562,6 +4824,15 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
 
         [cfg.command, cfg.range].forEach((el) => { if (el) el.addEventListener('change', load); });
         if (moreBtn) moreBtn.addEventListener('click', renderMore);
+
+        // Delegated, because the rows are rebuilt on every sort, filter and
+        // page: a listener per toggle would be re-bound each time or lost.
+        if (runTbody) runTbody.addEventListener('click', (e) => {
+            const btn = e.target instanceof Element ? e.target.closest('[data-cs-tiles]') : null;
+            if (!btn) return;
+            const runID = Number(btn.getAttribute('data-cs-tiles'));
+            if (runID > 0) toggleTiles(runID, btn);
+        });
 
         // Each table's sort controls: the select and the direction button in
         // the card's control row, and the header cells behind them.
@@ -5466,10 +5737,33 @@ if (isset($_GET['action']) && $_GET['action'] === 'command_stats') {
     // The recent-runs table is a sample, not the statistics: the aggregates
     // below run over the whole filtered set regardless of this cap.
     $csRowLimit = 200;
+    // A run's own request list is capped separately, and deliberately above
+    // what the Go side keeps per run: a reader who expanded one run asked for
+    // all of it, so this only ever bites rows written by some future binary
+    // that keeps more — which is why the panel can say it cut the list.
+    $csTileLimit = 600;
     // A run still marked 'running' after this long never finished. Nothing
     // clears the row later — there is no daemon — so the reader decides, and
     // the window is generous enough to cover a slow `suggest --persist`.
     $csStaleHours = 6;
+
+    // A single run's requests, asked for by expanding that run in the table.
+    // It shares this action for the admin check and nothing else, so it answers
+    // before any of the window parsing below.
+    $csTilesFor = (int) ($_GET['tiles_for'] ?? 0);
+    if ($csTilesFor > 0) {
+        try {
+            echo json_encode(
+                gasolineCommandStatsTiles($authPdo, $dbDriver, $csTilesFor, $csTileLimit) + ['errors' => []],
+                $jsonFlags
+            );
+        } catch (Throwable $e) {
+            error_log('gasoline command_stats tiles error: ' . $e->getMessage());
+            http_response_code(500);
+            echo json_encode(['errors' => [['key' => 'loadError', 'params' => [], 'message' => 'Could not load the requests of that run.']]], $jsonFlags);
+        }
+        exit;
+    }
 
     $csCommand = trim((string) ($_GET['command'] ?? 'all'));
     if (!in_array($csCommand, ['all', 'update', 'suggest', 'check', 'notify'], true)) {
@@ -9453,6 +9747,24 @@ const translations = {
         statsStatus_partial: 'Partial',
         statsStatus_error: 'Failed',
         statsStatus_running: 'Unfinished',
+        statsTileRequests: 'requests',
+        statsTileRetries: 'retried',
+        statsTileShow: 'Show the individual requests of this run',
+        statsTileHide: 'Hide the individual requests of this run',
+        statsTileColCity: 'City',
+        statsTileColTile: 'Tile',
+        statsTileColAttempt: 'Try',
+        statsTileColSent: 'Sent',
+        statsTileColRequest: 'Request',
+        statsTileColWaited: 'Paced',
+        statsTileColStatus: 'Status',
+        statsTileCentre: 'centre',
+        statsTileStatus_ok: 'answered',
+        statsTileStatus_retried: 'retried',
+        statsTileStatus_failed: 'failed',
+        statsTileNone: 'This run recorded no individual requests.',
+        statsTileUnsupported: 'No request log in this database yet — it is written by a newer gasoline binary.',
+        statsTileTruncated: 'Only the first requests of this run are shown.',
         statsLegendDuration: 'Avg duration',
         statsJustNow: 'just now',
         statsMinutesAgo: 'min ago',
@@ -9798,6 +10110,24 @@ const translations = {
         statsStatus_partial: 'Teilweise',
         statsStatus_error: 'Fehlgeschlagen',
         statsStatus_running: 'Unbeendet',
+        statsTileRequests: 'Anfragen',
+        statsTileRetries: 'wiederholt',
+        statsTileShow: 'Die einzelnen Anfragen dieses Laufs anzeigen',
+        statsTileHide: 'Die einzelnen Anfragen dieses Laufs ausblenden',
+        statsTileColCity: 'Stadt',
+        statsTileColTile: 'Kachel',
+        statsTileColAttempt: 'Versuch',
+        statsTileColSent: 'Gesendet',
+        statsTileColRequest: 'Anfrage',
+        statsTileColWaited: 'Getaktet',
+        statsTileColStatus: 'Status',
+        statsTileCentre: 'Zentrum',
+        statsTileStatus_ok: 'beantwortet',
+        statsTileStatus_retried: 'wiederholt',
+        statsTileStatus_failed: 'fehlgeschlagen',
+        statsTileNone: 'Dieser Lauf hat keine einzelnen Anfragen aufgezeichnet.',
+        statsTileUnsupported: 'In dieser Datenbank gibt es noch kein Anfrageprotokoll — es wird von einer neueren gasoline-Version geschrieben.',
+        statsTileTruncated: 'Es werden nur die ersten Anfragen dieses Laufs angezeigt.',
         statsLegendDuration: 'Ø Dauer',
         statsJustNow: 'gerade eben',
         statsMinutesAgo: 'Min. her',

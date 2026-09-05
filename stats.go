@@ -25,6 +25,11 @@ const (
 	commandRunStatusError   = "error"
 )
 
+// commandRunTileBatch is how many per-request rows go in one INSERT. Ten
+// columns each keeps this well inside the placeholder limits both engines
+// enforce, with room for the cap the producer applies.
+const commandRunTileBatch = 100
+
 // commandRunErrorLimit bounds the stored error string. The column is TEXT, but
 // a runaway error (a whole API response, say) is noise on a page that shows it
 // inline next to a hundred other runs.
@@ -44,6 +49,9 @@ type commandRun struct {
 	// run; order preserves first-set order for a stable row order on disk.
 	metrics map[string]float64
 	order   []string
+	// tiles is the per-request log a tiled sweep hands over, written out as
+	// child rows of the run. It is capped by its producer, not here.
+	tiles   []tileAttempt
 	partial bool
 	live    bool
 }
@@ -107,6 +115,20 @@ func (r *commandRun) setBool(name string, value bool) {
 		return
 	}
 	r.set(name, 0)
+}
+
+// recordTiles hands over one sweep's individual requests, which are written out
+// as child rows of the run. A sweep that made more than its producer keeps
+// reports the difference as a counter — see tile_requests_unlogged — so this
+// only ever receives the list itself.
+//
+// Calling it twice replaces the log rather than appending: a run has exactly
+// one sweep, and a second call means a caller lost track of that.
+func (r *commandRun) recordTiles(attempts []tileAttempt) {
+	if r == nil || !r.live {
+		return
+	}
+	r.tiles = attempts
 }
 
 // markPartial records that some units of work failed while others succeeded —
@@ -185,6 +207,39 @@ func (r *commandRun) finish(ctx context.Context, cmdErr error) {
 		}
 	}
 
+	// The requests go in one statement per batch rather than one per request:
+	// a 50 km sweep is a handful of rows, but a sweep of many tiled targets is
+	// a few hundred, and that is a round trip each against MySQL.
+	for start := 0; start < len(r.tiles); start += commandRunTileBatch {
+		end := min(start+commandRunTileBatch, len(r.tiles))
+		var (
+			placeholders []string
+			args         []any
+		)
+		for i, tile := range r.tiles[start:end] {
+			placeholders = append(placeholders, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+			var errText any
+			if tile.Err != "" {
+				errText = truncateRunError(tile.Err)
+			}
+			args = append(args,
+				r.id, start+i, tile.City, tile.Tile, tile.Attempt,
+				tile.SentAt.UTC().Format(time.RFC3339),
+				tile.Waited.Milliseconds(), tile.Duration.Milliseconds(),
+				tile.Status, errText,
+			)
+		}
+		if _, err := tx.ExecContext(writeCtx,
+			`INSERT INTO command_run_tiles
+				(run_id, seq, city, tile_index, attempt, sent_at, waited_ms, duration_ms, status, error)
+			VALUES `+strings.Join(placeholders, ", "),
+			args...,
+		); err != nil {
+			r.fail("record tile requests", err)
+			return
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		r.fail("record finish", err)
 	}
@@ -220,6 +275,12 @@ func pruneCommandRuns(ctx context.Context, db *sql.DB, now time.Time) (int, erro
 	cutoff := now.AddDate(0, 0, -commandRunRetentionDays).UTC().Format(time.RFC3339)
 	if _, err := db.ExecContext(ctx, `
 		DELETE FROM command_run_metrics
+		WHERE run_id IN (SELECT id FROM command_runs WHERE started_at < ?)
+	`, cutoff); err != nil {
+		return 0, err
+	}
+	if _, err := db.ExecContext(ctx, `
+		DELETE FROM command_run_tiles
 		WHERE run_id IN (SELECT id FROM command_runs WHERE started_at < ?)
 	`, cutoff); err != nil {
 		return 0, err
