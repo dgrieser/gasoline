@@ -374,6 +374,61 @@ console.log('web_stats_test: cascade');
         beats('.cs-layout .cs-wide-only', '.field', '.field {'));
 }
 
+/* ── Sorting from the column header ─────────────────────────────── */
+
+console.log('web_stats_test: setSort');
+{
+    // The work table has no sort control any more: its header is there at
+    // every width, so a column sorts by being tapped and taps after that
+    // reverse it. That cycle is the whole interface, so it is worth asserting
+    // rather than assuming.
+    const setSort = new Function('syncSortControls', 'data', [
+        lift('        function setSort(spec, key) {'),
+        'return setSort;',
+    ].join('\n'))(() => {}, null);
+
+    const spec = {
+        cols: [{ key: 'name', dir: 'asc' }, { key: 'total', dir: 'desc' }],
+        sort: { key: 'name', dir: 'asc' },
+        render: () => { throw new Error('rendered with no data loaded'); },
+    };
+
+    setSort(spec, 'total');
+    // A column arrives sorted the way it is worth reading first — counts
+    // largest, names smallest — rather than inheriting the last column's.
+    check('a new column takes its own first direction', spec.sort, { key: 'total', dir: 'desc' });
+    setSort(spec, 'total');
+    check('tapping it again reverses it', spec.sort, { key: 'total', dir: 'asc' });
+    setSort(spec, 'total');
+    check('and again', spec.sort, { key: 'total', dir: 'desc' });
+    setSort(spec, 'name');
+    check('moving to another column does not carry the direction over',
+        spec.sort, { key: 'name', dir: 'asc' });
+    setSort(spec, 'nope');
+    check('a column the table does not have changes nothing',
+        spec.sort, { key: 'name', dir: 'asc' });
+}
+
+console.log('web_stats_test: controls');
+{
+    // The select existed because the card layout hides the header. The work
+    // table keeps its header now, so the select would be a second way to do
+    // one job; the runs table still cards its rows and still needs one.
+    checkTrue('the work table has no sort select left', !viewer.includes('cs-metric-sort'));
+    checkTrue('nor a direction button', !viewer.includes('cs-metric-dir'));
+    checkTrue('the runs table still has both', viewer.includes('cs-run-sort') && viewer.includes('cs-run-dir'));
+    // Both resets are desktop-only: neither fits a phone card's third of a row.
+    // One is hidden by its own class and the other by the control row around
+    // it — which is the whole row, in the card that has nothing else left — so
+    // what is asserted is that something between the two hides it.
+    for (const id of ['cs-metric-reset', 'cs-run-reset']) {
+        const at = viewer.indexOf('id="' + id + '"');
+        const row = viewer.lastIndexOf('<div class="cs-controls', at);
+        checkTrue(`${id} is hidden on a phone`,
+            at !== -1 && row !== -1 && viewer.slice(row, at).includes('cs-wide-only'));
+    }
+}
+
 /* ── Both languages carry every label the panel asks for ────────── */
 
 console.log('web_stats_test: translations');

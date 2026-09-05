@@ -3878,9 +3878,31 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             .cs-layout .settings-card { padding: 0.85rem 0.8rem; }
             .cs-layout .auth-note { font-size: 0.68rem; line-height: 1.5; }
             .cs-layout .cs-card-head h2 { font-size: 1.05rem; }
-            .cs-layout .cs-controls { gap: 0.45rem 0.7rem; margin: 0.7rem 0 0.8rem; }
+            /* Controls on a phone. Two *equal* columns rather than auto-fit:
+               auto-fit sizes each track to its own content, so a short label
+               and a long one came out different widths and nothing lined up
+               down the card. Everything else here is size — four filters and a
+               sort were costing three times the height they needed. */
+            .cs-layout .cs-controls {
+                grid-template-columns: repeat(3, 1fr);
+                gap: 0.4rem 0.4rem;
+                margin: 0.6rem 0 0.7rem;
+                align-items: end;
+            }
+            .cs-layout .cs-controls .field { gap: 0.15rem; max-width: none; }
+            .cs-layout .cs-controls .field label {
+                font-size: 0.58rem;
+                letter-spacing: 0.08em;
+            }
             .cs-layout .cs-controls .field select,
-            .cs-layout .cs-controls .field input { padding: 0.4rem 0.5rem; font-size: 0.74rem; }
+            .cs-layout .cs-controls .field input { padding: 0.35rem 0.45rem; font-size: 0.72rem; }
+            .cs-layout .cs-sort-row { gap: 0.3rem; }
+            .cs-layout .cs-dir { min-width: 1.9rem; }
+
+            /* Tapping a column header is the only way this table sorts, so the
+               button gets a row's worth of height to be tapped by. The padding
+               is vertical only: horizontal would widen the columns it sorts. */
+            .cs-layout .stack-table.cs-inline.cs-flat th .cs-sort-btn { padding: 0.3rem 0; }
             .cs-layout .cs-columns { gap: 0.8rem; }
 
             /* Two columns of tighter tiles: eight dashboard-sized ones would
@@ -4021,23 +4043,21 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                     <span class="cs-count" id="cs-metric-count"></span>
                 </div>
                 <p class="auth-note" data-i18n="statsWorkHint">The counters the commands report, summed over the filtered runs. Per run averages only over the runs that reported the metric, so suggest’s persist counters are not diluted by runs without --persist.</p>
-                <div class="cs-controls">
-                    <div class="field cs-wide-only">
+                <!-- No sort control here: this table keeps its header at every
+                     width, so its columns sort by tapping them, and a select
+                     saying the same thing is a second way to do one job. The
+                     filters that remain are desktop-only, which leaves a phone
+                     no controls above the table at all. -->
+                <div class="cs-controls cs-wide-only">
+                    <div class="field">
                         <label for="cs-metric-command" data-i18n="statsColCommand">Command</label>
                         <select id="cs-metric-command"></select>
                     </div>
-                    <div class="field cs-wide-only">
+                    <div class="field">
                         <label for="cs-metric-name" data-i18n="statsColMetric">Metric</label>
                         <input type="search" id="cs-metric-name" data-i18n-placeholder="statsFilterContains" placeholder="contains…" autocomplete="off">
                     </div>
-                    <div class="field">
-                        <label for="cs-metric-sort" data-i18n="statsSort">Sort by</label>
-                        <div class="cs-sort-row">
-                            <select id="cs-metric-sort"></select>
-                            <button type="button" class="range-toggle cs-dir" id="cs-metric-dir"></button>
-                        </div>
-                    </div>
-                    <button type="button" class="btn-small cs-reset cs-wide-only" id="cs-metric-reset" data-i18n="statsClearFilters">Clear filters</button>
+                    <button type="button" class="btn-small cs-reset" id="cs-metric-reset" data-i18n="statsClearFilters">Clear filters</button>
                 </div>
                 <div class="table-scroll">
                     <table class="stack-table cs-inline cs-flat" id="cs-metric-table">
@@ -4098,7 +4118,13 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                         <button type="button" class="range-toggle cs-dir" id="cs-run-dir"></button>
                     </div>
                 </div>
-                <button type="button" class="btn-small cs-reset" id="cs-run-reset" data-i18n="statsClearFilters">Clear filters</button>
+                <!-- Desktop-only, like the work table's. "Filter zurücksetzen"
+                     is nineteen characters and no readable size fits it on one
+                     line in a third of a phone card, so it wrapped and left the
+                     row it sits in the only one not lining up. Every filter
+                     beside it offers its own "any" option, which is the same
+                     reset four taps apart. -->
+                <button type="button" class="btn-small cs-reset cs-wide-only" id="cs-run-reset" data-i18n="statsClearFilters">Clear filters</button>
             </div>
             <div class="auth-note" id="cs-truncated" data-i18n="statsTruncated" hidden>Only the newest 200 matching runs are listed, and sorting reorders those; the tiles and tables above always cover the whole range.</div>
             <div class="table-scroll">
@@ -4310,8 +4336,10 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             });
         }
 
-        // The sort select is the only sort control a phone has: the stacked
-        // card layout hides the header the arrows live in.
+        // The sort select is the only sort control a phone has wherever the
+        // stacked card layout hides the header the arrows live in. A table that
+        // keeps its header there — the work table — has no select at all, and
+        // this returns for it.
         function fillSortOptions(spec) {
             if (!spec.sortSel) return;
             const t = T();
