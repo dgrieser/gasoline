@@ -3907,6 +3907,16 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                    rest, which in a real table reads as one column shouting. */
                 font-size: inherit;
             }
+            /* The first column carried no left padding, which put it hard
+               against the left edge of the header's background band. The last
+               column's right gutter has nothing beside it to be a gutter from,
+               so it pays for the indent and leaves the table a few pixels
+               narrower than it was. */
+            .cs-layout .stack-table.cs-inline.cs-flat th:first-child,
+            .cs-layout .stack-table.cs-inline.cs-flat td:first-child { padding-left: 0.45rem; }
+            .cs-layout .stack-table.cs-inline.cs-flat th:last-child,
+            .cs-layout .stack-table.cs-inline.cs-flat td:last-child { padding-right: 0; }
+
             /* The header names the columns, so the card layout's per-cell
                label would repeat it on every row. */
             .cs-layout .stack-table.cs-inline.cs-flat td[data-label]::before { content: none; }
@@ -3943,6 +3953,8 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             }
             .cs-layout .cs-controls .field select,
             .cs-layout .cs-controls .field input { padding: 0.35rem 0.45rem; font-size: 0.72rem; }
+            .cs-layout .cs-reset-cell { justify-self: stretch; }
+            .cs-layout .cs-reset { width: 100%; }
             .cs-layout .cs-sort-row { gap: 0.3rem; }
             .cs-layout .cs-dir { min-width: 1.9rem; }
 
