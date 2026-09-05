@@ -32,8 +32,27 @@ const (
 	// defaultRequestDelay and defaultRequestBurst are the pace a tiled sweep
 	// keeps: at most defaultRequestBurst requests inside any window of
 	// defaultRequestDelay.
-	defaultRequestDelay = 30 * time.Second
-	defaultRequestBurst = 3
+	//
+	// One request per window rather than a burst of them is what a shared key
+	// tolerates best: the same budget spent evenly instead of three requests
+	// arriving back to back and then a minute of silence. The window is then as
+	// wide as the sweep's own deadline allows — see sweepBudget, which is what
+	// picks 35 s over anything rounder.
+	defaultRequestDelay = 35 * time.Second
+	defaultRequestBurst = 1
+
+	// sweepBudget is the wall clock a tiled sweep has to fit inside. The
+	// packaged cron entry and systemd timer both fire `update` every five
+	// minutes and lean on flock to drop a run that would overlap the last one,
+	// so a sweep that overruns does not queue up — it loses the whole cycle.
+	// The ten seconds held back cover geocoding, the requests themselves and
+	// the write at the end.
+	//
+	// The widest sweep is a 50 km target: 8 tiles, plus the one retry a
+	// transient failure costs, is 9 requests, and at one per 35 s window the
+	// last of them goes out at 280 s. A second retry overruns, which is the
+	// case flock is there for.
+	sweepBudget = 4*time.Minute + 50*time.Second
 
 	// maxTileRetries is how often one tile is retried after a failure that
 	// retrying can plausibly fix.
@@ -175,6 +194,16 @@ func (l *tankerLimiter) wait() time.Time {
 	}
 	l.recent = append(l.recent, now)
 	return now
+}
+
+// pace reports how long this limiter takes to let n requests out, measured from
+// the first — request i goes out at (i/burst)·delay, so the last one waits
+// ((n-1)/burst)·delay. It is what sizes the defaults against sweepBudget.
+func (l *tankerLimiter) pace(n int) time.Duration {
+	if l == nil || l.delay <= 0 || l.burst < 1 || n < 2 {
+		return 0
+	}
+	return time.Duration((n-1)/l.burst) * l.delay
 }
 
 // tankerRequestError carries whether retrying a failed Tankerkönig request can

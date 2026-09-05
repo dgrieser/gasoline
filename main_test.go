@@ -4432,10 +4432,13 @@ func TestRunUpdateTiledStampsFirstRequestAcrossCities(t *testing.T) {
 	t.Setenv(envAPIKeyName, "test-key")
 	clock := stubTileClock(t)
 
-	// 40 km is 6 tiles, and the defaults pace 3 requests per 30 s window. So
-	// the first city's six requests leave the window full at its 30 s mark,
-	// and the second city's very first request has to wait for the next one.
+	// 40 km is 6 tiles, and the pace belongs to the API key rather than to the
+	// city, so the second city's very first request is the seventh of the sweep
+	// and is held back by whatever the defaults make of that. The timeline is
+	// derived from the defaults rather than written out, so tuning them moves
+	// this test's expectations with them instead of breaking it.
 	const radius = "40"
+	pacing := &tankerLimiter{delay: defaultRequestDelay, burst: defaultRequestBurst}
 	if tiles, err := planSearchTiles(52.5, 13.4, 40); err != nil || len(tiles) != 6 {
 		t.Fatalf("40 km planned %d tiles (err %v), want 6 — the pacing timeline below assumes it", len(tiles), err)
 	}
@@ -4498,9 +4501,9 @@ func TestRunUpdateTiledStampsFirstRequestAcrossCities(t *testing.T) {
 	if want := clock.start.UTC().Format(time.RFC3339); stamps["Berlin"] != want {
 		t.Errorf("Berlin recorded_at = %q, want %q (its first request went out at once)", stamps["Berlin"], want)
 	}
-	// The second city's first request is held for the next window, and that is
-	// the instant its stations were observed.
-	if want := clock.start.Add(60 * time.Second).UTC().Format(time.RFC3339); stamps["Uchte"] != want {
+	// The second city's first request is held until its slot comes up, and that
+	// is the instant its stations were observed.
+	if want := clock.start.Add(pacing.pace(7)).UTC().Format(time.RFC3339); stamps["Uchte"] != want {
 		t.Errorf("Uchte recorded_at = %q, want %q (the instant its first request actually went out)", stamps["Uchte"], want)
 	}
 }

@@ -6,7 +6,11 @@ Description=Run gasoline update every 5 minutes
 # OnUnitInactiveSec, not OnUnitActiveSec: the latter counts from when the run
 # *started*, so a sweep that takes longer than the interval would re-fire the
 # moment it ends. A wide --radius is collected as several paced requests and can
-# take a minute or more, which is exactly when that difference bites.
+# take minutes, which is exactly when that difference bites. Note the cost of
+# that choice: a 50 km target paces to about 4:05, so sweeps land roughly every
+# 9 minutes here rather than every 5. If you need the interval measured from the
+# start instead, use the cron entry in examples/cron/, which pairs a fixed
+# schedule with `flock -n`.
 OnBootSec=1min
 OnUnitInactiveSec=5min
 # Catch up on a missed run if the machine was asleep/off at the scheduled time.
