@@ -3688,7 +3688,52 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
            next to it is the schedule we chose, so it stays quiet. */
         .cs-tiles-panel td.cs-tile-dur { color: var(--ink); }
         .cs-tiles-panel td.cs-tile-wait { color: var(--muted); }
-        .cs-tiles-panel td.cs-tile-why { white-space: normal; overflow-wrap: anywhere; color: var(--red); }
+        /* Only the table scrolls. The reasons under it are bounded by the
+           panel instead, which is what lets them be ellipsised against a width
+           the reader can actually see. */
+        .cs-tiles-scroll { overflow-x: auto; }
+        .cs-why-head {
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            padding: 0.45rem 0 0.15rem;
+        }
+        .cs-why-list { list-style: none; margin: 0; padding: 0; }
+        .cs-why-list li + li { margin-top: 0.15rem; }
+        /* A button so a reason opens by tap as well as by pointer, and looks
+           like the text it is. */
+        .cs-why-toggle {
+            display: flex;
+            align-items: baseline;
+            gap: 0.5rem;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            border: 0;
+            background: none;
+            font: inherit;
+            text-align: left;
+            cursor: pointer;
+            color: var(--red);
+        }
+        /* The requests this reason belongs to, in the numbering the table's
+           own first column uses. */
+        .cs-why-seq { flex: 0 0 auto; color: var(--muted); }
+        .cs-why-text {
+            flex: 0 1 auto;
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        /* Opened, it wraps in place — no character budget to guess at, and
+           none to be wrong about on a desktop where it would all have fit. */
+        .cs-why-toggle[aria-expanded="true"] .cs-why-text {
+            flex: 1 1 auto;
+            white-space: normal;
+            overflow: visible;
+            overflow-wrap: anywhere;
+        }
         .cs-tiles-note { color: var(--muted); padding: 0.3rem 0 0 0; }
         @media (max-width: 640px) {
             /* The card layout the outer table takes on at this width reaches
@@ -3710,7 +3755,7 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                three times over without scrolling: on the toggle before
                anything is expanded, by the amber attempt number, and by the
                reason row spanning the width beneath it. */
-            .cs-tiles-panel { overflow-x: auto; }
+            .cs-tiles-scroll { overflow-x: auto; }
             /* Every one of these carries the full `.stack-table.cs-inline`
                prefix, and it is load-bearing rather than tidy: the card rule
                that turns a row into a flex line is `.stack-table.cs-inline tr`,
@@ -4735,6 +4780,13 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                 + '</button>';
         }
 
+        // An API reason can be a whole HTML error page — newlines, tabs and a
+        // paragraph about enabling friendly error messages in the browser. A
+        // table row is one line whatever it holds, so it is flattened first.
+        function flattenReason(msg) {
+            return String(msg || '').replace(/\s+/g, ' ').trim();
+        }
+
         function tilesPanelHtml(runID) {
             const t = T();
             const entry = tileCache.get(runID);
@@ -4777,17 +4829,45 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                 + '<td class="cs-tile-wait">' + esc(x.waited_ms > 0 ? '+' + fmtDuration(x.waited_ms) : '—') + '</td>'
                 + '<td class="' + tileStatusClass(x.status) + '">' + esc(tileStatusLabel(x.status)) + '</td>'
                 + '</tr>'
-                // The reason spans the rest of the row, indented past the
-                // sequence number: one column fewer than the header has, and
-                // the header is one wider when it is naming cities.
-                + (x.error
-                    ? '<tr><td></td><td class="cs-tile-why" colspan="' + (multiCity ? 7 : 6) + '">' + esc(x.error) + '</td></tr>'
-                    : '')
             ).join('');
+
+            // The reasons are listed under the table rather than as rows in it,
+            // keyed by the request numbers they belong to. In the table they
+            // were a value in no column — the question every reader asked of
+            // that red line — and worse, unreadable: a row spanning every
+            // column is as wide as its sentence, so the table scrolled to the
+            // width of an API's prose and the reason could only be ellipsised
+            // against a width nobody could see. Out here the panel's own width
+            // bounds them.
+            //
+            // Identical messages are listed once. A sweep that meets a failing
+            // API meets the same failure on every tile, so this is five copies
+            // of one sentence collapsed to one line naming five requests.
+            const reasons = [];
+            const byText = new Map();
+            for (const x of tiles) {
+                if (!x.error) continue;
+                const text = flattenReason(x.error);
+                if (!byText.has(text)) {
+                    byText.set(text, { text: text, seqs: [] });
+                    reasons.push(byText.get(text));
+                }
+                byText.get(text).seqs.push(x.seq + 1);
+            }
+            const why = reasons.length === 0 ? '' :
+                '<div class="cs-why-head">' + esc(t.statsTileReason) + '</div>'
+                + '<ul class="cs-why-list">' + reasons.map((r) =>
+                    '<li><button type="button" class="cs-why-toggle" data-cs-why aria-expanded="false">'
+                    + '<span class="cs-why-seq">' + esc(r.seqs.map(fmtNumber).join(', ')) + '</span>'
+                    + '<span class="cs-why-text">' + esc(r.text) + '</span>'
+                    + '</button></li>').join('')
+                + '</ul>';
             const note = entry.truncated
                 ? '<div class="cs-tiles-note">' + esc(t.statsTileTruncated) + '</div>'
                 : '';
-            return '<div class="cs-tiles-panel"><table><thead>' + head + '</thead><tbody>' + body + '</tbody></table>' + note + '</div>';
+            return '<div class="cs-tiles-panel">'
+                + '<div class="cs-tiles-scroll"><table><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>'
+                + why + note + '</div>';
         }
 
         function tilesRowHtml(runID) {
@@ -5105,10 +5185,22 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         // Delegated, because the rows are rebuilt on every sort, filter and
         // page: a listener per toggle would be re-bound each time or lost.
         if (runTbody) runTbody.addEventListener('click', (e) => {
-            const btn = e.target instanceof Element ? e.target.closest('[data-cs-tiles]') : null;
-            if (!btn) return;
-            const runID = Number(btn.getAttribute('data-cs-tiles'));
-            if (runID > 0) toggleTiles(runID, btn);
+            if (!(e.target instanceof Element)) return;
+            const btn = e.target.closest('[data-cs-tiles]');
+            if (btn) {
+                const runID = Number(btn.getAttribute('data-cs-tiles'));
+                if (runID > 0) toggleTiles(runID, btn);
+                return;
+            }
+            // A reason shows one line until it is asked for. Swapping which of
+            // the two spans is hidden, rather than rewriting the text, keeps
+            // the full message out of the table's width while it is shut and
+            // selectable once it is open.
+            const why = e.target.closest('[data-cs-why]');
+            if (!why) return;
+            const open = why.getAttribute('aria-expanded') === 'true';
+            why.setAttribute('aria-expanded', open ? 'false' : 'true');
+
         });
 
         // Each table's sort controls: the select and the direction button in
@@ -10037,6 +10129,7 @@ const translations = {
         statsTileColWaited: 'Paced',
         statsTileColStatus: 'Status',
         statsTileCentre: 'centre',
+        statsTileReason: 'Reason',
         statsTileStatus_ok: 'answered',
         statsTileStatus_retried: 'retried',
         statsTileStatus_failed: 'failed',
@@ -10400,6 +10493,7 @@ const translations = {
         statsTileColWaited: 'Getaktet',
         statsTileColStatus: 'Status',
         statsTileCentre: 'Zentrum',
+        statsTileReason: 'Grund',
         statsTileStatus_ok: 'beantwortet',
         statsTileStatus_retried: 'wiederholt',
         statsTileStatus_failed: 'fehlgeschlagen',
