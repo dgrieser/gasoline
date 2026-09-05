@@ -3714,21 +3714,37 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                anything is expanded, by the amber attempt number, and by the
                reason row spanning the width beneath it. */
             .cs-tiles-panel { overflow-x: auto; }
-            .stack-table .cs-tiles-panel table { display: table; width: max-content; min-width: 100%; }
-            .stack-table .cs-tiles-panel thead { display: table-header-group; }
-            .stack-table .cs-tiles-panel tbody { display: table-row-group; }
-            .stack-table .cs-tiles-panel tr {
+            /* Every one of these carries the full `.stack-table.cs-inline`
+               prefix, and it is load-bearing rather than tidy: the card rule
+               that turns a row into a flex line is `.stack-table.cs-inline tr`,
+               declared further down this stylesheet with the same specificity
+               a plain `.stack-table .cs-tiles-panel tr` has. An equal
+               specificity loses to the later rule — and a flex container
+               blockifies its children, so losing on the row alone was enough
+               to take the cells with it and leave the columns ragged, each
+               header sitting in a box of its own. */
+            .stack-table.cs-inline .cs-tiles-panel table { display: table; width: max-content; min-width: 100%; }
+            .stack-table.cs-inline .cs-tiles-panel thead { display: table-header-group; }
+            .stack-table.cs-inline .cs-tiles-panel tbody { display: table-row-group; }
+            .stack-table.cs-inline .cs-tiles-panel tr {
                 display: table-row;
                 border: none;
                 border-radius: 0;
                 padding: 0;
                 margin: 0;
+                gap: 0;
             }
-            .stack-table .cs-tiles-panel th,
-            .stack-table .cs-tiles-panel td {
+            .stack-table.cs-inline .cs-tiles-panel th,
+            .stack-table.cs-inline .cs-tiles-panel td {
                 display: table-cell;
                 width: auto;
                 border: none;
+                /* The card layout's own cell padding drops the horizontal
+                   half, which for a real table means neighbouring columns
+                   touch: a two-digit row number runs straight into the tile
+                   beside it. The gutter has to be restated here. */
+                padding: 0.12rem 0.6rem 0.12rem 0;
+                vertical-align: top;
             }
         }
         .cs-legend-swatch { width: 16px; height: 10px; border-radius: 2px; display: inline-block; }
