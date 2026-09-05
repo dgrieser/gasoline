@@ -3776,7 +3776,52 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         .cs-sort-row { display: flex; gap: 0.35rem; }
         .cs-sort-row select { flex: 1 1 auto; min-width: 0; }
         .cs-dir { flex: 0 0 auto; min-width: 2.4rem; }
-        .cs-reset { justify-self: start; align-self: end; }
+        /* Every table's controls live behind one of these, shut. They are
+           worth having and worth not looking at: on a phone the runs card's
+           six controls were taller than the first run they filter, and on a
+           desktop they are a row of selects above a table nobody came to
+           configure. Native <details> rather than a button and a hidden div —
+           the open/closed state, the keyboard and the semantics come free, and
+           there is no way for a script error to leave them unopenable. */
+        .cs-collapse { margin: 0.6rem 0 0.9rem; }
+        .cs-collapse > summary {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            width: auto;
+            padding: 0.28rem 0.6rem;
+            border: 1px solid var(--border-hi);
+            border-radius: 7px;
+            background: var(--surface-hi);
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 0.7rem;
+            cursor: pointer;
+            list-style: none;
+            user-select: none;
+        }
+        /* The default marker is replaced by one that matches the request
+           panel's toggle, so the two disclosures on this page read alike. */
+        .cs-collapse > summary::-webkit-details-marker { display: none; }
+        .cs-collapse > summary::before { content: '▸'; font-size: 0.85em; }
+        .cs-collapse[open] > summary::before { content: '▾'; }
+        .cs-collapse > summary:hover,
+        .cs-collapse[open] > summary { border-color: var(--amber); color: var(--amber); }
+        /* The row inside keeps its own top margin off, the disclosure having
+           supplied the space above it already. */
+        .cs-collapse .cs-controls { margin-top: 0.55rem; }
+
+        /* The reset says what it does through its title and aria-label rather
+           than its face: as text it is the widest control in the row and the
+           only one that cannot shorten. Sized to match the direction toggle
+           beside it. */
+        .cs-reset-cell { justify-self: start; }
+        .cs-reset {
+            min-width: 2.4rem;
+            text-align: center;
+            font-size: 0.95rem;
+            line-height: 1.1;
+        }
 
         /* Sorting from the header: the button fills the cell so a tap anywhere
            on the label sorts, and only the sorted column carries an arrow. */
@@ -3814,12 +3859,6 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         .cs-tight th { white-space: normal; }
 
         @media (max-width: 640px) {
-            /* Controls a phone does not get. The work table is four narrow
-               columns and its filters are three more controls stacked above
-               it — more screen than the table they narrow. Sorting is the one
-               that earns its place, so the other two and the reset go. */
-            .cs-layout .cs-wide-only { display: none; }
-
             /* A table that stays a table here. Four narrow columns fit a phone
                where four cards do not: the same rows carded run a screen and a
                half, most of it the repeated labels.
@@ -4016,15 +4055,18 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                     <h2 data-i18n="statsByCommand">By command</h2>
                     <span class="cs-count" id="cs-cmd-count"></span>
                 </div>
-                <div class="cs-controls">
-                    <div class="field">
-                        <label for="cs-cmd-sort" data-i18n="statsSort">Sort by</label>
-                        <div class="cs-sort-row">
-                            <select id="cs-cmd-sort"></select>
-                            <button type="button" class="range-toggle cs-dir" id="cs-cmd-dir"></button>
+                <details class="cs-collapse">
+                    <summary><span data-i18n="statsSorting">Sorting</span></summary>
+                    <div class="cs-controls">
+                        <div class="field">
+                            <label for="cs-cmd-sort" data-i18n="statsSort">Sort by</label>
+                            <div class="cs-sort-row">
+                                <select id="cs-cmd-sort"></select>
+                                <button type="button" class="range-toggle cs-dir" id="cs-cmd-dir"></button>
+                            </div>
                         </div>
                     </div>
-                </div>
+                </details>
                 <div class="table-scroll">
                     <table class="stack-table cs-inline cs-tight" id="cs-cmd-table">
                         <thead>
@@ -4045,20 +4087,30 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                 <p class="auth-note" data-i18n="statsWorkHint">The counters the commands report, summed over the filtered runs. Per run averages only over the runs that reported the metric, so suggest’s persist counters are not diluted by runs without --persist.</p>
                 <!-- No sort control here: this table keeps its header at every
                      width, so its columns sort by tapping them, and a select
-                     saying the same thing is a second way to do one job. The
-                     filters that remain are desktop-only, which leaves a phone
-                     no controls above the table at all. -->
-                <div class="cs-controls cs-wide-only">
-                    <div class="field">
-                        <label for="cs-metric-command" data-i18n="statsColCommand">Command</label>
-                        <select id="cs-metric-command"></select>
+                     saying the same thing is a second way to do one job. -->
+                <details class="cs-collapse">
+                    <summary><span data-i18n="statsFiltersLabel">Filters</span></summary>
+                    <div class="cs-controls">
+                        <div class="field">
+                            <label for="cs-metric-command" data-i18n="statsColCommand">Command</label>
+                            <select id="cs-metric-command"></select>
+                        </div>
+                        <div class="field">
+                            <label for="cs-metric-name" data-i18n="statsColMetric">Metric</label>
+                            <input type="search" id="cs-metric-name" data-i18n-placeholder="statsFilterContains" placeholder="contains…" autocomplete="off">
+                        </div>
+                        <div class="field cs-reset-cell">
+                            <!-- A blank label so this cell is built like the
+                                 ones beside it and lands where they land. A
+                                 lone button in a grid of labelled fields sits
+                                 a label's height lower than all of them. -->
+                            <label aria-hidden="true">&nbsp;</label>
+                            <button type="button" class="btn-small cs-reset" id="cs-metric-reset"
+                                data-i18n-aria-label="statsClearFilters" data-i18n-title="statsClearFilters"
+                                aria-label="Clear filters" title="Clear filters">↺</button>
+                        </div>
                     </div>
-                    <div class="field">
-                        <label for="cs-metric-name" data-i18n="statsColMetric">Metric</label>
-                        <input type="search" id="cs-metric-name" data-i18n-placeholder="statsFilterContains" placeholder="contains…" autocomplete="off">
-                    </div>
-                    <button type="button" class="btn-small cs-reset" id="cs-metric-reset" data-i18n="statsClearFilters">Clear filters</button>
-                </div>
+                </details>
                 <div class="table-scroll">
                     <table class="stack-table cs-inline cs-flat" id="cs-metric-table">
                         <thead>
@@ -4078,54 +4130,63 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                 <span class="cs-count" id="cs-run-count"></span>
             </div>
             <p class="auth-note" data-i18n="statsRecentHint">These filters run over the whole selected range, so "Failed" finds the failures even in a month whose newest runs were all green.</p>
-            <div class="cs-controls">
-                <div class="field">
-                    <label for="cs-run-status" data-i18n="statsColStatus">Status</label>
-                    <select id="cs-run-status">
-                        <option value="all" data-i18n="statsFilterAny">Any</option>
-                        <option value="ok" data-i18n="statsStatus_ok">OK</option>
-                        <option value="partial" data-i18n="statsStatus_partial">Partial</option>
-                        <option value="error" data-i18n="statsStatus_error">Failed</option>
-                        <option value="running" data-i18n="statsStatus_running">Unfinished</option>
-                    </select>
-                </div>
-                <div class="field">
-                    <label for="cs-run-duration" data-i18n="statsColDuration">Duration</label>
-                    <select id="cs-run-duration">
-                        <option value="all" data-i18n="statsFilterAny">Any</option>
-                        <option value="1s" data-i18n="statsDur1s">1 s and up</option>
-                        <option value="10s" data-i18n="statsDur10s">10 s and up</option>
-                        <option value="1m" data-i18n="statsDur1m">1 min and up</option>
-                        <option value="outlier" data-i18n="statsDurOutlier">Outliers (p95 and up)</option>
-                    </select>
-                </div>
-                <div class="field">
-                    <label for="cs-run-host" data-i18n="statsColHost">Host</label>
-                    <select id="cs-run-host"><option value="all" data-i18n="statsFilterAny">Any</option></select>
-                </div>
-                <div class="field">
-                    <label for="cs-run-command" data-i18n="statsColCommand">Command</label>
-                    <select id="cs-run-command">
-                        <?php foreach ($commandLabels as $value => $label) { ?>
-                        <option value="<?= h($value) ?>"<?= $value === 'all' ? ' data-i18n="statsFilterAny"' : '' ?>><?= $value === 'all' ? 'Any' : h($label) ?></option>
-                        <?php } ?>
-                    </select>
-                </div>
-                <div class="field">
-                    <label for="cs-run-sort" data-i18n="statsSort">Sort by</label>
-                    <div class="cs-sort-row">
-                        <select id="cs-run-sort"></select>
-                        <button type="button" class="range-toggle cs-dir" id="cs-run-dir"></button>
+            <details class="cs-collapse">
+                <summary><span data-i18n="statsControls">Filters &amp; sorting</span></summary>
+                <div class="cs-controls">
+                    <div class="field">
+                        <label for="cs-run-status" data-i18n="statsColStatus">Status</label>
+                        <select id="cs-run-status">
+                            <option value="all" data-i18n="statsFilterAny">Any</option>
+                            <option value="ok" data-i18n="statsStatus_ok">OK</option>
+                            <option value="partial" data-i18n="statsStatus_partial">Partial</option>
+                            <option value="error" data-i18n="statsStatus_error">Failed</option>
+                            <option value="running" data-i18n="statsStatus_running">Unfinished</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="cs-run-duration" data-i18n="statsColDuration">Duration</label>
+                        <select id="cs-run-duration">
+                            <option value="all" data-i18n="statsFilterAny">Any</option>
+                            <option value="1s" data-i18n="statsDur1s">1 s and up</option>
+                            <option value="10s" data-i18n="statsDur10s">10 s and up</option>
+                            <option value="1m" data-i18n="statsDur1m">1 min and up</option>
+                            <option value="outlier" data-i18n="statsDurOutlier">Outliers (p95 and up)</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="cs-run-host" data-i18n="statsColHost">Host</label>
+                        <select id="cs-run-host"><option value="all" data-i18n="statsFilterAny">Any</option></select>
+                    </div>
+                    <div class="field">
+                        <label for="cs-run-command" data-i18n="statsColCommand">Command</label>
+                        <select id="cs-run-command">
+                            <?php foreach ($commandLabels as $value => $label) { ?>
+                            <option value="<?= h($value) ?>"<?= $value === 'all' ? ' data-i18n="statsFilterAny"' : '' ?>><?= $value === 'all' ? 'Any' : h($label) ?></option>
+                            <?php } ?>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="cs-run-sort" data-i18n="statsSort">Sort by</label>
+                        <div class="cs-sort-row">
+                            <select id="cs-run-sort"></select>
+                            <button type="button" class="range-toggle cs-dir" id="cs-run-dir"></button>
+                        </div>
+                    </div>
+                    <!-- A symbol, not a label: "Filter zurücksetzen" is nineteen
+                         characters and no readable size fits it on one line in a
+                         third of a phone card, so as text it wrapped and left its
+                         row the only one not lining up. The name it lost is on the
+                         button's title and aria-label, both translated. -->
+                    <div class="field cs-reset-cell">
+                        <!-- See the work table's: the blank label is what puts
+                             this button on the same line as its neighbours. -->
+                        <label aria-hidden="true">&nbsp;</label>
+                        <button type="button" class="btn-small cs-reset" id="cs-run-reset"
+                            data-i18n-aria-label="statsClearFilters" data-i18n-title="statsClearFilters"
+                            aria-label="Clear filters" title="Clear filters">↺</button>
                     </div>
                 </div>
-                <!-- Desktop-only, like the work table's. "Filter zurücksetzen"
-                     is nineteen characters and no readable size fits it on one
-                     line in a third of a phone card, so it wrapped and left the
-                     row it sits in the only one not lining up. Every filter
-                     beside it offers its own "any" option, which is the same
-                     reset four taps apart. -->
-                <button type="button" class="btn-small cs-reset cs-wide-only" id="cs-run-reset" data-i18n="statsClearFilters">Clear filters</button>
-            </div>
+            </details>
             <div class="auth-note" id="cs-truncated" data-i18n="statsTruncated" hidden>Only the newest 200 matching runs are listed, and sorting reorders those; the tiles and tables above always cover the whole range.</div>
             <div class="table-scroll">
                 <table class="stack-table cs-inline" id="cs-run-table">
@@ -9856,6 +9917,9 @@ const translations = {
         statsNoTable: 'No runs have been recorded yet. Run `gasoline migrate` on the server to create the tables, then wait for the next scheduled command.',
         statsCommand: 'Command',
         statsAllCommands: 'All commands',
+        statsControls: 'Filters & sorting',
+        statsFiltersLabel: 'Filters',
+        statsSorting: 'Sorting',
         statsRange: 'Range',
         statsTileRuns: 'Runs',
         statsTileSuccess: 'Success rate',
@@ -10218,6 +10282,9 @@ const translations = {
         statsNoTable: 'Es wurden noch keine Läufe aufgezeichnet. Führe `gasoline migrate` auf dem Server aus, um die Tabellen anzulegen, und warte auf den nächsten geplanten Befehl.',
         statsCommand: 'Befehl',
         statsAllCommands: 'Alle Befehle',
+        statsControls: 'Filter & Sortierung',
+        statsFiltersLabel: 'Filter',
+        statsSorting: 'Sortierung',
         statsRange: 'Zeitraum',
         statsTileRuns: 'Läufe',
         statsTileSuccess: 'Erfolgsquote',

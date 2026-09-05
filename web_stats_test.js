@@ -367,11 +367,6 @@ console.log('web_stats_test: cascade');
         beats('.cs-layout .stack-table.cs-inline.cs-flat tr', '.stack-table.cs-inline tr'));
     checkTrue('and its cells their padding',
         beats('.cs-layout .stack-table.cs-inline.cs-flat td', '.stack-table.cs-inline td.cs-mini'));
-    // The controls the phone does not get are hidden by a class, and .field
-    // sets display too — later in the document, so an equal specificity there
-    // would leave them on screen.
-    checkTrue('and the desktop-only controls stay hidden',
-        beats('.cs-layout .cs-wide-only', '.field', '.field {'));
 }
 
 /* ── Sorting from the column header ─────────────────────────────── */
@@ -417,15 +412,32 @@ console.log('web_stats_test: controls');
     checkTrue('the work table has no sort select left', !viewer.includes('cs-metric-sort'));
     checkTrue('nor a direction button', !viewer.includes('cs-metric-dir'));
     checkTrue('the runs table still has both', viewer.includes('cs-run-sort') && viewer.includes('cs-run-dir'));
-    // Both resets are desktop-only: neither fits a phone card's third of a row.
-    // One is hidden by its own class and the other by the control row around
-    // it — which is the whole row, in the card that has nothing else left — so
-    // what is asserted is that something between the two hides it.
+    // Every table's controls sit behind a disclosure that starts shut, so a
+    // card opens as its heading and its table and nothing else.
+    const disclosures = viewer.match(/<details class="cs-collapse">/g) || [];
+    check('each of the three tables has a disclosure', disclosures.length, 3);
+    checkTrue('none of them starts open', !/<details class="cs-collapse"[^>]*\bopen\b/.test(viewer));
+    for (const id of ['cs-cmd-sort', 'cs-metric-command', 'cs-run-status']) {
+        const at = viewer.indexOf('id="' + id + '"');
+        const open = viewer.lastIndexOf('<details class="cs-collapse">', at);
+        const close = viewer.lastIndexOf('</details>', at);
+        checkTrue(`${id} is inside one`, at !== -1 && open !== -1 && open > close);
+    }
+
+    // The resets say what they do through a translated title and aria-label
+    // rather than their face: as text the label is the widest control in the
+    // row and the only one that cannot shorten.
     for (const id of ['cs-metric-reset', 'cs-run-reset']) {
         const at = viewer.indexOf('id="' + id + '"');
-        const row = viewer.lastIndexOf('<div class="cs-controls', at);
-        checkTrue(`${id} is hidden on a phone`,
-            at !== -1 && row !== -1 && viewer.slice(row, at).includes('cs-wide-only'));
+        const tag = viewer.slice(viewer.lastIndexOf('<button', at), viewer.indexOf('</button>', at));
+        checkTrue(`${id} is a symbol`, />\s*↺\s*$/.test(tag));
+        checkTrue(`${id} keeps its name for assistive tech`,
+            tag.includes('data-i18n-aria-label="statsClearFilters"')
+            && tag.includes('data-i18n-title="statsClearFilters"'));
+        // A lone button in a grid of labelled fields sits a label's height
+        // below every control beside it, so it is built like one.
+        checkTrue(`${id} is built like the fields it sits among`,
+            viewer.slice(viewer.lastIndexOf('<div class="field cs-reset-cell">', at), at).includes('<label aria-hidden="true">'));
     }
 }
 
