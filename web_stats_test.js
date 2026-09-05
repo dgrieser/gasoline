@@ -302,13 +302,62 @@ console.log('web_stats_test: card layout');
     const card = breakpointOf('.stack-table thead { display: none; }');
     check('the card layout still has a breakpoint to match', typeof card, 'number');
     check('the drill-down is put back to a table exactly where carding starts',
-        breakpointOf('.stack-table .cs-tiles-panel table'), card);
+        breakpointOf('.stack-table.cs-inline .cs-tiles-panel table'), card);
     check('and the toggle is given its own line there too',
         breakpointOf('.stack-table.cs-inline td.cs-wide > .cs-tiles-toggle'), card);
     // The toggle cannot shrink, so the detail cell has to be allowed to wrap:
     // sharing one flex line with it is what left the counters a character wide.
     check('the detail cell may wrap at that width',
         breakpointOf('.stack-table.cs-inline td.cs-wide { flex-wrap: wrap; }'), card);
+}
+
+/* ── The panel's rules have to outrank the card rules ───────────── */
+
+console.log('web_stats_test: cascade');
+{
+    /** CSS specificity as one comparable number. */
+    function specificity(selector) {
+        const ids = (selector.match(/#[\w-]+/g) || []).length;
+        const classes = (selector.match(/\.[\w-]+/g) || []).length;
+        const elements = (selector.replace(/[.#][\w-]+/g, ' ').match(/\b[a-z][\w-]*\b/g) || []).length;
+        return ids * 10000 + classes * 100 + elements;
+    }
+
+    check('the specificity arithmetic is right', [
+        specificity('.stack-table td'),
+        specificity('.stack-table.cs-inline tr'),
+        specificity('.stack-table.cs-inline .cs-tiles-panel tr'),
+    ], [101, 201, 301]);
+
+    /**
+     * Whether a rule beats another one it shares a declaration with. Equal
+     * specificity is decided by document order, which is the trap: the panel's
+     * rules are declared before the card rules they have to survive, so a tie
+     * silently loses.
+     */
+    function beats(panelSelector, cardSelector) {
+        const panelAt = viewer.indexOf(panelSelector + ' ');
+        const cardAt = viewer.indexOf(cardSelector + ' ');
+        if (panelAt === -1) return `panel rule is gone: ${panelSelector}`;
+        if (cardAt === -1) return `card rule is gone: ${cardSelector}`;
+        const bySpec = specificity(panelSelector) - specificity(cardSelector);
+        return bySpec !== 0 ? bySpec > 0 : panelAt > cardAt;
+    }
+
+    // The row is the one that matters most. A flex container blockifies its
+    // children, so losing the row alone takes the cells with it: the columns
+    // stop lining up and every header sits in a box of its own.
+    checkTrue('the panel keeps its rows table rows',
+        beats('.stack-table.cs-inline .cs-tiles-panel tr', '.stack-table.cs-inline tr'));
+    checkTrue('and its cells table cells',
+        beats('.stack-table.cs-inline .cs-tiles-panel td', '.stack-table td'));
+    // Winning the display is not enough: the card layout also drops a cell's
+    // horizontal padding, so the rule that wins has to restate the gutter or a
+    // two-digit row number touches the column beside it.
+    const cellRuleAt = viewer.indexOf('.stack-table.cs-inline .cs-tiles-panel th,');
+    const cellRule = cellRuleAt === -1 ? '' : viewer.slice(cellRuleAt, viewer.indexOf('}', cellRuleAt));
+    checkTrue('and restates the column gutter the card layout drops',
+        /padding:[^;]*\d/.test(cellRule));
 }
 
 /* ── Both languages carry every label the panel asks for ────────── */
