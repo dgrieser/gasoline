@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,51 @@ func readCommandRuns(t *testing.T, dbPath string) []commandRunRow {
 	return out
 }
 
+// commandRunTileRow is one recorded Tankerkönig request as the Statistics page
+// reads it back.
+type commandRunTileRow struct {
+	Seq        int
+	City       string
+	TileIndex  int
+	Attempt    int
+	SentAt     string
+	WaitedMS   int64
+	DurationMS int64
+	Status     string
+	Error      sql.NullString
+}
+
+func readCommandRunTiles(t *testing.T, dbPath string, runID int64) []commandRunTileRow {
+	t.Helper()
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT seq, city, tile_index, attempt, sent_at, waited_ms, duration_ms, status, error
+		FROM command_run_tiles WHERE run_id = ? ORDER BY seq
+	`, runID)
+	if err != nil {
+		t.Fatalf("query command_run_tiles: %v", err)
+	}
+	defer rows.Close()
+
+	var out []commandRunTileRow
+	for rows.Next() {
+		var r commandRunTileRow
+		if err := rows.Scan(&r.Seq, &r.City, &r.TileIndex, &r.Attempt, &r.SentAt, &r.WaitedMS, &r.DurationMS, &r.Status, &r.Error); err != nil {
+			t.Fatalf("scan command_run_tiles: %v", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("command_run_tiles rows: %v", err)
+	}
+	return out
+}
+
 func readCommandRunMetrics(t *testing.T, dbPath string, runID int64) map[string]float64 {
 	t.Helper()
 	db, err := openDB(dbPath)
@@ -95,12 +141,21 @@ func readCommandRunMetrics(t *testing.T, dbPath string, runID int64) map[string]
 // wantMetrics asserts the exact metric set, so a renamed or dropped metric —
 // the contract the Statistics page renders — fails here rather than silently
 // blanking a column in the UI.
+// anyMetricValue asserts that a metric was recorded without pinning what it
+// says. It is for the timing counters: their value is a real clock reading, and
+// a test that demanded a particular number of milliseconds would be asserting
+// how fast the machine running it is.
+var anyMetricValue = math.NaN()
+
 func wantMetrics(t *testing.T, got map[string]float64, want map[string]float64) {
 	t.Helper()
 	for name, value := range want {
 		actual, ok := got[name]
 		if !ok {
 			t.Fatalf("metric %q missing, got %v", name, got)
+		}
+		if math.IsNaN(value) {
+			continue
 		}
 		if actual != value {
 			t.Fatalf("metric %q = %v, want %v", name, actual, value)
@@ -178,6 +233,10 @@ func TestCommandRunRecordsUpdate(t *testing.T) {
 		"cities_failed":    0,
 		"stations_fetched": 1,
 		"snapshots_stored": 1,
+		"tile_requests":    1,
+		"tile_retries":     0,
+		"tile_slowest_ms":  anyMetricValue,
+		"tile_wait_ms":     anyMetricValue,
 	})
 }
 
@@ -227,6 +286,12 @@ func TestCommandRunRecordsPartialFailure(t *testing.T) {
 		"cities_failed":    1,
 		"stations_fetched": 1,
 		"snapshots_stored": 1,
+		// Berlin answered on its first request; Pforzheim's transport error is
+		// retryable, so it cost two and neither answered.
+		"tile_requests":   3,
+		"tile_retries":    1,
+		"tile_slowest_ms": anyMetricValue,
+		"tile_wait_ms":    anyMetricValue,
 	})
 }
 
@@ -551,6 +616,13 @@ func TestCommandRunRecordsSingleCityFailure(t *testing.T) {
 		"cities_failed":    1,
 		"stations_fetched": 0,
 		"snapshots_stored": 0,
+		// The one target's transport error is retryable, so the sweep made two
+		// requests and recorded both — which is the whole point of keeping the
+		// attempts of a run that failed.
+		"tile_requests":   2,
+		"tile_retries":    1,
+		"tile_slowest_ms": anyMetricValue,
+		"tile_wait_ms":    anyMetricValue,
 	})
 }
 
@@ -784,5 +856,152 @@ func TestTruncateRunErrorKeepsValidUTF8(t *testing.T) {
 	short := "boom"
 	if truncateRunError(short) != short {
 		t.Fatalf("short message was altered")
+	}
+}
+
+// A tiled sweep records every request it made, in order, with the retry that
+// one tile needed kept as its own row. This is what the Statistics page's
+// per-request drill-down reads, so the row shape is the contract.
+func TestCommandRunRecordsTileRequests(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "stats-tiles.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	clock := stubTileClock(t)
+
+	tankerCalls := 0
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.5","lon":"13.4"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			tankerCalls++
+			// The second request fails retryably, so tile 1 costs two attempts
+			// and the sweep still succeeds.
+			if tankerCalls == 2 {
+				return jsonResponse(http.StatusServiceUnavailable, `{"ok":false,"message":"busy"}`), nil
+			}
+			lat := u.Query().Get("lat")
+			return jsonResponse(http.StatusOK, `{"ok":true,"stations":[{"id":"s-`+lat+`","name":"S","brand":"B","street":"St","place":"P","lat":52.5,"lng":13.4,"dist":1,"diesel":1.5,"e5":1.7,"e10":1.6,"isOpen":true,"houseNumber":"1","postCode":1}]}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	// 30 km is 5 tiles, so the sweep is 5 tiles plus the one retry = 6 requests.
+	captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--radius", "30", "--city", "Berlin", "--output", "json"})
+	})
+
+	row, metrics := singleCommandRun(t, dbPath, "update")
+	if row.Status != commandRunStatusOK {
+		t.Fatalf("status = %q, want %q — the retry answered", row.Status, commandRunStatusOK)
+	}
+	if metrics["tile_requests"] != 6 || metrics["tile_retries"] != 1 {
+		t.Fatalf("tile_requests = %v, tile_retries = %v, want 6 and 1", metrics["tile_requests"], metrics["tile_retries"])
+	}
+
+	tiles := readCommandRunTiles(t, dbPath, row.ID)
+	if len(tiles) != 6 {
+		t.Fatalf("command_run_tiles = %d rows, want 6: %+v", len(tiles), tiles)
+	}
+	// Tile 1's failed first try and its successful retry are both kept, which
+	// is what makes the cost of the retry visible: two requests, two windows.
+	wantShape := []struct {
+		tile    int
+		attempt int
+		status  string
+	}{
+		{0, 1, tileAttemptOK},
+		{1, 1, tileAttemptRetried},
+		{1, 2, tileAttemptOK},
+		{2, 1, tileAttemptOK},
+		{3, 1, tileAttemptOK},
+		{4, 1, tileAttemptOK},
+	}
+	for i, want := range wantShape {
+		got := tiles[i]
+		if got.Seq != i {
+			t.Errorf("row %d has seq %d, want %d — the order requests went out in is the order they are read back", i, got.Seq, i)
+		}
+		if got.TileIndex != want.tile || got.Attempt != want.attempt || got.Status != want.status {
+			t.Errorf("row %d = tile %d attempt %d %s, want tile %d attempt %d %s",
+				i, got.TileIndex, got.Attempt, got.Status, want.tile, want.attempt, want.status)
+		}
+		if got.City != "Berlin" {
+			t.Errorf("row %d city = %q, want %q", i, got.City, "Berlin")
+		}
+		// The failed attempt is the only one that carries a reason.
+		if hasErr := got.Error.Valid && got.Error.String != ""; hasErr != (want.status != tileAttemptOK) {
+			t.Errorf("row %d error = %q, which does not match status %q", i, got.Error.String, got.Status)
+		}
+	}
+
+	// The pacing is the only thing that moves the stubbed clock, so each
+	// request's sent_at is its slot: one 35 s window per request at burst 1.
+	for i, got := range tiles {
+		want := clock.start.Add(time.Duration(i) * defaultRequestDelay).UTC().Format(time.RFC3339)
+		if got.SentAt != want {
+			t.Errorf("row %d sent_at = %q, want %q", i, got.SentAt, want)
+		}
+		if i > 0 && got.WaitedMS != defaultRequestDelay.Milliseconds() {
+			t.Errorf("row %d waited_ms = %d, want %d — every request after the first waits a full window at burst 1",
+				i, got.WaitedMS, defaultRequestDelay.Milliseconds())
+		}
+	}
+	if tiles[0].WaitedMS != 0 {
+		t.Errorf("the first request waited %d ms, want 0 — it goes out on an empty window", tiles[0].WaitedMS)
+	}
+	if metrics["tile_wait_ms"] != float64(5*defaultRequestDelay.Milliseconds()) {
+		t.Errorf("tile_wait_ms = %v, want %v (five of the six requests waited a window)",
+			metrics["tile_wait_ms"], 5*defaultRequestDelay.Milliseconds())
+	}
+}
+
+// Pruning a run takes its requests with it: the child rows outlive the parent
+// otherwise, and the foreign key would refuse the delete on MySQL.
+func TestPruneCommandRunsDropsTileRequests(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "prune-tiles.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initSchema(context.Background(), db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+
+	old := time.Now().UTC().AddDate(0, 0, -(commandRunRetentionDays + 1))
+	res, err := db.Exec(`INSERT INTO command_runs (command, started_at, status) VALUES (?, ?, ?)`,
+		"update", old.Format(time.RFC3339), commandRunStatusOK)
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	runID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("last insert id: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO command_run_tiles (run_id, seq, city, tile_index, attempt, sent_at, waited_ms, duration_ms, status)
+		VALUES (?, 0, 'Berlin', 0, 1, ?, 0, 12, ?)
+	`, runID, old.Format(time.RFC3339), tileAttemptOK); err != nil {
+		t.Fatalf("insert tile: %v", err)
+	}
+
+	pruned, err := pruneCommandRuns(context.Background(), db, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("pruneCommandRuns: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned %d runs, want 1", pruned)
+	}
+	var left int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM command_run_tiles`).Scan(&left); err != nil {
+		t.Fatalf("count tiles: %v", err)
+	}
+	if left != 0 {
+		t.Fatalf("%d tile rows outlived their run", left)
 	}
 }

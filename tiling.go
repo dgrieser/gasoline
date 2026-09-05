@@ -57,6 +57,21 @@ const (
 	// maxTileRetries is how often one tile is retried after a failure that
 	// retrying can plausibly fix.
 	maxTileRetries = 1
+
+	// The outcome of one recorded request. A retried attempt is kept as its own
+	// row rather than folded into the try that replaced it: the whole point of
+	// recording attempts is that a tile which needed two of them cost a whole
+	// pacing window, and a log that only shows the winner hides that.
+	tileAttemptOK      = "ok"
+	tileAttemptRetried = "retried"
+	tileAttemptFailed  = "failed"
+
+	// maxLoggedTileAttempts bounds what one sweep keeps. A sweep of a single
+	// 50 km target is 8 requests, 16 in the worst retry case, so this is only
+	// reached by a sweep with dozens of tiled targets — where the newest
+	// attempts are the ones worth having and the storage is better spent than
+	// on a run row with thousands of children.
+	maxLoggedTileAttempts = 512
 )
 
 // sleepFn and nowFn are the clock the request pacing runs on, replaced in tests
@@ -161,6 +176,93 @@ func normalizeLongitude(lng float64) float64 {
 	return math.Mod(math.Mod(lng+180, 360)+360, 360) - 180
 }
 
+// tileAttempt is one Tankerkönig request as it actually went out: which tile of
+// which city it was for, which try, when the pacing released it, how long the
+// pacing had held it, and what the request itself then cost.
+//
+// Waited and the duration are kept apart on purpose. They are the two halves of
+// a tiled sweep's wall clock and they have opposite fixes: time spent waiting is
+// the pace we chose and is tuned with --request-delay, while time spent inside
+// the request is the API being slow and is not ours to tune. A single elapsed
+// figure per tile would leave the admin page unable to tell them apart.
+type tileAttempt struct {
+	City     string
+	Tile     int // 0 is the city centre tile
+	Attempt  int // 1 for the first try, 2 for the retry
+	SentAt   time.Time
+	Waited   time.Duration
+	Duration time.Duration
+	Status   string
+	Err      string
+}
+
+// tileLog collects a sweep's requests in the order they went out. A nil log
+// records nothing, which is what a caller that only wants the stations passes.
+//
+// The totals are accumulated separately from the list rather than derived from
+// it, because only the list is capped: a sweep of dozens of tiled targets stops
+// keeping individual requests long before it stops counting them, and a
+// request-count metric that silently stopped at the cap would be the one number
+// on the page nobody could sanity-check.
+type tileLog struct {
+	attempts []tileAttempt
+	total    int
+	retries  int
+	slowest  time.Duration
+	waited   time.Duration
+}
+
+// record counts one request and, while there is room, keeps it. The city is
+// filled in by the caller that knows it: the tiling itself only ever sees
+// coordinates.
+func (l *tileLog) record(a tileAttempt) {
+	if l == nil {
+		return
+	}
+	l.total++
+	if a.Attempt > 1 {
+		l.retries++
+	}
+	if a.Duration > l.slowest {
+		l.slowest = a.Duration
+	}
+	l.waited += a.Waited
+	if len(l.attempts) >= maxLoggedTileAttempts {
+		return
+	}
+	l.attempts = append(l.attempts, a)
+}
+
+// dropped is how many requests were counted but not kept.
+func (l *tileLog) dropped() int {
+	if l == nil {
+		return 0
+	}
+	return l.total - len(l.attempts)
+}
+
+// nameCity labels every attempt recorded since the log held from attempts
+// requests with the city they belong to. The fetch that knows the city name
+// brackets its own tiles with it, which keeps the city out of every function
+// signature between here and there.
+func (l *tileLog) nameCity(from int, city string) {
+	if l == nil {
+		return
+	}
+	for i := from; i < len(l.attempts); i++ {
+		l.attempts[i].City = city
+	}
+}
+
+// count is how many attempts the log holds, which is also where the next one
+// will land — a caller brackets a city with it.
+func (l *tileLog) count() int {
+	if l == nil {
+		return 0
+	}
+	return len(l.attempts)
+}
+
 // tankerLimiter paces Tankerkönig requests: at most burst of them inside any
 // window of delay. Request i waits until request i-burst is delay old, so a
 // burst goes out back to back and the one after it waits for the window to roll
@@ -247,14 +349,14 @@ func retryableStatus(code int) bool {
 // failing costs only the stations that tile alone could see, which is a gap the
 // next sweep closes well inside the 48-hour freshness window — so those are
 // counted and the city is still stored.
-func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, centre cachedCity, tiles []searchTile, radiusKM float64, fuelType, sortBy string) ([]tankerStation, time.Time, int, error) {
+func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, log *tileLog, centre cachedCity, tiles []searchTile, radiusKM float64, fuelType, sortBy string) ([]tankerStation, time.Time, int, error) {
 	merged := make(map[string]tankerStation)
 	order := make([]string, 0, len(tiles)*64)
 	tilesFailed := 0
 	var observedAt time.Time
 
 	for i, tile := range tiles {
-		stations, sentAt, err := fetchTileStations(ctx, cfg, lim, tile, fuelType, sortBy)
+		stations, sentAt, err := fetchTileStations(ctx, cfg, lim, log, i, tile, fuelType, sortBy)
 		if err != nil {
 			if i == 0 {
 				return nil, time.Time{}, 0, err
@@ -313,12 +415,33 @@ func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, cen
 // retrying once if the failure looks transient. It reports when the attempt that
 // answered went out: an attempt that failed saw nothing, so a retried tile is
 // anchored to the retry rather than to the try that came back empty.
-func fetchTileStations(ctx context.Context, cfg config, lim *tankerLimiter, tile searchTile, fuelType, sortBy string) ([]tankerStation, time.Time, error) {
+func fetchTileStations(ctx context.Context, cfg config, lim *tankerLimiter, log *tileLog, index int, tile searchTile, fuelType, sortBy string) ([]tankerStation, time.Time, error) {
 	var err error
 	for attempt := 0; attempt <= maxTileRetries; attempt++ {
+		queued := nowFn()
 		sentAt := lim.wait()
 		var stations []tankerStation
 		stations, err = fetchStations(ctx, cfg, tile.Lat, tile.Lng, tile.RadiusKM, fuelType, sortBy)
+		// Every attempt is recorded before it is acted on, so the log describes
+		// the requests that were made rather than the ones that worked. The
+		// status is decided here because only this loop knows whether a failure
+		// is about to be retried or is the tile's last word.
+		record := tileAttempt{
+			Tile:     index,
+			Attempt:  attempt + 1,
+			SentAt:   sentAt,
+			Waited:   sentAt.Sub(queued),
+			Duration: nowFn().Sub(sentAt),
+			Status:   tileAttemptOK,
+		}
+		if err != nil {
+			record.Status = tileAttemptFailed
+			record.Err = err.Error()
+			if attempt < maxTileRetries && retryableTankerError(err) && ctx.Err() == nil {
+				record.Status = tileAttemptRetried
+			}
+		}
+		log.record(record)
 		if err == nil {
 			return stations, sentAt, nil
 		}

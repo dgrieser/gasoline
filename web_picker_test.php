@@ -60,6 +60,7 @@ foreach (['raisedNinePrice', 'raisedNinePriceSql', 'loadNearbyPrices', 'geocodeL
     'saveDashboardFilters', 'clearDashboardFilters', 'loadFilteredPredictions',
     'gasolineCommandStatsSeries', 'gasolineCommandStatsPercentile',
     'gasolineCommandStatsRowFilter', 'gasolineCommandStatsRows',
+    'gasolineCommandStatsTiles', 'gasolineTableExists',
     'gasolineLeadBucketLabels', 'gasolineLeadBucketSql',
     'gasolineBreakdownTables'] as $name) {
     eval(extractFunction($viewer, $name));
@@ -881,6 +882,69 @@ $page = gasolineCommandStatsRows($runsPdo, $where . $filter['sql'],
     array_merge($params, $filter['params']), 10);
 check('a duration threshold selects only measured runs',
     array_column($page['rows'], 'duration_ms'), [90000]);
+
+echo "web_picker_test: gasolineCommandStatsTiles\n";
+
+/** A database holding one run's recorded requests, each [seq, city, tile, attempt, waited, duration, status, error]. */
+function seedCommandRunTiles(array $tiles): PDO
+{
+    $pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]);
+    $pdo->exec('CREATE TABLE command_run_tiles (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL, seq INTEGER NOT NULL, city TEXT NOT NULL DEFAULT \'\',
+        tile_index INTEGER NOT NULL, attempt INTEGER NOT NULL, sent_at TEXT NOT NULL,
+        waited_ms INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL, error TEXT)');
+    $stmt = $pdo->prepare('INSERT INTO command_run_tiles (run_id, seq, city, tile_index, attempt,
+        sent_at, waited_ms, duration_ms, status, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    foreach ($tiles as $tile) {
+        $stmt->execute([$tile[0], $tile[1], $tile[2], $tile[3], $tile[4],
+            '2026-08-21T09:0' . $tile[1] . ':00Z', $tile[5], $tile[6], $tile[7], $tile[8]]);
+    }
+
+    return $pdo;
+}
+
+// run 7 tiled and retried its second tile; run 8 is a different run's request
+// and must not leak into run 7's drill-down.
+$tilesPdo = seedCommandRunTiles([
+    [7, 0, 'Berlin', 0, 1, 0, 120, 'ok', null],
+    [7, 1, 'Berlin', 1, 1, 35000, 90, 'retried', 'tankerkönig request failed: 503'],
+    [7, 2, 'Berlin', 1, 2, 35000, 140, 'ok', null],
+    [8, 0, 'Uchte', 0, 1, 0, 80, 'ok', null],
+]);
+
+$detail = gasolineCommandStatsTiles($tilesPdo, 'sqlite', 7, 10);
+check('a run\'s requests come back in the order they went out',
+    array_column($detail['tiles'], 'seq'), [0, 1, 2]);
+check('and only that run\'s',
+    array_unique(array_column($detail['tiles'], 'city')), ['Berlin']);
+check('the retry is kept as its own attempt',
+    array_column($detail['tiles'], 'attempt'), [1, 1, 2]);
+check('the failed attempt carries its reason',
+    $detail['tiles'][1]['error'], 'tankerkönig request failed: 503');
+check('an answered attempt carries none', $detail['tiles'][0]['error'], null);
+// The two halves of a request's cost stay apart: the pacing wait is the
+// schedule, the duration is the API.
+check('the pacing wait is reported apart from the request', $detail['tiles'][2]['waited_ms'], 35000);
+check('as is the request itself', $detail['tiles'][2]['duration_ms'], 140);
+check('a run under the cap is not called truncated', $detail['truncated'], false);
+check('a database with the table says so', $detail['supported'], true);
+
+$detail = gasolineCommandStatsTiles($tilesPdo, 'sqlite', 7, 2);
+check('the cap limits the requests', count($detail['tiles']), 2);
+check('and says the list was cut', $detail['truncated'], true);
+
+check('a run with no recorded requests reads as empty, not missing',
+    gasolineCommandStatsTiles($tilesPdo, 'sqlite', 99, 10)['tiles'], []);
+
+// A database written by a binary older than this page has no such table. That
+// is an empty drill-down, not a broken statistics page.
+$noTable = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]);
+$detail = gasolineCommandStatsTiles($noTable, 'sqlite', 7, 10);
+check('a database without the table is unsupported, not an error', $detail['supported'], false);
+check('and has no requests to show', $detail['tiles'], []);
 
 if ($failures > 0) {
     printf("web_picker_test: %d failed\n", $failures);

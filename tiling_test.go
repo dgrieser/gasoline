@@ -395,7 +395,7 @@ func TestFetchTiledStationsDedupe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist")
+	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, 50, "all", "dist")
 	if err != nil {
 		t.Fatalf("fetchTiledStations: %v", err)
 	}
@@ -457,7 +457,7 @@ func TestFetchTiledStationsFiltersOvershoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, _, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist")
+	stations, _, _, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, 50, "all", "dist")
 	if err != nil {
 		t.Fatalf("fetchTiledStations: %v", err)
 	}
@@ -493,7 +493,7 @@ func TestFetchTiledStationsPartialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{delay: 30 * time.Second, burst: 3}, centre, tiles, 50, "all", "dist")
+	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{delay: 30 * time.Second, burst: 3}, nil, centre, tiles, 50, "all", "dist")
 	if err != nil {
 		t.Fatalf("a failing tile must not fail the city: %v", err)
 	}
@@ -527,7 +527,7 @@ func TestFetchTiledStationsFirstTileFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	_, _, _, err = fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist")
+	_, _, _, err = fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, 50, "all", "dist")
 	if err == nil {
 		t.Fatal("a failing centre tile must fail the whole city")
 	}
@@ -556,7 +556,7 @@ func TestFetchTiledStationsDoesNotRetryPermanentFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	if _, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, centre, tiles, 50, "all", "dist"); err != nil || failed != 1 {
+	if _, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, 50, "all", "dist"); err != nil || failed != 1 {
 		t.Fatalf("failed = %d, err = %v", failed, err)
 	}
 	if attempts != len(tiles) {
@@ -652,7 +652,7 @@ func TestFetchTiledStationsObservedAtSkipsFailedAttempt(t *testing.T) {
 	// burst 1 makes every request wait, so the retry lands a window after the
 	// attempt it replaces and the two instants cannot be confused.
 	lim := &tankerLimiter{delay: 30 * time.Second, burst: 1}
-	_, observedAt, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, lim, centre, tiles, 50, "all", "dist")
+	_, observedAt, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, lim, nil, centre, tiles, 50, "all", "dist")
 	if err != nil {
 		t.Fatalf("a retryable centre failure that then succeeds must not fail the city: %v", err)
 	}

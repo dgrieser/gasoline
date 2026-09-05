@@ -842,6 +842,11 @@ func runUpdate(args []string) (err error) {
 	// of the fetch loop below without reaching the end of the function, and it
 	// has to report the same names as a full sweep or cities_failed undercounts
 	// exactly the failure a one-target install hits most.
+	// Every Tankerkönig request the sweep makes, in the order it makes them.
+	// Declared before recordSweep so the counters below can be read off it on
+	// every exit path, the one-target bail-out included.
+	requestLog := &tileLog{}
+
 	recordSweep := func(cities, failed, fetched, stored, tiles, tilesFailed int) {
 		stats.set("cities", float64(cities))
 		stats.set("cities_failed", float64(failed))
@@ -855,6 +860,27 @@ func runUpdate(args []string) (err error) {
 			stats.set("tiles", float64(tiles))
 			stats.set("tiles_failed", float64(tilesFailed))
 		}
+		// The request counters, unlike the two above, are reported by every
+		// sweep. A narrow sweep is one request per city rather than none, and a
+		// retry there is worth seeing for the same reason it is worth seeing in
+		// a tiled one — it is the difference between a slow API and a failing
+		// one, which the run's own duration cannot tell you.
+		attempts := requestLog.attempts
+		if len(attempts) == 0 {
+			return
+		}
+		stats.set("tile_requests", float64(requestLog.total))
+		stats.set("tile_retries", float64(requestLog.retries))
+		stats.set("tile_slowest_ms", float64(requestLog.slowest.Milliseconds()))
+		// How much of the sweep was the pacing rather than the API. Zero for a
+		// sweep with nothing to tile, which is the honest answer there.
+		stats.set("tile_wait_ms", float64(requestLog.waited.Milliseconds()))
+		// A sweep large enough to outrun the log's own cap says so, rather
+		// than leaving a request count that disagrees with the list behind it.
+		if dropped := requestLog.dropped(); dropped > 0 {
+			stats.set("tile_requests_unlogged", float64(dropped))
+		}
+		stats.recordTiles(attempts)
 	}
 
 	queries := buildCityQueries(events)
@@ -896,7 +922,7 @@ func runUpdate(args []string) (err error) {
 	fetchErrs := make([]string, len(queries))
 	failures := 0
 	for i, q := range queries {
-		f, err := fetchCityStations(ctx, db, cfg, limiter, q, *fuelType, *sortBy)
+		f, err := fetchCityStations(ctx, db, cfg, limiter, requestLog, q, *fuelType, *sortBy)
 		if err != nil {
 			// Single city: preserve the original error shape.
 			if len(queries) == 1 {
@@ -1060,7 +1086,7 @@ type cityFetch struct {
 // fetchCityStations geocodes one target and fetches its stations. It writes no
 // snapshots, so a whole sweep can be de-duplicated before it touches
 // price_snapshots. (Geocoding still caches the city itself, as before.)
-func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, lim *tankerLimiter, q cityQuery, fuelType, sortBy string) (cityFetch, error) {
+func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, lim *tankerLimiter, log *tileLog, q cityQuery, fuelType, sortBy string) (cityFetch, error) {
 	location, cached, err := getOrCreateCity(ctx, db, q.name, cfg.UserAgent)
 	if err != nil {
 		return cityFetch{}, err
@@ -1069,7 +1095,12 @@ func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, lim *tankerL
 	if err != nil {
 		return cityFetch{}, err
 	}
-	stations, observedAt, tilesFailed, err := fetchTiledStations(ctx, cfg, lim, location, tiles, q.radius, fuelType, sortBy)
+	// Bracket this target's requests so they can be labelled with its name
+	// afterwards — including when the fetch fails, which is exactly the run
+	// whose requests someone will want to look at.
+	from := log.count()
+	stations, observedAt, tilesFailed, err := fetchTiledStations(ctx, cfg, lim, log, location, tiles, q.radius, fuelType, sortBy)
+	log.nameCity(from, q.name)
 	if err != nil {
 		return cityFetch{}, err
 	}

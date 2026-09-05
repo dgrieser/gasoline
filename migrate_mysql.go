@@ -29,10 +29,11 @@ var migrationTables = []struct {
 	{"prediction_runs", []string{"id", "run_at", "city_name", "fuel", "range_km", "history_days", "predict_days", "jump_anchor_hour", "station_count", "suggestion_bias"}},
 	{"price_predictions", []string{"id", "run_id", "station_id", "fuel", "target_start", "target_end", "predicted_price", "baseline", "confidence", "sample_count", "is_suggestion", "lead_minutes", "applied_correction", "actual_price", "error", "evaluated_at"}},
 	{"price_check_decisions", []string{"id", "run_id", "station_id", "fuel", "decided_at", "target_start", "target_end", "observed_price", "observed_at", "predicted_price", "error", "history_percentile", "confidence", "sample_count", "verdict", "recommendation", "expected_lower", "expected_drop", "day_floor_price", "day_floor_at", "regret", "outcome_evaluated_at"}},
-	// Parent before child, and ids copied, so command_run_metrics.run_id keeps
-	// pointing at its run.
+	// Parent before child, and ids copied, so command_run_metrics.run_id and
+	// command_run_tiles.run_id keep pointing at their run.
 	{"command_runs", []string{"id", "command", "started_at", "finished_at", "duration_ms", "status", "error", "host", "version"}},
 	{"command_run_metrics", []string{"id", "run_id", "name", "value"}},
+	{"command_run_tiles", []string{"id", "run_id", "seq", "city", "tile_index", "attempt", "sent_at", "waited_ms", "duration_ms", "status", "error"}},
 }
 
 type mysqlMigrationResult struct {
@@ -46,6 +47,7 @@ type mysqlMigrationResult struct {
 	CheckDecisions   int    `json:"check_decisions"`
 	CommandRuns      int    `json:"command_runs"`
 	CommandRunMetric int    `json:"command_run_metrics"`
+	CommandRunTiles  int    `json:"command_run_tiles"`
 	Overwritten      bool   `json:"overwritten"`
 }
 
@@ -118,7 +120,7 @@ func runMigrateToMySQL(args []string) error {
 	fmt.Fprintf(stdout, "prediction runs: %d\n", result.PredictionRuns)
 	fmt.Fprintf(stdout, "price predictions: %d\n", result.PricePredictions)
 	fmt.Fprintf(stdout, "check decisions: %d\n", result.CheckDecisions)
-	fmt.Fprintf(stdout, "command runs: %d (%d metrics)\n", result.CommandRuns, result.CommandRunMetric)
+	fmt.Fprintf(stdout, "command runs: %d (%d metrics, %d requests)\n", result.CommandRuns, result.CommandRunMetric, result.CommandRunTiles)
 	return nil
 }
 
@@ -175,6 +177,7 @@ func copySQLiteToMySQL(ctx context.Context, src, dst *sql.DB, overwrite bool) (m
 		CheckDecisions:   counts["price_check_decisions"],
 		CommandRuns:      counts["command_runs"],
 		CommandRunMetric: counts["command_run_metrics"],
+		CommandRunTiles:  counts["command_run_tiles"],
 		Overwritten:      overwritten,
 	}, nil
 }
