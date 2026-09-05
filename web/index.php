@@ -3783,30 +3783,38 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
            configure. Native <details> rather than a button and a hidden div —
            the open/closed state, the keyboard and the semantics come free, and
            there is no way for a script error to leave them unopenable. */
-        .cs-collapse { margin: 0.6rem 0 0.9rem; }
+        .cs-collapse { margin: 0.7rem 0 0.9rem; }
+        /* A section header rather than a button: the page's own small-label
+           typography, the full width of the card, and a rule under it. It is
+           still the control that opens the section, so it keeps a caret and
+           answers to hover — but it reads as the heading of what is inside
+           rather than as something to press. */
         .cs-collapse > summary {
-            display: inline-flex;
+            display: flex;
             align-items: center;
             gap: 0.4rem;
-            width: auto;
-            padding: 0.28rem 0.6rem;
-            border: 1px solid var(--border-hi);
-            border-radius: 7px;
-            background: var(--surface-hi);
+            padding: 0.25rem 0 0.35rem;
+            border-bottom: 1px solid var(--border);
             color: var(--muted);
             font-family: var(--mono);
-            font-size: 0.7rem;
+            font-size: 0.62rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
             cursor: pointer;
             list-style: none;
             user-select: none;
         }
-        /* The default marker is replaced by one that matches the request
-           panel's toggle, so the two disclosures on this page read alike. */
         .cs-collapse > summary::-webkit-details-marker { display: none; }
-        .cs-collapse > summary::before { content: '▸'; font-size: 0.85em; }
-        .cs-collapse[open] > summary::before { content: '▾'; }
-        .cs-collapse > summary:hover,
-        .cs-collapse[open] > summary { border-color: var(--amber); color: var(--amber); }
+        /* The caret turns rather than being swapped, which is one glyph to
+           position instead of two that measure differently. */
+        .cs-collapse > summary::before {
+            content: '▸';
+            font-size: 0.9em;
+            transition: transform 0.12s ease;
+        }
+        .cs-collapse[open] > summary::before { transform: rotate(90deg); }
+        .cs-collapse > summary:hover { color: var(--ink); border-bottom-color: var(--border-hi); }
+        .cs-collapse[open] > summary { color: var(--ink); }
         /* The row inside keeps its own top margin off, the disclosure having
            supplied the space above it already. */
         .cs-collapse .cs-controls { margin-top: 0.55rem; }
@@ -4131,7 +4139,7 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             </div>
             <p class="auth-note" data-i18n="statsRecentHint">These filters run over the whole selected range, so "Failed" finds the failures even in a month whose newest runs were all green.</p>
             <details class="cs-collapse">
-                <summary><span data-i18n="statsControls">Filters &amp; sorting</span></summary>
+                <summary><span data-i18n="statsFiltersLabel">Filters</span></summary>
                 <div class="cs-controls">
                     <div class="field">
                         <label for="cs-run-status" data-i18n="statsColStatus">Status</label>
@@ -9917,7 +9925,6 @@ const translations = {
         statsNoTable: 'No runs have been recorded yet. Run `gasoline migrate` on the server to create the tables, then wait for the next scheduled command.',
         statsCommand: 'Command',
         statsAllCommands: 'All commands',
-        statsControls: 'Filters & sorting',
         statsFiltersLabel: 'Filters',
         statsSorting: 'Sorting',
         statsRange: 'Range',
@@ -10282,7 +10289,6 @@ const translations = {
         statsNoTable: 'Es wurden noch keine Läufe aufgezeichnet. Führe `gasoline migrate` auf dem Server aus, um die Tabellen anzulegen, und warte auf den nächsten geplanten Befehl.',
         statsCommand: 'Befehl',
         statsAllCommands: 'Alle Befehle',
-        statsControls: 'Filter & Sortierung',
         statsFiltersLabel: 'Filter',
         statsSorting: 'Sortierung',
         statsRange: 'Zeitraum',

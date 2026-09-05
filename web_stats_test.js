@@ -416,6 +416,12 @@ console.log('web_stats_test: controls');
     // card opens as its heading and its table and nothing else.
     const disclosures = viewer.match(/<details class="cs-collapse">/g) || [];
     check('each of the three tables has a disclosure', disclosures.length, 3);
+    // Both sections that hold filters are headed by the same one word. The
+    // runs card's used to name sorting as well, which made the two cards read
+    // as different kinds of thing when they are the same kind.
+    check('the two filter sections share one heading',
+        (viewer.match(/data-i18n="statsFiltersLabel"/g) || []).length, 2);
+    checkTrue('and nothing advertises sorting alongside it', !viewer.includes('statsControls'));
     checkTrue('none of them starts open', !/<details class="cs-collapse"[^>]*\bopen\b/.test(viewer));
     for (const id of ['cs-cmd-sort', 'cs-metric-command', 'cs-run-status']) {
         const at = viewer.indexOf('id="' + id + '"');
