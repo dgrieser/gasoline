@@ -131,8 +131,8 @@ Useful `update` flags:
 
 - `--fuel all|diesel|e5|e10`
 - `--sort dist|price`
-- `--radius` in km, up to 50 (see [Radii wider than the API serves](#radii-wider-than-the-api-serves))
-- `--request-delay`, `--request-burst`, `--request-group` and `--request-group-pause` pace the requests a wide radius needs (one per 37 s, with 2 s more after every third)
+- `--radius` in km, up to 42 (see [Radii wider than the API serves](#radii-wider-than-the-api-serves))
+- `--request-delay` and `--request-burst` pace the requests a wide radius needs (one per 50 s)
 - `--user-agent "your-app/1.0"`
 - `--output json` or `-o json`
 
@@ -142,41 +142,42 @@ Ownership is compared against the city that already owns a station, not only aga
 
 #### Radii wider than the API serves
 
-Tankerkönig's station list serves a radius of at most **25 km**. `--radius` accepts up to **50**, and anything above 25 is covered internally by several overlapping 25 km queries — a query on the city centre plus one ring around it, sized so the ring's tiles overlap each other and still reach back to the centre tile. There are no gaps, and every tile is placed with about 750 m to spare so a station sitting on a seam is returned by at least one query rather than by none.
+Tankerkönig's station list serves a radius of at most **25 km**. `--radius` accepts up to **42**, and anything above 25 is covered internally by several overlapping 25 km queries — one ring of them around the city centre, sized so neighbouring tiles overlap and the ring still closes over the middle. There are no gaps, and every tile is placed with about 750 m to spare so a station sitting on a seam is returned by at least one query rather than by none.
 
 What that costs, since it is a request budget and not just a wait:
 
 | `--radius` | API requests | added time per sweep |
 | --- | --- | --- |
 | up to 25 | 1 | none |
-| up to 28 | 4 | 1:53 |
-| up to 34 | 5 | 2:30 |
-| up to 41 | 6 | 3:07 |
-| up to 48 | 7 | 3:46 |
-| up to 50 | 8 | 4:23 |
+| up to 28.0 | 3 | 1:40 |
+| up to 34.2 | 4 | 2:30 |
+| up to 39.2 | 5 | 3:20 |
+| up to 42 | 6 | 4:10 |
 
-The requests are paced at `--request-burst` (default 1) per `--request-delay` (default 37s), so they go out one at a time, a window apart — and after every `--request-group` of them (default 3) the next one waits a further `--request-group-pause` (default 2s). Three requests, a breather, three more, a breather, the rest. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
+The requests are paced at `--request-burst` (default 1) per `--request-delay` (default 50s), so they go out one at a time, 50 s apart. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
 
-**Why 37 s and a breather, and what it costs you.** The default pace is the slowest one that still lets the widest sweep *that answers first time* finish inside a five-minute schedule, which is what the packaged cron entry and systemd timer both use. A 50 km target is 8 requests, whose last goes out at 4:23 — inside the 4:50 the sweep is budgeted (`sweepBudget` in `tiling.go`, asserted by `TestDefaultPaceFitsSweepBudget`).
+**Why 50 s and a 42 km ceiling.** The two are one decision. Tankerkönig answers a paced sweep with 503s often enough that retries are routine rather than exceptional, and a retry is the API asking to be left alone — so the window is set as wide as the schedule allows rather than as narrow as the sweep needs.
 
-The breather is the margin the window itself could not take. 37 s is already as wide as that budget allows; two seconds after every third request costs the whole sweep four more and still fits, which is the rest of what was left.
+42 km is where a ring of six tiles reaches. The old ceiling was 50, which costs **eight** requests: seven disks of this size cover exactly twice their own radius and no more, so 50 km sits just past what seven can do. Those two extra requests bought 8 km of rim and cost every sweep the headroom it needed when the API refused.
 
-A sweep that **retries does not fit**, and that is the trade rather than an oversight. One retry is 9 requests and 5:00; in practice Tankerkönig answers a paced sweep with 503s often enough that several retries in one sweep are ordinary, and those run well past five minutes. Such a run loses the following tick to `flock` — prices land ten minutes apart instead of five. A pace where retries do fit is available (`--request-burst 2` spends the same budget two requests at a time) and is deliberately not the default: it is bursty in exactly the way an API that is already refusing is asking us not to be. A retry is the API asking to be left alone, and widening the window is the only lever this program has for that. `tile_retries` on the Statistics page is how you tell whether it is working.
+At six requests 50 s apart the widest sweep ends at **4:10**, inside the 4:50 it is budgeted (`sweepBudget` in `tiling.go`) on the five-minute schedule the packaged cron entry and systemd timer both use. What is left of that budget is 40 seconds, which is not a whole window — so `sweepRetryHeadroom` is **0**: a sweep that answers first time fits, and a seventh request lands at 5:00, ten seconds past. Both edges are asserted by `TestDefaultPaceFitsSweepBudget`.
+
+That is the trade the window sits on the other side of: every second added to the pace is more room for the API to be left alone and less room for it to be asked twice. **48 s** is the widest window that still fits one retry (7 requests, 4:48), if the balance ever wants moving back. As it stands, a sweep that retries at all finishes late and loses the next tick to `flock` — prices land ten minutes apart instead of five. `tile_retries` on the Statistics page is how you tell how often that is happening.
 
 Two more things are worth knowing:
 
-- **More than one tiled city in the same sweep overruns too**, and by much more than a retry does — the pace belongs to the API key, not to the city, so two 50 km targets are 16 requests and about 9:15. `flock -n` covers it the same way: the overrunning run finishes and the next tick is dropped. If you tile more than one city on a five-minute schedule, either raise `--request-burst` or give the sweep its own, slower timer.
-- **Widening the radius ceiling** re-opens this arithmetic. `TestDefaultPaceFitsSweepBudget` fails in both directions — too slow for the budget, and a whole window slower than it needs to be — so the default has to be re-derived rather than drifting. It deliberately says nothing about retries: pinning today's overrun as an expectation would fail the day someone makes retries fit again, which would be an improvement.
+- **More than one tiled city in the same sweep overruns** — the pace belongs to the API key, not to the city, so two 42 km targets are 12 requests and 9:10, most of two ticks. `flock -n` covers it: the overrunning run finishes and the next tick is dropped. If you tile more than one city, either raise `--request-burst` or give the sweep its own, slower timer.
+- **Widening the radius ceiling** re-opens all of this. `TestDefaultPaceFitsSweepBudget` pins the widest target at exactly six requests and the retry headroom at exactly zero, failing in both directions, so a raised ceiling or a changed placement safety has to be re-derived against the schedule rather than quietly costing every sweep its headroom.
 
 Three things make a wide radius behave like a single narrow one:
 
-- **One snapshot per station.** The tiles overlap, so most stations are reported several times; they are de-duplicated by station id, and the query nearest the city centre is the one that wins.
+- **One snapshot per station.** The tiles overlap, so most stations are reported several times; they are de-duplicated by station id, and the first query to report one wins. The tile order is fixed, so that choice is the same on every sweep.
 - **One timestamp per city.** The requests are deliberately spread over minutes, so stamping each station with the query that happened to see it would spread one city's readings across that window and read like a price history. Every station of a tiled city therefore carries the instant its first request went out.
 - **The radius you asked for.** The overlapping tiles bulge slightly past it; stations in the bulge are dropped, so `search_radius_km` stays honest and station ownership does not drift between sweeps.
 
-If a query other than the centre one fails, it is retried once and then given up on: the city is still stored with everything the other queries saw, `tiles_failed` reports the loss, and the run is recorded as `partial`. The stations only that query could see go unrefreshed until the next sweep, which is well inside the 48-hour window the model already tolerates. A failing **centre** query fails the city, because that failure is almost always systemic — a rejected key, no network — and a city assembled purely out of its own edges is worse than no update.
+If a query other than the first fails, it is retried once and then given up on: the city is still stored with everything the other queries saw, `tiles_failed` reports the loss, and the run is recorded as `partial`. The stations only that query could see go unrefreshed until the next sweep, which is well inside the 48-hour window the model already tolerates. A failing **first** query fails the city, because that failure is almost always systemic — a rejected key, no network — and a city assembled out of whatever happened to answer is worse than no update.
 
-A 50 km target covers four times the area of a 25 km one. `suggest`, `check` and `notify` cover every station still being fed, and `suggest --persist` stores the full forecast grid per station per fuel, so that multiplies `price_predictions` growth and `suggest` runtime too — see [Diagnosing a slow database](#diagnosing-a-slow-database-gasoline-doctor).
+A 42 km target covers nearly three times the area of a 25 km one. `suggest`, `check` and `notify` cover every station still being fed, and `suggest --persist` stores the full forecast grid per station per fuel, so that multiplies `price_predictions` growth and `suggest` runtime too — see [Diagnosing a slow database](#diagnosing-a-slow-database-gasoline-doctor).
 
 Compact existing snapshots in place:
 
@@ -282,11 +283,11 @@ The normal suggestion output is unchanged; a one-line summary (`persist: stored 
 
 ### Server-stored configuration (admin settings)
 
-Administrators configure two things in the web UI (hamburger menu → Settings): the **update targets** (city + radius pairs) that decide which stations are collected, and the **notification texts**. A target's radius is editable in place — each row has its own radius field and save button, up to 50 km, and the change takes effect on the next `gasoline update`. The city is the target's identity and is not editable: changing it means removing the target and adding the new city.
+Administrators configure two things in the web UI (hamburger menu → Settings): the **update targets** (city + radius pairs) that decide which stations are collected, and the **notification texts**. A target's radius is editable in place — each row has its own radius field and save button, up to 42 km, and the change takes effect on the next `gasoline update`. The city is the target's identity and is not editable: changing it means removing the target and adding the new city.
 
 That is deliberately all of it. The station scope, the fuels, the model parameters and the delivery limits used to be settings and are now fixed, because none of them had a per-install answer:
 
-- `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius, as a single de-duplicated sweep: targets whose radii overlap share stations, and each shared station is stored once under its nearest target. Passing explicit flags ignores the targets entirely. `radius_km` is the only radius in the system, and may be up to 50 km — a target over 25 km costs several paced API requests per sweep, see [Radii wider than the API serves](#radii-wider-than-the-api-serves).
+- `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius, as a single de-duplicated sweep: targets whose radii overlap share stations, and each shared station is stored once under its nearest target. Passing explicit flags ignores the targets entirely. `radius_km` is the only radius in the system, and may be up to 42 km — a target over 25 km costs several paced API requests per sweep, see [Radii wider than the API serves](#radii-wider-than-the-api-serves). `gasoline migrate` brings a target stored under the older 50 km ceiling down to 42.
 - `gasoline suggest`, `gasoline check` and `notify` take no scope or fuel arguments. They cover every station still being fed and compute all three fuels, so nothing that gets delivered goes unmeasured. Each user picks the one fuel they are notified about (see below).
 - The fixed parameters are 30 days of history, a 3-day forecast horizon, 3 suggestions per day, 5 check rows, a flat 2 ct price margin, a 48-hour station freshness window, and a baseline reset at local midnight. The per-user notification schedule defaults (every day, 07:00–21:00, suggestions at 08:00 and 13:00) apply only until a user sets their own.
 
@@ -403,13 +404,13 @@ The metric names per command, which are what the web UI renders:
 
 They are the same numbers the commands print when you run them by hand; `stations` and `snapshots_scanned` are the size of the shared history scan, which is what explains a `suggest` or `check` run's duration.
 
-`update`'s four request counters are what explains *its* duration, and they split it the only way that is actionable: `tile_wait_ms` is the pacing — the windows and the breathers together — and `tile_slowest_ms` is the API being slow. The first is yours to tune, the second is not. `tile_retries` counts the requests that were not a tile's first try — the number that separates a slow Tankerkönig from a failing one, and the reason a sweep can take a window longer than its tile count suggests.
+`update`'s four request counters are what explains *its* duration, and they split it the only way that is actionable: `tile_wait_ms` is the pacing — the windows the requests spent waiting their turn — and `tile_slowest_ms` is the API being slow. The first is yours to tune, the second is not. `tile_retries` counts the requests that were not a tile's first try — the number that separates a slow Tankerkönig from a failing one, and the reason a sweep can take a window longer than its tile count suggests.
 
 #### The individual requests of a run
 
 `update` also writes one row per Tankerkönig request to `command_run_tiles`: which city and tile it was for, which attempt, the instant the pacing released it, how long it had been held, how long the request itself took, and whether it answered, was retried, or failed. A retried attempt is kept **as its own row** rather than folded into the try that replaced it — the whole point is that a tile needing two attempts cost two pacing windows, which a log showing only the winner hides.
 
-The metrics table holds one number per name per run, so none of that can live there: the shape of a sweep needs a row per request. This is the one thing that makes a 4-minute sweep legible — a slow tile, a retried one, and a sweep that simply has eight tiles to get through all look the same from the run's own duration.
+The metrics table holds one number per name per run, so none of that can live there: the shape of a sweep needs a row per request. This is the one thing that makes a 4-minute sweep legible — a slow tile, a retried one, and a sweep that simply has six tiles to get through all look the same from the run's own duration.
 
 Every sweep writes these, tiled or not: a narrow sweep is one request per city rather than none, and a retry there is worth seeing for the same reason. They are pruned with their run, and copied by `migrate-to-mysql` along with it.
 

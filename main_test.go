@@ -1312,6 +1312,7 @@ func TestValidateCityQueries(t *testing.T) {
 		t.Fatalf("name not trimmed: %q", qs[0].name)
 	}
 
+	wantRange := fmt.Sprintf("> 0 and <= %.0f", maxRequestRadiusKM)
 	cases := []struct {
 		name string
 		qs   []cityQuery
@@ -1319,8 +1320,8 @@ func TestValidateCityQueries(t *testing.T) {
 	}{
 		{"empty", nil, "requires --city"},
 		{"empty_name", []cityQuery{{"   ", 5}}, "must not be empty"},
-		{"radius_zero", []cityQuery{{"Berlin", 0}}, "> 0 and <= 50"},
-		{"radius_too_big", []cityQuery{{"Berlin", 51}}, "> 0 and <= 50"},
+		{"radius_zero", []cityQuery{{"Berlin", 0}}, wantRange},
+		{"radius_too_big", []cityQuery{{"Berlin", maxRequestRadiusKM + 1}}, wantRange},
 		{"duplicate", []cityQuery{{"Berlin", 5}, {"Berlin", 10}}, "given more than once"},
 		{"duplicate_case_insensitive", []cityQuery{{"Berlin", 5}, {"berlin", 10}}, "given more than once"},
 	}
@@ -4139,7 +4140,7 @@ func TestRunUpdateTiled(t *testing.T) {
 	defer restore()
 
 	output := captureStdout(t, func() error {
-		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--radius", "50", "--output", "json"})
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--radius", "42", "--output", "json"})
 	})
 
 	var result updateResult
@@ -4156,7 +4157,7 @@ func TestRunUpdateTiled(t *testing.T) {
 		t.Fatalf("the fetch spanned only %v of clock time, too little to tell one stamp from many", spanned)
 	}
 
-	wantTiles, err := planSearchTiles(centreLat, centreLng, 50)
+	wantTiles, err := planSearchTiles(centreLat, centreLng, 42)
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
@@ -4208,8 +4209,8 @@ func TestRunUpdateTiled(t *testing.T) {
 	if want := clock.start.UTC().Format(time.RFC3339); recordedAt != want {
 		t.Fatalf("recorded_at = %q, want %q (the first request's instant)", recordedAt, want)
 	}
-	if radius != 50 {
-		t.Fatalf("search_radius_km = %v, want the 50 that was asked for", radius)
+	if radius != 42 {
+		t.Fatalf("search_radius_km = %v, want the 42 that was asked for", radius)
 	}
 
 	// One city, not one per tile centre.
@@ -4251,7 +4252,7 @@ func TestRunUpdateTiledPartial(t *testing.T) {
 	defer restore()
 
 	output := captureStdout(t, func() error {
-		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--radius", "50", "--request-delay", "0", "--output", "json"})
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--radius", "42", "--request-delay", "0", "--output", "json"})
 	})
 
 	var result updateResult
@@ -4400,9 +4401,9 @@ func TestRunUpdateTiledTextOutput(t *testing.T) {
 	defer restore()
 
 	single := captureStdout(t, func() error {
-		return run([]string{"update", "--db", filepath.Join(dir, "a.db"), "--city", "Berlin", "--radius", "50"})
+		return run([]string{"update", "--db", filepath.Join(dir, "a.db"), "--city", "Berlin", "--radius", "42"})
 	})
-	if !strings.Contains(single, "from 8 queries (1 failed)") {
+	if !strings.Contains(single, "from 6 queries (1 failed)") {
 		t.Fatalf("single-city output does not name the queries:\n%s", single)
 	}
 	// One "in" clause, naming the database — not two.
@@ -4412,9 +4413,9 @@ func TestRunUpdateTiledTextOutput(t *testing.T) {
 
 	calls = 0
 	multi := captureStdout(t, func() error {
-		return run([]string{"update", "--db", filepath.Join(dir, "b.db"), "--radius", "50", "--city", "Berlin", "--city", "Uchte", "--radius", "5"})
+		return run([]string{"update", "--db", filepath.Join(dir, "b.db"), "--radius", "42", "--city", "Berlin", "--city", "Uchte", "--radius", "5"})
 	})
-	if !strings.Contains(multi, "radius 50.00 km in 8 queries (1 failed), stored") {
+	if !strings.Contains(multi, "radius 42.00 km in 6 queries (1 failed), stored") {
 		t.Fatalf("tiled target is not reported:\n%s", multi)
 	}
 	// The 5 km target fitted in one request, so its line is unchanged.

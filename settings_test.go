@@ -640,3 +640,64 @@ func TestMigrateBackfillsNotifyLocationFromCitySelection(t *testing.T) {
 		}
 	}
 }
+
+// The tiling ceiling came down from 50 km, so targets stored under the old one
+// would fail every sweep with "exceeds the supported maximum" until someone
+// noticed. The migration brings them to the widest radius still covered rather
+// than dropping them.
+func TestMigrateClampsUpdateTargetRadius(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	insertUpdateTargetRow(t, db, "Wide", maxRequestRadiusKM+8)
+	insertUpdateTargetRow(t, db, "Exact", maxRequestRadiusKM)
+	insertUpdateTargetRow(t, db, "Narrow", 12)
+
+	result, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("migrateSchema: %v", err)
+	}
+	want := fmt.Sprintf("update_targets.radius_km<=%.0f", maxRequestRadiusKM)
+	if !containsString(result.Applied, want) {
+		t.Fatalf("migrate did not report the clamp: %v", result.Applied)
+	}
+
+	radii := map[string]float64{}
+	rows, err := db.QueryContext(ctx, `SELECT city, radius_km FROM update_targets`)
+	if err != nil {
+		t.Fatalf("read targets: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var city string
+		var radius float64
+		if err := rows.Scan(&city, &radius); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		radii[city] = radius
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	// Only the one past the ceiling moves; the others are left exactly as they
+	// were, including the one sitting on it.
+	if radii["Wide"] != maxRequestRadiusKM {
+		t.Errorf("Wide is %v km, want %v", radii["Wide"], maxRequestRadiusKM)
+	}
+	if radii["Exact"] != maxRequestRadiusKM {
+		t.Errorf("Exact is %v km, want %v", radii["Exact"], maxRequestRadiusKM)
+	}
+	if radii["Narrow"] != 12 {
+		t.Errorf("Narrow is %v km, want 12", radii["Narrow"])
+	}
+
+	// And it is a no-op the second time, so a migrate on a healthy database
+	// does not keep reporting a step it did not take.
+	second, err := migrateSchema(ctx, db, dialectSQLite)
+	if err != nil {
+		t.Fatalf("second migrateSchema: %v", err)
+	}
+	if containsString(second.Applied, want) {
+		t.Fatalf("the clamp reported itself again on an already-clamped database: %v", second.Applied)
+	}
+}

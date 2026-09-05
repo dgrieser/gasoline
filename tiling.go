@@ -17,7 +17,14 @@ const (
 	maxAPIRadiusKM = 25.0
 	// maxRequestRadiusKM is the largest radius --radius and an update target
 	// accept. Everything between maxAPIRadiusKM and this is tiled.
-	maxRequestRadiusKM = 50.0
+	//
+	// 42 km is where a bare ring of six reaches, and six requests is what the
+	// schedule can afford with room for retries left over. The ceiling was 50,
+	// which costs eight: seven disks of this size cover exactly twice their own
+	// radius and no more, so 50 km sits a hair beyond what seven can do and
+	// eight is the next stop. Those two extra requests bought 8 km of rim and
+	// cost every sweep the headroom it needed when the API refused.
+	maxRequestRadiusKM = 42.0
 	// tilePlacementSafety shrinks the radius the tile geometry is *placed*
 	// against, while every tile still requests the full maxAPIRadiusKM. The
 	// difference is the margin that absorbs the projection's second-order
@@ -37,50 +44,41 @@ const (
 	// tolerates best: the same budget spent evenly instead of three requests
 	// arriving back to back and then a minute of silence.
 	//
-	// The window is as wide as the sweep's own deadline allows — see
-	// sweepBudget — and it is deliberately at the top of that range rather than
-	// comfortably inside it. Tankerkönig answers a paced sweep with 503s often
+	// 50 s apart, flat. Tankerkönig answers a paced sweep with 503s often
 	// enough that retries are routine rather than exceptional, and a retry is
-	// the API asking to be left alone. Widening the window is the only lever
-	// this program has for that.
-	defaultRequestDelay = 37 * time.Second
+	// the API asking to be left alone — so the window is set as wide as the
+	// schedule allows rather than as narrow as the sweep needs. At six requests
+	// that is 4:10 of the 4:50 a five-minute schedule affords.
+	//
+	// It replaces a 37 s window with an extra two seconds after every third
+	// request — an arrangement that bought a 1.7% lower request rate and three
+	// shapes of pacing to reason about instead of one.
+	defaultRequestDelay = 50 * time.Second
 	defaultRequestBurst = 1
 
-	// defaultRequestGroup and defaultRequestGroupPause are the breather on top
-	// of that: after every defaultRequestGroup requests, the next one waits
-	// defaultRequestGroupPause longer than the window.
-	//
-	// This is the margin the window itself could not take. 37 s is already the
-	// widest window a clean 50 km sweep can afford; two seconds every third
-	// request costs the sweep four seconds in total and still fits, which is
-	// the whole of what was left. Whether a fifth of a window every third
-	// request is enough to stop an API refusing is not something this program
-	// can reason about — tile_retries on the Statistics page is what answers
-	// it, and this is the change that makes that measurement worth taking.
-	defaultRequestGroup      = 3
-	defaultRequestGroupPause = 2 * time.Second
-
 	// sweepBudget is the wall clock a tiled sweep has to fit inside. The
-	// packaged cron entry and systemd timer both fire `update` every five
-	// minutes and lean on flock to drop a run that would overlap the last one,
-	// so a sweep that overruns does not queue up — it loses the whole cycle.
-	// The ten seconds held back cover geocoding, the requests themselves and
-	// the write at the end.
+	// packaged cron entry and systemd timer fire `update` every five minutes
+	// and lean on flock to drop a run that would overlap the last one, so a
+	// sweep that overruns does not queue up — it loses the whole cycle. The ten
+	// seconds held back cover geocoding, the requests themselves and the write
+	// at the end.
 	//
-	// What has to fit is the widest sweep that answers first time: a 50 km
-	// target is 8 tiles, which at one per 37 s window plus a 2 s breather after
-	// every third puts the last one at 4:23.
-	//
-	// A sweep that retries does not fit, and that is the deliberate trade. One
-	// retry is 9 requests and 5:00, ten seconds past the budget; the sweeps
-	// this pace was widened for retry several times and run well past five
-	// minutes. Those lose the following tick to flock — prices land ten minutes
-	// apart rather than five — which is the price of not hammering an API that
-	// is already refusing. A pace that fits every retry inside five minutes is
-	// available (--request-burst 2 spends the same budget two requests at a
-	// time), and is the wrong default: it is bursty in exactly the way a
-	// refusing API is asking us not to be.
+	// The widest sweep is a 42 km target: 6 requests, the last going out at
+	// 4:10. What is left of the budget after that is sweepRetryHeadroom.
 	sweepBudget = 4*time.Minute + 50*time.Second
+
+	// sweepRetryHeadroom is how many retries the widest sweep can absorb and
+	// still finish inside the budget, and at this pace it is none: a seventh
+	// request lands at 5:00, ten seconds past. That is the trade the window is
+	// on the other side of — every second added to the pace is more room for
+	// the API to be left alone and less room for it to be asked twice — and 48 s
+	// is the widest window that still fits a retry, if the balance ever wants
+	// moving back. A sweep that does retry finishes late and loses the next
+	// cycle to flock, so prices land ten minutes apart rather than five.
+	sweepRetryHeadroom = 0
+
+	// minRingTiles is the smallest ring either construction is defined for.
+	minRingTiles = 3
 
 	// maxTileRetries is how often one tile is retried after a failure that
 	// retrying can plausibly fix.
@@ -95,7 +93,7 @@ const (
 	tileAttemptFailed  = "failed"
 
 	// maxLoggedTileAttempts bounds what one sweep keeps. A sweep of a single
-	// 50 km target is 8 requests, 16 in the worst retry case, so this is only
+	// 42 km target is 6 requests, 12 in the worst retry case, so this is only
 	// reached by a sweep with dozens of tiled targets — where the newest
 	// attempts are the ones worth having and the storage is better spent than
 	// on a run row with thousands of children.
@@ -138,14 +136,37 @@ func ringReach(n int, rd float64) (d, outer float64) {
 	return 2 * rd * cos, rd * (2*cos*cos + math.Cos(2*phi))
 }
 
+// bareRingReach returns the distance to place a ring of n tiles at, and how far
+// out it then reaches, when there is no centre tile under it.
+//
+// Without one, the ring itself has to cover the middle, which caps d at rd. Left
+// free the best distance is rd·cot φ, reaching rd/sin φ; that stays inside the
+// cap while cot φ ≤ 1, which is n ≤ 4. Beyond that the ring is held at d = rd
+// and reaches 2·rd·cos φ.
+//
+// This is what the centre tile costs. For n ≤ 4 a ring reaches exactly as far
+// without one as with one, so the centre tile is a whole request spent on
+// ground the ring already covers. For 5 and 6 the ring pulled in to d = rd
+// still reaches further than a centre tile plus a ring one smaller. Only from
+// 7 does the centre tile start earning its request, and there it earns it
+// handsomely — the hexagon reaches 2·rd, which no bare ring approaches.
+func bareRingReach(n int, rd float64) (d, outer float64) {
+	phi := math.Pi / float64(n)
+	sin, cos := math.Sin(phi), math.Cos(phi)
+	if cos <= sin { // n <= 4: the unconstrained best still covers the middle
+		return rd * cos / sin, rd / sin
+	}
+	return rd, 2 * rd * cos
+}
+
 // planSearchTiles covers the disk of radiusKM around (lat, lng) with tiles no
 // larger than the API's own limit, leaving no gaps.
 //
 // A radius the API can serve directly returns exactly one tile asking for
 // exactly that radius, so nothing about a narrow search changes. Anything wider
-// becomes a tile on the city centre plus one ring around it, the smallest ring
-// that reaches far enough (see ringReach). Tile 0 is always the centre, which
-// makes the merge order deterministic and centre-biased.
+// becomes the cheapest ring that reaches far enough — a bare ring up to six
+// requests, a ring around a centre tile beyond that (see bareRingReach and
+// ringReach). The tile order is fixed, which keeps the merge deterministic.
 func planSearchTiles(lat, lng, radiusKM float64) ([]searchTile, error) {
 	if radiusKM <= 0 {
 		return nil, fmt.Errorf("radius %.2f km must be positive", radiusKM)
@@ -157,24 +178,46 @@ func planSearchTiles(lat, lng, radiusKM float64) ([]searchTile, error) {
 		return nil, fmt.Errorf("radius %.2f km exceeds the supported maximum of %.0f km", radiusKM, maxRequestRadiusKM)
 	}
 
+	// Both constructions are tried at every request count, smallest count
+	// first, and the first that reaches far enough wins. Neither is better
+	// everywhere: a bare ring is the whole of it up to six requests, a centre
+	// tile and a ring from seven.
+	// Three is where both constructions start: two tiles on a ring are two
+	// tiles on top of each other, and a "ring" of one or two under a centre
+	// tile is not a ring at all — the closed forms below describe neither.
 	rd := maxAPIRadiusKM * tilePlacementSafety
-	for n := 3; n <= 12; n++ {
-		d, outer := ringReach(n, rd)
-		if outer < radiusKM {
-			continue
+	for requests := minRingTiles; requests <= 13; requests++ {
+		// A bare ring of `requests` tiles.
+		if d, outer := bareRingReach(requests, rd); outer >= radiusKM {
+			return ringTiles(lat, lng, d, requests, false), nil
 		}
-		tiles := make([]searchTile, 0, n+1)
-		tiles = append(tiles, searchTile{Lat: lat, Lng: lng, RadiusKM: maxAPIRadiusKM})
-		for k := 0; k < n; k++ {
-			tileLat, tileLng := destinationPoint(lat, lng, d, float64(k)*360/float64(n))
-			tiles = append(tiles, searchTile{Lat: tileLat, Lng: tileLng, RadiusKM: maxAPIRadiusKM})
+		// A centre tile and a ring of one fewer.
+		if requests > minRingTiles {
+			if d, outer := ringReach(requests-1, rd); outer >= radiusKM {
+				return ringTiles(lat, lng, d, requests-1, true), nil
+			}
 		}
-		return tiles, nil
 	}
-	// Unreachable while maxRequestRadiusKM stays inside a single ring's reach;
-	// a raised ceiling has to grow the construction rather than silently
+	// Unreachable while maxRequestRadiusKM stays inside these constructions'
+	// reach; a raised ceiling has to grow them rather than silently
 	// under-cover the disk.
 	return nil, fmt.Errorf("no tiling covers a radius of %.2f km", radiusKM)
+}
+
+// ringTiles lays n tiles evenly around (lat, lng) at distance d, optionally
+// preceded by one on the centre. Tile 0 is the centre when there is one and
+// otherwise the first of the ring, which keeps the merge order deterministic
+// either way.
+func ringTiles(lat, lng, d float64, n int, centre bool) []searchTile {
+	tiles := make([]searchTile, 0, n+1)
+	if centre {
+		tiles = append(tiles, searchTile{Lat: lat, Lng: lng, RadiusKM: maxAPIRadiusKM})
+	}
+	for k := 0; k < n; k++ {
+		tileLat, tileLng := destinationPoint(lat, lng, d, float64(k)*360/float64(n))
+		tiles = append(tiles, searchTile{Lat: tileLat, Lng: tileLng, RadiusKM: maxAPIRadiusKM})
+	}
+	return tiles
 }
 
 // destinationPoint returns the point distanceKM away from (lat, lng) along
@@ -215,7 +258,7 @@ func normalizeLongitude(lng float64) float64 {
 // figure per tile would leave the admin page unable to tell them apart.
 type tileAttempt struct {
 	City     string
-	Tile     int // 0 is the city centre tile
+	Tile     int // the tile's index in the plan; 0 is the first one queried
 	Attempt  int // 1 for the first try, 2 for the retry
 	SentAt   time.Time
 	Waited   time.Duration
@@ -296,25 +339,11 @@ func (l *tileLog) count() int {
 // burst goes out back to back and the one after it waits for the window to roll
 // over. A zero delay or burst never waits at all, which is what a sweep with
 // nothing to tile gets.
-//
-// On top of that even pace, every groupSize requests are followed by an extra
-// groupPause before the next one. The window is already the whole lever this
-// program has against an API that answers a paced sweep with 503s, and it is
-// pinned at the top of what the sweep's deadline allows; the pause is the
-// remaining room — a breather every few requests, bought a couple of seconds at
-// a time out of the margin left over.
 type tankerLimiter struct {
 	delay time.Duration
 	burst int
-	// groupSize and groupPause are off when either is zero, which is every
-	// caller that only wants the even pace.
-	groupSize  int
-	groupPause time.Duration
 	// recent holds the times of the last burst requests, oldest first.
 	recent []time.Time
-	// sent counts the requests already let out, which is what decides where a
-	// group ends.
-	sent int
 }
 
 // wait blocks until this request's turn in the pace comes up, and returns the
@@ -327,13 +356,7 @@ func (l *tankerLimiter) wait() time.Time {
 	}
 	now := nowFn()
 	if len(l.recent) >= l.burst {
-		until := l.recent[0].Add(l.delay)
-		// This request opens a new group, so it also waits out the breather
-		// the last one earned.
-		if l.groupSize > 0 && l.groupPause > 0 && l.sent%l.groupSize == 0 {
-			until = until.Add(l.groupPause)
-		}
-		if until.After(now) {
+		if until := l.recent[0].Add(l.delay); until.After(now) {
 			sleepFn(until.Sub(now))
 			// Book the slot at the time we waited for rather than re-reading
 			// the clock: the pace then stays even instead of drifting by
@@ -343,23 +366,17 @@ func (l *tankerLimiter) wait() time.Time {
 		l.recent = l.recent[1:]
 	}
 	l.recent = append(l.recent, now)
-	l.sent++
 	return now
 }
 
 // pace reports how long this limiter takes to let n requests out, measured from
 // the first — request i goes out at (i/burst)·delay, so the last one waits
-// ((n-1)/burst)·delay, plus a groupPause for every group boundary it crossed on
-// the way. It is what sizes the defaults against sweepBudget.
+// ((n-1)/burst)·delay. It is what sizes the defaults against sweepBudget.
 func (l *tankerLimiter) pace(n int) time.Duration {
 	if l == nil || l.delay <= 0 || l.burst < 1 || n < 2 {
 		return 0
 	}
-	total := time.Duration((n-1)/l.burst) * l.delay
-	if l.groupSize > 0 && l.groupPause > 0 {
-		total += time.Duration((n-1)/l.groupSize) * l.groupPause
-	}
-	return total
+	return time.Duration((n-1)/l.burst) * l.delay
 }
 
 // tankerRequestError carries whether retrying a failed Tankerkönig request can
@@ -395,10 +412,10 @@ func retryableStatus(code int) bool {
 // centre, with Dist restated as the distance from that centre. It also reports
 // when the first request went out, which the caller stamps the whole city with.
 //
-// The first tile is the city centre and is treated as the load-bearing one: if
-// it fails even on retry the whole city fails, because the cause is almost
-// always systemic (a rejected key, no network) and the alternative is reporting
-// a city assembled entirely out of its own edges. That also makes it the first
+// The first tile is treated as the load-bearing one: if it fails even on retry
+// the whole city fails, because the cause is almost always systemic (a rejected
+// key, no network) and the alternative is reporting a city assembled out of
+// whatever happened to answer. That also makes it the first
 // request that answered, so it is the one observedAt comes from. A later tile
 // failing costs only the stations that tile alone could see, which is a gap the
 // next sweep closes well inside the 48-hour freshness window — so those are
@@ -424,8 +441,8 @@ func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, log
 		for _, station := range stations {
 			if _, seen := merged[station.ID]; seen {
 				// The tiles overlap by construction, so most stations arrive
-				// more than once. The first tile to report one wins, which
-				// with the centre tile first keeps the choice deterministic.
+				// more than once. The first tile to report one wins, and the
+				// tile order is fixed, so the choice is deterministic.
 				continue
 			}
 			merged[station.ID] = station

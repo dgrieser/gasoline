@@ -889,7 +889,7 @@ func TestCommandRunRecordsTileRequests(t *testing.T) {
 	})
 	defer restore()
 
-	// 30 km is 5 tiles, so the sweep is 5 tiles plus the one retry = 6 requests.
+	// 30 km is 4 tiles, so the sweep is 4 tiles plus the one retry = 5 requests.
 	captureStdout(t, func() error {
 		return run([]string{"update", "--db", dbPath, "--radius", "30", "--city", "Berlin", "--output", "json"})
 	})
@@ -898,13 +898,13 @@ func TestCommandRunRecordsTileRequests(t *testing.T) {
 	if row.Status != commandRunStatusOK {
 		t.Fatalf("status = %q, want %q — the retry answered", row.Status, commandRunStatusOK)
 	}
-	if metrics["tile_requests"] != 6 || metrics["tile_retries"] != 1 {
-		t.Fatalf("tile_requests = %v, tile_retries = %v, want 6 and 1", metrics["tile_requests"], metrics["tile_retries"])
+	if metrics["tile_requests"] != 5 || metrics["tile_retries"] != 1 {
+		t.Fatalf("tile_requests = %v, tile_retries = %v, want 5 and 1", metrics["tile_requests"], metrics["tile_retries"])
 	}
 
 	tiles := readCommandRunTiles(t, dbPath, row.ID)
-	if len(tiles) != 6 {
-		t.Fatalf("command_run_tiles = %d rows, want 6: %+v", len(tiles), tiles)
+	if len(tiles) != 5 {
+		t.Fatalf("command_run_tiles = %d rows, want 5: %+v", len(tiles), tiles)
 	}
 	// Tile 1's failed first try and its successful retry are both kept, which
 	// is what makes the cost of the retry visible: two requests, two windows.
@@ -918,7 +918,6 @@ func TestCommandRunRecordsTileRequests(t *testing.T) {
 		{1, 2, tileAttemptOK},
 		{2, 1, tileAttemptOK},
 		{3, 1, tileAttemptOK},
-		{4, 1, tileAttemptOK},
 	}
 	for i, want := range wantShape {
 		got := tiles[i]
@@ -940,9 +939,8 @@ func TestCommandRunRecordsTileRequests(t *testing.T) {
 
 	// The pacing is the only thing that moves the stubbed clock, so each
 	// request's sent_at is its slot. The slots come from the limiter itself
-	// rather than from a window multiplied out here: the pace has a breather in
-	// it every few requests, and a test restating that arithmetic is a second
-	// copy of it to keep in step.
+	// rather than from a window multiplied out here, so a change to how the
+	// pace is shaped does not need this arithmetic restated alongside it.
 	pacing := defaultLimiter()
 	for i, got := range tiles {
 		want := clock.start.Add(pacing.pace(i + 1)).UTC().Format(time.RFC3339)
