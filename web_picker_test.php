@@ -736,7 +736,7 @@ echo "web_picker_test: gasolineCommandStatsRowFilter\n";
 $filter = gasolineCommandStatsRowFilter([], null);
 check('no filters narrow nothing', [$filter['sql'], $filter['params']], ['', []]);
 check('and report themselves as unset', $filter['filters'],
-    ['status' => 'all', 'duration' => 'all', 'host' => '', 'q' => '']);
+    ['status' => 'all', 'duration' => 'all', 'host' => '', 'rcommand' => 'all']);
 
 $filter = gasolineCommandStatsRowFilter(['status' => 'error'], null);
 check('a status filter binds the status', [$filter['sql'], $filter['params']],
@@ -768,36 +768,34 @@ check('the host select\'s own "any" option is not a hostname',
 $filter = gasolineCommandStatsRowFilter(['host' => str_repeat('h', 300)], null);
 check('a hostname longer than the column is not searched for', $filter['sql'], '');
 
-$filter = gasolineCommandStatsRowFilter(['q' => 'timeout'], null);
-check('an error search is a contains match',
-    [$filter['sql'], $filter['params']],
-    [" AND cr.error LIKE :rf_error ESCAPE '!'", [':rf_error' => '%timeout%']]);
+// The table's own command filter. It intersects with the page-wide one rather
+// than replacing it: on a phone that filter is several screens above the table.
+$filter = gasolineCommandStatsRowFilter(['rcommand' => 'update'], null);
+check('a command filter is an exact match', [$filter['sql'], $filter['params']],
+    [' AND cr.command = :rf_command', [':rf_command' => 'update']]);
+$filter = gasolineCommandStatsRowFilter(['rcommand' => 'all'], null);
+check('the command select\'s own "any" option narrows nothing',
+    [$filter['filters']['rcommand'], $filter['sql']], ['all', '']);
+// A command is only ever one of the four the page records, so anything else is
+// a crafted parameter rather than a choice, and narrows nothing.
+$filter = gasolineCommandStatsRowFilter(['rcommand' => 'rm -rf'], null);
+check('a command the page does not record falls back to all',
+    [$filter['filters']['rcommand'], $filter['sql']], ['all', '']);
 
-// A LIKE wildcard typed into the box is a character to find, not syntax. The
-// escape character is '!' because MySQL would read ESCAPE '\\' as an
-// unterminated string literal.
-$filter = gasolineCommandStatsRowFilter(['q' => '100% _done_ !'], null);
-check('wildcards in the search term are escaped, not honoured',
-    $filter['params'][':rf_error'], '%100!% !_done!_ !!%');
-
-$filter = gasolineCommandStatsRowFilter(['q' => str_repeat('x', 400)], null);
-check('an overlong search term is cut to the column search limit',
-    strlen((string) $filter['params'][':rf_error']), 202);
-
-// Filters compose: "the failures on this host, over a second" is one query.
+// Filters compose: "the failed updates on this host, over a second" is one query.
 $filter = gasolineCommandStatsRowFilter(
-    ['status' => 'partial', 'duration' => '1s', 'host' => 'box-b', 'q' => 'upstream'],
+    ['status' => 'partial', 'duration' => '1s', 'host' => 'box-b', 'rcommand' => 'update'],
     9999
 );
 check('every filter that is set is joined onto the same WHERE',
     $filter['sql'],
     " AND cr.status = :rf_status AND cr.duration_ms >= :rf_duration"
-    . " AND cr.host = :rf_host AND cr.error LIKE :rf_error ESCAPE '!'");
+    . " AND cr.host = :rf_host AND cr.command = :rf_command");
 check('and each binds its own parameter', $filter['params'], [
     ':rf_status' => 'partial',
     ':rf_duration' => 1000,
     ':rf_host' => 'box-b',
-    ':rf_error' => '%upstream%',
+    ':rf_command' => 'update',
 ]);
 
 echo "web_picker_test: gasolineCommandStatsRows\n";
@@ -869,11 +867,11 @@ $page = gasolineCommandStatsRows($older, $where . $filter['sql'],
 check('a failure outside the newest rows is still found',
     array_column($page['rows'], 'error'), ['boom']);
 
-$filter = gasolineCommandStatsRowFilter(['q' => 'upstream'], null);
+$filter = gasolineCommandStatsRowFilter(['rcommand' => 'update'], null);
 $page = gasolineCommandStatsRows($runsPdo, $where . $filter['sql'],
     array_merge($params, $filter['params']), 10);
-check('an error search matches on the error text',
-    array_column($page['rows'], 'command'), ['check']);
+check('a command filter narrows the rows to that command',
+    array_column($page['rows'], 'command'), ['update', 'update']);
 
 // An unfinished run has no measured duration, so no threshold can select it:
 // it is not a slow run, it is an unmeasured one.

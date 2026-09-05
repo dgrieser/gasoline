@@ -335,9 +335,9 @@ console.log('web_stats_test: cascade');
      * rules are declared before the card rules they have to survive, so a tie
      * silently loses.
      */
-    function beats(panelSelector, cardSelector) {
+    function beats(panelSelector, cardSelector, cardNeedle) {
         const panelAt = viewer.indexOf(panelSelector + ' ');
-        const cardAt = viewer.indexOf(cardSelector + ' ');
+        const cardAt = viewer.indexOf(cardNeedle || cardSelector + ' ');
         if (panelAt === -1) return `panel rule is gone: ${panelSelector}`;
         if (cardAt === -1) return `card rule is gone: ${cardSelector}`;
         const bySpec = specificity(panelSelector) - specificity(cardSelector);
@@ -358,6 +358,131 @@ console.log('web_stats_test: cascade');
     const cellRule = cellRuleAt === -1 ? '' : viewer.slice(cellRuleAt, viewer.indexOf('}', cellRuleAt));
     checkTrue('and restates the column gutter the card layout drops',
         /padding:[^;]*\d/.test(cellRule));
+
+    // The work table stays a real table at the same width, and has the same
+    // fight to win — plus a harder one, because the card rules that size a
+    // cell name the cell's own class and so tie at three classes rather than
+    // two. That is what the .cs-layout prefix on its rules is buying.
+    checkTrue('the work table keeps its rows table rows',
+        beats('.cs-layout .stack-table.cs-inline.cs-flat tr', '.stack-table.cs-inline tr'));
+    checkTrue('and its cells their padding',
+        beats('.cs-layout .stack-table.cs-inline.cs-flat td', '.stack-table.cs-inline td.cs-mini'));
+}
+
+/* ── Filtering the per-command table by status ──────────────────── */
+
+console.log('web_stats_test: csFilterCommandRows');
+{
+    const csFilterCommandRows = new Function([
+        lift('        function csFilterCommandRows(rows, status) {'),
+        'return csFilterCommandRows;',
+    ].join('\n'))();
+
+    // A row here is a command and its tallies, not a run, so a status keeps
+    // the commands that have any run of it — "which of these ever failed".
+    const rows = [
+        { command: 'update', runs: 826, ok: 800, partial: 20, error: 6 },
+        { command: 'suggest', runs: 138, ok: 138, partial: 0, error: 0 },
+        { command: 'check', runs: 138, ok: 137, partial: 0, error: 1 },
+        { command: 'notify', runs: 690, ok: 690, partial: 0, error: 0 },
+    ];
+    const names = (out) => out.map((r) => r.command);
+
+    check('no status narrows nothing', names(csFilterCommandRows(rows, 'all')),
+        ['update', 'suggest', 'check', 'notify']);
+    check('nor does a missing one', names(csFilterCommandRows(rows, '')),
+        ['update', 'suggest', 'check', 'notify']);
+    check('failed keeps the commands that have failures',
+        names(csFilterCommandRows(rows, 'error')), ['update', 'check']);
+    check('partial keeps the ones that have degraded runs',
+        names(csFilterCommandRows(rows, 'partial')), ['update']);
+    // Every command here has succeeded at least once, which is the ordinary
+    // case and has to read as "all four" rather than as an empty table.
+    check('ok keeps everything that has ever succeeded',
+        names(csFilterCommandRows(rows, 'ok')), ['update', 'suggest', 'check', 'notify']);
+    check('a command with none of the status drops out',
+        names(csFilterCommandRows([{ command: 'notify', ok: 690, partial: 0, error: 0 }], 'error')), []);
+}
+
+/* ── Sorting from the column header ─────────────────────────────── */
+
+console.log('web_stats_test: setSort');
+{
+    // The work table has no sort control any more: its header is there at
+    // every width, so a column sorts by being tapped and taps after that
+    // reverse it. That cycle is the whole interface, so it is worth asserting
+    // rather than assuming.
+    const setSort = new Function('syncSortControls', 'data', [
+        lift('        function setSort(spec, key) {'),
+        'return setSort;',
+    ].join('\n'))(() => {}, null);
+
+    const spec = {
+        cols: [{ key: 'name', dir: 'asc' }, { key: 'total', dir: 'desc' }],
+        sort: { key: 'name', dir: 'asc' },
+        render: () => { throw new Error('rendered with no data loaded'); },
+    };
+
+    setSort(spec, 'total');
+    // A column arrives sorted the way it is worth reading first — counts
+    // largest, names smallest — rather than inheriting the last column's.
+    check('a new column takes its own first direction', spec.sort, { key: 'total', dir: 'desc' });
+    setSort(spec, 'total');
+    check('tapping it again reverses it', spec.sort, { key: 'total', dir: 'asc' });
+    setSort(spec, 'total');
+    check('and again', spec.sort, { key: 'total', dir: 'desc' });
+    setSort(spec, 'name');
+    check('moving to another column does not carry the direction over',
+        spec.sort, { key: 'name', dir: 'asc' });
+    setSort(spec, 'nope');
+    check('a column the table does not have changes nothing',
+        spec.sort, { key: 'name', dir: 'asc' });
+}
+
+console.log('web_stats_test: controls');
+{
+    // The select existed because the card layout hides the header. The work
+    // table keeps its header now, so the select would be a second way to do
+    // one job; the runs table still cards its rows and still needs one.
+    checkTrue('the work table has no sort select left', !viewer.includes('cs-metric-sort'));
+    checkTrue('nor a direction button', !viewer.includes('cs-metric-dir'));
+    checkTrue('the runs table still has both', viewer.includes('cs-run-sort') && viewer.includes('cs-run-dir'));
+    // Every table's controls sit behind a disclosure that starts shut, so a
+    // card opens as its heading and its table and nothing else.
+    const disclosures = viewer.match(/<details class="cs-collapse">/g) || [];
+    check('each of the three tables has a disclosure', disclosures.length, 3);
+    // All three sections are headed by the same one word. Two of them used to
+    // name sorting instead, which made cards of the same kind read as
+    // different kinds of thing.
+    check('every section shares one heading',
+        (viewer.match(/data-i18n="statsFiltersLabel"/g) || []).length, 3);
+    checkTrue('and nothing names sorting in a heading any more',
+        !viewer.includes('statsControls') && !viewer.includes('statsSorting'));
+    check('each table has a reset',
+        (viewer.match(/class="btn-small cs-reset"/g) || []).length, 3);
+    checkTrue('none of them starts open', !/<details class="cs-collapse"[^>]*\bopen\b/.test(viewer));
+    for (const id of ['cs-cmd-sort', 'cs-metric-command', 'cs-run-status']) {
+        const at = viewer.indexOf('id="' + id + '"');
+        const open = viewer.lastIndexOf('<details class="cs-collapse">', at);
+        const close = viewer.lastIndexOf('</details>', at);
+        checkTrue(`${id} is inside one`, at !== -1 && open !== -1 && open > close);
+    }
+
+    // The resets say what they do through a translated title and aria-label
+    // rather than their face: as text the label is the widest control in the
+    // row and the only one that cannot shorten.
+    for (const id of ['cs-cmd-reset', 'cs-metric-reset', 'cs-run-reset']) {
+        const at = viewer.indexOf('id="' + id + '"');
+        const tag = viewer.slice(viewer.lastIndexOf('<button', at), viewer.indexOf('</button>', at));
+        checkTrue(`${id} is a symbol`, />\s*↺\s*$/.test(tag));
+        checkTrue(`${id} keeps its name for assistive tech`,
+            tag.includes('data-i18n-aria-label="statsClearFilters"')
+            && tag.includes('data-i18n-title="statsClearFilters"'));
+        // A lone button in a grid of labelled fields sits a label's height
+        // below every control beside it, so it is built like one.
+        checkTrue(`${id} is built like the fields it sits among`,
+            viewer.slice(viewer.lastIndexOf('<div class="field cs-reset-cell">', at), at).includes('<label aria-hidden="true">'));
+    }
 }
 
 /* ── Both languages carry every label the panel asks for ────────── */
