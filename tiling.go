@@ -35,10 +35,15 @@ const (
 	//
 	// One request per window rather than a burst of them is what a shared key
 	// tolerates best: the same budget spent evenly instead of three requests
-	// arriving back to back and then a minute of silence. The window is then as
-	// wide as the sweep's own deadline allows — see sweepBudget, which is what
-	// picks 35 s over anything rounder.
-	defaultRequestDelay = 35 * time.Second
+	// arriving back to back and then a minute of silence.
+	//
+	// The window is as wide as the sweep's own deadline allows — see
+	// sweepBudget — and it is deliberately at the top of that range rather than
+	// comfortably inside it. Tankerkönig answers a paced sweep with 503s often
+	// enough that retries are routine rather than exceptional, and a retry is
+	// the API asking to be left alone. Widening the window is the only lever
+	// this program has for that.
+	defaultRequestDelay = 37 * time.Second
 	defaultRequestBurst = 1
 
 	// sweepBudget is the wall clock a tiled sweep has to fit inside. The
@@ -48,10 +53,18 @@ const (
 	// The ten seconds held back cover geocoding, the requests themselves and
 	// the write at the end.
 	//
-	// The widest sweep is a 50 km target: 8 tiles, plus the one retry a
-	// transient failure costs, is 9 requests, and at one per 35 s window the
-	// last of them goes out at 280 s. A second retry overruns, which is the
-	// case flock is there for.
+	// What has to fit is the widest sweep that answers first time: a 50 km
+	// target is 8 tiles, and at one per 37 s window the last goes out at 4:19.
+	//
+	// A sweep that retries does not fit, and that is the deliberate trade. One
+	// retry is 9 requests and 4:56, six seconds past the budget; the sweeps
+	// this pace was widened for retry several times and run well past five
+	// minutes. Those lose the following tick to flock — prices land ten minutes
+	// apart rather than five — which is the price of not hammering an API that
+	// is already refusing. A pace that fits every retry inside five minutes is
+	// available (--request-burst 2 spends the same budget two requests at a
+	// time), and is the wrong default: it is bursty in exactly the way a
+	// refusing API is asking us not to be.
 	sweepBudget = 4*time.Minute + 50*time.Second
 
 	// maxTileRetries is how often one tile is retried after a failure that

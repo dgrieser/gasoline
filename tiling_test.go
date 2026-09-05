@@ -671,19 +671,25 @@ func TestDefaultPaceFitsSweepBudget(t *testing.T) {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
 	lim := &tankerLimiter{delay: defaultRequestDelay, burst: defaultRequestBurst}
-	// The widest sweep the defaults have to carry: every tile of a 50 km target
-	// plus the one retry a transient failure costs. Overrunning the budget does
-	// not just finish late — flock drops the next run, so the sweep after it is
-	// lost too.
-	worst := lim.pace(len(tiles) + maxTileRetries)
-	if worst > sweepBudget {
-		t.Fatalf("a %d-tile sweep with one retry paces to %v, over the %v budget", len(tiles), worst, sweepBudget)
+	// What the budget governs is the widest sweep that answers first time:
+	// every tile of a 50 km target, no retries. Overrunning does not just
+	// finish late — flock drops the next run, so the sweep after it is lost
+	// too.
+	//
+	// A sweep that retries is knowingly outside this and is not asserted here:
+	// see sweepBudget for why the pace is set where a retry overruns rather
+	// than where it fits. Pinning that overrun as an expectation would be worse
+	// than leaving it out, because it would fail the day someone makes retries
+	// fit again — which is an improvement, not a regression.
+	clean := lim.pace(len(tiles))
+	if clean > sweepBudget {
+		t.Fatalf("a %d-tile sweep paces to %v, over the %v budget", len(tiles), clean, sweepBudget)
 	}
 	// And the pace is as slow as that budget allows, to within a window: a
 	// default that leaves a whole further window unspent is being gentler on
 	// the deadline than on the API key, which is the wrong way round.
-	if worst+defaultRequestDelay <= sweepBudget {
-		t.Fatalf("the defaults pace to %v and a whole further %v window still fits inside %v — widen --request-delay", worst, defaultRequestDelay, sweepBudget)
+	if clean+defaultRequestDelay <= sweepBudget {
+		t.Fatalf("the defaults pace to %v and a whole further %v window still fits inside %v — widen --request-delay", clean, defaultRequestDelay, sweepBudget)
 	}
 }
 
