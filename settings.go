@@ -165,6 +165,27 @@ func migrateDropObsoleteSettings(ctx context.Context, tx *sql.Tx, d dialect, res
 	return nil
 }
 
+// migrateUpdateTargetsRadius brings stored update targets under the ceiling.
+//
+// The ceiling came down from 50 km to 42, and a target above it is not a
+// validation error a sweep can report and carry on from — planSearchTiles
+// refuses the radius, so the city fails outright, every run, until someone
+// notices. Clamping is the only outcome that keeps those installs sweeping;
+// the alternative is a database that was valid when it was written and is
+// silently broken by an upgrade.
+func migrateUpdateTargetsRadius(ctx context.Context, tx *sql.Tx, result *migrateResult) error {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE update_targets SET radius_km = ? WHERE radius_km > ?`,
+		maxRequestRadiusKM, maxRequestRadiusKM)
+	if err != nil {
+		return fmt.Errorf("clamp update target radius: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		result.Applied = append(result.Applied, fmt.Sprintf("update_targets.radius_km<=%.0f", maxRequestRadiusKM))
+	}
+	return nil
+}
+
 type settingsQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }

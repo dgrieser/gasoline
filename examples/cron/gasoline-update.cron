@@ -1,5 +1,5 @@
-# Gasoline price update every 5 minutes — install with `crontab -e`
-# (or drop into /etc/cron.d/ with a user field: `*/5 * * * * root set -a; ...`).
+# Gasoline price update every 10 minutes — install with `crontab -e`
+# (or drop into /etc/cron.d/ with a user field: `*/10 * * * * root set -a; ...`).
 #
 # Cron starts with an empty environment, so source the env file first; `set -a`
 # exports every KEY=value it defines (TANKER_KOENIG_API_KEY, storage settings).
@@ -8,12 +8,12 @@
 # `flock -n` keeps the runs from overlapping: cron fires on a fixed schedule
 # whether the last run finished or not, and two sweeps at once would race each
 # other for the API rate limit and for the database write lock. A radius over
-# 25 km is collected as several requests paced one per 37 s with a 2 s breather
-# after every third, and a 50 km target spends about 4:23 of the 5 minutes below
-# — 5:00, over the budget, if a request has to be retried at all — so the lock
-# is what keeps that safe on this schedule. Tiling a
-# second city in the same sweep does overrun it — the lock then drops the next
-# tick rather than letting two sweeps collide. See "Radii wider than the API
-# serves" in the README before putting more than one wide target on 5 minutes.
+# 25 km is collected as several requests paced one per minute, and the widest
+# target — 42 km, six requests — ends at 5:00, leaving the rest of the ten
+# minutes below for the retries a busy Tankerkönig makes routine. Tiling a
+# second city in the same sweep spends that headroom and more; the lock then
+# drops the next tick rather than letting two sweeps collide. See "Radii wider
+# than the API serves" in the README before putting more than one wide target
+# on this schedule.
 
-*/5 * * * * set -a; . /etc/gasoline/gasoline.env; set +a; flock -n /tmp/gasoline-update.lock /usr/local/bin/gasoline update --radius 25 --city 'Luebbecke'
+*/10 * * * * set -a; . /etc/gasoline/gasoline.env; set +a; flock -n /tmp/gasoline-update.lock /usr/local/bin/gasoline update --radius 25 --city 'Luebbecke'

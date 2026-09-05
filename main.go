@@ -622,7 +622,7 @@ Database:
 Examples:
   gasoline update --city "Berlin, Germany" --radius 5
   gasoline update --radius 10 --city Berlin --city "Lübbecke" --radius 25 --city Pforzheim
-  gasoline update --city "Lübbecke" --radius 50   # tiled: several paced 25 km queries
+  gasoline update --city "Lübbecke" --radius 42   # tiled: several paced 25 km queries
   gasoline update --city Berlin --db-driver mysql --mysql-dsn "gas:secret@tcp(db.example.com:3306)/gasoline"
   gasoline compact
   gasoline migrate
@@ -786,13 +786,11 @@ func runUpdate(args []string) (err error) {
 	dbf := addDBFlags(fs)
 	var events []updateArg
 	fs.Var(cityFlag{&events}, "city", "City or place to geocode (repeatable)")
-	fs.Var(radiusFlag{&events}, "radius", "Search radius in km, repeatable; default 5, max 50 (over 25 is fetched as several 25 km queries)")
+	fs.Var(radiusFlag{&events}, "radius", "Search radius in km, repeatable; default 5, max 42 (over 25 is fetched as several 25 km queries)")
 	fuelType := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
 	sortBy := fs.String("sort", "dist", "Sort order: dist or price")
-	requestDelay := fs.Duration("request-delay", defaultRequestDelay, "Window the Tankerkönig requests of a tiled radius are paced over (default 37s: a 50 km sweep that answers first time then fits a 5-minute schedule)")
+	requestDelay := fs.Duration("request-delay", defaultRequestDelay, "Window the Tankerkönig requests of a tiled radius are paced over (default 60s: a 42 km sweep is then 6 requests over 5 minutes)")
 	requestBurst := fs.Int("request-burst", defaultRequestBurst, "Tankerkönig requests allowed inside one --request-delay window")
-	requestGroup := fs.Int("request-group", defaultRequestGroup, "Requests between the extra --request-group-pause breathers; 0 for an even pace")
-	requestGroupPause := fs.Duration("request-group-pause", defaultRequestGroupPause, "Extra wait after every --request-group requests, on top of --request-delay")
 	userAgent := fs.String("user-agent", defaultUserAgent, "User-Agent for Nominatim and API calls")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
@@ -817,12 +815,6 @@ func runUpdate(args []string) (err error) {
 	}
 	if *requestBurst < 1 {
 		return errors.New("--request-burst must be at least 1")
-	}
-	if *requestGroup < 0 {
-		return errors.New("--request-group must not be negative")
-	}
-	if *requestGroupPause < 0 {
-		return errors.New("--request-group-pause must not be negative")
 	}
 	if *fuelType == "all" {
 		*sortBy = "dist"
@@ -918,12 +910,7 @@ func runUpdate(args []string) (err error) {
 			break
 		}
 	}
-	limiter := &tankerLimiter{
-		delay:      delay,
-		burst:      *requestBurst,
-		groupSize:  *requestGroup,
-		groupPause: *requestGroupPause,
-	}
+	limiter := &tankerLimiter{delay: delay, burst: *requestBurst}
 
 	// Fetch every target before writing anything: targets with overlapping
 	// radii report the same station, and a sweep has to see all of them at
@@ -3841,6 +3828,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, d dialect) (migrateResult, e
 		return migrateResult{}, err
 	}
 	if err := migrateDropObsoleteSettings(ctx, tx, d, &result); err != nil {
+		return migrateResult{}, err
+	}
+	if err := migrateUpdateTargetsRadius(ctx, tx, &result); err != nil {
 		return migrateResult{}, err
 	}
 

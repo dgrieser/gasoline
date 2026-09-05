@@ -256,8 +256,8 @@ function flashText(string $key): string
         'targetAdded' => 'Update target added.',
         'targetUpdated' => 'Update target radius saved.',
         'targetRemoved' => 'Update target removed.',
-        'invalidTarget' => 'Invalid city or radius (1-50 km).',
-        'invalidTargetRadius' => 'Invalid radius (1-50 km).',
+        'invalidTarget' => 'Invalid city or radius (1-42 km).',
+        'invalidTargetRadius' => 'Invalid radius (1-42 km).',
         'targetExists' => 'This city is already an update target.',
         'stationRenamed' => 'Station renamed.',
         'renameCleared' => 'Rename removed. The original name is used again.',
@@ -1338,7 +1338,7 @@ const GASOLINE_MAX_NOTIFY_RADIUS_KM = 100;
  * queries paced to stay under the rate limit — which costs a target over 25 km
  * a handful of requests and about a minute per sweep instead of one request.
  */
-const GASOLINE_MAX_TARGET_RADIUS_KM = 50;
+const GASOLINE_MAX_TARGET_RADIUS_KM = 42;
 
 /** The suggest/check fuel types, in canonical display order. */
 const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
@@ -10029,8 +10029,8 @@ const translations = {
         targetAdded: 'Update target added.',
         targetUpdated: 'Update target radius saved.',
         targetRemoved: 'Update target removed.',
-        invalidTarget: 'Invalid city or radius (1-50 km).',
-        invalidTargetRadius: 'Invalid radius (1-50 km).',
+        invalidTarget: 'Invalid city or radius (1-42 km).',
+        invalidTargetRadius: 'Invalid radius (1-42 km).',
         targetExists: 'This city is already an update target.',
         renameStation: 'Rename a station',
         renameStationHint: 'The new name replaces the Tankerkönig name everywhere — dashboard, CLI output, and notifications. The original name is kept and can be restored at any time.',
@@ -10393,8 +10393,8 @@ const translations = {
         targetAdded: 'Update-Ziel hinzugefügt.',
         targetUpdated: 'Radius des Update-Ziels gespeichert.',
         targetRemoved: 'Update-Ziel entfernt.',
-        invalidTarget: 'Ungültige Stadt oder ungültiger Radius (1-50 km).',
-        invalidTargetRadius: 'Ungültiger Radius (1-50 km).',
+        invalidTarget: 'Ungültige Stadt oder ungültiger Radius (1-42 km).',
+        invalidTargetRadius: 'Ungültiger Radius (1-42 km).',
         targetExists: 'Diese Stadt ist bereits ein Update-Ziel.',
         renameStation: 'Tankstelle umbenennen',
         renameStationHint: 'Der neue Name ersetzt den Tankerkönig-Namen überall — Dashboard, CLI-Ausgabe und Benachrichtigungen. Der Originalname bleibt erhalten und kann jederzeit wiederhergestellt werden.',

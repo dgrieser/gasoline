@@ -1,18 +1,20 @@
 [Unit]
-Description=Run gasoline update every 5 minutes
+Description=Run gasoline update every 10 minutes
 
 [Timer]
-# First run 1 min after boot, then every 5 minutes after the last run finishes.
+# First run 1 min after boot, then every 10 minutes after the last run finishes.
 # OnUnitInactiveSec, not OnUnitActiveSec: the latter counts from when the run
 # *started*, so a sweep that takes longer than the interval would re-fire the
 # moment it ends. A wide --radius is collected as several paced requests and can
-# take minutes, which is exactly when that difference bites. Note the cost of
-# that choice: a 50 km target paces to about 4:23, so sweeps land roughly every
-# 9 minutes here rather than every 5 — longer still when a request is retried. If you need the interval measured from the
-# start instead, use the cron entry in examples/cron/, which pairs a fixed
+# take minutes, which is exactly when that difference bites. Ten minutes is what
+# that pace needs: a 42 km target is six requests a minute apart, so it ends at
+# 5:00, and the rest of the interval is the room a retried request needs. Since
+# the interval is measured from the end of a run, sweeps land roughly every
+# 15 minutes here rather than every 10. If you need the interval measured from
+# the start instead, use the cron entry in examples/cron/, which pairs a fixed
 # schedule with `flock -n`.
 OnBootSec=1min
-OnUnitInactiveSec=5min
+OnUnitInactiveSec=10min
 # Catch up on a missed run if the machine was asleep/off at the scheduled time.
 Persistent=true
 AccuracySec=30s

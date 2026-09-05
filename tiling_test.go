@@ -58,7 +58,7 @@ func TestPlanSearchTilesCoversDisk(t *testing.T) {
 	// reliably returned.
 	const wantWithinKM = 24.30
 
-	radii := []float64{25.5, 26, 28, 30, 34, 34.5, 35, 40, 41, 41.5, 42, 45, 48, 48.6, 49, 50}
+	radii := []float64{25.5, 26, 28, 28.1, 30, 34, 34.29, 34.3, 35, 39.23, 39.24, 40, 41, 41.5, 42}
 	for _, centre := range tileTestCentres {
 		for _, radius := range radii {
 			tiles, err := planSearchTiles(centre.lat, centre.lng, radius)
@@ -110,11 +110,10 @@ func TestPlanSearchTilesTileCount(t *testing.T) {
 		want   int
 	}{
 		{5, 1}, {25, 1},
-		{25.5, 4}, {28, 4},
-		{30, 5}, {34, 5},
-		{35, 6}, {41, 6},
-		{42, 7}, {48, 7},
-		{49, 8}, {50, 8},
+		{25.5, 3}, {28, 3},
+		{28.1, 4}, {34.29, 4},
+		{34.3, 5}, {39.23, 5},
+		{39.24, 6}, {42, 6},
 	}
 	for _, tc := range cases {
 		tiles, err := planSearchTiles(52.5, 13.4, tc.radius)
@@ -128,8 +127,8 @@ func TestPlanSearchTilesTileCount(t *testing.T) {
 }
 
 // Across the whole tiled range the plan has to stay well formed: never cheaper
-// for a wider disk, always centred on the city, always asking the API for the
-// most it will serve, and always one ring of equidistant tiles.
+// for a wider disk, always asking the API for the most it will serve, and
+// always a single ring of equidistant tiles, with or without a centre tile.
 func TestPlanSearchTilesLadder(t *testing.T) {
 	previous := 0
 	for radius := 25.5; radius <= maxRequestRadiusKM+1e-9; radius += 0.5 {
@@ -142,31 +141,36 @@ func TestPlanSearchTilesLadder(t *testing.T) {
 		}
 		previous = len(tiles)
 
-		if tiles[0].Lat != 52.5 || tiles[0].Lng != 13.4 {
-			t.Fatalf("radius %.2f: tile 0 is not the city centre", radius)
-		}
 		for i, tile := range tiles {
 			if tile.RadiusKM != maxAPIRadiusKM {
 				t.Fatalf("radius %.2f: tile %d asks for %.2f km, want the API maximum", radius, i, tile.RadiusKM)
 			}
 		}
-		// One ring: every tile but the centre sits at the same distance.
-		ring := haversineKM(52.5, 13.4, tiles[1].Lat, tiles[1].Lng)
-		for i, tile := range tiles[1:] {
+
+		// A centre tile, if the plan has one, is tile 0; the rest are the ring.
+		ringStart := 0
+		if tiles[0].Lat == 52.5 && tiles[0].Lng == 13.4 {
+			ringStart = 1
+		}
+		if len(tiles)-ringStart < minRingTiles {
+			t.Fatalf("radius %.2f: %d ring tiles, want at least %d", radius, len(tiles)-ringStart, minRingTiles)
+		}
+		ring := haversineKM(52.5, 13.4, tiles[ringStart].Lat, tiles[ringStart].Lng)
+		for i, tile := range tiles[ringStart:] {
 			d := haversineKM(52.5, 13.4, tile.Lat, tile.Lng)
 			if math.Abs(d-ring) > 1e-6 {
-				t.Fatalf("radius %.2f: ring tile %d is %.6f km out, want %.6f", radius, i+1, d, ring)
+				t.Fatalf("radius %.2f: ring tile %d is %.6f km out, want %.6f", radius, ringStart+i, d, ring)
 			}
 		}
 	}
 }
 
 func TestPlanSearchTilesDeterministic(t *testing.T) {
-	first, err := planSearchTiles(52.5, 13.4, 50)
+	first, err := planSearchTiles(52.5, 13.4, maxRequestRadiusKM)
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	second, err := planSearchTiles(52.5, 13.4, 50)
+	second, err := planSearchTiles(52.5, 13.4, maxRequestRadiusKM)
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
@@ -391,11 +395,11 @@ func TestFetchTiledStationsDedupe(t *testing.T) {
 		), nil
 	})
 
-	tiles, err := planSearchTiles(centre.Lat, centre.Lng, 50)
+	tiles, err := planSearchTiles(centre.Lat, centre.Lng, maxRequestRadiusKM)
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, 50, "all", "dist")
+	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err != nil {
 		t.Fatalf("fetchTiledStations: %v", err)
 	}
@@ -448,16 +452,16 @@ func TestFetchTiledStationsFiltersOvershoot(t *testing.T) {
 			return tileListResponse(tileStation("centre", centre.Lat, centre.Lng, 1, 0)), nil
 		}
 		return tileListResponse(
-			tileStation(fmt.Sprintf("inside-%d", index), centre.Lat, centre.Lng, 49, float64(index)*40),
-			tileStation(fmt.Sprintf("outside-%d", index), centre.Lat, centre.Lng, 54, float64(index)*40),
+			tileStation(fmt.Sprintf("inside-%d", index), centre.Lat, centre.Lng, 41, float64(index)*40),
+			tileStation(fmt.Sprintf("outside-%d", index), centre.Lat, centre.Lng, 46, float64(index)*40),
 		), nil
 	})
 
-	tiles, err := planSearchTiles(centre.Lat, centre.Lng, 50)
+	tiles, err := planSearchTiles(centre.Lat, centre.Lng, maxRequestRadiusKM)
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, _, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, 50, "all", "dist")
+	stations, _, _, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err != nil {
 		t.Fatalf("fetchTiledStations: %v", err)
 	}
@@ -465,8 +469,8 @@ func TestFetchTiledStationsFiltersOvershoot(t *testing.T) {
 		if strings.HasPrefix(s.ID, "outside-") {
 			t.Errorf("%s is %.3f km out and should have been dropped", s.ID, s.Dist)
 		}
-		if d := haversineKM(centre.Lat, centre.Lng, s.Lat, s.Lng); d > 50 {
-			t.Errorf("%s is %.3f km from the centre, past the 50 km asked for", s.ID, d)
+		if d := haversineKM(centre.Lat, centre.Lng, s.Lat, s.Lng); d > maxRequestRadiusKM {
+			t.Errorf("%s is %.3f km from the centre, past the %.0f km asked for", s.ID, d, maxRequestRadiusKM)
 		}
 	}
 	if len(stations) == 0 {
@@ -489,11 +493,11 @@ func TestFetchTiledStationsPartialFailure(t *testing.T) {
 		return tileListResponse(tileStation(fmt.Sprintf("s-%d", index), lat, lng, 1, 0)), nil
 	})
 
-	tiles, err := planSearchTiles(centre.Lat, centre.Lng, 50)
+	tiles, err := planSearchTiles(centre.Lat, centre.Lng, maxRequestRadiusKM)
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{delay: 30 * time.Second, burst: 3}, nil, centre, tiles, 50, "all", "dist")
+	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{delay: 30 * time.Second, burst: 3}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err != nil {
 		t.Fatalf("a failing tile must not fail the city: %v", err)
 	}
@@ -523,11 +527,11 @@ func TestFetchTiledStationsFirstTileFails(t *testing.T) {
 		return tileListResponse(tileStation("late", lat, lng, 1, 0)), nil
 	})
 
-	tiles, err := planSearchTiles(centre.Lat, centre.Lng, 50)
+	tiles, err := planSearchTiles(centre.Lat, centre.Lng, maxRequestRadiusKM)
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	_, _, _, err = fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, 50, "all", "dist")
+	_, _, _, err = fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err == nil {
 		t.Fatal("a failing centre tile must fail the whole city")
 	}
@@ -552,11 +556,11 @@ func TestFetchTiledStationsDoesNotRetryPermanentFailures(t *testing.T) {
 		return tileListResponse(tileStation(fmt.Sprintf("s-%d", index), lat, lng, 1, 0)), nil
 	})
 
-	tiles, err := planSearchTiles(centre.Lat, centre.Lng, 50)
+	tiles, err := planSearchTiles(centre.Lat, centre.Lng, maxRequestRadiusKM)
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	if _, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, 50, "all", "dist"); err != nil || failed != 1 {
+	if _, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist"); err != nil || failed != 1 {
 		t.Fatalf("failed = %d, err = %v", failed, err)
 	}
 	if attempts != len(tiles) {
@@ -645,14 +649,14 @@ func TestFetchTiledStationsObservedAtSkipsFailedAttempt(t *testing.T) {
 		return tileListResponse(tileStation(fmt.Sprintf("s-%d", calls), lat, lng, 1, 0)), nil
 	})
 
-	tiles, err := planSearchTiles(centre.Lat, centre.Lng, 50)
+	tiles, err := planSearchTiles(centre.Lat, centre.Lng, maxRequestRadiusKM)
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
 	// burst 1 makes every request wait, so the retry lands a window after the
 	// attempt it replaces and the two instants cannot be confused.
 	lim := &tankerLimiter{delay: 30 * time.Second, burst: 1}
-	_, observedAt, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, lim, nil, centre, tiles, 50, "all", "dist")
+	_, observedAt, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, lim, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err != nil {
 		t.Fatalf("a retryable centre failure that then succeeds must not fail the city: %v", err)
 	}
@@ -670,12 +674,7 @@ func TestFetchTiledStationsObservedAtSkipsFailedAttempt(t *testing.T) {
 // added to the program and not to the limiter here would be a default no test
 // ever measured.
 func defaultLimiter() *tankerLimiter {
-	return &tankerLimiter{
-		delay:      defaultRequestDelay,
-		burst:      defaultRequestBurst,
-		groupSize:  defaultRequestGroup,
-		groupPause: defaultRequestGroupPause,
-	}
+	return &tankerLimiter{delay: defaultRequestDelay, burst: defaultRequestBurst}
 }
 
 func TestDefaultPaceFitsSweepBudget(t *testing.T) {
@@ -683,81 +682,29 @@ func TestDefaultPaceFitsSweepBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
+	// The ceiling is set where the geometry stops, so the widest target has to
+	// come out at exactly the request count the pace is designed around. A
+	// change to the tile placement safety that pushed this to seven would cost
+	// every sweep a whole window without anything else looking wrong.
+	if len(tiles) != 6 {
+		t.Fatalf("a %.0f km target is %d requests, want 6", maxRequestRadiusKM, len(tiles))
+	}
+
 	lim := defaultLimiter()
-	// What the budget governs is the widest sweep that answers first time:
-	// every tile of a 50 km target, no retries. Overrunning does not just
-	// finish late — flock drops the next run, so the sweep after it is lost
-	// too.
-	//
-	// A sweep that retries is knowingly outside this and is not asserted here:
-	// see sweepBudget for why the pace is set where a retry overruns rather
-	// than where it fits. Pinning that overrun as an expectation would be worse
-	// than leaving it out, because it would fail the day someone makes retries
-	// fit again — which is an improvement, not a regression.
-	clean := lim.pace(len(tiles))
-	if clean > sweepBudget {
-		t.Fatalf("a %d-tile sweep paces to %v, over the %v budget", len(tiles), clean, sweepBudget)
+	// What the budget has to hold is that sweep plus the retries it is sized
+	// for. Overrunning does not just finish late — flock drops the next run, so
+	// the sweep after it is lost too.
+	worst := lim.pace(len(tiles) + sweepRetryHeadroom)
+	if worst > sweepBudget {
+		t.Fatalf("a %d-request sweep with %d retries paces to %v, over the %v budget",
+			len(tiles), sweepRetryHeadroom, worst, sweepBudget)
 	}
-	// And the pace is as slow as that budget allows, to within a window: a
-	// default that leaves a whole further window unspent is being gentler on
-	// the deadline than on the API key, which is the wrong way round.
-	if clean+defaultRequestDelay <= sweepBudget {
-		t.Fatalf("the defaults pace to %v and a whole further %v window still fits inside %v — widen --request-delay", clean, defaultRequestDelay, sweepBudget)
-	}
-}
-
-// The schedule the defaults really produce: three requests a window apart, then
-// a breather, then three more, then the rest. Asserted as instants rather than
-// as an arithmetic rule, because the point of the breather is where it falls.
-func TestDefaultPaceGroupsRequests(t *testing.T) {
-	clock := stubTileClock(t)
-	lim := defaultLimiter()
-
-	var out []time.Duration
-	for i := 0; i < 8; i++ {
-		out = append(out, lim.wait().Sub(clock.start))
-	}
-
-	d, p := defaultRequestDelay, defaultRequestGroupPause
-	want := []time.Duration{
-		0,         // the first goes out at once
-		d,         //
-		2 * d,     // third of the group
-		3*d + p,   // a breather before the next group opens
-		4*d + p,   //
-		5*d + p,   //
-		6*d + 2*p, // and again
-		7*d + 2*p, //
-	}
-	for i := range want {
-		if out[i] != want[i] {
-			t.Errorf("request %d went out at %v, want %v", i+1, out[i], want[i])
-		}
-	}
-	// The whole 50 km sweep, which is what has to fit the budget.
-	if got := lim.pace(8); got != out[7] {
-		t.Errorf("pace(8) = %v but the eighth request went out at %v", got, out[7])
-	}
-}
-
-// A limiter with no group keeps the even pace it always had, which is what
-// --request-group 0 asks for and what every narrow sweep gets.
-func TestUngroupedLimiterIsUnchanged(t *testing.T) {
-	clock := stubTileClock(t)
-	lim := &tankerLimiter{delay: defaultRequestDelay, burst: 1}
-	for i := 0; i < 5; i++ {
-		if got, want := lim.wait().Sub(clock.start), time.Duration(i)*defaultRequestDelay; got != want {
-			t.Fatalf("request %d went out at %v, want %v", i+1, got, want)
-		}
-	}
-	// A pause with no group, and a group with no pause, are both off.
-	for _, lim := range []*tankerLimiter{
-		{delay: defaultRequestDelay, burst: 1, groupPause: time.Minute},
-		{delay: defaultRequestDelay, burst: 1, groupSize: 3},
-	} {
-		if got := lim.pace(8); got != 7*defaultRequestDelay {
-			t.Errorf("half a group setting changed the pace to %v", got)
-		}
+	// And the headroom is what it claims and no more: one retry further has to
+	// fall outside, or the number in sweepRetryHeadroom is understating what
+	// the schedule actually affords and the pace could be slower.
+	if beyond := lim.pace(len(tiles) + sweepRetryHeadroom + 1); beyond <= sweepBudget {
+		t.Fatalf("%d retries also fit (%v inside %v) — sweepRetryHeadroom understates the budget",
+			sweepRetryHeadroom+1, beyond, sweepBudget)
 	}
 }
 
@@ -765,19 +712,16 @@ func TestPaceMatchesTheLimiterItDescribes(t *testing.T) {
 	for _, tc := range []struct {
 		delay time.Duration
 		burst int
-		group int
-		pause time.Duration
 	}{
-		{35 * time.Second, 1, 0, 0},
-		{30 * time.Second, 3, 0, 0},
-		{90 * time.Second, 2, 0, 0},
-		{0, 3, 0, 0},
-		{30 * time.Second, 0, 0, 0},
-		{defaultRequestDelay, 1, defaultRequestGroup, defaultRequestGroupPause},
-		{30 * time.Second, 2, 2, 5 * time.Second},
+		{35 * time.Second, 1},
+		{30 * time.Second, 3},
+		{90 * time.Second, 2},
+		{0, 3},
+		{30 * time.Second, 0},
+		{defaultRequestDelay, defaultRequestBurst},
 	} {
 		clock := stubTileClock(t)
-		lim := &tankerLimiter{delay: tc.delay, burst: tc.burst, groupSize: tc.group, groupPause: tc.pause}
+		lim := &tankerLimiter{delay: tc.delay, burst: tc.burst}
 		var last time.Time
 		for i := 0; i < 9; i++ {
 			last = lim.wait()
@@ -785,8 +729,8 @@ func TestPaceMatchesTheLimiterItDescribes(t *testing.T) {
 		// pace is only trustworthy as a budget check while it agrees with what
 		// the limiter actually does to the clock.
 		if got, want := lim.pace(9), last.Sub(clock.start); got != want {
-			t.Fatalf("delay %v burst %d group %d/%v: pace(9) = %v, but 9 requests took %v",
-				tc.delay, tc.burst, tc.group, tc.pause, got, want)
+			t.Fatalf("delay %v burst %d: pace(9) = %v, but 9 requests took %v",
+				tc.delay, tc.burst, got, want)
 		}
 	}
 }
