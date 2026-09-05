@@ -4076,14 +4076,32 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                     <span class="cs-count" id="cs-cmd-count"></span>
                 </div>
                 <details class="cs-collapse">
-                    <summary><span data-i18n="statsSorting">Sorting</span></summary>
+                    <summary><span data-i18n="statsFiltersLabel">Filters</span></summary>
                     <div class="cs-controls">
+                        <div class="field">
+                            <!-- A row here is one command with its counts, so a
+                                 status narrows the commands rather than the
+                                 runs: "which of them have failed at all". -->
+                            <label for="cs-cmd-status" data-i18n="statsColStatus">Status</label>
+                            <select id="cs-cmd-status">
+                                <option value="all" data-i18n="statsFilterAny">Any</option>
+                                <option value="ok" data-i18n="statsStatus_ok">OK</option>
+                                <option value="partial" data-i18n="statsStatus_partial">Partial</option>
+                                <option value="error" data-i18n="statsStatus_error">Failed</option>
+                            </select>
+                        </div>
                         <div class="field">
                             <label for="cs-cmd-sort" data-i18n="statsSort">Sort by</label>
                             <div class="cs-sort-row">
                                 <select id="cs-cmd-sort"></select>
                                 <button type="button" class="range-toggle cs-dir" id="cs-cmd-dir"></button>
                             </div>
+                        </div>
+                        <div class="field cs-reset-cell">
+                            <label aria-hidden="true">&nbsp;</label>
+                            <button type="button" class="btn-small cs-reset" id="cs-cmd-reset"
+                                data-i18n-aria-label="statsClearFilters" data-i18n-title="statsClearFilters"
+                                aria-label="Clear filters" title="Clear filters">↺</button>
                         </div>
                     </div>
                 </details>
@@ -4264,6 +4282,8 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
 
         // The work table's own filters, applied in the browser: the server
         // returns that aggregate whole, so nothing can be hidden behind a cap.
+        const cmdStatusSel  = document.getElementById('cs-cmd-status');
+        const cmdReset      = document.getElementById('cs-cmd-reset');
         const metricCmdSel  = document.getElementById('cs-metric-command');
         const metricNameEl  = document.getElementById('cs-metric-name');
         const metricReset   = document.getElementById('cs-metric-reset');
@@ -4381,6 +4401,14 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             return rows.filter((row) =>
                 (command === 'all' || row.command === command)
                 && (q === '' || String(row.name).toLowerCase().indexOf(q) !== -1));
+        }
+
+        // A by-command row is one command and its tallies, so "Failed" means
+        // the commands that have a failure among their runs, not the failures
+        // themselves. A command with none of the status drops out.
+        function csFilterCommandRows(rows, status) {
+            if (status === 'all' || !status) return rows;
+            return rows.filter((row) => Number(row[status] || 0) > 0);
         }
 
         // Picking the column a table is already sorted by reverses it, which
@@ -4618,8 +4646,9 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             if (!cmdTbody) return;
             const spec = tables.cmd;
             const all = (data && data.by_command) || [];
-            const rows = csSortRows(all, spec.sort.key, spec.sort.dir);
-            setCount(spec, rows.length);
+            const filtered = csFilterCommandRows(all, cmdStatusSel ? cmdStatusSel.value : 'all');
+            const rows = csSortRows(filtered, spec.sort.key, spec.sort.dir);
+            setCount(spec, rows.length, all.length);
             const t = T();
             if (rows.length === 0) { cmdTbody.innerHTML = emptyRow(spec.span); return; }
             cmdTbody.innerHTML = rows.map((r) =>
@@ -5110,6 +5139,14 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                 const btn = th.querySelector('.cs-sort-btn');
                 if (btn) btn.addEventListener('click', () => setSort(spec, th.dataset.key));
             });
+        });
+
+        // Both aggregate tables filter the rows already in hand.
+        if (cmdStatusSel) cmdStatusSel.addEventListener('change', renderByCommand);
+        if (cmdReset) cmdReset.addEventListener('click', () => {
+            if (!cmdStatusSel || cmdStatusSel.value === 'all') return;
+            cmdStatusSel.value = 'all';
+            renderByCommand();
         });
 
         // The work table's filters are local to the rows already in hand.
@@ -9938,7 +9975,6 @@ const translations = {
         statsCommand: 'Command',
         statsAllCommands: 'All commands',
         statsFiltersLabel: 'Filters',
-        statsSorting: 'Sorting',
         statsRange: 'Range',
         statsTileRuns: 'Runs',
         statsTileSuccess: 'Success rate',
@@ -10302,7 +10338,6 @@ const translations = {
         statsCommand: 'Befehl',
         statsAllCommands: 'Alle Befehle',
         statsFiltersLabel: 'Filter',
-        statsSorting: 'Sortierung',
         statsRange: 'Zeitraum',
         statsTileRuns: 'Läufe',
         statsTileSuccess: 'Erfolgsquote',

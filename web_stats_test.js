@@ -369,6 +369,41 @@ console.log('web_stats_test: cascade');
         beats('.cs-layout .stack-table.cs-inline.cs-flat td', '.stack-table.cs-inline td.cs-mini'));
 }
 
+/* ── Filtering the per-command table by status ──────────────────── */
+
+console.log('web_stats_test: csFilterCommandRows');
+{
+    const csFilterCommandRows = new Function([
+        lift('        function csFilterCommandRows(rows, status) {'),
+        'return csFilterCommandRows;',
+    ].join('\n'))();
+
+    // A row here is a command and its tallies, not a run, so a status keeps
+    // the commands that have any run of it — "which of these ever failed".
+    const rows = [
+        { command: 'update', runs: 826, ok: 800, partial: 20, error: 6 },
+        { command: 'suggest', runs: 138, ok: 138, partial: 0, error: 0 },
+        { command: 'check', runs: 138, ok: 137, partial: 0, error: 1 },
+        { command: 'notify', runs: 690, ok: 690, partial: 0, error: 0 },
+    ];
+    const names = (out) => out.map((r) => r.command);
+
+    check('no status narrows nothing', names(csFilterCommandRows(rows, 'all')),
+        ['update', 'suggest', 'check', 'notify']);
+    check('nor does a missing one', names(csFilterCommandRows(rows, '')),
+        ['update', 'suggest', 'check', 'notify']);
+    check('failed keeps the commands that have failures',
+        names(csFilterCommandRows(rows, 'error')), ['update', 'check']);
+    check('partial keeps the ones that have degraded runs',
+        names(csFilterCommandRows(rows, 'partial')), ['update']);
+    // Every command here has succeeded at least once, which is the ordinary
+    // case and has to read as "all four" rather than as an empty table.
+    check('ok keeps everything that has ever succeeded',
+        names(csFilterCommandRows(rows, 'ok')), ['update', 'suggest', 'check', 'notify']);
+    check('a command with none of the status drops out',
+        names(csFilterCommandRows([{ command: 'notify', ok: 690, partial: 0, error: 0 }], 'error')), []);
+}
+
 /* ── Sorting from the column header ─────────────────────────────── */
 
 console.log('web_stats_test: setSort');
@@ -416,12 +451,15 @@ console.log('web_stats_test: controls');
     // card opens as its heading and its table and nothing else.
     const disclosures = viewer.match(/<details class="cs-collapse">/g) || [];
     check('each of the three tables has a disclosure', disclosures.length, 3);
-    // Both sections that hold filters are headed by the same one word. The
-    // runs card's used to name sorting as well, which made the two cards read
-    // as different kinds of thing when they are the same kind.
-    check('the two filter sections share one heading',
-        (viewer.match(/data-i18n="statsFiltersLabel"/g) || []).length, 2);
-    checkTrue('and nothing advertises sorting alongside it', !viewer.includes('statsControls'));
+    // All three sections are headed by the same one word. Two of them used to
+    // name sorting instead, which made cards of the same kind read as
+    // different kinds of thing.
+    check('every section shares one heading',
+        (viewer.match(/data-i18n="statsFiltersLabel"/g) || []).length, 3);
+    checkTrue('and nothing names sorting in a heading any more',
+        !viewer.includes('statsControls') && !viewer.includes('statsSorting'));
+    check('each table has a reset',
+        (viewer.match(/class="btn-small cs-reset"/g) || []).length, 3);
     checkTrue('none of them starts open', !/<details class="cs-collapse"[^>]*\bopen\b/.test(viewer));
     for (const id of ['cs-cmd-sort', 'cs-metric-command', 'cs-run-status']) {
         const at = viewer.indexOf('id="' + id + '"');
@@ -433,7 +471,7 @@ console.log('web_stats_test: controls');
     // The resets say what they do through a translated title and aria-label
     // rather than their face: as text the label is the widest control in the
     // row and the only one that cannot shorten.
-    for (const id of ['cs-metric-reset', 'cs-run-reset']) {
+    for (const id of ['cs-cmd-reset', 'cs-metric-reset', 'cs-run-reset']) {
         const at = viewer.indexOf('id="' + id + '"');
         const tag = viewer.slice(viewer.lastIndexOf('<button', at), viewer.indexOf('</button>', at));
         checkTrue(`${id} is a symbol`, />\s*↺\s*$/.test(tag));
