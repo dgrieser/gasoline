@@ -76,6 +76,7 @@ function build(lang, cache) {
         lift('        function tileStatusLabel(s) {'),
         lift('        function tileStatusClass(s) {'),
         lift('        function tileToggleHtml(r) {'),
+        lift('        function flattenReason(msg) {'),
         lift('        function tilesPanelHtml(runID) {'),
         lift('        function metricsHtml(metrics) {'),
         'return { tileToggleHtml, tilesPanelHtml, tileStatusClass, tileStatusLabel, metricsHtml };',
@@ -176,15 +177,18 @@ console.log('web_stats_test: tilesPanelHtml');
     checkTrue('and the attempt that replaced it as answered', html.includes('>answered<'));
     checkTrue('a retry is flagged amber rather than red',
         html.includes('<td class="cs-partial">2</td>'));
-    checkTrue('the failure reason is shown under the attempt that hit it',
+    checkTrue('the failure reason is shown',
         html.includes('tankerkönig request failed: 503 Service Unavailable'));
-    // The reason goes on a row of its own beneath the attempt rather than into
-    // its status cell: it is a sentence, and the columns around it are numbers.
-    check('and on a row of its own', (html.match(/cs-tile-why/g) || []).length, 1);
-    // It spans the rest of the row and no further: a colspan wider than the
-    // header adds a phantom column to the whole table.
-    checkTrue('spanning exactly the columns it has left',
-        html.includes('<td class="cs-tile-why" colspan="6">'));
+    // It is listed under the table rather than as a row in it, keyed by the
+    // request numbers it belongs to. As a row spanning every column it was a
+    // value in no column, and it made the table as wide as its own sentence.
+    check('as one entry under the table', (html.match(/data-cs-why/g) || []).length, 1);
+    checkTrue('naming the request it belongs to', html.includes('<span class="cs-why-seq">2</span>'));
+    checkTrue('and no longer as a row in the table', !html.includes('cs-tile-why'));
+    // Outside the scroller, so the panel's width bounds it rather than the
+    // table's — which is what lets it be ellipsised to something visible.
+    checkTrue('the table scrolls and the reasons do not',
+        html.indexOf('cs-tiles-scroll') < html.indexOf('cs-why-list'));
 
     // The two halves of a request's cost are rendered apart: the API's own
     // latency, and the pacing wait that is the schedule we chose.
@@ -210,13 +214,7 @@ console.log('web_stats_test: tilesPanelHtml');
     ])).tilesPanelHtml(7);
     checkTrue('a sweep of several cities names them', twoCities.includes('>City<')
         && twoCities.includes('>Uchte<'));
-    // And the reason row widens with the header rather than staying behind it.
-    const twoCityFail = build('en', okCache([
-        req(0, 0, 1, 'failed'),
-        req(1, 0, 1, 'ok', { city: 'Uchte' }),
-    ])).tilesPanelHtml(7);
-    checkTrue('a reason row follows the city column in',
-        twoCityFail.includes('<td class="cs-tile-why" colspan="7">'));
+
 }
 
 console.log('web_stats_test: tilesPanelHtml edge cases');
@@ -367,6 +365,49 @@ console.log('web_stats_test: cascade');
         beats('.cs-layout .stack-table.cs-inline.cs-flat tr', '.stack-table.cs-inline tr'));
     checkTrue('and its cells their padding',
         beats('.cs-layout .stack-table.cs-inline.cs-flat td', '.stack-table.cs-inline td.cs-mini'));
+}
+
+/* ── The reasons under the table ────────────────────────────────── */
+
+console.log('web_stats_test: reasons');
+{
+    // A sweep that meets a failing API meets the same failure on every tile.
+    // Five copies of one sentence is five lines of the same thing; one line
+    // naming five requests is the same information, read once.
+    const many = build('en', okCache([
+        req(0, 0, 1, 'ok'),
+        req(1, 1, 1, 'retried'),
+        req(2, 1, 2, 'ok'),
+        req(3, 2, 1, 'retried'),
+        req(4, 2, 2, 'ok'),
+    ])).tilesPanelHtml(7);
+    check('identical reasons are listed once', (many.match(/data-cs-why/g) || []).length, 1);
+    checkTrue('naming every request that hit it', many.includes('<span class="cs-why-seq">2, 4</span>'));
+
+    // Two different failures stay two entries, each with its own requests.
+    const mixed = build('en', okCache([
+        req(0, 0, 1, 'retried', { error: 'first failure' }),
+        req(1, 0, 2, 'retried', { error: 'second failure' }),
+        req(2, 0, 3, 'retried', { error: 'first failure' }),
+    ])).tilesPanelHtml(7);
+    check('different reasons stay apart', (mixed.match(/data-cs-why/g) || []).length, 2);
+    checkTrue('each keeping its own requests',
+        mixed.includes('<span class="cs-why-seq">1, 3</span>')
+        && mixed.includes('<span class="cs-why-seq">2</span>'));
+
+    // An API reason can be a whole HTML error page. One line is one line
+    // whatever it holds, so newlines and runs of spaces are flattened.
+    const messy = build('en', okCache([
+        req(0, 0, 1, 'failed', { error: '  503\n\tService   Unavailable\n\nEnable friendly errors.  ' }),
+    ])).tilesPanelHtml(7);
+    checkTrue('a multi-line reason is flattened to one line',
+        messy.includes('>503 Service Unavailable Enable friendly errors.<'));
+
+    // The ellipsis is the browser's, against the width the reader can see. A
+    // character budget would truncate a message that fitted a desktop fine.
+    checkTrue('nothing truncates the text before the browser does',
+        !viewer.includes('REASON_MAX'));
+    checkTrue('and a reason starts shut', many.includes('aria-expanded="false"'));
 }
 
 /* ── Filtering the per-command table by status ──────────────────── */
