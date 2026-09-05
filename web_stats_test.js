@@ -335,9 +335,9 @@ console.log('web_stats_test: cascade');
      * rules are declared before the card rules they have to survive, so a tie
      * silently loses.
      */
-    function beats(panelSelector, cardSelector) {
+    function beats(panelSelector, cardSelector, cardNeedle) {
         const panelAt = viewer.indexOf(panelSelector + ' ');
-        const cardAt = viewer.indexOf(cardSelector + ' ');
+        const cardAt = viewer.indexOf(cardNeedle || cardSelector + ' ');
         if (panelAt === -1) return `panel rule is gone: ${panelSelector}`;
         if (cardAt === -1) return `card rule is gone: ${cardSelector}`;
         const bySpec = specificity(panelSelector) - specificity(cardSelector);
@@ -358,6 +358,20 @@ console.log('web_stats_test: cascade');
     const cellRule = cellRuleAt === -1 ? '' : viewer.slice(cellRuleAt, viewer.indexOf('}', cellRuleAt));
     checkTrue('and restates the column gutter the card layout drops',
         /padding:[^;]*\d/.test(cellRule));
+
+    // The work table stays a real table at the same width, and has the same
+    // fight to win — plus a harder one, because the card rules that size a
+    // cell name the cell's own class and so tie at three classes rather than
+    // two. That is what the .cs-layout prefix on its rules is buying.
+    checkTrue('the work table keeps its rows table rows',
+        beats('.cs-layout .stack-table.cs-inline.cs-flat tr', '.stack-table.cs-inline tr'));
+    checkTrue('and its cells their padding',
+        beats('.cs-layout .stack-table.cs-inline.cs-flat td', '.stack-table.cs-inline td.cs-mini'));
+    // The controls the phone does not get are hidden by a class, and .field
+    // sets display too — later in the document, so an equal specificity there
+    // would leave them on screen.
+    checkTrue('and the desktop-only controls stay hidden',
+        beats('.cs-layout .cs-wide-only', '.field', '.field {'));
 }
 
 /* ── Both languages carry every label the panel asks for ────────── */

@@ -690,9 +690,12 @@ function gasolineCommandStatsRowFilter(array $query, ?int $p95Ms): array
         $host = '';
     }
 
-    $needle = trim((string) ($query['q'] ?? ''));
-    if (strlen($needle) > 200) {
-        $needle = substr($needle, 0, 200);
+    // The page filters by command too, at the top of the page. This one is not
+    // redundant with it: on a phone the page filter is several screens away
+    // from the table it narrows, and the two simply intersect.
+    $command = trim((string) ($query['rcommand'] ?? 'all'));
+    if (!in_array($command, ['all', 'update', 'suggest', 'check', 'notify'], true)) {
+        $command = 'all';
     }
 
     $sql = '';
@@ -717,15 +720,9 @@ function gasolineCommandStatsRowFilter(array $query, ?int $p95Ms): array
         $params[':rf_host'] = $host;
     }
 
-    if ($needle !== '') {
-        // The wildcards belong to LIKE, not to the reader: a run whose error
-        // really contains a percent sign has to be findable by typing one. The
-        // escape character is '!' rather than the usual backslash because
-        // MySQL reads a backslash inside a string literal as an escape of its
-        // own, which would leave ESCAPE '\' an unterminated literal there.
-        $escaped = str_replace(['!', '%', '_'], ['!!', '!%', '!_'], $needle);
-        $sql .= " AND cr.error LIKE :rf_error ESCAPE '!'";
-        $params[':rf_error'] = '%' . $escaped . '%';
+    if ($command !== 'all') {
+        $sql .= ' AND cr.command = :rf_command';
+        $params[':rf_command'] = $command;
     }
 
     return [
@@ -733,7 +730,7 @@ function gasolineCommandStatsRowFilter(array $query, ?int $p95Ms): array
             'status' => $status,
             'duration' => $duration,
             'host' => $host,
-            'q' => $needle,
+            'rcommand' => $command,
         ],
         'sql' => $sql,
         'params' => $params,
@@ -3817,6 +3814,75 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         .cs-tight th { white-space: normal; }
 
         @media (max-width: 640px) {
+            /* Controls a phone does not get. The work table is four narrow
+               columns and its filters are three more controls stacked above
+               it — more screen than the table they narrow. Sorting is the one
+               that earns its place, so the other two and the reset go. */
+            .cs-layout .cs-wide-only { display: none; }
+
+            /* A table that stays a table here. Four narrow columns fit a phone
+               where four cards do not: the same rows carded run a screen and a
+               half, most of it the repeated labels.
+               The full .cs-layout .stack-table.cs-inline.cs-flat prefix outranks the card
+               rules rather than tying with them — a tie loses to whichever is
+               declared later, which is how the request panel below was carded
+               for two releases without anyone seeing why. */
+            /* max-content, not 100%: at 100% the columns are squeezed to the
+               card and a long total runs straight into the column beside it,
+               mono text having nothing to give. The table takes the width its
+               numbers need and .table-scroll carries the rest — which for the
+               usual row is no scrolling at all, min-width keeping it filling
+               the card. */
+            .cs-layout .stack-table.cs-inline.cs-flat {
+                display: table;
+                width: max-content;
+                min-width: 100%;
+                font-size: 0.68rem;
+            }
+            .cs-layout .stack-table.cs-inline.cs-flat thead { display: table-header-group; }
+            .cs-layout .stack-table.cs-inline.cs-flat tbody { display: table-row-group; }
+            .cs-layout .stack-table.cs-inline.cs-flat tr {
+                display: table-row;
+                border: none;
+                border-radius: 0;
+                padding: 0;
+                margin: 0;
+            }
+            .cs-layout .stack-table.cs-inline.cs-flat th,
+            .cs-layout .stack-table.cs-inline.cs-flat td {
+                display: table-cell;
+                width: auto;
+                border: none;
+                border-bottom: 1px solid var(--border);
+                padding: 0.25rem 0.7rem 0.25rem 0;
+                vertical-align: baseline;
+                /* The card layout sizes the row's first cell larger than the
+                   rest, which in a real table reads as one column shouting. */
+                font-size: inherit;
+            }
+            /* The header names the columns, so the card layout's per-cell
+               label would repeat it on every row. */
+            .cs-layout .stack-table.cs-inline.cs-flat td[data-label]::before { content: none; }
+            /* A metric name is the one value here that can outrun its column,
+               and it is the column the reader scans, so it wraps rather than
+               pushing the other three off the screen. The cap is what makes it
+               wrap at all: left to itself the longest name takes a third of
+               the card and the numbers it is there to label get squeezed. */
+            .cs-layout .stack-table.cs-inline.cs-flat td.stack-primary {
+                overflow-wrap: anywhere;
+                max-width: 8.5rem;
+            }
+
+            /* Slimmer cards throughout: the statistics page is tables, and on
+               a phone the padding around them was costing more than they did. */
+            .cs-layout .settings-card { padding: 0.85rem 0.8rem; }
+            .cs-layout .auth-note { font-size: 0.68rem; line-height: 1.5; }
+            .cs-layout .cs-card-head h2 { font-size: 1.05rem; }
+            .cs-layout .cs-controls { gap: 0.45rem 0.7rem; margin: 0.7rem 0 0.8rem; }
+            .cs-layout .cs-controls .field select,
+            .cs-layout .cs-controls .field input { padding: 0.4rem 0.5rem; font-size: 0.74rem; }
+            .cs-layout .cs-columns { gap: 0.8rem; }
+
             /* Two columns of tighter tiles: eight dashboard-sized ones would
                be four screens of scrolling before the first table. */
             .cs-layout .stats { grid-template-columns: repeat(2, 1fr); }
@@ -3956,11 +4022,11 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                 </div>
                 <p class="auth-note" data-i18n="statsWorkHint">The counters the commands report, summed over the filtered runs. Per run averages only over the runs that reported the metric, so suggest’s persist counters are not diluted by runs without --persist.</p>
                 <div class="cs-controls">
-                    <div class="field">
+                    <div class="field cs-wide-only">
                         <label for="cs-metric-command" data-i18n="statsColCommand">Command</label>
                         <select id="cs-metric-command"></select>
                     </div>
-                    <div class="field">
+                    <div class="field cs-wide-only">
                         <label for="cs-metric-name" data-i18n="statsColMetric">Metric</label>
                         <input type="search" id="cs-metric-name" data-i18n-placeholder="statsFilterContains" placeholder="contains…" autocomplete="off">
                     </div>
@@ -3971,10 +4037,10 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                             <button type="button" class="range-toggle cs-dir" id="cs-metric-dir"></button>
                         </div>
                     </div>
-                    <button type="button" class="btn-small cs-reset" id="cs-metric-reset" data-i18n="statsClearFilters">Clear filters</button>
+                    <button type="button" class="btn-small cs-reset cs-wide-only" id="cs-metric-reset" data-i18n="statsClearFilters">Clear filters</button>
                 </div>
                 <div class="table-scroll">
-                    <table class="stack-table cs-inline" id="cs-metric-table">
+                    <table class="stack-table cs-inline cs-flat" id="cs-metric-table">
                         <thead>
                             <tr>
                                 <?php foreach ($csColumns['metric'] as $col) { echo $csTh($col); } ?>
@@ -4018,8 +4084,12 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
                     <select id="cs-run-host"><option value="all" data-i18n="statsFilterAny">Any</option></select>
                 </div>
                 <div class="field">
-                    <label for="cs-run-q" data-i18n="statsFilterError">Error</label>
-                    <input type="search" id="cs-run-q" data-i18n-placeholder="statsFilterContains" placeholder="contains…" autocomplete="off">
+                    <label for="cs-run-command" data-i18n="statsColCommand">Command</label>
+                    <select id="cs-run-command">
+                        <?php foreach ($commandLabels as $value => $label) { ?>
+                        <option value="<?= h($value) ?>"<?= $value === 'all' ? ' data-i18n="statsFilterAny"' : '' ?>><?= $value === 'all' ? 'Any' : h($label) ?></option>
+                        <?php } ?>
+                    </select>
                 </div>
                 <div class="field">
                     <label for="cs-run-sort" data-i18n="statsSort">Sort by</label>
@@ -4098,7 +4168,7 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             status:   document.getElementById('cs-run-status'),
             duration: document.getElementById('cs-run-duration'),
             host:     document.getElementById('cs-run-host'),
-            q:        document.getElementById('cs-run-q'),
+            rcommand: document.getElementById('cs-run-command'),
         };
         const runReset = document.getElementById('cs-run-reset');
 
@@ -4942,24 +5012,17 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             renderMetrics();
         });
 
-        // The runs table's filters are answered by the server, so the typed
-        // one waits for a pause rather than firing per keystroke.
-        ['status', 'duration', 'host'].forEach((key) => {
+        // Every runs filter is a select answered by the server, so each one
+        // re-reads the rows as soon as it changes.
+        Object.keys(runFilterEls).forEach((key) => {
             const el = runFilterEls[key];
             if (el) el.addEventListener('change', loadRows);
-        });
-        let qTimer = null;
-        if (runFilterEls.q) runFilterEls.q.addEventListener('input', () => {
-            if (qTimer !== null) clearTimeout(qTimer);
-            qTimer = setTimeout(loadRows, 300);
         });
         if (runReset) runReset.addEventListener('click', () => {
             let changed = false;
             Object.keys(runFilterEls).forEach((key) => {
                 const el = runFilterEls[key];
-                if (!el) return;
-                const cleared = key === 'q' ? '' : 'all';
-                if (el.value !== cleared) { el.value = cleared; changed = true; }
+                if (el && el.value !== 'all') { el.value = 'all'; changed = true; }
             });
             if (changed) loadRows();
         });
@@ -9788,7 +9851,6 @@ const translations = {
         statsSortDesc: 'Descending',
         statsFilterAny: 'Any',
         statsFilterContains: 'contains…',
-        statsFilterError: 'Error',
         statsDur1s: '1 s and up',
         statsDur10s: '10 s and up',
         statsDur1m: '1 min and up',
@@ -10151,7 +10213,6 @@ const translations = {
         statsSortDesc: 'Absteigend',
         statsFilterAny: 'Alle',
         statsFilterContains: 'enthält …',
-        statsFilterError: 'Fehler',
         statsDur1s: 'ab 1 s',
         statsDur10s: 'ab 10 s',
         statsDur1m: 'ab 1 min',
