@@ -77,7 +77,8 @@ function build(lang, cache) {
         lift('        function tileStatusClass(s) {'),
         lift('        function tileToggleHtml(r) {'),
         lift('        function tilesPanelHtml(runID) {'),
-        'return { tileToggleHtml, tilesPanelHtml, tileStatusClass, tileStatusLabel };',
+        lift('        function metricsHtml(metrics) {'),
+        'return { tileToggleHtml, tilesPanelHtml, tileStatusClass, tileStatusLabel, metricsHtml };',
     ].join('\n'))(
         () => translations[lang],
         cache,
@@ -256,6 +257,58 @@ console.log('web_stats_test: status colours');
     check('a failed one reads as a failure', tileStatusClass('failed'), 'cs-error');
     check('and an unknown status is not quietly called a success',
         tileStatusClass('something-new'), 'cs-error');
+}
+
+/* ── The counter list beside the toggle ─────────────────────────── */
+
+console.log('web_stats_test: metricsHtml');
+{
+    const { metricsHtml } = build('en', new Map());
+
+    check('a run with no counters contributes nothing', metricsHtml({}), '');
+    check('nor does a missing set', metricsHtml(null), '');
+
+    const html = metricsHtml({ tile_retries: 2, cities: 1, tile_requests: 10 });
+    // Each pair is its own box. A single string has no spaces inside a pair to
+    // break at, so on a phone it wraps mid-token — which is what put a column
+    // one character wide next to the toggle.
+    check('each counter is its own box', (html.match(/class="cs-metric"/g) || []).length, 3);
+    checkTrue('a pair is not split across boxes', html.includes('>tile_requests=10<'));
+    checkTrue('and the counters read in a stable order',
+        html.indexOf('cities=1') < html.indexOf('tile_requests=10')
+        && html.indexOf('tile_requests=10') < html.indexOf('tile_retries=2'));
+    // Nothing separates the boxes in the markup: the spacing is the box's own
+    // margin, so a wrapped line does not start with a stray gap.
+    checkTrue('the boxes carry their own spacing', !html.includes('</span>  <span'));
+}
+
+/* ── The card layout the panel lives inside ─────────────────────── */
+
+console.log('web_stats_test: card layout');
+{
+    /** The max-width of the media query a rule is declared inside, or null. */
+    function breakpointOf(needle) {
+        const at = viewer.indexOf(needle);
+        if (at === -1) return `missing rule: ${needle}`;
+        const opened = [...viewer.slice(0, at).matchAll(/@media \(max-width: (\d+)px\)/g)].pop();
+        return opened ? Number(opened[1]) : null;
+    }
+
+    // Below this width the page turns every table row into a card — including,
+    // because the rule reaches every descendant cell, the request table inside
+    // the drill-down. The overrides that put that table back have to start at
+    // exactly the same width: higher and they fire while the outer table is
+    // still a table, lower and the panel is carded with no columns left.
+    const card = breakpointOf('.stack-table thead { display: none; }');
+    check('the card layout still has a breakpoint to match', typeof card, 'number');
+    check('the drill-down is put back to a table exactly where carding starts',
+        breakpointOf('.stack-table .cs-tiles-panel table'), card);
+    check('and the toggle is given its own line there too',
+        breakpointOf('.stack-table.cs-inline td.cs-wide > .cs-tiles-toggle'), card);
+    // The toggle cannot shrink, so the detail cell has to be allowed to wrap:
+    // sharing one flex line with it is what left the counters a character wide.
+    check('the detail cell may wrap at that width',
+        breakpointOf('.stack-table.cs-inline td.cs-wide { flex-wrap: wrap; }'), card);
 }
 
 /* ── Both languages carry every label the panel asks for ────────── */

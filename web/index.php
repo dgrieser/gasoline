@@ -3646,6 +3646,10 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         .cs-running { color: var(--muted); }
         /* The metric list inside a run row: name=value pairs, wrapping. */
         .cs-metrics { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
+        /* One counter. inline-block keeps `name=value` whole while the list
+           wraps between pairs; `anywhere` is the fallback for the single pair
+           too long to fit a line at all, which would otherwise overflow. */
+        .cs-metric { display: inline-block; margin-right: 0.75rem; overflow-wrap: anywhere; }
         .cs-err { font-family: var(--mono); font-size: 0.72rem; color: var(--red); word-break: break-word; }
         /* A run's request drill-down. It is a table inside a row rather than
            more columns on the row itself: the requests are a list per run, and
@@ -3689,12 +3693,43 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
         .cs-tiles-panel td.cs-tile-wait { color: var(--muted); }
         .cs-tiles-panel td.cs-tile-why { white-space: normal; overflow-wrap: anywhere; color: var(--red); }
         .cs-tiles-note { color: var(--muted); padding: 0.3rem 0 0 0; }
-        @media (max-width: 720px) {
-            /* The flex row layout the card view applies to the outer table
-               would tear this one apart, so it is put back to a table. */
+        @media (max-width: 640px) {
+            /* The card layout the outer table takes on at this width reaches
+               every table cell inside it, this panel's included — and a list of
+               requests carded one value per line loses the very thing it is:
+               columns. So the panel is put back to a table and allowed to
+               scroll sideways, where the header keeps labelling the numbers.
+               The .stack-table prefix is what wins these back: the card rules
+               are declared later in the document, so equal specificity loses.
+               The width is the card layout's own breakpoint — above it the
+               outer table is still a table and there is nothing to undo. */
             .stack-table.cs-inline tr.cs-tiles-row { display: block; }
             .stack-table.cs-inline tr.cs-tiles-row td.cs-tiles-cell { display: block; width: 100%; }
+            /* Seven columns do not fit a phone — the headers alone floor the
+               table about a third wider than the card — so the panel scrolls
+               sideways rather than hiding columns the reader could not then
+               get back. What falls off the right is when a request was sent
+               and its status, and that a request was retried is already said
+               three times over without scrolling: on the toggle before
+               anything is expanded, by the amber attempt number, and by the
+               reason row spanning the width beneath it. */
             .cs-tiles-panel { overflow-x: auto; }
+            .stack-table .cs-tiles-panel table { display: table; width: max-content; min-width: 100%; }
+            .stack-table .cs-tiles-panel thead { display: table-header-group; }
+            .stack-table .cs-tiles-panel tbody { display: table-row-group; }
+            .stack-table .cs-tiles-panel tr {
+                display: table-row;
+                border: none;
+                border-radius: 0;
+                padding: 0;
+                margin: 0;
+            }
+            .stack-table .cs-tiles-panel th,
+            .stack-table .cs-tiles-panel td {
+                display: table-cell;
+                width: auto;
+                border: none;
+            }
         }
         .cs-legend-swatch { width: 16px; height: 10px; border-radius: 2px; display: inline-block; }
         .cs-legend-line { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
@@ -3794,11 +3829,24 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             .stack-table.cs-inline td.cs-wide { padding-top: 0.4rem; }
             /* The metric list and the error text are the only values here
                that can outrun the card, so they are the ones allowed to
-               break mid-token rather than push the row wider. */
+               break mid-token rather than push the row wider.
+               They also get a line to themselves. The cell is a flex row, and
+               the requests toggle in it cannot shrink — its label has to stay
+               on one line to be readable — so sharing a line with it leaves the
+               metric list about one character wide. */
+            .stack-table.cs-inline td.cs-wide { flex-wrap: wrap; }
             .stack-table.cs-inline td.cs-wide > span {
-                flex: 1 1 auto;
+                flex: 1 1 100%;
                 min-width: 0;
                 overflow-wrap: anywhere;
+            }
+            /* Sized to its own text on the line below, not stretched across
+               the card: a full-width button reads as the row's action rather
+               than as a disclosure for the numbers above it. */
+            .stack-table.cs-inline td.cs-wide > .cs-tiles-toggle {
+                flex: 0 0 auto;
+                margin-left: 0;
+                margin-top: 0.45rem;
             }
         }
     </style>
@@ -4416,10 +4464,15 @@ function renderAdminStatsPage(PDO $pdo, string $driver, array $user): never
             ).join('');
         }
 
+        // Each pair is its own box rather than one long string: a run now
+        // reports ten counters, and a single string can only wrap mid-token —
+        // `tile_re / quests=10` — because the pairs have no spaces to break at.
         function metricsHtml(metrics) {
             const names = Object.keys(metrics || {}).sort();
             if (names.length === 0) return '';
-            return '<span class="cs-metrics">' + names.map((n) => esc(n) + '=' + esc(fmtNumber(metrics[n]))).join('  ') + '</span>';
+            return '<span class="cs-metrics">'
+                + names.map((n) => '<span class="cs-metric">' + esc(n) + '=' + esc(fmtNumber(metrics[n])) + '</span>').join('')
+                + '</span>';
         }
 
         /* ── A run's individual requests ───────────────────────── */
