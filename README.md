@@ -132,7 +132,7 @@ Useful `update` flags:
 - `--fuel all|diesel|e5|e10`
 - `--sort dist|price`
 - `--radius` in km, up to 50 (see [Radii wider than the API serves](#radii-wider-than-the-api-serves))
-- `--request-delay` and `--request-burst` pace the requests a wide radius needs
+- `--request-delay` and `--request-burst` pace the requests a wide radius needs (one per 35 s by default)
 - `--user-agent "your-app/1.0"`
 - `--output json` or `-o json`
 
@@ -149,13 +149,18 @@ What that costs, since it is a request budget and not just a wait:
 | `--radius` | API requests | added time per sweep |
 | --- | --- | --- |
 | up to 25 | 1 | none |
-| up to 28 | 4 | none |
-| up to 34 | 5 | 30 s |
-| up to 41 | 6 | 30 s |
-| up to 48 | 7 | 60 s |
-| up to 50 | 8 | 60 s |
+| up to 28 | 4 | 1:45 |
+| up to 34 | 5 | 2:20 |
+| up to 41 | 6 | 2:55 |
+| up to 48 | 7 | 3:30 |
+| up to 50 | 8 | 4:05 |
 
-The requests are paced at `--request-burst` (default 3) per `--request-delay` (default 30s), so they go out in bursts of three a window apart. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
+The requests are paced at `--request-burst` (default 1) per `--request-delay` (default 35s), so they go out one at a time, a window apart. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
+
+**Why 35 s, and what it costs you.** The default pace is the slowest one that still lets the widest sweep finish inside a five-minute schedule, which is what the packaged cron entry and systemd timer both use. A 50 km target is 8 requests; add the one retry a transient failure costs and that is 9, whose last one goes out at 4:40 — just inside the 4:50 the sweep is budgeted (`sweepBudget` in `tiling.go`, asserted by `TestDefaultPaceFitsSweepBudget`). The margin is deliberately thin, so two things are worth knowing:
+
+- **A second retry overruns**, and so does **more than one tiled city in the same sweep** — the pace belongs to the API key, not to the city, so two 50 km targets are 16 requests and about 8:45. That is what `flock -n` is for: the overrunning run finishes, the next cron tick is dropped, and prices land 10 minutes apart instead of 5. If you tile more than one city on a five-minute schedule, either raise `--request-burst` or give the sweep its own, slower timer.
+- **Widening the radius ceiling or the retry count** re-opens this arithmetic. `TestDefaultPaceFitsSweepBudget` fails in both directions — too slow for the budget, and a whole window slower than it needs to be — so the defaults have to be re-derived rather than drifting.
 
 Three things make a wide radius behave like a single narrow one:
 

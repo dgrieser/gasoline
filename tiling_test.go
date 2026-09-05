@@ -664,3 +664,50 @@ func TestFetchTiledStationsObservedAtSkipsFailedAttempt(t *testing.T) {
 		t.Fatalf("observedAt = %v, want %v (the retry, not the attempt that came back empty)", observedAt, want)
 	}
 }
+
+func TestDefaultPaceFitsSweepBudget(t *testing.T) {
+	tiles, err := planSearchTiles(52.2799, 8.6122, maxRequestRadiusKM)
+	if err != nil {
+		t.Fatalf("planSearchTiles: %v", err)
+	}
+	lim := &tankerLimiter{delay: defaultRequestDelay, burst: defaultRequestBurst}
+	// The widest sweep the defaults have to carry: every tile of a 50 km target
+	// plus the one retry a transient failure costs. Overrunning the budget does
+	// not just finish late — flock drops the next run, so the sweep after it is
+	// lost too.
+	worst := lim.pace(len(tiles) + maxTileRetries)
+	if worst > sweepBudget {
+		t.Fatalf("a %d-tile sweep with one retry paces to %v, over the %v budget", len(tiles), worst, sweepBudget)
+	}
+	// And the pace is as slow as that budget allows, to within a window: a
+	// default that leaves a whole further window unspent is being gentler on
+	// the deadline than on the API key, which is the wrong way round.
+	if worst+defaultRequestDelay <= sweepBudget {
+		t.Fatalf("the defaults pace to %v and a whole further %v window still fits inside %v — widen --request-delay", worst, defaultRequestDelay, sweepBudget)
+	}
+}
+
+func TestPaceMatchesTheLimiterItDescribes(t *testing.T) {
+	for _, tc := range []struct {
+		delay time.Duration
+		burst int
+	}{
+		{35 * time.Second, 1},
+		{30 * time.Second, 3},
+		{90 * time.Second, 2},
+		{0, 3},
+		{30 * time.Second, 0},
+	} {
+		clock := stubTileClock(t)
+		lim := &tankerLimiter{delay: tc.delay, burst: tc.burst}
+		var last time.Time
+		for i := 0; i < 9; i++ {
+			last = lim.wait()
+		}
+		// pace is only trustworthy as a budget check while it agrees with what
+		// the limiter actually does to the clock.
+		if got, want := lim.pace(9), last.Sub(clock.start); got != want {
+			t.Fatalf("delay %v burst %d: pace(9) = %v, but 9 requests took %v", tc.delay, tc.burst, got, want)
+		}
+	}
+}
