@@ -665,12 +665,25 @@ func TestFetchTiledStationsObservedAtSkipsFailedAttempt(t *testing.T) {
 	}
 }
 
+// defaultLimiter is the pace a sweep really keeps. Tests build it through this
+// rather than naming the fields they happen to know about: a pacing default
+// added to the program and not to the limiter here would be a default no test
+// ever measured.
+func defaultLimiter() *tankerLimiter {
+	return &tankerLimiter{
+		delay:      defaultRequestDelay,
+		burst:      defaultRequestBurst,
+		groupSize:  defaultRequestGroup,
+		groupPause: defaultRequestGroupPause,
+	}
+}
+
 func TestDefaultPaceFitsSweepBudget(t *testing.T) {
 	tiles, err := planSearchTiles(52.2799, 8.6122, maxRequestRadiusKM)
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	lim := &tankerLimiter{delay: defaultRequestDelay, burst: defaultRequestBurst}
+	lim := defaultLimiter()
 	// What the budget governs is the widest sweep that answers first time:
 	// every tile of a 50 km target, no retries. Overrunning does not just
 	// finish late — flock drops the next run, so the sweep after it is lost
@@ -693,19 +706,78 @@ func TestDefaultPaceFitsSweepBudget(t *testing.T) {
 	}
 }
 
+// The schedule the defaults really produce: three requests a window apart, then
+// a breather, then three more, then the rest. Asserted as instants rather than
+// as an arithmetic rule, because the point of the breather is where it falls.
+func TestDefaultPaceGroupsRequests(t *testing.T) {
+	clock := stubTileClock(t)
+	lim := defaultLimiter()
+
+	var out []time.Duration
+	for i := 0; i < 8; i++ {
+		out = append(out, lim.wait().Sub(clock.start))
+	}
+
+	d, p := defaultRequestDelay, defaultRequestGroupPause
+	want := []time.Duration{
+		0,         // the first goes out at once
+		d,         //
+		2 * d,     // third of the group
+		3*d + p,   // a breather before the next group opens
+		4*d + p,   //
+		5*d + p,   //
+		6*d + 2*p, // and again
+		7*d + 2*p, //
+	}
+	for i := range want {
+		if out[i] != want[i] {
+			t.Errorf("request %d went out at %v, want %v", i+1, out[i], want[i])
+		}
+	}
+	// The whole 50 km sweep, which is what has to fit the budget.
+	if got := lim.pace(8); got != out[7] {
+		t.Errorf("pace(8) = %v but the eighth request went out at %v", got, out[7])
+	}
+}
+
+// A limiter with no group keeps the even pace it always had, which is what
+// --request-group 0 asks for and what every narrow sweep gets.
+func TestUngroupedLimiterIsUnchanged(t *testing.T) {
+	clock := stubTileClock(t)
+	lim := &tankerLimiter{delay: defaultRequestDelay, burst: 1}
+	for i := 0; i < 5; i++ {
+		if got, want := lim.wait().Sub(clock.start), time.Duration(i)*defaultRequestDelay; got != want {
+			t.Fatalf("request %d went out at %v, want %v", i+1, got, want)
+		}
+	}
+	// A pause with no group, and a group with no pause, are both off.
+	for _, lim := range []*tankerLimiter{
+		{delay: defaultRequestDelay, burst: 1, groupPause: time.Minute},
+		{delay: defaultRequestDelay, burst: 1, groupSize: 3},
+	} {
+		if got := lim.pace(8); got != 7*defaultRequestDelay {
+			t.Errorf("half a group setting changed the pace to %v", got)
+		}
+	}
+}
+
 func TestPaceMatchesTheLimiterItDescribes(t *testing.T) {
 	for _, tc := range []struct {
 		delay time.Duration
 		burst int
+		group int
+		pause time.Duration
 	}{
-		{35 * time.Second, 1},
-		{30 * time.Second, 3},
-		{90 * time.Second, 2},
-		{0, 3},
-		{30 * time.Second, 0},
+		{35 * time.Second, 1, 0, 0},
+		{30 * time.Second, 3, 0, 0},
+		{90 * time.Second, 2, 0, 0},
+		{0, 3, 0, 0},
+		{30 * time.Second, 0, 0, 0},
+		{defaultRequestDelay, 1, defaultRequestGroup, defaultRequestGroupPause},
+		{30 * time.Second, 2, 2, 5 * time.Second},
 	} {
 		clock := stubTileClock(t)
-		lim := &tankerLimiter{delay: tc.delay, burst: tc.burst}
+		lim := &tankerLimiter{delay: tc.delay, burst: tc.burst, groupSize: tc.group, groupPause: tc.pause}
 		var last time.Time
 		for i := 0; i < 9; i++ {
 			last = lim.wait()
@@ -713,7 +785,8 @@ func TestPaceMatchesTheLimiterItDescribes(t *testing.T) {
 		// pace is only trustworthy as a budget check while it agrees with what
 		// the limiter actually does to the clock.
 		if got, want := lim.pace(9), last.Sub(clock.start); got != want {
-			t.Fatalf("delay %v burst %d: pace(9) = %v, but 9 requests took %v", tc.delay, tc.burst, got, want)
+			t.Fatalf("delay %v burst %d group %d/%v: pace(9) = %v, but 9 requests took %v",
+				tc.delay, tc.burst, tc.group, tc.pause, got, want)
 		}
 	}
 }

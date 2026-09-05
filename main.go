@@ -791,6 +791,8 @@ func runUpdate(args []string) (err error) {
 	sortBy := fs.String("sort", "dist", "Sort order: dist or price")
 	requestDelay := fs.Duration("request-delay", defaultRequestDelay, "Window the Tankerkönig requests of a tiled radius are paced over (default 37s: a 50 km sweep that answers first time then fits a 5-minute schedule)")
 	requestBurst := fs.Int("request-burst", defaultRequestBurst, "Tankerkönig requests allowed inside one --request-delay window")
+	requestGroup := fs.Int("request-group", defaultRequestGroup, "Requests between the extra --request-group-pause breathers; 0 for an even pace")
+	requestGroupPause := fs.Duration("request-group-pause", defaultRequestGroupPause, "Extra wait after every --request-group requests, on top of --request-delay")
 	userAgent := fs.String("user-agent", defaultUserAgent, "User-Agent for Nominatim and API calls")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
@@ -815,6 +817,12 @@ func runUpdate(args []string) (err error) {
 	}
 	if *requestBurst < 1 {
 		return errors.New("--request-burst must be at least 1")
+	}
+	if *requestGroup < 0 {
+		return errors.New("--request-group must not be negative")
+	}
+	if *requestGroupPause < 0 {
+		return errors.New("--request-group-pause must not be negative")
 	}
 	if *fuelType == "all" {
 		*sortBy = "dist"
@@ -910,7 +918,12 @@ func runUpdate(args []string) (err error) {
 			break
 		}
 	}
-	limiter := &tankerLimiter{delay: delay, burst: *requestBurst}
+	limiter := &tankerLimiter{
+		delay:      delay,
+		burst:      *requestBurst,
+		groupSize:  *requestGroup,
+		groupPause: *requestGroupPause,
+	}
 
 	// Fetch every target before writing anything: targets with overlapping
 	// radii report the same station, and a sweep has to see all of them at
