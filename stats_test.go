@@ -939,23 +939,29 @@ func TestCommandRunRecordsTileRequests(t *testing.T) {
 	}
 
 	// The pacing is the only thing that moves the stubbed clock, so each
-	// request's sent_at is its slot: one 35 s window per request at burst 1.
+	// request's sent_at is its slot. The slots come from the limiter itself
+	// rather than from a window multiplied out here: the pace has a breather in
+	// it every few requests, and a test restating that arithmetic is a second
+	// copy of it to keep in step.
+	pacing := defaultLimiter()
 	for i, got := range tiles {
-		want := clock.start.Add(time.Duration(i) * defaultRequestDelay).UTC().Format(time.RFC3339)
+		want := clock.start.Add(pacing.pace(i + 1)).UTC().Format(time.RFC3339)
 		if got.SentAt != want {
 			t.Errorf("row %d sent_at = %q, want %q", i, got.SentAt, want)
 		}
-		if i > 0 && got.WaitedMS != defaultRequestDelay.Milliseconds() {
-			t.Errorf("row %d waited_ms = %d, want %d — every request after the first waits a full window at burst 1",
-				i, got.WaitedMS, defaultRequestDelay.Milliseconds())
+		// What each request waited is what its slot added to the one before.
+		wantWait := (pacing.pace(i+1) - pacing.pace(i)).Milliseconds()
+		if got.WaitedMS != wantWait {
+			t.Errorf("row %d waited_ms = %d, want %d", i, got.WaitedMS, wantWait)
 		}
 	}
 	if tiles[0].WaitedMS != 0 {
 		t.Errorf("the first request waited %d ms, want 0 — it goes out on an empty window", tiles[0].WaitedMS)
 	}
-	if metrics["tile_wait_ms"] != float64(5*defaultRequestDelay.Milliseconds()) {
-		t.Errorf("tile_wait_ms = %v, want %v (five of the six requests waited a window)",
-			metrics["tile_wait_ms"], 5*defaultRequestDelay.Milliseconds())
+	// Which sums to the whole sweep's pacing, the first request having waited
+	// for nothing.
+	if want := float64(pacing.pace(len(tiles)).Milliseconds()); metrics["tile_wait_ms"] != want {
+		t.Errorf("tile_wait_ms = %v, want %v", metrics["tile_wait_ms"], want)
 	}
 }
 

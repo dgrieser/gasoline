@@ -46,6 +46,20 @@ const (
 	defaultRequestDelay = 37 * time.Second
 	defaultRequestBurst = 1
 
+	// defaultRequestGroup and defaultRequestGroupPause are the breather on top
+	// of that: after every defaultRequestGroup requests, the next one waits
+	// defaultRequestGroupPause longer than the window.
+	//
+	// This is the margin the window itself could not take. 37 s is already the
+	// widest window a clean 50 km sweep can afford; two seconds every third
+	// request costs the sweep four seconds in total and still fits, which is
+	// the whole of what was left. Whether a fifth of a window every third
+	// request is enough to stop an API refusing is not something this program
+	// can reason about — tile_retries on the Statistics page is what answers
+	// it, and this is the change that makes that measurement worth taking.
+	defaultRequestGroup      = 3
+	defaultRequestGroupPause = 2 * time.Second
+
 	// sweepBudget is the wall clock a tiled sweep has to fit inside. The
 	// packaged cron entry and systemd timer both fire `update` every five
 	// minutes and lean on flock to drop a run that would overlap the last one,
@@ -54,10 +68,11 @@ const (
 	// the write at the end.
 	//
 	// What has to fit is the widest sweep that answers first time: a 50 km
-	// target is 8 tiles, and at one per 37 s window the last goes out at 4:19.
+	// target is 8 tiles, which at one per 37 s window plus a 2 s breather after
+	// every third puts the last one at 4:23.
 	//
 	// A sweep that retries does not fit, and that is the deliberate trade. One
-	// retry is 9 requests and 4:56, six seconds past the budget; the sweeps
+	// retry is 9 requests and 5:00, ten seconds past the budget; the sweeps
 	// this pace was widened for retry several times and run well past five
 	// minutes. Those lose the following tick to flock — prices land ten minutes
 	// apart rather than five — which is the price of not hammering an API that
@@ -281,11 +296,25 @@ func (l *tileLog) count() int {
 // burst goes out back to back and the one after it waits for the window to roll
 // over. A zero delay or burst never waits at all, which is what a sweep with
 // nothing to tile gets.
+//
+// On top of that even pace, every groupSize requests are followed by an extra
+// groupPause before the next one. The window is already the whole lever this
+// program has against an API that answers a paced sweep with 503s, and it is
+// pinned at the top of what the sweep's deadline allows; the pause is the
+// remaining room — a breather every few requests, bought a couple of seconds at
+// a time out of the margin left over.
 type tankerLimiter struct {
 	delay time.Duration
 	burst int
+	// groupSize and groupPause are off when either is zero, which is every
+	// caller that only wants the even pace.
+	groupSize  int
+	groupPause time.Duration
 	// recent holds the times of the last burst requests, oldest first.
 	recent []time.Time
+	// sent counts the requests already let out, which is what decides where a
+	// group ends.
+	sent int
 }
 
 // wait blocks until this request's turn in the pace comes up, and returns the
@@ -298,7 +327,13 @@ func (l *tankerLimiter) wait() time.Time {
 	}
 	now := nowFn()
 	if len(l.recent) >= l.burst {
-		if until := l.recent[0].Add(l.delay); until.After(now) {
+		until := l.recent[0].Add(l.delay)
+		// This request opens a new group, so it also waits out the breather
+		// the last one earned.
+		if l.groupSize > 0 && l.groupPause > 0 && l.sent%l.groupSize == 0 {
+			until = until.Add(l.groupPause)
+		}
+		if until.After(now) {
 			sleepFn(until.Sub(now))
 			// Book the slot at the time we waited for rather than re-reading
 			// the clock: the pace then stays even instead of drifting by
@@ -308,17 +343,23 @@ func (l *tankerLimiter) wait() time.Time {
 		l.recent = l.recent[1:]
 	}
 	l.recent = append(l.recent, now)
+	l.sent++
 	return now
 }
 
 // pace reports how long this limiter takes to let n requests out, measured from
 // the first — request i goes out at (i/burst)·delay, so the last one waits
-// ((n-1)/burst)·delay. It is what sizes the defaults against sweepBudget.
+// ((n-1)/burst)·delay, plus a groupPause for every group boundary it crossed on
+// the way. It is what sizes the defaults against sweepBudget.
 func (l *tankerLimiter) pace(n int) time.Duration {
 	if l == nil || l.delay <= 0 || l.burst < 1 || n < 2 {
 		return 0
 	}
-	return time.Duration((n-1)/l.burst) * l.delay
+	total := time.Duration((n-1)/l.burst) * l.delay
+	if l.groupSize > 0 && l.groupPause > 0 {
+		total += time.Duration((n-1)/l.groupSize) * l.groupPause
+	}
+	return total
 }
 
 // tankerRequestError carries whether retrying a failed Tankerkönig request can

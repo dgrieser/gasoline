@@ -132,7 +132,7 @@ Useful `update` flags:
 - `--fuel all|diesel|e5|e10`
 - `--sort dist|price`
 - `--radius` in km, up to 50 (see [Radii wider than the API serves](#radii-wider-than-the-api-serves))
-- `--request-delay` and `--request-burst` pace the requests a wide radius needs (one per 37 s by default)
+- `--request-delay`, `--request-burst`, `--request-group` and `--request-group-pause` pace the requests a wide radius needs (one per 37 s, with 2 s more after every third)
 - `--user-agent "your-app/1.0"`
 - `--output json` or `-o json`
 
@@ -149,17 +149,19 @@ What that costs, since it is a request budget and not just a wait:
 | `--radius` | API requests | added time per sweep |
 | --- | --- | --- |
 | up to 25 | 1 | none |
-| up to 28 | 4 | 1:51 |
-| up to 34 | 5 | 2:28 |
-| up to 41 | 6 | 3:05 |
-| up to 48 | 7 | 3:42 |
-| up to 50 | 8 | 4:19 |
+| up to 28 | 4 | 1:53 |
+| up to 34 | 5 | 2:30 |
+| up to 41 | 6 | 3:07 |
+| up to 48 | 7 | 3:46 |
+| up to 50 | 8 | 4:23 |
 
-The requests are paced at `--request-burst` (default 1) per `--request-delay` (default 37s), so they go out one at a time, a window apart. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
+The requests are paced at `--request-burst` (default 1) per `--request-delay` (default 37s), so they go out one at a time, a window apart — and after every `--request-group` of them (default 3) the next one waits a further `--request-group-pause` (default 2s). Three requests, a breather, three more, a breather, the rest. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
 
-**Why 37 s, and what it costs you.** The default pace is the slowest one that still lets the widest sweep *that answers first time* finish inside a five-minute schedule, which is what the packaged cron entry and systemd timer both use. A 50 km target is 8 requests, whose last goes out at 4:19 — inside the 4:50 the sweep is budgeted (`sweepBudget` in `tiling.go`, asserted by `TestDefaultPaceFitsSweepBudget`).
+**Why 37 s and a breather, and what it costs you.** The default pace is the slowest one that still lets the widest sweep *that answers first time* finish inside a five-minute schedule, which is what the packaged cron entry and systemd timer both use. A 50 km target is 8 requests, whose last goes out at 4:23 — inside the 4:50 the sweep is budgeted (`sweepBudget` in `tiling.go`, asserted by `TestDefaultPaceFitsSweepBudget`).
 
-A sweep that **retries does not fit**, and that is the trade rather than an oversight. One retry is 9 requests and 4:56; in practice Tankerkönig answers a paced sweep with 503s often enough that several retries in one sweep are ordinary, and those run well past five minutes. Such a run loses the following tick to `flock` — prices land ten minutes apart instead of five. A pace where retries do fit is available (`--request-burst 2` spends the same budget two requests at a time) and is deliberately not the default: it is bursty in exactly the way an API that is already refusing is asking us not to be. A retry is the API asking to be left alone, and widening the window is the only lever this program has for that. `tile_retries` on the Statistics page is how you tell whether it is working.
+The breather is the margin the window itself could not take. 37 s is already as wide as that budget allows; two seconds after every third request costs the whole sweep four more and still fits, which is the rest of what was left.
+
+A sweep that **retries does not fit**, and that is the trade rather than an oversight. One retry is 9 requests and 5:00; in practice Tankerkönig answers a paced sweep with 503s often enough that several retries in one sweep are ordinary, and those run well past five minutes. Such a run loses the following tick to `flock` — prices land ten minutes apart instead of five. A pace where retries do fit is available (`--request-burst 2` spends the same budget two requests at a time) and is deliberately not the default: it is bursty in exactly the way an API that is already refusing is asking us not to be. A retry is the API asking to be left alone, and widening the window is the only lever this program has for that. `tile_retries` on the Statistics page is how you tell whether it is working.
 
 Two more things are worth knowing:
 
@@ -401,7 +403,7 @@ The metric names per command, which are what the web UI renders:
 
 They are the same numbers the commands print when you run them by hand; `stations` and `snapshots_scanned` are the size of the shared history scan, which is what explains a `suggest` or `check` run's duration.
 
-`update`'s four request counters are what explains *its* duration, and they split it the only way that is actionable: `tile_wait_ms` is the pacing obeying `--request-delay`, and `tile_slowest_ms` is the API being slow. The first is yours to tune, the second is not. `tile_retries` counts the requests that were not a tile's first try — the number that separates a slow Tankerkönig from a failing one, and the reason a sweep can take a window longer than its tile count suggests.
+`update`'s four request counters are what explains *its* duration, and they split it the only way that is actionable: `tile_wait_ms` is the pacing — the windows and the breathers together — and `tile_slowest_ms` is the API being slow. The first is yours to tune, the second is not. `tile_retries` counts the requests that were not a tile's first try — the number that separates a slow Tankerkönig from a failing one, and the reason a sweep can take a window longer than its tile count suggests.
 
 #### The individual requests of a run
 

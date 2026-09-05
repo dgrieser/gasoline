@@ -4438,7 +4438,7 @@ func TestRunUpdateTiledStampsFirstRequestAcrossCities(t *testing.T) {
 	// derived from the defaults rather than written out, so tuning them moves
 	// this test's expectations with them instead of breaking it.
 	const radius = "40"
-	pacing := &tankerLimiter{delay: defaultRequestDelay, burst: defaultRequestBurst}
+	pacing := defaultLimiter()
 	if tiles, err := planSearchTiles(52.5, 13.4, 40); err != nil || len(tiles) != 6 {
 		t.Fatalf("40 km planned %d tiles (err %v), want 6 — the pacing timeline below assumes it", len(tiles), err)
 	}

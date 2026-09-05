@@ -8,10 +8,10 @@
 # `flock -n` keeps the runs from overlapping: cron fires on a fixed schedule
 # whether the last run finished or not, and two sweeps at once would race each
 # other for the API rate limit and for the database write lock. A radius over
-# 25 km is collected as several requests paced one per 37 s, and a 50 km target
-# spends about 4:19 of the 5 minutes below — 4:56, over the budget, if a request
-# has to be retried at all — so the lock is what keeps that safe on this
-# schedule. Tiling a
+# 25 km is collected as several requests paced one per 37 s with a 2 s breather
+# after every third, and a 50 km target spends about 4:23 of the 5 minutes below
+# — 5:00, over the budget, if a request has to be retried at all — so the lock
+# is what keeps that safe on this schedule. Tiling a
 # second city in the same sweep does overrun it — the lock then drops the next
 # tick rather than letting two sweeps collide. See "Radii wider than the API
 # serves" in the README before putting more than one wide target on 5 minutes.
