@@ -44,37 +44,35 @@ const (
 	// tolerates best: the same budget spent evenly instead of three requests
 	// arriving back to back and then a minute of silence.
 	//
-	// A minute apart, flat. Tankerkönig answers a paced sweep with 503s often
+	// 45 s apart, flat. Tankerkönig answers a paced sweep with 503s often
 	// enough that retries are routine rather than exceptional, and a retry is
-	// the API asking to be left alone; a round minute is the widest window a
-	// six-request sweep can keep and still leave the schedule room for four of
-	// them. It replaces a 37 s window with an extra two seconds after every
-	// third request — an arrangement that bought a 1.7% lower request rate and
-	// three shapes of pacing to reason about instead of one.
-	defaultRequestDelay = 60 * time.Second
+	// the API asking to be left alone — so the window is set as wide as the
+	// schedule allows rather than as narrow as the sweep needs. At six requests
+	// that is 3:45, which leaves a five-minute schedule room for one retry.
+	//
+	// It replaces a 37 s window with an extra two seconds after every third
+	// request — an arrangement that bought a 1.7% lower request rate and three
+	// shapes of pacing to reason about instead of one.
+	defaultRequestDelay = 45 * time.Second
 	defaultRequestBurst = 1
 
 	// sweepBudget is the wall clock a tiled sweep has to fit inside. The
-	// packaged cron entry and systemd timer fire `update` every ten minutes and
-	// lean on flock to drop a run that would overlap the last one, so a sweep
-	// that overruns does not queue up — it loses the whole cycle. The ten
+	// packaged cron entry and systemd timer fire `update` every five minutes
+	// and lean on flock to drop a run that would overlap the last one, so a
+	// sweep that overruns does not queue up — it loses the whole cycle. The ten
 	// seconds held back cover geocoding, the requests themselves and the write
 	// at the end.
 	//
-	// Ten minutes rather than five is what a minute between requests costs. The
-	// widest sweep is a 42 km target: 6 requests, the last at 5:00 — five
-	// seconds past what a five-minute schedule can hold, and there is no
-	// arrangement of a round minute that fits one.
-	//
-	// What the rest of the budget buys is sweepRetryHeadroom.
-	sweepBudget = 9*time.Minute + 50*time.Second
+	// The widest sweep is a 42 km target: 6 requests, the last going out at
+	// 3:45. What the rest of the budget buys is sweepRetryHeadroom.
+	sweepBudget = 4*time.Minute + 50*time.Second
 
 	// sweepRetryHeadroom is how many retries the widest sweep can absorb and
-	// still finish inside the budget. This is the number the pace is set for:
-	// the recorded sweeps that prompted it retried two to five times, and a
-	// pace that fits none of that loses a cycle every time the API has a bad
-	// ten minutes.
-	sweepRetryHeadroom = 4
+	// still finish inside the budget. This is what the window is traded
+	// against: every second added to the pace is more room for the API to be
+	// left alone and less room for it to be asked twice, and a sweep that
+	// overruns loses the next cycle to flock as well as running late.
+	sweepRetryHeadroom = 1
 
 	// minRingTiles is the smallest ring either construction is defined for.
 	minRingTiles = 3

@@ -132,7 +132,7 @@ Useful `update` flags:
 - `--fuel all|diesel|e5|e10`
 - `--sort dist|price`
 - `--radius` in km, up to 42 (see [Radii wider than the API serves](#radii-wider-than-the-api-serves))
-- `--request-delay` and `--request-burst` pace the requests a wide radius needs (one per minute)
+- `--request-delay` and `--request-burst` pace the requests a wide radius needs (one per 45 s)
 - `--user-agent "your-app/1.0"`
 - `--output json` or `-o json`
 
@@ -149,23 +149,25 @@ What that costs, since it is a request budget and not just a wait:
 | `--radius` | API requests | added time per sweep |
 | --- | --- | --- |
 | up to 25 | 1 | none |
-| up to 28.0 | 3 | 2:00 |
-| up to 34.2 | 4 | 3:00 |
-| up to 39.2 | 5 | 4:00 |
-| up to 42 | 6 | 5:00 |
+| up to 28.0 | 3 | 1:30 |
+| up to 34.2 | 4 | 2:15 |
+| up to 39.2 | 5 | 3:00 |
+| up to 42 | 6 | 3:45 |
 
-The requests are paced at `--request-burst` (default 1) per `--request-delay` (default 60s), so they go out one at a time, a minute apart. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
+The requests are paced at `--request-burst` (default 1) per `--request-delay` (default 45s), so they go out one at a time, 45 s apart. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
 
-**Why a minute, a 42 km ceiling, and a ten-minute schedule.** These three are one decision. Tankerkönig answers a paced sweep with 503s often enough that retries are routine rather than exceptional, and a retry is the API asking to be left alone — so the pace is set to leave room for them rather than to be the fastest thing that fits.
+**Why 45 s and a 42 km ceiling.** The two are one decision. Tankerkönig answers a paced sweep with 503s often enough that retries are routine rather than exceptional, and a retry is the API asking to be left alone — so the window is set as wide as the schedule allows rather than as narrow as the sweep needs.
 
 42 km is where a ring of six tiles reaches. The old ceiling was 50, which costs **eight** requests: seven disks of this size cover exactly twice their own radius and no more, so 50 km sits just past what seven can do. Those two extra requests bought 8 km of rim and cost every sweep the headroom it needed when the API refused.
 
-At six requests a minute apart the widest sweep ends at 5:00. That is five seconds past what a five-minute schedule can hold, and no round-minute pace fits one — hence the packaged cron entry and systemd timer fire every **ten** minutes, and `sweepBudget` in `tiling.go` is 9:50. What the rest of that budget buys is retries: four of them still fit (10 requests, 9:00) and a fifth does not, which is `sweepRetryHeadroom`, asserted in both directions by `TestDefaultPaceFitsSweepBudget`. The recorded sweeps that prompted this retried two to five times, so this is the difference between losing a cycle on a bad ten minutes and riding it out. `tile_retries` on the Statistics page is how you tell whether it is working.
+At six requests 45 s apart the widest sweep ends at **3:45**, inside the 4:50 it is budgeted (`sweepBudget` in `tiling.go`) on the five-minute schedule the packaged cron entry and systemd timer both use. What the rest of that budget buys is retries: **one** still fits (7 requests, 4:30) and a second does not, which is `sweepRetryHeadroom`, asserted in both directions by `TestDefaultPaceFitsSweepBudget`.
+
+That is the whole trade, and it is a narrow one: every second added to the window is more room for the API to be left alone and less room for it to be asked twice. A sweep that retries twice runs past the tick and loses the next one to `flock` — prices land ten minutes apart instead of five. `tile_retries` on the Statistics page is how you tell how often that is happening; if it is often, widen `--request-delay` and give the sweep its own slower timer, rather than leaving it to overrun.
 
 Two more things are worth knowing:
 
-- **More than one tiled city in the same sweep eats the headroom** — the pace belongs to the API key, not to the city, so two 42 km targets are 12 requests and 11:00, past the budget before a single retry. `flock -n` covers it: the overrunning run finishes and the next tick is dropped. If you tile more than one city, either raise `--request-burst` or give the sweep its own, slower timer.
-- **Widening the radius ceiling** re-opens all of this. `TestDefaultPaceFitsSweepBudget` pins the widest target at exactly six requests and the retry headroom at exactly four, failing in both directions, so a raised ceiling or a changed placement safety has to be re-derived against the schedule rather than quietly costing every sweep its headroom.
+- **More than one tiled city in the same sweep overruns** — the pace belongs to the API key, not to the city, so two 42 km targets are 12 requests and 8:15, past the budget before a single retry. `flock -n` covers it: the overrunning run finishes and the next tick is dropped. If you tile more than one city, either raise `--request-burst` or give the sweep its own, slower timer.
+- **Widening the radius ceiling** re-opens all of this. `TestDefaultPaceFitsSweepBudget` pins the widest target at exactly six requests and the retry headroom at exactly one, failing in both directions, so a raised ceiling or a changed placement safety has to be re-derived against the schedule rather than quietly costing every sweep its headroom.
 
 Three things make a wide radius behave like a single narrow one:
 
@@ -408,7 +410,7 @@ They are the same numbers the commands print when you run them by hand; `station
 
 `update` also writes one row per Tankerkönig request to `command_run_tiles`: which city and tile it was for, which attempt, the instant the pacing released it, how long it had been held, how long the request itself took, and whether it answered, was retried, or failed. A retried attempt is kept **as its own row** rather than folded into the try that replaced it — the whole point is that a tile needing two attempts cost two pacing windows, which a log showing only the winner hides.
 
-The metrics table holds one number per name per run, so none of that can live there: the shape of a sweep needs a row per request. This is the one thing that makes a 5-minute sweep legible — a slow tile, a retried one, and a sweep that simply has six tiles to get through all look the same from the run's own duration.
+The metrics table holds one number per name per run, so none of that can live there: the shape of a sweep needs a row per request. This is the one thing that makes a 4-minute sweep legible — a slow tile, a retried one, and a sweep that simply has six tiles to get through all look the same from the run's own duration.
 
 Every sweep writes these, tiled or not: a narrow sweep is one request per city rather than none, and a retry there is worth seeing for the same reason. They are pruned with their run, and copied by `migrate-to-mysql` along with it.
 
@@ -416,7 +418,7 @@ Runs are kept for 30 days and pruned by `gasoline compact`, which takes each run
 
 ### Continuous updates with a timer
 
-To keep prices fresh without the full watcher, run `gasoline update` on a schedule. A oneshot service plus a timer live at `examples/systemd/gasoline-update.service` and `examples/systemd/gasoline-update.timer`; the timer fires the service every 10 minutes:
+To keep prices fresh without the full watcher, run `gasoline update` on a schedule. A oneshot service plus a timer live at `examples/systemd/gasoline-update.service` and `examples/systemd/gasoline-update.timer`; the timer fires the service every 5 minutes:
 
 ```bash
 # 1. Install the environment file (skip if already done for the watcher above).
