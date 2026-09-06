@@ -55,9 +55,22 @@ const (
 	// selection bias of suggested windows.
 	predictionSuggestionBiasMinSamples = 30
 	predictionSuggestionBiasMaxAbs     = 0.05
-	// evaluateBatchLimit bounds how many due predictions one run settles, so
-	// a run after long downtime stays cheap.
-	evaluateBatchLimit = 5000
+	// evaluateBatchRows is how many due prediction rows one transaction
+	// reads before settling them. Rows are read only to discover the target
+	// windows they belong to — a window carries one row per run that
+	// predicted it, dozens of them — so this bounds the read, not what the
+	// batch settles: every row of every window the batch touches is settled,
+	// including the ones past this limit.
+	evaluateBatchRows = 20000
+	// evaluateRunRowLimit bounds one run's whole catch-up, so a run after
+	// long downtime stays cheap. In the steady state a run never reaches it:
+	// what falls due between two runs is one target hour per station per run
+	// inside the lead horizon. It only binds while working off arrears, and
+	// then it is what keeps a single run from reading the entire backlog —
+	// at this size a run settles well over a day of arrears per fuel, so a
+	// backlog of weeks clears over a day of hourly runs rather than in one
+	// very long one.
+	evaluateRunRowLimit = 250000
 	// persistInsertBatch rows per multi-row INSERT. At 12 placeholders per
 	// row this stays under SQLite's historical 999-variable limit (12 x 80 =
 	// 960), so the insert also works against builds without the modern 32766
@@ -76,6 +89,21 @@ const (
 // midpoint. Predictions without usable price data (station closed, no
 // snapshot) are marked evaluated with a NULL actual so they are not retried
 // forever. Returns how many predictions received an actual price.
+//
+// The unit of work is the target window, not the row. Every run re-predicts
+// the same future hours, so one window ends up carrying one row per run
+// inside its lead horizon — around fifty at forecastPredictDays and hourly
+// runs — and all of them settle against the same recorded price. Looking that
+// price up once per window and writing the whole stack with one UPDATE keeps
+// the work proportional to stations x hours instead of stations x hours x
+// runs.
+//
+// That ratio is what broke when the collected radius grew: with a fixed cap
+// of a few thousand rows per run, a run settled less than an hour of arrears
+// while more than an hour's worth fell due, so evaluation slipped further
+// behind every hour and the admin accuracy page — which only ever sees
+// evaluated rows — stopped showing anything recent. A run now keeps taking
+// batches until the due queue is empty or evaluateRunRowLimit is reached.
 func evaluateDuePredictions(ctx context.Context, db *sql.DB, fuel string, now time.Time) (int, error) {
 	column, err := suggestFuelColumn(fuel)
 	if err != nil {
@@ -84,65 +112,115 @@ func evaluateDuePredictions(ctx context.Context, db *sql.DB, fuel string, now ti
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	// The whole evaluation runs in one transaction so a concurrent run cannot
-	// pick up the same due rows between select and update.
+	measured, read := 0, 0
+	for read < evaluateRunRowLimit {
+		limit := evaluateBatchRows
+		if remaining := evaluateRunRowLimit - read; remaining < limit {
+			limit = remaining
+		}
+		batch, err := evaluateDueBatch(ctx, db, column, fuel, now, limit)
+		if err != nil {
+			// The failed batch rolled back, so none of what it counted
+			// happened; what earlier batches committed still stands.
+			return measured, err
+		}
+		measured += batch.Measured
+		read += batch.Read
+		// A short read means the queue is drained. A batch that settled
+		// nothing while reading rows cannot happen — every row read belongs
+		// to a window the batch updates — but stopping on it anyway keeps a
+		// surprise from turning into an endless loop.
+		if batch.Read < limit || batch.Settled == 0 {
+			break
+		}
+	}
+	return measured, nil
+}
+
+// evaluateBatch reports what one transaction of evaluateDuePredictions did:
+// how many due rows it read, how many rows its updates settled (windows reach
+// past the read), and how many of those received an actual price.
+type evaluateBatch struct {
+	Read     int
+	Settled  int
+	Measured int
+}
+
+// evaluateDueBatch settles the target windows found in one bounded read of the
+// due queue.
+//
+// Each batch is its own transaction. The select and the updates it feeds are
+// therefore no longer isolated from a concurrent run as one unit, which does
+// not matter: every update carries `evaluated_at IS NULL`, so a window another
+// run settled first is left exactly as that run wrote it and the loser only
+// wastes a snapshot lookup. Batching them is what keeps a catch-up run from
+// holding one write transaction over hundreds of thousands of rows.
+func evaluateDueBatch(ctx context.Context, db *sql.DB, column, fuel string, now time.Time, limit int) (evaluateBatch, error) {
+	var batch evaluateBatch
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return batch, err
 	}
 	defer tx.Rollback()
 
+	// Ordered by target_end so the oldest arrears go first and the evaluated
+	// frontier advances in time rather than in scattered pieces.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, station_id, target_start, target_end, predicted_price
+		SELECT station_id, target_start, target_end
 		FROM price_predictions
 		WHERE fuel = ?
 			AND evaluated_at IS NULL
 			AND target_end <= ?
 		ORDER BY target_end ASC
-		LIMIT `+fmt.Sprint(evaluateBatchLimit),
+		LIMIT `+fmt.Sprint(limit),
 		fuel, now.UTC().Format(time.RFC3339))
 	if err != nil {
-		return 0, err
+		return batch, err
 	}
 	defer rows.Close()
 
-	type duePrediction struct {
-		ID        int64
+	type dueWindow struct {
 		StationID string
+		Start     string
+		End       string
 		Midpoint  time.Time
-		Predicted float64
 	}
-	var due []duePrediction
+	var due []dueWindow
+	seen := make(map[string]bool)
 	for rows.Next() {
-		var (
-			id                 int64
-			stationID          string
-			startText, endText string
-			predicted          float64
-		)
-		if err := rows.Scan(&id, &stationID, &startText, &endText, &predicted); err != nil {
-			return 0, err
+		var stationID, startText, endText string
+		if err := rows.Scan(&stationID, &startText, &endText); err != nil {
+			return batch, err
 		}
+		batch.Read++
+		// The read is capped mid-window as often as not, so the same window
+		// arrives many times over and, at the boundary, only partly. Both are
+		// handled here: it is settled once, in full, by station and window.
+		key := stationID + "\x00" + startText + "\x00" + endText
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		start, err := time.Parse(time.RFC3339, startText)
 		if err != nil {
-			return 0, fmt.Errorf("parse target_start %q: %w", startText, err)
+			return batch, fmt.Errorf("parse target_start %q: %w", startText, err)
 		}
 		end, err := time.Parse(time.RFC3339, endText)
 		if err != nil {
-			return 0, fmt.Errorf("parse target_end %q: %w", endText, err)
+			return batch, fmt.Errorf("parse target_end %q: %w", endText, err)
 		}
-		due = append(due, duePrediction{
-			ID:        id,
+		due = append(due, dueWindow{
 			StationID: stationID,
+			Start:     startText,
+			End:       endText,
 			Midpoint:  start.Add(end.Sub(start) / 2),
-			Predicted: predicted,
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return batch, err
 	}
 	if len(due) == 0 {
-		return 0, nil
+		return batch, nil
 	}
 
 	snapshotStmt, err := tx.PrepareContext(ctx, fmt.Sprintf(`
@@ -153,46 +231,86 @@ func evaluateDuePredictions(ctx context.Context, db *sql.DB, fuel string, now ti
 		LIMIT 1
 	`, column))
 	if err != nil {
-		return 0, err
+		return batch, err
 	}
 	defer snapshotStmt.Close()
+	// One statement for both outcomes: with a NULL actual bound, `? -
+	// predicted_price` is NULL too, which is exactly the "evaluated, no price"
+	// state. The error stays per row — it measures that row's own prediction —
+	// while the actual is the window's.
 	updateStmt, err := tx.PrepareContext(ctx, `
 		UPDATE price_predictions
-		SET actual_price = ?, error = ?, evaluated_at = ?
-		WHERE id = ? AND evaluated_at IS NULL
+		SET actual_price = ?, error = ? - predicted_price, evaluated_at = ?
+		WHERE fuel = ? AND station_id = ? AND target_start = ? AND target_end = ?
+			AND evaluated_at IS NULL
 	`)
 	if err != nil {
-		return 0, err
+		return batch, err
 	}
 	defer updateStmt.Close()
 
 	evaluatedAt := now.UTC().Format(time.RFC3339)
-	measured := 0
-	for _, prediction := range due {
+	for _, window := range due {
 		var (
 			isOpen bool
 			price  sql.NullFloat64
 		)
 		err := snapshotStmt.QueryRowContext(ctx,
-			prediction.StationID, prediction.Midpoint.UTC().Format(time.RFC3339)).Scan(&isOpen, &price)
+			window.StationID, window.Midpoint.UTC().Format(time.RFC3339)).Scan(&isOpen, &price)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return 0, err
+			return batch, err
 		}
 		actual := sql.NullFloat64{}
-		predictionError := sql.NullFloat64{}
 		if err == nil && isOpen && price.Valid {
 			actual = sql.NullFloat64{Float64: price.Float64, Valid: true}
-			predictionError = sql.NullFloat64{Float64: price.Float64 - prediction.Predicted, Valid: true}
-			measured++
 		}
-		if _, err := updateStmt.ExecContext(ctx, actual, predictionError, evaluatedAt, prediction.ID); err != nil {
-			return 0, err
+		result, err := updateStmt.ExecContext(ctx, actual, actual, evaluatedAt,
+			fuel, window.StationID, window.Start, window.End)
+		if err != nil {
+			return batch, err
+		}
+		settled, err := result.RowsAffected()
+		if err != nil {
+			return batch, err
+		}
+		batch.Settled += int(settled)
+		if actual.Valid {
+			batch.Measured += int(settled)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return batch, err
 	}
-	return measured, nil
+	return batch, nil
+}
+
+// oldestPendingEvaluation reports the target window still waiting to be
+// evaluated for the longest, and whether there is one at all. It is the
+// cheapest possible answer to "is evaluation keeping up" — a single seek
+// along idx_price_predictions_due — and the persist summary reports it,
+// because a backlog is otherwise invisible: nothing fails, the accuracy page
+// simply stops moving.
+func oldestPendingEvaluation(ctx context.Context, db *sql.DB, fuel string, now time.Time) (time.Time, bool, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var oldest sql.NullString
+	err := db.QueryRowContext(ctx, `
+		SELECT MIN(target_end)
+		FROM price_predictions
+		WHERE fuel = ? AND evaluated_at IS NULL AND target_end <= ?
+	`, fuel, now.UTC().Format(time.RFC3339)).Scan(&oldest)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, err
+	}
+	if !oldest.Valid || oldest.String == "" {
+		return time.Time{}, false, nil
+	}
+	pending, err := time.Parse(time.RFC3339, oldest.String)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse target_end %q: %w", oldest.String, err)
+	}
+	return pending, true, nil
 }
 
 // evaluateCheckOutcomes scores logged check decisions against the cheapest
@@ -627,9 +745,10 @@ func clampAbs(value, limit float64) float64 {
 
 // persistPredictionRun stores one prediction_runs row plus the full forecast
 // grid: every (station, future hour) the model can score within the predict
-// window. Rows covered by a printed suggestion are flagged. Newer runs
-// supersede older ones for the same target hour — readers should take the
-// latest run — while older rows remain as learning history.
+// window. Rows covered by a suggested window are flagged, per station — see
+// suggestionFlagWindows. Newer runs supersede older ones for the same target
+// hour — readers should take the latest run — while older rows remain as
+// learning history.
 //
 // The run's id is returned alongside the row count so sibling records — the
 // check decisions — can hang off the same run and inherit its city, fuel and
@@ -638,7 +757,7 @@ func persistPredictionRun(ctx context.Context, db *sql.DB, computation *suggestC
 	nowLocal := computation.Now.In(computation.Location)
 	start := nextLocalHour(nowLocal)
 	end := localDayStart(start).AddDate(0, 0, opts.PredictDays)
-	windows := suggestionWindows(computation.Suggestions, computation.Location)
+	windows := suggestionFlagWindows(computation, opts)
 
 	stationIDs := make([]string, 0, len(computation.Model.Stations))
 	for stationID := range computation.Model.Stations {
@@ -850,6 +969,46 @@ func persistCheckDecisions(ctx context.Context, db *sql.DB, computation *suggest
 		return 0, err
 	}
 	return total, nil
+}
+
+// suggestionFlagWindows picks the windows persistPredictionRun flags as
+// suggestions: per station, the windows that station's own forecast would be
+// suggested for, chosen by the same selection the notifier uses (cheapest
+// hours of each local day, no two within two hours of each other, at most
+// LimitPerDay of them).
+//
+// The printed suggestions cannot be used for this any more. A run went from
+// covering one city to covering every station being fed, so what it prints is
+// the handful of globally cheapest windows — in practice one or two stations
+// out of hundreds — while what a subscriber is actually sent is picked per
+// area, from their own stations (notify.go collectSuggestions). Flagging the
+// printed set therefore marked almost nothing: the admin accuracy page showed
+// no suggested rows at all, and the suggestion selection bias was measured off
+// whichever station happened to be cheapest that hour.
+//
+// Per station is the set every per-area suggestion is drawn from: a window
+// that is the cheapest in some area is necessarily the cheapest at its own
+// station that day, so no window a subscriber could be sent is left unflagged.
+// It is a slightly wider set than any one area's picks — the selection bias it
+// measures is the one from choosing the best hour of a day rather than the
+// best hour across an area's stations too — which is the price of measuring it
+// on every station instead of on the one that happened to win.
+func suggestionFlagWindows(computation *suggestComputation, opts suggestOptions) map[string][][2]time.Time {
+	windows := make(map[string][][2]time.Time, len(computation.Model.Stations))
+	// The model is copied per station rather than rebuilt: only the station
+	// set the selection iterates over changes, and everything the scores come
+	// from (the samples, the learned corrections) is shared with the full
+	// model, so a flagged window carries exactly the price the grid stores.
+	single := computation.Model
+	for stationID, station := range computation.Model.Stations {
+		single.Stations = map[string]forecastStation{stationID: station}
+		picked := generateSuggestions(single, opts.Fuel, computation.Now, computation.Location,
+			opts.PredictDays, opts.LimitPerDay)
+		for id, spans := range suggestionWindows(picked, computation.Location) {
+			windows[id] = append(windows[id], spans...)
+		}
+	}
+	return windows
 }
 
 // suggestionWindows converts the printed suggestion rows (local date + time

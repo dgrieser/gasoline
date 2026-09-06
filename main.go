@@ -1891,6 +1891,12 @@ func runSuggest(args []string) (err error) {
 	failures := 0
 	var totals persistCounts
 	var evaluated, outcomes int
+	// The oldest window still waiting for an actual price, across fuels. A run
+	// that cannot settle everything due leaves this behind, and nothing else
+	// says so: the command succeeds, the grid keeps growing, and only the
+	// accuracy page — where the newest evaluated row quietly stops moving —
+	// shows it.
+	var pending time.Time
 	for _, fuel := range suggestFuels {
 		fuelOpts := opts
 		fuelOpts.Fuel = fuel
@@ -1911,6 +1917,13 @@ func runSuggest(args []string) (err error) {
 				return err
 			}
 			outcomes += m
+			oldest, ok, err := oldestPendingEvaluation(ctx, db, fuel, opts.Now)
+			if err != nil {
+				return err
+			}
+			if ok && (pending.IsZero() || oldest.Before(pending)) {
+				pending = oldest
+			}
 		}
 		suggestions, counts, err := suggestOneFuel(ctx, db, scan, fuelOpts, *persist)
 		if err != nil {
@@ -1947,15 +1960,25 @@ func runSuggest(args []string) (err error) {
 		if err != nil {
 			return err
 		}
+		backlogHours := 0.0
+		backlog := "evaluation caught up"
+		if !pending.IsZero() {
+			backlogHours = opts.Now.Sub(pending).Hours()
+			backlog = fmt.Sprintf("evaluation %.1fh behind (oldest unsettled window %s)",
+				backlogHours, pending.UTC().Format(time.RFC3339))
+		}
 		fmt.Fprintf(os.Stderr,
 			"persist: stored %d predictions, %d decisions, evaluated %d, outcomes %d, bias-corrected %d stations, "+
-				"pruned %d/%d by retention, %d/%d for %d stations that left scope\n",
+				"pruned %d/%d by retention, %d/%d for %d stations that left scope, %s\n",
 			totals.Predictions, totals.Decisions, evaluated, outcomes, totals.BiasedStations,
-			pruned, prunedDecisions, unfedPredictions, unfedDecisions, unfedStations)
+			pruned, prunedDecisions, unfedPredictions, unfedDecisions, unfedStations, backlog)
 
 		stats.set("predictions_stored", float64(totals.Predictions))
 		stats.set("decisions_stored", float64(totals.Decisions))
 		stats.set("predictions_evaluated", float64(evaluated))
+		// Zero once nothing is due, so a rising value across runs is the one
+		// reading that says evaluation is losing ground.
+		stats.set("evaluation_backlog_hours", backlogHours)
 		stats.set("outcomes_scored", float64(outcomes))
 		stats.set("stations_bias_corrected", float64(totals.BiasedStations))
 		stats.set("pruned_predictions", float64(pruned))

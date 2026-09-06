@@ -2804,6 +2804,9 @@ function renderAdminPredictionsPage(array $user): never
            own long-press reactions (selection, iOS callout) off the chart. */
         #pred-chart { width: 100%; display: block; height: auto; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
         .pred-note { font-family: var(--mono); font-size: 0.76rem; color: var(--muted); margin-bottom: 0.85rem; }
+        /* The backlog note reports a pipeline that is behind, not a filter
+           that found nothing: it is the one line here worth colouring. */
+        .pred-behind { color: var(--amber); margin: 0.4rem 0 0; }
         .pred-err-good { color: var(--e10); }
         .pred-err-bad  { color: var(--red); }
         .pred-sugg { color: var(--amber); margin-left: 0.25rem; }
@@ -2844,6 +2847,7 @@ function renderAdminPredictionsPage(array $user): never
                     </select>
                 </div>
             </div>
+            <div class="pred-note pred-behind" id="pred-behind" role="status" hidden></div>
         </div>
 
         <div class="stats" aria-live="polite">
@@ -2975,6 +2979,7 @@ function renderAdminPredictionsPage(array $user): never
         const moreWrap   = document.getElementById('pred-more');
         const moreBtn    = document.getElementById('pred-more-btn');
         const truncEl    = document.getElementById('pred-truncated');
+        const behindEl   = document.getElementById('pred-behind');
         const viewTogl   = document.getElementById('pred-view-toggles');
         const statIds    = ['ps-count','ps-stations','ps-mae','ps-bias','ps-rmse','ps-within1','ps-within2','ps-worst','ps-l-count','ps-l-mae','ps-l-bias','ps-l-within2'];
 
@@ -3032,6 +3037,7 @@ function renderAdminPredictionsPage(array $user): never
             if (decTbody) decTbody.innerHTML = '<tr><td colspan="5" class="table-loading" aria-busy="true"><span class="spinner" aria-hidden="true"></span></td></tr>';
             if (moreWrap) moreWrap.hidden = true;
             if (truncEl) truncEl.hidden = true;
+            if (behindEl) behindEl.hidden = true;
         }
 
         function showError(err) {
@@ -3076,6 +3082,7 @@ function renderAdminPredictionsPage(array $user): never
 
         function render() {
             if (!data) return;
+            renderBacklog();
             renderStats();
             renderConf();
             renderLead();
@@ -3083,6 +3090,17 @@ function renderAdminPredictionsPage(array $user): never
             renderDecisions();
             renderChart();
             renderTable();
+        }
+
+        // Says why the newest rows stop where they do when evaluation is behind:
+        // a window with no actual price yet cannot be on this page at all, so
+        // without this the range simply looks empty at its recent end.
+        function renderBacklog() {
+            if (!behindEl) return;
+            const pending = data && data.pending;
+            if (!pending) { behindEl.hidden = true; behindEl.textContent = ''; return; }
+            behindEl.hidden = false;
+            behindEl.textContent = T().predEvalBehind.replace('{time}', fmtDateTime(pending));
         }
 
         function renderStats() {
@@ -5783,6 +5801,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         // null (not []) while the decisions table does not exist yet, so the
         // UI can hide the card instead of showing an empty one.
         'decisions' => null,
+        // The oldest target window still waiting for an actual price, or null
+        // when evaluation has nothing outstanding.
+        'pending' => null,
         'series' => [],
         'rows' => [],
         'stations' => [],
@@ -5834,6 +5855,29 @@ if (isset($_GET['action']) && $_GET['action'] === 'prediction_accuracy') {
         $aggStmt->execute();
         $agg = $aggStmt->fetch() ?: [];
         $count = (int) ($agg['n'] ?? 0);
+
+        // How far behind evaluation is, if at all. Everything on this page is
+        // an evaluated row, so a persist run that cannot settle windows as
+        // fast as it stores them looks exactly like a model that stopped
+        // predicting: the newest window here simply stops moving, with nothing
+        // saying why. One seek along idx_price_predictions_due answers it, and
+        // it is asked before the empty-result exit below because a range whose
+        // windows are all still unsettled is precisely when it explains most.
+        $pendingStmt = $pdo->prepare(
+            'SELECT MIN(pp.target_end) AS pending FROM price_predictions pp '
+            . 'WHERE pp.fuel = :fuel AND pp.evaluated_at IS NULL AND pp.target_end <= :now'
+        );
+        $pendingStmt->bindValue(':fuel', $paFuel);
+        $pendingStmt->bindValue(':now', gmdate('Y-m-d\TH:i:s\Z'));
+        $pendingStmt->execute();
+        $pendingRow = $pendingStmt->fetch() ?: [];
+        $pendingOldest = (string) ($pendingRow['pending'] ?? '');
+        // A window that fell due since the last persist run has not been
+        // settled yet either, and that is the normal state rather than a
+        // backlog — hence the grace period. Beyond it, runs are not keeping up
+        // with what they store, which is worth saying out loud.
+        $pendingGrace = gmdate('Y-m-d\TH:i:s\Z', time() - 6 * 3600);
+        $out['pending'] = ($pendingOldest !== '' && $pendingOldest < $pendingGrace) ? $pendingOldest : null;
 
         if ($count === 0) {
             echo json_encode($out, $jsonFlags);
@@ -7093,24 +7137,24 @@ function buildSnapshotQuery(
 /**
  * Pick the upcoming fill-up windows for the in-scope stations.
  *
- * Since prediction runs went global, the stored is_suggestion flag marks the
- * per-run *globally* cheapest windows across every station being fed — for a
- * dashboard filtered to one area those flags almost never land in scope, so
- * they cannot drive this card. Instead the windows are picked here, from the
- * newest run's full forecast grid restricted to exactly the stations in
- * scope, mirroring the notifier's per-area picker (notify.go
- * collectSuggestions → generateSuggestions → the medium/high filter): per
- * fuel and local day the cheapest hour windows are selected — ordered by
- * price, then confidence, then distance, then start — up to the notifier's
- * per-day limit, a window less than two hours from an already selected
- * window at the same station is skipped as a duplicate, equal-priced picks
- * of one station merge into a single span, and only medium/high confidence
- * survives. Displayed prices carry the run's recorded suggestion display
- * correction (prediction_runs.suggestion_bias) on top of the raw grid price,
- * again like the notifier, and are then normalized to the raised-9 board
- * style — ordering stays on the raw price. The result is
- * what a subscriber to this area would be sent. It never triggers a suggest
- * run.
+ * The stored is_suggestion flag cannot drive this card. It marks each
+ * station's own suggested windows (predictions.go suggestionFlagWindows) —
+ * the set a per-area suggestion is drawn from, but not that set itself: it
+ * applies neither the ordering an area imposes across its stations, nor the
+ * per-day limit spent across them, nor the medium/high filter. Instead the
+ * windows are picked here, from the newest run's full forecast grid
+ * restricted to exactly the stations in scope, mirroring the notifier's
+ * per-area picker (notify.go collectSuggestions → generateSuggestions → the
+ * medium/high filter): per fuel and local day the cheapest hour windows are
+ * selected — ordered by price, then confidence, then distance, then start —
+ * up to the notifier's per-day limit, a window less than two hours from an
+ * already selected window at the same station is skipped as a duplicate,
+ * equal-priced picks of one station merge into a single span, and only
+ * medium/high confidence survives. Displayed prices carry the run's recorded
+ * suggestion display correction (prediction_runs.suggestion_bias) on top of
+ * the raw grid price, again like the notifier, and are then normalized to the
+ * raised-9 board style — ordering stays on the raw price. The result is what a
+ * subscriber to this area would be sent. It never triggers a suggest run.
  *
  * Later runs supersede earlier ones for the same target hour, so only the
  * newest run per (station, fuel) is considered; a station covered by several
@@ -10201,7 +10245,8 @@ const translations = {
         predLegendDiagonal: 'Perfect accuracy',
         predAxisPredicted: 'Predicted (€)',
         predAxisActual: 'Actual (€)',
-        predSuggestion: 'This prediction was surfaced as a suggestion',
+        predSuggestion: 'One of this station\u2019s suggested windows for that day',
+        predEvalBehind: 'Evaluation is behind: target windows ending {time} or later have no recorded actual price yet, so nothing newer can appear here. The next persist runs work through the backlog.',
     },
     de: {
         title: 'Preisverlauf',
@@ -10565,7 +10610,8 @@ const translations = {
         predLegendDiagonal: 'Perfekte Genauigkeit',
         predAxisPredicted: 'Vorhergesagt (€)',
         predAxisActual: 'Tatsächlich (€)',
-        predSuggestion: 'Diese Vorhersage wurde als Empfehlung angezeigt',
+        predSuggestion: 'Eines der empfohlenen Zeitfenster dieser Tankstelle für diesen Tag',
+        predEvalBehind: 'Die Auswertung hängt hinterher: Für Zielfenster, die {time} oder später enden, ist noch kein Ist-Preis erfasst — neuere Daten können hier deshalb nicht erscheinen. Die nächsten Persist-Läufe arbeiten den Rückstand ab.',
     },
 };
 
