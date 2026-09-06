@@ -80,9 +80,18 @@ const (
 	// minRingTiles is the smallest ring either construction is defined for.
 	minRingTiles = 3
 
-	// maxTileRetries is how often one tile is retried after a failure that
-	// retrying can plausibly fix.
-	maxTileRetries = 1
+	// defaultTileRetries is how often one tile is retried after a failure that
+	// retrying can plausibly fix, while nothing else says otherwise.
+	defaultTileRetries = 1
+
+	// The bounds an admin-supplied pace has to fall inside. They are wide
+	// enough that nobody sane meets them and narrow enough that a typo in the
+	// settings table cannot turn a sweep into an hour of sleeping or a burst
+	// into a flood; a value outside them is ignored in favour of the default,
+	// which is the only outcome that keeps sweeping.
+	maxConfigurableRequestDelay = 10 * time.Minute
+	maxConfigurableRequestBurst = 10
+	maxConfigurableTileRetries  = 5
 
 	// The outcome of one recorded request. A retried attempt is kept as its own
 	// row rather than folded into the try that replaced it: the whole point of
@@ -334,14 +343,20 @@ func (l *tileLog) count() int {
 	return len(l.attempts)
 }
 
-// tankerLimiter paces Tankerkönig requests: at most burst of them inside any
-// window of delay. Request i waits until request i-burst is delay old, so a
-// burst goes out back to back and the one after it waits for the window to roll
-// over. A zero delay or burst never waits at all, which is what a sweep with
-// nothing to tile gets.
-type tankerLimiter struct {
-	delay time.Duration
-	burst int
+// tankerPacing is how a sweep talks to Tankerkönig: how fast it asks, and how
+// insistently. At most burst requests go out inside any window of delay —
+// request i waits until request i-burst is delay old, so a burst goes out back
+// to back and the one after it waits for the window to roll over. A zero delay
+// or burst never waits at all, which is what a sweep with nothing to tile gets.
+//
+// retries belongs here rather than beside the request that uses it because it
+// is the same trade the window is: both decide how much of the schedule the
+// sweep spends being polite to an API that is refusing, and an admin moves them
+// together (see resolveTankerPacing).
+type tankerPacing struct {
+	delay   time.Duration
+	burst   int
+	retries int
 	// recent holds the times of the last burst requests, oldest first.
 	recent []time.Time
 }
@@ -350,7 +365,7 @@ type tankerLimiter struct {
 // instant it goes out. That is not necessarily the instant wait was called: a
 // caller whose window is already full is held back, so anything that wants to
 // record when a request was actually made has to take it from here.
-func (l *tankerLimiter) wait() time.Time {
+func (l *tankerPacing) wait() time.Time {
 	if l == nil || l.delay <= 0 || l.burst < 1 {
 		return nowFn()
 	}
@@ -369,10 +384,71 @@ func (l *tankerLimiter) wait() time.Time {
 	return now
 }
 
+// tankerPacingFlags is what the command line said about the pace, and whether
+// it said anything at all. The zero-set flags are what makes "the admin setting
+// is the default" expressible: --request-delay 50s typed out has to mean the
+// same thing as leaving it off only when the setting also says 50s.
+type tankerPacingFlags struct {
+	delay      time.Duration
+	burst      int
+	retries    int
+	delaySet   bool
+	burstSet   bool
+	retriesSet bool
+}
+
+// resolveTankerPacing settles the pace for one sweep. The admin setting is the
+// default and an explicit flag overrides it, one value at a time: an operator
+// slowing a single run down from the command line should not silently take the
+// stored burst or retry count back to the built-in one.
+//
+// The delay is armed only when something in the sweep actually needs tiling.
+// The pace is a property of the API key, not of the city, so once anything here
+// is tiled every request the sweep makes is spaced — including the seam between
+// one city's last tile and the next city's first — but a sweep where every
+// target fits in one request waits for nothing. Retries are not gated that way:
+// a single-request city that fails is worth asking again for the same reason a
+// tile is.
+func resolveTankerPacing(s appSettings, f tankerPacingFlags, queries []cityQuery) *tankerPacing {
+	pace := &tankerPacing{delay: s.RequestDelay, burst: s.RequestBurst, retries: s.TileRetries}
+	if f.delaySet {
+		pace.delay = f.delay
+	}
+	if f.burstSet {
+		pace.burst = f.burst
+	}
+	if f.retriesSet {
+		pace.retries = f.retries
+	}
+	tiled := false
+	for _, q := range queries {
+		if q.radius > maxAPIRadiusKM {
+			tiled = true
+			break
+		}
+	}
+	if !tiled {
+		pace.delay = 0
+	}
+	return pace
+}
+
+// retryBudget is how many extra attempts one tile gets, and it is exactly what
+// the pace says: there is no "unset" reading of it, because an admin asking for
+// no retries at all is a real answer this has to be able to give. Every pace
+// that reaches a request is built by resolveTankerPacing, which is where the
+// default lives.
+func (l *tankerPacing) retryBudget() int {
+	if l == nil || l.retries < 0 {
+		return 0
+	}
+	return l.retries
+}
+
 // pace reports how long this limiter takes to let n requests out, measured from
 // the first — request i goes out at (i/burst)·delay, so the last one waits
 // ((n-1)/burst)·delay. It is what sizes the defaults against sweepBudget.
-func (l *tankerLimiter) pace(n int) time.Duration {
+func (l *tankerPacing) pace(n int) time.Duration {
 	if l == nil || l.delay <= 0 || l.burst < 1 || n < 2 {
 		return 0
 	}
@@ -420,7 +496,7 @@ func retryableStatus(code int) bool {
 // failing costs only the stations that tile alone could see, which is a gap the
 // next sweep closes well inside the 48-hour freshness window — so those are
 // counted and the city is still stored.
-func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, log *tileLog, centre cachedCity, tiles []searchTile, radiusKM float64, fuelType, sortBy string) ([]tankerStation, time.Time, int, error) {
+func fetchTiledStations(ctx context.Context, cfg config, lim *tankerPacing, log *tileLog, centre cachedCity, tiles []searchTile, radiusKM float64, fuelType, sortBy string) ([]tankerStation, time.Time, int, error) {
 	merged := make(map[string]tankerStation)
 	order := make([]string, 0, len(tiles)*64)
 	tilesFailed := 0
@@ -486,9 +562,9 @@ func fetchTiledStations(ctx context.Context, cfg config, lim *tankerLimiter, log
 // retrying once if the failure looks transient. It reports when the attempt that
 // answered went out: an attempt that failed saw nothing, so a retried tile is
 // anchored to the retry rather than to the try that came back empty.
-func fetchTileStations(ctx context.Context, cfg config, lim *tankerLimiter, log *tileLog, index int, tile searchTile, fuelType, sortBy string) ([]tankerStation, time.Time, error) {
+func fetchTileStations(ctx context.Context, cfg config, lim *tankerPacing, log *tileLog, index int, tile searchTile, fuelType, sortBy string) ([]tankerStation, time.Time, error) {
 	var err error
-	for attempt := 0; attempt <= maxTileRetries; attempt++ {
+	for attempt := 0; attempt <= lim.retryBudget(); attempt++ {
 		queued := nowFn()
 		sentAt := lim.wait()
 		var stations []tankerStation
@@ -508,7 +584,7 @@ func fetchTileStations(ctx context.Context, cfg config, lim *tankerLimiter, log 
 		if err != nil {
 			record.Status = tileAttemptFailed
 			record.Err = err.Error()
-			if attempt < maxTileRetries && retryableTankerError(err) && ctx.Err() == nil {
+			if attempt < lim.retryBudget() && retryableTankerError(err) && ctx.Err() == nil {
 				record.Status = tileAttemptRetried
 			}
 		}

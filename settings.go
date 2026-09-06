@@ -4,14 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// Canonical admin settings keys stored in the settings table. Only the
-// notification texts are configurable: they are the one piece of operational
-// configuration with no universal answer. Everything the suggest/check models
-// need is a constant below.
+// Canonical admin settings keys stored in the settings table. Two things are
+// configurable: the notification texts, and how a tiled sweep paces itself
+// against Tankerkönig. Both are operational choices with no universal answer —
+// the texts because they are language and taste, the pace because it depends on
+// the key, the schedule and how busy the API is for that install. Everything
+// the suggest/check models need is a constant below.
 const (
 	settingCheckTemplate   = "check_template"
 	settingSuggestTemplate = "suggest_template"
@@ -20,6 +23,14 @@ const (
 	// pushover_app_name, preserving pre-existing behavior.
 	settingCheckTitleTemplate   = "check_title_template"
 	settingSuggestTitleTemplate = "suggest_title_template"
+
+	// How a sweep paces the several requests a radius over maxAPIRadiusKM
+	// costs, and how often it asks again when one of them fails. The radius
+	// ceiling itself is deliberately not here: it is where the tiling geometry
+	// stops, not a preference (see maxRequestRadiusKM).
+	settingRequestDelaySeconds = "tile_request_delay_seconds"
+	settingRequestBurst        = "tile_request_burst"
+	settingTileRetries         = "tile_retries"
 )
 
 // obsoleteSettings are keys earlier versions stored in the settings table and
@@ -94,20 +105,31 @@ const (
 	defaultSuggestTimes  = "08:00,13:00"
 )
 
-// appSettings is the admin configuration that drives the notify command: the
-// notification texts, and nothing else.
+// appSettings is the admin configuration: the notification texts the notify
+// command sends, and the pace the update command keeps once a target is wide
+// enough to need several requests.
 type appSettings struct {
 	CheckTemplate        string
 	SuggestTemplate      string
 	CheckTitleTemplate   string
 	SuggestTitleTemplate string
+
+	// The tiled sweep's pace. RequestDelay of 0 means no pacing at all, which
+	// is a legitimate choice against a key nobody else is using.
+	RequestDelay time.Duration
+	RequestBurst int
+	TileRetries  int
 }
 
-// defaultAppSettings matches the templates gasoline-watch.sh ships with.
+// defaultAppSettings matches the templates gasoline-watch.sh ships with and the
+// pace derived in tiling.go.
 func defaultAppSettings() appSettings {
 	return appSettings{
 		CheckTemplate:   defaultCheckTemplate,
 		SuggestTemplate: defaultSuggestTemplate,
+		RequestDelay:    defaultRequestDelay,
+		RequestBurst:    defaultRequestBurst,
+		TileRetries:     defaultTileRetries,
 	}
 }
 
@@ -120,6 +142,12 @@ func seededSettings() [][2]string {
 		{settingSuggestTemplate, d.SuggestTemplate},
 		{settingCheckTitleTemplate, d.CheckTitleTemplate},
 		{settingSuggestTitleTemplate, d.SuggestTitleTemplate},
+		// Seeded with today's defaults rather than left absent, so the admin
+		// page shows the pace a sweep is actually keeping instead of empty
+		// fields the reader has to know the code to fill in.
+		{settingRequestDelaySeconds, strconv.Itoa(int(d.RequestDelay / time.Second))},
+		{settingRequestBurst, strconv.Itoa(d.RequestBurst)},
+		{settingTileRetries, strconv.Itoa(d.TileRetries)},
 	}
 }
 
@@ -220,6 +248,23 @@ func loadSettings(ctx context.Context, q settingsQuerier) (appSettings, error) {
 			s.CheckTitleTemplate = unescapeTemplate(value)
 		case settingSuggestTitleTemplate:
 			s.SuggestTitleTemplate = unescapeTemplate(value)
+		// A stored pace that does not parse or falls outside the bounds keeps
+		// the default. Refusing to sweep because one settings row is junk would
+		// turn a bad edit into no prices at all; the web UI validates the same
+		// bounds before writing, so anything rejected here got there another
+		// way.
+		case settingRequestDelaySeconds:
+			if n, err := strconv.Atoi(value); err == nil && n >= 0 && time.Duration(n)*time.Second <= maxConfigurableRequestDelay {
+				s.RequestDelay = time.Duration(n) * time.Second
+			}
+		case settingRequestBurst:
+			if n, err := strconv.Atoi(value); err == nil && n >= 1 && n <= maxConfigurableRequestBurst {
+				s.RequestBurst = n
+			}
+		case settingTileRetries:
+			if n, err := strconv.Atoi(value); err == nil && n >= 0 && n <= maxConfigurableTileRetries {
+				s.TileRetries = n
+			}
 		}
 	}
 	return s, rows.Err()

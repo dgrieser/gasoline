@@ -4508,3 +4508,123 @@ func TestRunUpdateTiledStampsFirstRequestAcrossCities(t *testing.T) {
 		t.Errorf("Uchte recorded_at = %q, want %q (the instant its first request actually went out)", stamps["Uchte"], want)
 	}
 }
+
+// The stored pace reaches the sweep: an admin who slows the requests down or
+// turns retrying off in the web UI changes what `gasoline update` does without
+// touching the cron line that runs it.
+func TestRunUpdateUsesTheStoredPace(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "paced.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	clock := stubTileClock(t)
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	if err := initSchema(context.Background(), db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	seedSettingRows(t, db, map[string]string{
+		settingRequestDelaySeconds: "10",
+		settingRequestBurst:        "1",
+		settingTileRetries:         "0",
+	})
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	calls := 0
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.500000","lon":"13.400000"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			calls++
+			// A retryable failure the stored pace says not to retry.
+			if calls == 2 {
+				return jsonResponse(http.StatusBadGateway, `{"ok":false,"message":"upstream"}`), nil
+			}
+			lat, _ := strconv.ParseFloat(u.Query().Get("lat"), 64)
+			lng, _ := strconv.ParseFloat(u.Query().Get("lng"), 64)
+			return tileListResponse(tileStation(fmt.Sprintf("s-%d", calls), lat, lng, 1, 0)), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	// 30 km is four tiles, so the sweep is four requests with the failed one
+	// not asked again.
+	output := captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--radius", "30", "--output", "json"})
+	})
+	var result updateResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("unmarshal: %v\noutput=%s", err, output)
+	}
+	if result.TilesFailed != 1 {
+		t.Fatalf("tiles_failed = %d, want 1", result.TilesFailed)
+	}
+	if calls != 4 {
+		t.Fatalf("%d requests, want 4 — the stored retry count of 0 was not honoured", calls)
+	}
+	// Four requests 10 s apart: the stored delay, not the built-in one.
+	if spanned := clock.now.Sub(clock.start); spanned != 30*time.Second {
+		t.Fatalf("the sweep spanned %v, want 30s (3 waits of the stored 10s)", spanned)
+	}
+}
+
+// A flag still wins over the stored pace, and only for the value it names.
+func TestRunUpdatePacingFlagOverridesTheStoredPace(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "override.db")
+	t.Setenv(envAPIKeyName, "test-key")
+	clock := stubTileClock(t)
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	if err := initSchema(context.Background(), db, dialectSQLite); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	seedSettingRows(t, db, map[string]string{
+		settingRequestDelaySeconds: "10",
+		settingRequestBurst:        "1",
+		settingTileRetries:         "2",
+	})
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	calls := 0
+	restore := stubDefaultTransport(t, func(req *http.Request) (*http.Response, error) {
+		u := req.URL
+		switch {
+		case strings.HasPrefix(u.String(), nominatimBaseURL):
+			return jsonResponse(http.StatusOK, `[{"name":"Berlin","display_name":"Berlin, DE","lat":"52.500000","lon":"13.400000"}]`), nil
+		case strings.HasPrefix(u.String(), tankerKoenigBase+"/list.php"):
+			calls++
+			lat, _ := strconv.ParseFloat(u.Query().Get("lat"), 64)
+			lng, _ := strconv.ParseFloat(u.Query().Get("lng"), 64)
+			return tileListResponse(tileStation(fmt.Sprintf("s-%d", calls), lat, lng, 1, 0)), nil
+		default:
+			return nil, fmt.Errorf("unexpected URL: %s", u.String())
+		}
+	})
+	defer restore()
+
+	captureStdout(t, func() error {
+		return run([]string{"update", "--db", dbPath, "--city", "Berlin", "--radius", "30", "--request-delay", "20s", "--output", "json"})
+	})
+	if calls != 4 {
+		t.Fatalf("%d requests, want 4", calls)
+	}
+	// The flag's 20 s, not the stored 10 s — and the stored burst of 1 is still
+	// in force, which is what makes the span three whole windows.
+	if spanned := clock.now.Sub(clock.start); spanned != 60*time.Second {
+		t.Fatalf("the sweep spanned %v, want 1m0s (3 waits of the flag's 20s)", spanned)
+	}
+}

@@ -282,6 +282,24 @@ function redirectTo(string $query): never
  * as gasolineSchemaReady. Used for tables added after a deployment's database
  * was created, so the page degrades instead of erroring.
  */
+/**
+ * Whether $value is a plain non-negative integer inside [$min, $max].
+ *
+ * ctype_digit rather than is_numeric: "5.0", " 5" and "5e0" all round-trip
+ * through (int) to something, and a settings row that reads differently to PHP
+ * and to Go's strconv.Atoi is a pace the admin page reports and the collector
+ * does not keep.
+ */
+function gasolineIsIntInRange(string $value, int $min, int $max): bool
+{
+    if (!ctype_digit($value)) {
+        return false;
+    }
+    $n = (int) $value;
+
+    return $n >= $min && $n <= $max;
+}
+
 function gasolineTableExists(PDO $pdo, string $driver, string $table): bool
 {
     try {
@@ -1340,6 +1358,44 @@ const GASOLINE_MAX_NOTIFY_RADIUS_KM = 100;
  */
 const GASOLINE_MAX_TARGET_RADIUS_KM = 42;
 
+/**
+ * What the widest target costs, mirroring Go's planSearchTiles: a
+ * GASOLINE_MAX_TARGET_RADIUS_KM disk is covered by this many overlapping 25 km
+ * queries. Used only to show an admin what a pace adds up to before they save
+ * it; TestWebPacingConstantsMatchGo pins it against the geometry itself.
+ */
+const GASOLINE_MAX_TARGET_TILES = 6;
+
+/**
+ * The wall clock one sweep has to finish inside, mirroring Go's sweepBudget
+ * (tiling.go). The packaged cron entry and systemd timer fire `gasoline update`
+ * every five minutes and lean on flock, so a sweep that overruns does not queue
+ * up — it loses the whole cycle.
+ */
+const GASOLINE_SWEEP_BUDGET_SECONDS = 290;
+
+/**
+ * Bounds on the request pacing an admin may store, mirroring Go's
+ * maxConfigurableRequestDelay, maxConfigurableRequestBurst and
+ * maxConfigurableTileRetries (tiling.go). Go ignores a stored value outside
+ * them in favour of its built-in default, so anything this form accepts has to
+ * be something Go will honour.
+ */
+const GASOLINE_MAX_REQUEST_DELAY_SECONDS = 600;
+const GASOLINE_MAX_REQUEST_BURST = 10;
+const GASOLINE_MAX_TILE_RETRIES = 5;
+
+/**
+ * The pace a sweep keeps while the settings table says nothing, mirroring Go's
+ * defaultRequestDelay, defaultRequestBurst and defaultTileRetries (tiling.go).
+ * `gasoline migrate` seeds these as rows, so they are only reached on a database
+ * migrated by an older binary — where showing the collector's real default beats
+ * showing an empty field.
+ */
+const GASOLINE_DEFAULT_REQUEST_DELAY_SECONDS = 50;
+const GASOLINE_DEFAULT_REQUEST_BURST = 1;
+const GASOLINE_DEFAULT_TILE_RETRIES = 1;
+
 /** The suggest/check fuel types, in canonical display order. */
 const GASOLINE_FUELS = ['diesel', 'e5', 'e10'];
 
@@ -2007,14 +2063,22 @@ function handlePost(PDO $pdo, string $driver): void
             // no break
 
         case 'save_settings':
-            // Templates are the whole of the stored configuration. Title
-            // templates may be empty: notifications then fall back to each
-            // user's configured notification title.
+            // The notification texts and the sweep's request pacing. Each form
+            // on the settings page posts its own subset, and a name that is not
+            // in this request is left alone. Title templates may be empty:
+            // notifications then fall back to each user's configured title.
+            //
+            // The numeric bounds are Go's: a value outside them is ignored by
+            // the sweep in favour of its built-in default, so storing one would
+            // show a pace here that the collector is not keeping.
             $fields = [
                 'check_template' => static fn (string $v): bool => $v !== '',
                 'suggest_template' => static fn (string $v): bool => $v !== '',
                 'check_title_template' => static fn (string $v): bool => true,
                 'suggest_title_template' => static fn (string $v): bool => true,
+                'tile_request_delay_seconds' => static fn (string $v): bool => gasolineIsIntInRange($v, 0, GASOLINE_MAX_REQUEST_DELAY_SECONDS),
+                'tile_request_burst' => static fn (string $v): bool => gasolineIsIntInRange($v, 1, GASOLINE_MAX_REQUEST_BURST),
+                'tile_retries' => static fn (string $v): bool => gasolineIsIntInRange($v, 0, GASOLINE_MAX_TILE_RETRIES),
             ];
             $kv = [];
             foreach ($fields as $name => $validate) {
@@ -5318,7 +5382,7 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
 
         <div class="settings-card">
             <h2 data-i18n="updateTargets">Automatic updates</h2>
-            <p class="auth-note" data-i18n="updateTargetsHint">These cities are collected automatically by `gasoline update` when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately. A radius over 25 km is more than the price API serves in one request, so it is collected as several overlapping queries: expect a handful of requests and about a minute per sweep for that target.</p>
+            <p class="auth-note" data-i18n="updateTargetsHint">These cities are collected automatically by `gasoline update` when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately. A radius over 25 km is more than the price API serves in one request, so it is collected as several overlapping queries — six of them at the 42 km maximum. How far apart those go out is set under Request pacing below.</p>
             <div class="table-scroll">
             <table class="stack-table">
                 <thead>
@@ -5344,6 +5408,31 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                 <input type="text" name="city" data-i18n-placeholder="targetCity" placeholder="City" required>
                 <input type="number" name="radius_km" min="1" max="<?= GASOLINE_MAX_TARGET_RADIUS_KM ?>" value="5" required>
                 <button type="submit" class="btn-primary" data-i18n="addTarget">Add</button>
+            </form>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="requestPacing">Request pacing</h2>
+            <p class="auth-note" data-i18n="requestPacingHint">A target wider than 25 km is collected as several overlapping queries, and these decide how they are spread out. A wider window is gentler on the price API; a sweep that runs past its schedule loses the next one, because the runs are locked against overlapping. Retries apply to every request, narrow targets included.</p>
+            <form method="post" action="" id="pacing-form">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="save_settings">
+                <div class="pacing-fields">
+                    <div class="field">
+                        <label for="st-delay" data-i18n="pacingDelay">Seconds between requests</label>
+                        <input type="number" id="st-delay" name="tile_request_delay_seconds" min="0" max="<?= GASOLINE_MAX_REQUEST_DELAY_SECONDS ?>" step="1" required value="<?= h($get('tile_request_delay_seconds', (string) GASOLINE_DEFAULT_REQUEST_DELAY_SECONDS)) ?>">
+                    </div>
+                    <div class="field">
+                        <label for="st-burst" data-i18n="pacingBurst">Requests per window</label>
+                        <input type="number" id="st-burst" name="tile_request_burst" min="1" max="<?= GASOLINE_MAX_REQUEST_BURST ?>" step="1" required value="<?= h($get('tile_request_burst', (string) GASOLINE_DEFAULT_REQUEST_BURST)) ?>">
+                    </div>
+                    <div class="field">
+                        <label for="st-retries" data-i18n="pacingRetries">Retries per request</label>
+                        <input type="number" id="st-retries" name="tile_retries" min="0" max="<?= GASOLINE_MAX_TILE_RETRIES ?>" step="1" required value="<?= h($get('tile_retries', (string) GASOLINE_DEFAULT_TILE_RETRIES)) ?>">
+                    </div>
+                </div>
+                <p class="auth-note pacing-estimate" id="pacing-estimate"></p>
+                <button type="submit" class="btn-primary" data-i18n="save">Save</button>
             </form>
         </div>
 
@@ -5375,6 +5464,81 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
             </form>
         </div>
     </div>
+    <script>
+    (function () {
+        // What the pace adds up to, restated as the admin types it. The
+        // arithmetic is small but it is the whole reason these fields are hard
+        // to set: the numbers that matter are the sweep's wall clock and how
+        // much of the schedule is left for a retried request, and neither is
+        // visible from the fields themselves.
+        const REQUESTS = <?= GASOLINE_MAX_TARGET_TILES ?>;
+        const RADIUS = <?= GASOLINE_MAX_TARGET_RADIUS_KM ?>;
+        const BUDGET = <?= GASOLINE_SWEEP_BUDGET_SECONDS ?>;
+        // A zero delay never waits, so every count fits; the loop below needs a
+        // stop rather than a number to report.
+        const MAX_SPARE = 99;
+        const out = document.getElementById('pacing-estimate');
+        const delayEl = document.getElementById('st-delay');
+        const burstEl = document.getElementById('st-burst');
+        if (!out || !delayEl || !burstEl) return;
+
+        // Mirrors Go's tankerPacing.pace: request i goes out at (i/burst)·delay,
+        // so the last of n waits ((n-1)/burst)·delay.
+        function pace(n, delay, burst) {
+            if (delay <= 0 || burst < 1 || n < 2) return 0;
+            return Math.floor((n - 1) / burst) * delay;
+        }
+
+        function clock(seconds) {
+            const m = Math.floor(seconds / 60);
+            return m + ':' + String(seconds - m * 60).padStart(2, '0');
+        }
+
+        function renderPacingEstimate() {
+            const t = translations[currentLang] || translations.en;
+            const delay = Number(delayEl.value);
+            const burst = Number(burstEl.value);
+            if (!Number.isFinite(delay) || !Number.isFinite(burst)) {
+                out.textContent = '';
+                return;
+            }
+            // A zero delay is not a fast pace, it is no pace: nothing below
+            // has a number to report, and "room for 99 more" would be a
+            // measurement of MAX_SPARE rather than of anything real.
+            if (delay <= 0) {
+                out.classList.remove('over-budget');
+                out.textContent = (t.pacingEstimateUnpaced || '')
+                    .replace('{radius}', String(RADIUS))
+                    .replace('{requests}', String(REQUESTS));
+                return;
+            }
+            const clean = pace(REQUESTS, delay, burst);
+            // How many retried requests still fit, which is what the schedule
+            // really buys. It is a property of the window and the budget, not of
+            // the retry setting above: that one decides how many retries may
+            // happen, this one how many the schedule can absorb.
+            let spare = 0;
+            while (spare < MAX_SPARE && pace(REQUESTS + spare + 1, delay, burst) <= BUDGET) spare++;
+            const over = clean > BUDGET;
+            out.classList.toggle('over-budget', over);
+            const template = over ? t.pacingEstimateOver : t.pacingEstimate;
+            out.textContent = (template || '')
+                .replace('{radius}', String(RADIUS))
+                .replace('{requests}', String(REQUESTS))
+                .replace('{clean}', clock(clean))
+                .replace('{budget}', clock(BUDGET))
+                .replace('{spare}', String(spare));
+        }
+
+        [delayEl, burstEl].forEach((el) => el.addEventListener('input', renderPacingEstimate));
+        window.onLangChange = renderPacingEstimate;
+        // The translations this reads live in the shared script, which the
+        // parser has not reached yet, so the first paint waits for the document
+        // rather than running here.
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderPacingEstimate);
+        else renderPacingEstimate();
+    })();
+    </script>
     <?php
     renderPageEnd();
 }
@@ -9526,6 +9690,22 @@ function renderDocumentHead(string $titleSuffix): void
             padding: 1.4rem 1.6rem;
         }
         .settings-card.danger { border-color: rgba(248, 113, 113, 0.35); }
+        /* Three short numeric fields read as one row of settings rather than a
+           column of unrelated questions; they wrap to one per line when there
+           is no room for that. */
+        .pacing-fields {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 0 1.1rem;
+        }
+        /* The three labels are not the same length, and in German one of them
+           wraps — so the fields are stretched to a common height and the input
+           pinned to the bottom of each. Left to themselves the inputs sit a
+           label's second line apart, which reads as a mistake. */
+        .pacing-fields .field { grid-template-rows: 1fr auto; }
+        .pacing-fields .field input { width: 100%; }
+        .pacing-estimate { font-family: var(--mono); }
+        .pacing-estimate.over-budget { color: var(--red); }
         .settings-card textarea {
             width: 100%;
             padding: 0.6rem 0.8rem;
@@ -10064,7 +10244,7 @@ const translations = {
         cannotActOnSelf: 'You cannot perform this action on your own account.',
         notFound: 'The requested item was not found.',
         updateTargets: 'Automatic updates',
-        updateTargetsHint: 'These cities are collected automatically by gasoline update when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately. A radius over 25 km is more than the price API serves in one request, so it is collected as several overlapping queries: expect a handful of requests and about a minute per sweep for that target.',
+        updateTargetsHint: 'These cities are collected automatically by gasoline update when the CLI is invoked without --city/--radius flags. They decide which stations exist; each user picks the area they are notified about separately. A radius over 25 km is more than the price API serves in one request, so it is collected as several overlapping queries — six of them at the 42 km maximum. How far apart those go out is set under Request pacing below.',
         targetCity: 'City',
         targetRadius: 'Radius (km)',
         addTarget: 'Add',
@@ -10093,6 +10273,14 @@ const translations = {
         templateSuggest: 'Suggestion notification template',
         notificationTexts: 'Notification texts',
         notificationTextsHint: 'Suggestions and checks are computed for every fuel, covering every station the update targets above currently feed. These templates are the only part that is configured here; each user picks their own fuel, area and schedule in My Account.',
+        requestPacing: 'Request pacing',
+        requestPacingHint: 'A target wider than 25 km is collected as several overlapping queries, and these decide how they are spread out. A wider window is gentler on the price API; a sweep that runs past its schedule loses the next one, because the runs are locked against overlapping. Retries apply to every request, narrow targets included.',
+        pacingDelay: 'Seconds between requests',
+        pacingBurst: 'Requests per window',
+        pacingRetries: 'Retries per request',
+        pacingEstimate: 'A {radius} km target is {requests} requests: {clean} of the {budget} a sweep has. Room for retried requests: {spare}.',
+        pacingEstimateOver: 'A {radius} km target is {requests} requests: {clean}, past the {budget} a sweep has — every run would overrun and the next one be skipped.',
+        pacingEstimateUnpaced: 'Pacing is off: a {radius} km target sends its {requests} requests as fast as the API answers.',
         templateCheckTitle: 'Buy-alert notification title',
         templateSuggestTitle: 'Suggestion notification title',
         titleTemplatePlaceholder: 'e.g. Fill up for {{cheapest_current_price_formatted}} EUR',
@@ -10429,7 +10617,7 @@ const translations = {
         cannotActOnSelf: 'Diese Aktion ist auf dem eigenen Konto nicht möglich.',
         notFound: 'Der angeforderte Eintrag wurde nicht gefunden.',
         updateTargets: 'Automatische Updates',
-        updateTargetsHint: 'Diese Städte werden von gasoline update automatisch erfasst, wenn die CLI ohne --city/--radius aufgerufen wird. Sie bestimmen, welche Tankstellen es gibt; das Gebiet für Benachrichtigungen wählt jeder Nutzer separat. Ein Radius über 25 km ist mehr, als die Preis-API in einer Anfrage liefert, und wird daher aus mehreren überlappenden Abfragen zusammengesetzt: rechne für dieses Ziel mit einigen Anfragen und etwa einer Minute pro Durchlauf.',
+        updateTargetsHint: 'Diese Städte werden von gasoline update automatisch erfasst, wenn die CLI ohne --city/--radius aufgerufen wird. Sie bestimmen, welche Tankstellen es gibt; das Gebiet für Benachrichtigungen wählt jeder Nutzer separat. Ein Radius über 25 km ist mehr, als die Preis-API in einer Anfrage liefert, und wird daher aus mehreren überlappenden Abfragen zusammengesetzt — sechs davon beim Maximum von 42 km. Wie weit sie auseinanderliegen, wird unten unter Abfragetempo festgelegt.',
         targetCity: 'Stadt',
         targetRadius: 'Radius (km)',
         addTarget: 'Hinzufügen',
@@ -10458,6 +10646,14 @@ const translations = {
         templateSuggest: 'Vorlage für Vorschläge',
         notificationTexts: 'Benachrichtigungstexte',
         notificationTextsHint: 'Vorschläge und Prüfungen werden für jeden Kraftstoff berechnet und umfassen alle Tankstellen, die von den Aktualisierungszielen oben derzeit erfasst werden. Nur diese Vorlagen werden hier konfiguriert; Kraftstoff, Gebiet und Zeitplan wählt jeder Nutzer im eigenen Konto.',
+        requestPacing: 'Abfragetempo',
+        requestPacingHint: 'Ein Ziel über 25 km wird als mehrere überlappende Abfragen erfasst; hier wird festgelegt, wie weit sie auseinanderliegen. Ein größeres Fenster schont die Preis-API; ein Durchlauf, der über seinen Zeitplan hinausläuft, kostet den nächsten, denn die Durchläufe sind gegen Überlappung gesperrt. Wiederholungen gelten für jede Abfrage, auch bei schmalen Zielen.',
+        pacingDelay: 'Sekunden zwischen Abfragen',
+        pacingBurst: 'Abfragen pro Fenster',
+        pacingRetries: 'Wiederholungen pro Abfrage',
+        pacingEstimate: 'Ein Ziel mit {radius} km sind {requests} Abfragen: {clean} von {budget}, die ein Durchlauf hat. Platz für Wiederholungen: {spare}.',
+        pacingEstimateOver: 'Ein Ziel mit {radius} km sind {requests} Abfragen: {clean} — mehr als die {budget}, die ein Durchlauf hat. Jeder Durchlauf würde überlaufen und den nächsten kosten.',
+        pacingEstimateUnpaced: 'Kein Tempolimit: Ein Ziel mit {radius} km sendet seine {requests} Abfragen, so schnell die API antwortet.',
         templateCheckTitle: 'Titel für Kaufalarme',
         templateSuggestTitle: 'Titel für Vorschläge',
         titleTemplatePlaceholder: 'z. B. Tanken für {{cheapest_current_price_formatted}} EUR',
