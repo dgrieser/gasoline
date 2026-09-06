@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInitSchemaCreatesAuthAndSettingsTables(t *testing.T) {
@@ -23,7 +26,8 @@ func TestInitSchemaCreatesAuthAndSettingsTables(t *testing.T) {
 		}
 	}
 
-	// The notification texts are the whole of the stored configuration.
+	// The notification texts and the sweep's pace are the whole of the stored
+	// configuration.
 	want := map[string]string{
 		settingCheckTemplate:   defaultCheckTemplate,
 		settingSuggestTemplate: defaultSuggestTemplate,
@@ -31,6 +35,11 @@ func TestInitSchemaCreatesAuthAndSettingsTables(t *testing.T) {
 		// user's pushover_app_name until an admin configures a template.
 		settingCheckTitleTemplate:   "",
 		settingSuggestTitleTemplate: "",
+		// The pace is seeded with the built-in default rather than left absent,
+		// so the admin page shows what a sweep is really doing.
+		settingRequestDelaySeconds: strconv.Itoa(int(defaultRequestDelay / time.Second)),
+		settingRequestBurst:        strconv.Itoa(defaultRequestBurst),
+		settingTileRetries:         strconv.Itoa(defaultTileRetries),
 	}
 	rows, err := db.QueryContext(ctx, `SELECT name, value FROM settings`)
 	if err != nil {
@@ -699,5 +708,152 @@ func TestMigrateClampsUpdateTargetRadius(t *testing.T) {
 	}
 	if containsString(second.Applied, want) {
 		t.Fatalf("the clamp reported itself again on an already-clamped database: %v", second.Applied)
+	}
+}
+
+// The pace is read back the way it was stored, and a row that says something
+// impossible is ignored rather than obeyed: a sweep that refuses to run because
+// one settings row is junk is a worse failure than one that runs at the
+// built-in pace.
+func TestLoadSettingsReadsThePace(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("stored values win", func(t *testing.T) {
+		db := openTestDB(t)
+		seedSettingRows(t, db, map[string]string{
+			settingRequestDelaySeconds: "90",
+			settingRequestBurst:        "3",
+			settingTileRetries:         "0",
+		})
+		s, err := loadSettings(ctx, db)
+		if err != nil {
+			t.Fatalf("loadSettings: %v", err)
+		}
+		if s.RequestDelay != 90*time.Second || s.RequestBurst != 3 || s.TileRetries != 0 {
+			t.Fatalf("pace = %v/%d/%d, want 1m30s/3/0", s.RequestDelay, s.RequestBurst, s.TileRetries)
+		}
+	})
+
+	// Zero delay is a real answer — no pacing at all, which is reasonable
+	// against a key nobody else is using — so it must not read as "unset".
+	t.Run("a zero delay is kept", func(t *testing.T) {
+		db := openTestDB(t)
+		seedSettingRows(t, db, map[string]string{settingRequestDelaySeconds: "0"})
+		s, err := loadSettings(ctx, db)
+		if err != nil {
+			t.Fatalf("loadSettings: %v", err)
+		}
+		if s.RequestDelay != 0 {
+			t.Fatalf("delay = %v, want 0", s.RequestDelay)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		rows map[string]string
+	}{
+		{"not a number", map[string]string{
+			settingRequestDelaySeconds: "soon",
+			settingRequestBurst:        "lots",
+			settingTileRetries:         "again",
+		}},
+		{"negative", map[string]string{
+			settingRequestDelaySeconds: "-1",
+			settingRequestBurst:        "-1",
+			settingTileRetries:         "-1",
+		}},
+		{"past the bounds", map[string]string{
+			settingRequestDelaySeconds: strconv.Itoa(int(maxConfigurableRequestDelay/time.Second) + 1),
+			settingRequestBurst:        strconv.Itoa(maxConfigurableRequestBurst + 1),
+			settingTileRetries:         strconv.Itoa(maxConfigurableTileRetries + 1),
+		}},
+		{"burst of zero, which would never let a request out", map[string]string{
+			settingRequestBurst: "0",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			seedSettingRows(t, db, tc.rows)
+			s, err := loadSettings(ctx, db)
+			if err != nil {
+				t.Fatalf("loadSettings: %v", err)
+			}
+			d := defaultAppSettings()
+			for name := range tc.rows {
+				switch name {
+				case settingRequestDelaySeconds:
+					if s.RequestDelay != d.RequestDelay {
+						t.Errorf("delay = %v, want the default %v", s.RequestDelay, d.RequestDelay)
+					}
+				case settingRequestBurst:
+					if s.RequestBurst != d.RequestBurst {
+						t.Errorf("burst = %d, want the default %d", s.RequestBurst, d.RequestBurst)
+					}
+				case settingTileRetries:
+					if s.TileRetries != d.TileRetries {
+						t.Errorf("retries = %d, want the default %d", s.TileRetries, d.TileRetries)
+					}
+				}
+			}
+		})
+	}
+}
+
+func seedSettingRows(t *testing.T, db *sql.DB, rows map[string]string) {
+	t.Helper()
+	for name, value := range rows {
+		if _, err := db.ExecContext(context.Background(), kvUpsertSQL(dialectSQLite, "settings"),
+			name, value, "2026-04-01T00:00:00Z"); err != nil {
+			t.Fatalf("seed setting %s: %v", name, err)
+		}
+	}
+}
+
+// The web UI restates several of Go's numbers: the pace it will store has to be
+// a pace the sweep will honour, and the estimate it shows an admin has to be
+// the sweep the collector will actually run. A constant that drifts here is not
+// a crash — it is an admin page confidently reporting the wrong thing.
+func TestWebPacingConstantsMatchGo(t *testing.T) {
+	viewer, err := os.ReadFile(filepath.Join("web", "index.php"))
+	if err != nil {
+		t.Fatalf("read web/index.php: %v", err)
+	}
+	tiles, err := planSearchTiles(52.5, 13.4, maxRequestRadiusKM)
+	if err != nil {
+		t.Fatalf("planSearchTiles: %v", err)
+	}
+	for _, want := range []struct {
+		what string
+		decl string
+	}{
+		{"the request budget of the widest target",
+			fmt.Sprintf("const GASOLINE_MAX_TARGET_TILES = %d;", len(tiles))},
+		{"the sweep budget",
+			fmt.Sprintf("const GASOLINE_SWEEP_BUDGET_SECONDS = %d;", int(sweepBudget/time.Second))},
+		{"the largest storable delay",
+			fmt.Sprintf("const GASOLINE_MAX_REQUEST_DELAY_SECONDS = %d;", int(maxConfigurableRequestDelay/time.Second))},
+		{"the largest storable burst",
+			fmt.Sprintf("const GASOLINE_MAX_REQUEST_BURST = %d;", maxConfigurableRequestBurst)},
+		{"the largest storable retry count",
+			fmt.Sprintf("const GASOLINE_MAX_TILE_RETRIES = %d;", maxConfigurableTileRetries)},
+		{"the radius ceiling",
+			fmt.Sprintf("const GASOLINE_MAX_TARGET_RADIUS_KM = %d;", int(maxRequestRadiusKM))},
+		{"the default delay",
+			fmt.Sprintf("const GASOLINE_DEFAULT_REQUEST_DELAY_SECONDS = %d;", int(defaultRequestDelay/time.Second))},
+		{"the default burst",
+			fmt.Sprintf("const GASOLINE_DEFAULT_REQUEST_BURST = %d;", defaultRequestBurst)},
+		{"the default retry count",
+			fmt.Sprintf("const GASOLINE_DEFAULT_TILE_RETRIES = %d;", defaultTileRetries)},
+	} {
+		if !strings.Contains(string(viewer), want.decl) {
+			t.Errorf("web/index.php does not declare %s as %q", want.what, want.decl)
+		}
+	}
+
+	// And the settings names it posts are the ones the sweep reads back.
+	for _, name := range []string{settingRequestDelaySeconds, settingRequestBurst, settingTileRetries} {
+		if !strings.Contains(string(viewer), `name="`+name+`"`) {
+			t.Errorf("web/index.php has no field posting the %q setting", name)
+		}
 	}
 }

@@ -789,13 +789,28 @@ func runUpdate(args []string) (err error) {
 	fs.Var(radiusFlag{&events}, "radius", "Search radius in km, repeatable; default 5, max 42 (over 25 is fetched as several 25 km queries)")
 	fuelType := fs.String("fuel", "all", "Fuel type: all, diesel, e5, e10")
 	sortBy := fs.String("sort", "dist", "Sort order: dist or price")
-	requestDelay := fs.Duration("request-delay", defaultRequestDelay, "Window the Tankerkönig requests of a tiled radius are paced over (default 50s: a 42 km sweep is then 6 requests over 4:10)")
-	requestBurst := fs.Int("request-burst", defaultRequestBurst, "Tankerkönig requests allowed inside one --request-delay window")
+	requestDelay := fs.Duration("request-delay", defaultRequestDelay, "Window the Tankerkönig requests of a tiled radius are paced over; overrides the admin setting (built-in default 50s: a 42 km sweep is then 6 requests over 4:10)")
+	requestBurst := fs.Int("request-burst", defaultRequestBurst, "Tankerkönig requests allowed inside one --request-delay window; overrides the admin setting")
+	tileRetries := fs.Int("tile-retries", defaultTileRetries, "Extra attempts one failed Tankerkönig request gets; overrides the admin setting")
 	userAgent := fs.String("user-agent", defaultUserAgent, "User-Agent for Nominatim and API calls")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Which pacing flags were actually given, so the admin setting can be the
+	// default for the ones that were not. A flag left off is not the same as a
+	// flag set to its built-in value.
+	pacingFlags := tankerPacingFlags{delay: *requestDelay, burst: *requestBurst, retries: *tileRetries}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "request-delay":
+			pacingFlags.delaySet = true
+		case "request-burst":
+			pacingFlags.burstSet = true
+		case "tile-retries":
+			pacingFlags.retriesSet = true
+		}
+	})
 	dbCfg, err := resolveDBConfig(fs, dbf)
 	if err != nil {
 		return err
@@ -815,6 +830,9 @@ func runUpdate(args []string) (err error) {
 	}
 	if *requestBurst < 1 {
 		return errors.New("--request-burst must be at least 1")
+	}
+	if *tileRetries < 0 {
+		return errors.New("--tile-retries must not be negative")
 	}
 	if *fuelType == "all" {
 		*sortBy = "dist"
@@ -899,18 +917,11 @@ func runUpdate(args []string) (err error) {
 		return err
 	}
 
-	// The pace is a property of the API key, so once anything in this sweep has
-	// to be tiled every request it makes is spaced — including the seam between
-	// one city's last tile and the next city's first. A sweep with nothing to
-	// tile keeps a zero delay and never waits, exactly as before.
-	delay := time.Duration(0)
-	for _, q := range queries {
-		if q.radius > maxAPIRadiusKM {
-			delay = *requestDelay
-			break
-		}
+	settings, err := loadSettings(ctx, db)
+	if err != nil {
+		return err
 	}
-	limiter := &tankerLimiter{delay: delay, burst: *requestBurst}
+	limiter := resolveTankerPacing(settings, pacingFlags, queries)
 
 	// Fetch every target before writing anything: targets with overlapping
 	// radii report the same station, and a sweep has to see all of them at
@@ -1086,7 +1097,7 @@ type cityFetch struct {
 // fetchCityStations geocodes one target and fetches its stations. It writes no
 // snapshots, so a whole sweep can be de-duplicated before it touches
 // price_snapshots. (Geocoding still caches the city itself, as before.)
-func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, lim *tankerLimiter, log *tileLog, q cityQuery, fuelType, sortBy string) (cityFetch, error) {
+func fetchCityStations(ctx context.Context, db *sql.DB, cfg config, lim *tankerPacing, log *tileLog, q cityQuery, fuelType, sortBy string) (cityFetch, error) {
 	location, cached, err := getOrCreateCity(ctx, db, q.name, cfg.UserAgent)
 	if err != nil {
 		return cityFetch{}, err

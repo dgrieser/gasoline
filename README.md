@@ -132,7 +132,7 @@ Useful `update` flags:
 - `--fuel all|diesel|e5|e10`
 - `--sort dist|price`
 - `--radius` in km, up to 42 (see [Radii wider than the API serves](#radii-wider-than-the-api-serves))
-- `--request-delay` and `--request-burst` pace the requests a wide radius needs (one per 50 s)
+- `--request-delay`, `--request-burst` and `--tile-retries` override the stored pacing for one run (built-in: one request per 50 s, one retry)
 - `--user-agent "your-app/1.0"`
 - `--output json` or `-o json`
 
@@ -154,9 +154,13 @@ What that costs, since it is a request budget and not just a wait:
 | up to 39.2 | 5 | 3:20 |
 | up to 42 | 6 | 4:10 |
 
-The requests are paced at `--request-burst` (default 1) per `--request-delay` (default 50s), so they go out one at a time, 50 s apart. Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. `--request-delay 0` removes the pacing entirely — useful against your own key, unwise against a shared one.
+The requests are paced at **requests per window** (default 1) per **seconds between requests** (default 50), so they go out one at a time, 50 s apart, and a failed one gets **retries per request** (default 1) more attempts. All three are admin settings — web UI, hamburger menu → Settings → *Request pacing* — and `--request-burst`, `--request-delay` and `--tile-retries` override them for one run. An override is per value: `--request-delay 90s` slows that run down without also taking the stored burst and retry count back to their built-in values.
 
-**Why 50 s and a 42 km ceiling.** The two are one decision. Tankerkönig answers a paced sweep with 503s often enough that retries are routine rather than exceptional, and a retry is the API asking to be left alone — so the window is set as wide as the schedule allows rather than as narrow as the sweep needs.
+Pacing is armed only when something in the sweep actually needs tiling: a sweep whose every target fits in 25 km issues one request per city with no waiting at all, exactly as before. Retries are not gated that way — a single-request city that fails is worth asking again for the same reason a tile is. `--request-delay 0`, or a stored delay of 0, removes the pacing entirely: useful against your own key, unwise against a shared one.
+
+The settings page shows what the numbers add up to as you type them — the widest target's wall clock, how much of the schedule is left for a retried request, and a warning when the sweep no longer fits at all. A stored value the collector would refuse (unparseable, or outside 0–600 s / 1–10 / 0–5) is ignored in favour of the built-in default rather than stopping the sweep, and the form enforces the same bounds so the two cannot disagree. The **radius ceiling is not configurable**: it is where the tiling geometry stops, not a preference.
+
+**Why 50 s and a 42 km ceiling by default.** The two are one decision. Tankerkönig answers a paced sweep with 503s often enough that retries are routine rather than exceptional, and a retry is the API asking to be left alone — so the window is set as wide as the schedule allows rather than as narrow as the sweep needs.
 
 42 km is where a ring of six tiles reaches. The old ceiling was 50, which costs **eight** requests: seven disks of this size cover exactly twice their own radius and no more, so 50 km sits just past what seven can do. Those two extra requests bought 8 km of rim and cost every sweep the headroom it needed when the API refused.
 
@@ -175,7 +179,7 @@ Three things make a wide radius behave like a single narrow one:
 - **One timestamp per city.** The requests are deliberately spread over minutes, so stamping each station with the query that happened to see it would spread one city's readings across that window and read like a price history. Every station of a tiled city therefore carries the instant its first request went out.
 - **The radius you asked for.** The overlapping tiles bulge slightly past it; stations in the bulge are dropped, so `search_radius_km` stays honest and station ownership does not drift between sweeps.
 
-If a query other than the first fails, it is retried once and then given up on: the city is still stored with everything the other queries saw, `tiles_failed` reports the loss, and the run is recorded as `partial`. The stations only that query could see go unrefreshed until the next sweep, which is well inside the 48-hour window the model already tolerates. A failing **first** query fails the city, because that failure is almost always systemic — a rejected key, no network — and a city assembled out of whatever happened to answer is worse than no update.
+If a query other than the first fails, it is retried (once by default, see the pacing settings above) and then given up on: the city is still stored with everything the other queries saw, `tiles_failed` reports the loss, and the run is recorded as `partial`. The stations only that query could see go unrefreshed until the next sweep, which is well inside the 48-hour window the model already tolerates. A failing **first** query fails the city, because that failure is almost always systemic — a rejected key, no network — and a city assembled out of whatever happened to answer is worse than no update.
 
 A 42 km target covers nearly three times the area of a 25 km one. `suggest`, `check` and `notify` cover every station still being fed, and `suggest --persist` stores the full forecast grid per station per fuel, so that multiplies `price_predictions` growth and `suggest` runtime too — see [Diagnosing a slow database](#diagnosing-a-slow-database-gasoline-doctor).
 
@@ -283,11 +287,12 @@ The normal suggestion output is unchanged; a one-line summary (`persist: stored 
 
 ### Server-stored configuration (admin settings)
 
-Administrators configure two things in the web UI (hamburger menu → Settings): the **update targets** (city + radius pairs) that decide which stations are collected, and the **notification texts**. A target's radius is editable in place — each row has its own radius field and save button, up to 42 km, and the change takes effect on the next `gasoline update`. The city is the target's identity and is not editable: changing it means removing the target and adding the new city.
+Administrators configure three things in the web UI (hamburger menu → Settings): the **update targets** (city + radius pairs) that decide which stations are collected, the **request pacing** those targets are collected at, and the **notification texts**. A target's radius is editable in place — each row has its own radius field and save button, up to 42 km, and the change takes effect on the next `gasoline update`. The city is the target's identity and is not editable: changing it means removing the target and adding the new city.
 
 That is deliberately all of it. The station scope, the fuels, the model parameters and the delivery limits used to be settings and are now fixed, because none of them had a per-install answer:
 
 - `gasoline update` invoked **without any** `--city`/`--radius` flags updates every configured update target with its per-target radius, as a single de-duplicated sweep: targets whose radii overlap share stations, and each shared station is stored once under its nearest target. Passing explicit flags ignores the targets entirely. `radius_km` is the only radius in the system, and may be up to 42 km — a target over 25 km costs several paced API requests per sweep, see [Radii wider than the API serves](#radii-wider-than-the-api-serves). `gasoline migrate` brings a target stored under the older 50 km ceiling down to 42.
+- **Request pacing** — seconds between requests, requests per window, and retries per request — is stored because it has no per-install answer: it depends on the key, on how busy Tankerkönig is for that install, and on the schedule the sweep runs under. It applies to `gasoline update` however it is invoked, and `--request-delay`, `--request-burst` and `--tile-retries` override it per value for one run. See [Radii wider than the API serves](#radii-wider-than-the-api-serves) for what the numbers cost.
 - `gasoline suggest`, `gasoline check` and `notify` take no scope or fuel arguments. They cover every station still being fed and compute all three fuels, so nothing that gets delivered goes unmeasured. Each user picks the one fuel they are notified about (see below).
 - The fixed parameters are 30 days of history, a 3-day forecast horizon, 3 suggestions per day, 5 check rows, a flat 2 ct price margin, a 48-hour station freshness window, and a baseline reset at local midnight. The per-user notification schedule defaults (every day, 07:00–21:00, suggestions at 08:00 and 13:00) apply only until a user sets their own.
 

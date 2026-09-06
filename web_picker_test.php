@@ -60,7 +60,7 @@ foreach (['raisedNinePrice', 'raisedNinePriceSql', 'loadNearbyPrices', 'geocodeL
     'saveDashboardFilters', 'clearDashboardFilters', 'loadFilteredPredictions',
     'gasolineCommandStatsSeries', 'gasolineCommandStatsPercentile',
     'gasolineCommandStatsRowFilter', 'gasolineCommandStatsRows',
-    'gasolineCommandStatsTiles', 'gasolineTableExists',
+    'gasolineCommandStatsTiles', 'gasolineTableExists', 'gasolineIsIntInRange',
     'gasolineLeadBucketLabels', 'gasolineLeadBucketSql',
     'gasolineBreakdownTables'] as $name) {
     eval(extractFunction($viewer, $name));
@@ -943,6 +943,38 @@ $noTable = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERR
 $detail = gasolineCommandStatsTiles($noTable, 'sqlite', 7, 10);
 check('a database without the table is unsupported, not an error', $detail['supported'], false);
 check('and has no requests to show', $detail['tiles'], []);
+
+/* ── The stored request pacing ───────────────────────────────────── */
+
+// What the settings form will and will not write. Go ignores a stored pace it
+// cannot parse or that falls outside its bounds and sweeps at the built-in one
+// instead, so anything accepted here that Go rejects is an admin page reporting
+// a pace the collector is not keeping.
+check('a plain integer inside the range is accepted', gasolineIsIntInRange('50', 0, 600), true);
+check('the low bound is inside it', gasolineIsIntInRange('0', 0, 600), true);
+check('the high bound is inside it', gasolineIsIntInRange('600', 0, 600), true);
+check('a value past the high bound is not', gasolineIsIntInRange('601', 0, 600), false);
+check('nor one under the low bound', gasolineIsIntInRange('0', 1, 10), false);
+// Everything below round-trips through (int) to something plausible, and every
+// one of them is a string Go's strconv.Atoi refuses.
+check('a negative number is not an unsigned integer', gasolineIsIntInRange('-1', 0, 600), false);
+check('nor is a decimal', gasolineIsIntInRange('5.0', 0, 600), false);
+check('nor exponent notation', gasolineIsIntInRange('5e1', 0, 600), false);
+check('nor a padded number', gasolineIsIntInRange(' 5', 0, 600), false);
+check('nor an empty field', gasolineIsIntInRange('', 0, 600), false);
+check('nor a word', gasolineIsIntInRange('soon', 0, 600), false);
+
+// The bounds the form itself enforces are the ones Go honours, so a value the
+// page accepts is a value the sweep will keep.
+$viewerSource = file_get_contents(__DIR__ . '/web/index.php');
+foreach ([
+    'the delay bound' => "gasolineIsIntInRange(\$v, 0, GASOLINE_MAX_REQUEST_DELAY_SECONDS)",
+    'the burst bound' => "gasolineIsIntInRange(\$v, 1, GASOLINE_MAX_REQUEST_BURST)",
+    'the retry bound' => "gasolineIsIntInRange(\$v, 0, GASOLINE_MAX_TILE_RETRIES)",
+] as $what => $fragment) {
+    check($what . ' is the one save_settings validates against',
+        str_contains($viewerSource, $fragment), true);
+}
 
 if ($failures > 0) {
     printf("web_picker_test: %d failed\n", $failures);

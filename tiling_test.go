@@ -312,7 +312,7 @@ func stubTileClock(t *testing.T) *fakeTileClock {
 func TestTankerLimiterBurst(t *testing.T) {
 	clock := stubTileClock(t)
 
-	lim := &tankerLimiter{delay: 30 * time.Second, burst: 3}
+	lim := &tankerPacing{delay: 30 * time.Second, burst: 3}
 	for i := 0; i < 8; i++ {
 		lim.wait()
 	}
@@ -331,7 +331,7 @@ func TestTankerLimiterBurst(t *testing.T) {
 func TestTankerLimiterNeverWaitsWhenDisarmed(t *testing.T) {
 	clock := stubTileClock(t)
 
-	for _, lim := range []*tankerLimiter{
+	for _, lim := range []*tankerPacing{
 		nil,
 		{delay: 0, burst: 3},
 		{delay: 30 * time.Second, burst: 0},
@@ -399,7 +399,7 @@ func TestFetchTiledStationsDedupe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
+	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerPacing{retries: defaultTileRetries}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err != nil {
 		t.Fatalf("fetchTiledStations: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestFetchTiledStationsFiltersOvershoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, _, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
+	stations, _, _, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerPacing{retries: defaultTileRetries}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err != nil {
 		t.Fatalf("fetchTiledStations: %v", err)
 	}
@@ -497,7 +497,7 @@ func TestFetchTiledStationsPartialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{delay: 30 * time.Second, burst: 3}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
+	stations, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerPacing{delay: 30 * time.Second, burst: 3, retries: defaultTileRetries}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err != nil {
 		t.Fatalf("a failing tile must not fail the city: %v", err)
 	}
@@ -531,7 +531,7 @@ func TestFetchTiledStationsFirstTileFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	_, _, _, err = fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
+	_, _, _, err = fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerPacing{retries: defaultTileRetries}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err == nil {
 		t.Fatal("a failing centre tile must fail the whole city")
 	}
@@ -560,7 +560,7 @@ func TestFetchTiledStationsDoesNotRetryPermanentFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planSearchTiles: %v", err)
 	}
-	if _, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerLimiter{}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist"); err != nil || failed != 1 {
+	if _, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, &tankerPacing{retries: defaultTileRetries}, nil, centre, tiles, maxRequestRadiusKM, "all", "dist"); err != nil || failed != 1 {
 		t.Fatalf("failed = %d, err = %v", failed, err)
 	}
 	if attempts != len(tiles) {
@@ -607,7 +607,7 @@ func TestTileStationPayloadDecodes(t *testing.T) {
 func TestTankerLimiterWaitReportsSlot(t *testing.T) {
 	clock := stubTileClock(t)
 
-	lim := &tankerLimiter{delay: 30 * time.Second, burst: 3}
+	lim := &tankerPacing{delay: 30 * time.Second, burst: 3}
 	for i := 0; i < 3; i++ {
 		if got := lim.wait(); !got.Equal(clock.start) {
 			t.Fatalf("request %d went out at %v, want %v", i+1, got, clock.start)
@@ -619,7 +619,7 @@ func TestTankerLimiterWaitReportsSlot(t *testing.T) {
 
 	// A disarmed limiter reports the current instant and never sleeps, so an
 	// untiled sweep is stamped exactly as it always was.
-	for _, disarmed := range []*tankerLimiter{
+	for _, disarmed := range []*tankerPacing{
 		nil,
 		{delay: 0, burst: 3},
 		{delay: 30 * time.Second, burst: 0},
@@ -655,7 +655,7 @@ func TestFetchTiledStationsObservedAtSkipsFailedAttempt(t *testing.T) {
 	}
 	// burst 1 makes every request wait, so the retry lands a window after the
 	// attempt it replaces and the two instants cannot be confused.
-	lim := &tankerLimiter{delay: 30 * time.Second, burst: 1}
+	lim := &tankerPacing{delay: 30 * time.Second, burst: 1, retries: defaultTileRetries}
 	_, observedAt, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, lim, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
 	if err != nil {
 		t.Fatalf("a retryable centre failure that then succeeds must not fail the city: %v", err)
@@ -673,8 +673,8 @@ func TestFetchTiledStationsObservedAtSkipsFailedAttempt(t *testing.T) {
 // rather than naming the fields they happen to know about: a pacing default
 // added to the program and not to the limiter here would be a default no test
 // ever measured.
-func defaultLimiter() *tankerLimiter {
-	return &tankerLimiter{delay: defaultRequestDelay, burst: defaultRequestBurst}
+func defaultLimiter() *tankerPacing {
+	return &tankerPacing{delay: defaultRequestDelay, burst: defaultRequestBurst, retries: defaultTileRetries}
 }
 
 func TestDefaultPaceFitsSweepBudget(t *testing.T) {
@@ -721,7 +721,7 @@ func TestPaceMatchesTheLimiterItDescribes(t *testing.T) {
 		{defaultRequestDelay, defaultRequestBurst},
 	} {
 		clock := stubTileClock(t)
-		lim := &tankerLimiter{delay: tc.delay, burst: tc.burst}
+		lim := &tankerPacing{delay: tc.delay, burst: tc.burst}
 		var last time.Time
 		for i := 0; i < 9; i++ {
 			last = lim.wait()
@@ -732,5 +732,127 @@ func TestPaceMatchesTheLimiterItDescribes(t *testing.T) {
 			t.Fatalf("delay %v burst %d: pace(9) = %v, but 9 requests took %v",
 				tc.delay, tc.burst, got, want)
 		}
+	}
+}
+
+// The stored pace is the default and a flag overrides it one value at a time.
+// Wholesale replacement is the bug worth guarding: an operator slowing a single
+// run down from the command line would silently take the burst and the retry
+// count back to the built-in ones, which is not what they asked for.
+func TestResolveTankerPacingPrefersFlagsPerValue(t *testing.T) {
+	stored := appSettings{RequestDelay: 90 * time.Second, RequestBurst: 3, TileRetries: 2}
+	tiled := []cityQuery{{"Berlin", maxRequestRadiusKM}}
+
+	t.Run("nothing on the command line", func(t *testing.T) {
+		got := resolveTankerPacing(stored, tankerPacingFlags{}, tiled)
+		if got.delay != 90*time.Second || got.burst != 3 || got.retries != 2 {
+			t.Fatalf("pace = %v/%d/%d, want the stored 1m30s/3/2", got.delay, got.burst, got.retries)
+		}
+	})
+
+	t.Run("one flag moves one value", func(t *testing.T) {
+		flags := tankerPacingFlags{delay: 10 * time.Second, burst: 1, retries: 0, delaySet: true}
+		got := resolveTankerPacing(stored, flags, tiled)
+		if got.delay != 10*time.Second {
+			t.Errorf("delay = %v, want the flag's 10s", got.delay)
+		}
+		if got.burst != 3 || got.retries != 2 {
+			t.Errorf("burst/retries = %d/%d, want the stored 3/2", got.burst, got.retries)
+		}
+	})
+
+	// Every value a flag can carry has to be reachable, the ones that read like
+	// "unset" included: --request-delay 0 disarms the pacing and --tile-retries
+	// 0 turns retrying off, and neither may fall back to the stored value.
+	t.Run("a flag set to zero still wins", func(t *testing.T) {
+		flags := tankerPacingFlags{delaySet: true, burstSet: true, burst: 1, retriesSet: true}
+		got := resolveTankerPacing(stored, flags, tiled)
+		if got.delay != 0 || got.retries != 0 {
+			t.Fatalf("delay/retries = %v/%d, want 0/0", got.delay, got.retries)
+		}
+	})
+}
+
+// The delay is armed only by a target the API cannot serve in one request; the
+// retry budget is not, because a single-request city that fails is worth asking
+// again for the same reason a tile is.
+func TestResolveTankerPacingArmsOnlyForTiling(t *testing.T) {
+	stored := appSettings{RequestDelay: 90 * time.Second, RequestBurst: 2, TileRetries: 2}
+
+	narrow := resolveTankerPacing(stored, tankerPacingFlags{}, []cityQuery{
+		{"Berlin", 5}, {"Uchte", maxAPIRadiusKM},
+	})
+	if narrow.delay != 0 {
+		t.Errorf("a sweep with nothing to tile paces at %v, want no waiting at all", narrow.delay)
+	}
+	if narrow.retries != 2 {
+		t.Errorf("retries = %d, want the stored 2 — retrying is not a tiling concern", narrow.retries)
+	}
+
+	// One wide target arms the whole sweep, the narrow cities included: the
+	// pace belongs to the API key, not to the city.
+	mixed := resolveTankerPacing(stored, tankerPacingFlags{}, []cityQuery{
+		{"Berlin", 5}, {"Uchte", maxAPIRadiusKM + 0.5},
+	})
+	if mixed.delay != 90*time.Second {
+		t.Errorf("delay = %v, want the stored 1m30s", mixed.delay)
+	}
+}
+
+// retryBudget says exactly what the pace says. There is no reading of it where
+// an unset field quietly means "one": an admin asking for no retries is a real
+// answer, and it has to survive reaching the request that honours it.
+func TestRetryBudgetIsWhatThePaceSays(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pace *tankerPacing
+		want int
+	}{
+		{"none configured", &tankerPacing{}, 0},
+		{"two", &tankerPacing{retries: 2}, 2},
+		{"negative is none", &tankerPacing{retries: -3}, 0},
+		{"no pace at all", nil, 0},
+	} {
+		if got := tc.pace.retryBudget(); got != tc.want {
+			t.Errorf("%s: retryBudget = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The retry budget really is what bounds the attempts, in both directions.
+func TestFetchTiledStationsHonoursTheConfiguredRetries(t *testing.T) {
+	for _, retries := range []int{0, 1, 3} {
+		t.Run(fmt.Sprintf("retries=%d", retries), func(t *testing.T) {
+			stubTileClock(t)
+			centre := cachedCity{QueryName: "Berlin", Name: "Berlin", Lat: 52.5, Lng: 13.4}
+
+			attempts := 0
+			stubTankerTiles(t, func(index int, lat, lng, rad float64) (*http.Response, error) {
+				attempts++
+				// The second tile is permanently down; every other answers on
+				// its first try, so the count below is exactly its attempts.
+				if index >= 1 && index <= retries+1 {
+					return jsonResponse(http.StatusBadGateway, `{"ok":false,"message":"upstream"}`), nil
+				}
+				return tileListResponse(tileStation(fmt.Sprintf("s-%d", index), lat, lng, 1, 0)), nil
+			})
+
+			tiles, err := planSearchTiles(centre.Lat, centre.Lng, maxRequestRadiusKM)
+			if err != nil {
+				t.Fatalf("planSearchTiles: %v", err)
+			}
+			lim := &tankerPacing{delay: 30 * time.Second, burst: 1, retries: retries}
+			_, _, failed, err := fetchTiledStations(context.Background(), config{APIKey: "k"}, lim, nil, centre, tiles, maxRequestRadiusKM, "all", "dist")
+			if err != nil {
+				t.Fatalf("fetchTiledStations: %v", err)
+			}
+			if failed != 1 {
+				t.Fatalf("tilesFailed = %d, want 1", failed)
+			}
+			// One tile spent 1 + retries attempts; the others one each.
+			if want := len(tiles) + retries; attempts != want {
+				t.Fatalf("%d requests for %d tiles at %d retries, want %d", attempts, len(tiles), retries, want)
+			}
+		})
 	}
 }
