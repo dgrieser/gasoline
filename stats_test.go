@@ -425,7 +425,7 @@ func TestCommandRunRecordsSuggestPersistCounters(t *testing.T) {
 	// Every persist-only counter has to be present, including the zero ones:
 	// the page renders the set, and a missing name reads as "no data".
 	for _, name := range []string{
-		"decisions_stored", "predictions_evaluated", "outcomes_scored",
+		"decisions_stored", "predictions_evaluated", "evaluation_backlog_hours", "outcomes_scored",
 		"stations_bias_corrected", "pruned_predictions", "pruned_decisions",
 		"unfed_stations", "unfed_predictions", "unfed_decisions",
 	} {

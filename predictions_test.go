@@ -361,6 +361,99 @@ func TestPersistPredictionRunStoresGridAndFlagsSuggestions(t *testing.T) {
 	}
 }
 
+// TestPersistPredictionRunFlagsEveryStationsOwnWindow pins what is_suggestion
+// means now that a run covers every station being fed rather than one city.
+// Flagging what the run prints marked the globally cheapest windows only — one
+// station out of however many are collected — so the admin accuracy page had
+// no suggested rows to show and the suggestion bias was measured off whichever
+// station happened to win. Each station's own picks are what a per-area
+// suggestion is drawn from, so those are what the grid flags.
+func TestPersistPredictionRunFlagsEveryStationsOwnWindow(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	city := cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131}
+	insertSuggestCity(t, db, city)
+	insertSuggestStation(t, db, "station-cheap", "Cheap", 52.517389, 13.395131)
+	insertSuggestStation(t, db, "station-dear", "Dear", 52.518389, 13.396131)
+	for day := 10; day <= 24; day++ {
+		when := time.Date(2026, 4, day, 0, 0, 0, 0, time.UTC)
+		insertSawtoothDay(t, db, "station-cheap", "Berlin", when, 2.00)
+		// Ten cents dearer at every hour: it never wins a global comparison.
+		insertSawtoothDay(t, db, "station-dear", "Berlin", when, 2.10)
+	}
+
+	opts := suggestOptions{
+		Fuel:        "diesel",
+		HistoryDays: 30,
+		PredictDays: 1,
+		LimitPerDay: 1,
+		Now:         time.Date(2026, 4, 25, 9, 30, 0, 0, time.UTC),
+		Location:    time.UTC,
+	}
+	computation, err := computeSuggestions(ctx, db, opts)
+	if err != nil {
+		t.Fatalf("computeSuggestions: %v", err)
+	}
+	// The printed suggestion is the run's global pick, and it is the cheap
+	// station's — the state the flag used to be built from.
+	if len(computation.Suggestions) != 1 || computation.Suggestions[0].StationID != "station-cheap" {
+		t.Fatalf("printed suggestions = %+v, want the one global pick at station-cheap", computation.Suggestions)
+	}
+	if _, _, err := persistPredictionRun(ctx, db, computation, opts); err != nil {
+		t.Fatalf("persistPredictionRun: %v", err)
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT station_id, predicted_price FROM price_predictions
+		WHERE is_suggestion = 1 ORDER BY station_id
+	`)
+	if err != nil {
+		t.Fatalf("read flagged rows: %v", err)
+	}
+	defer rows.Close()
+	flagged := map[string][]float64{}
+	for rows.Next() {
+		var (
+			stationID string
+			predicted float64
+		)
+		if err := rows.Scan(&stationID, &predicted); err != nil {
+			t.Fatalf("scan flagged row: %v", err)
+		}
+		flagged[stationID] = append(flagged[stationID], predicted)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if len(flagged) != 2 {
+		t.Fatalf("flagged stations = %v, want both — a station nobody quotes globally is still somebody's cheapest", flagged)
+	}
+	for _, stationID := range []string{"station-cheap", "station-dear"} {
+		picks := flagged[stationID]
+		if len(picks) != 1 {
+			t.Fatalf("%s has %d flagged windows, want the one LimitPerDay allows", stationID, len(picks))
+		}
+		var cheapest float64
+		if err := db.QueryRowContext(ctx,
+			`SELECT MIN(predicted_price) FROM price_predictions WHERE station_id = ?`, stationID).Scan(&cheapest); err != nil {
+			t.Fatalf("read cheapest hour for %s: %v", stationID, err)
+		}
+		if math.Abs(picks[0]-cheapest) > 1e-9 {
+			t.Fatalf("%s flagged a window at %v, want its own cheapest hour at %v", stationID, picks[0], cheapest)
+		}
+	}
+
+	// Selective, not a second name for the whole grid: the flag has to keep
+	// meaning "this window would have been suggested".
+	var total int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM price_predictions`).Scan(&total); err != nil {
+		t.Fatalf("count grid: %v", err)
+	}
+	if total <= 2*len(flagged) {
+		t.Fatalf("grid has %d rows against 2 flagged; the fixture is too small to say anything", total)
+	}
+}
+
 func TestEvaluateDuePredictionsFillsActualsAndErrors(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -418,6 +511,167 @@ func TestEvaluateDuePredictionsFillsActualsAndErrors(t *testing.T) {
 	readRow(future)
 	if evaluatedAt.Valid {
 		t.Fatal("future prediction must stay unevaluated")
+	}
+}
+
+// insertPredictionBacklog fills the due queue the way an hourly persist does:
+// every target window carries one row per run that predicted it, each with its
+// own predicted price. Returns how many rows it stored.
+func insertPredictionBacklog(t *testing.T, db *sql.DB, runID int64, stationID string, first time.Time, windows, perWindow int) int {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin backlog: %v", err)
+	}
+	defer tx.Rollback()
+	const prefix = `INSERT INTO price_predictions (run_id, station_id, fuel, target_start, target_end, predicted_price, confidence, sample_count, is_suggestion, lead_minutes, applied_correction) VALUES `
+	var (
+		placeholders string
+		args         []any
+		total        int
+		batched      int
+	)
+	flush := func() {
+		if batched == 0 {
+			return
+		}
+		if _, err := tx.ExecContext(ctx, prefix+placeholders, args...); err != nil {
+			t.Fatalf("insert backlog rows: %v", err)
+		}
+		placeholders, args, batched = "", args[:0], 0
+	}
+	for window := 0; window < windows; window++ {
+		start := first.Add(time.Duration(window) * time.Hour)
+		for lead := 0; lead < perWindow; lead++ {
+			if placeholders != "" {
+				placeholders += ", "
+			}
+			placeholders += "(?, ?, 'diesel', ?, ?, ?, 'low', 1, 0, ?, 0)"
+			args = append(args, runID, stationID,
+				start.UTC().Format(time.RFC3339), start.Add(time.Hour).UTC().Format(time.RFC3339),
+				// A distinct price per row: the actual is the window's, but the
+				// error has to stay each row's own.
+				1.50+float64(window)*0.001+float64(lead)*0.0001, (lead+1)*60)
+			total++
+			batched++
+			if batched == 80 {
+				flush()
+			}
+		}
+	}
+	flush()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit backlog: %v", err)
+	}
+	return total
+}
+
+// TestEvaluateDuePredictionsDrainsBacklogPastOneBatch is the regression test
+// for an evaluation that fell permanently behind. Predictions become due far
+// faster than one row at a time — every hourly run re-predicts the same window,
+// so a single target hour arrives carrying dozens of rows — and while a run
+// settled a fixed few thousand rows and stopped, the arrears grew every hour.
+// Nothing failed; the admin accuracy page simply stopped seeing recent windows.
+func TestEvaluateDuePredictionsDrainsBacklogPastOneBatch(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+	first := time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC)
+	const windows = 60
+	// One recorded price per target hour, so every window can be measured.
+	for window := 0; window < windows; window++ {
+		insertSuggestSnapshot(t, db, "station-1", "Berlin", first.Add(time.Duration(window)*time.Hour), 1.60+float64(window)*0.002, true)
+	}
+	runID := insertPredictionRunRow(t, db, first)
+	// Comfortably past one batch, so a run that stops at its read limit leaves
+	// the tail behind.
+	perWindow := evaluateBatchRows/windows + 10
+	total := insertPredictionBacklog(t, db, runID, "station-1", first, windows, perWindow)
+	if total <= evaluateBatchRows {
+		t.Fatalf("fixture has %d rows, want more than one batch of %d", total, evaluateBatchRows)
+	}
+
+	now := first.Add(windows * time.Hour)
+	measured, err := evaluateDuePredictions(ctx, db, "diesel", now)
+	if err != nil {
+		t.Fatalf("evaluateDuePredictions: %v", err)
+	}
+	if measured != total {
+		t.Fatalf("measured = %d, want every one of the %d due rows", measured, total)
+	}
+
+	var pending int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM price_predictions WHERE evaluated_at IS NULL`).Scan(&pending); err != nil {
+		t.Fatalf("count unevaluated: %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("%d rows left unevaluated: the backlog outlived the run", pending)
+	}
+	if _, ok, err := oldestPendingEvaluation(ctx, db, "diesel", now); err != nil || ok {
+		t.Fatalf("oldestPendingEvaluation = ok %v, err %v; want nothing pending", ok, err)
+	}
+
+	// One price is looked up per window and written across its whole stack, so
+	// the actual is the window's — but the error still measures each row's own
+	// prediction.
+	var mismatched int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM price_predictions
+		WHERE actual_price IS NULL OR error IS NULL
+			OR ABS(error - (actual_price - predicted_price)) > 0.000000001
+	`).Scan(&mismatched); err != nil {
+		t.Fatalf("count mismatched errors: %v", err)
+	}
+	if mismatched != 0 {
+		t.Fatalf("%d rows carry an error that is not actual - their own predicted price", mismatched)
+	}
+
+	// The stack of one window all settled against the same recorded price.
+	var distinct int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT actual_price) FROM price_predictions WHERE target_start = ?
+	`, first.UTC().Format(time.RFC3339)).Scan(&distinct); err != nil {
+		t.Fatalf("count distinct actuals: %v", err)
+	}
+	if distinct != 1 {
+		t.Fatalf("one window settled to %d different prices, want 1", distinct)
+	}
+}
+
+// TestEvaluateDuePredictionsStopsAtTheRunLimit pins the other side of the
+// drain: a backlog beyond what one run should chew through is left for the
+// next run rather than read in full.
+func TestEvaluateDuePredictionsStopsAtTheRunLimit(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	insertSuggestStation(t, db, "station-1", "Station 1", 52.517389, 13.395131)
+	first := time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC)
+	// One window per row: the read limit is then also the window limit, which
+	// is what makes a fixture of this size affordable.
+	windows := evaluateRunRowLimit/evaluateBatchRows + 2
+	runID := insertPredictionRunRow(t, db, first)
+	total := insertPredictionBacklog(t, db, runID, "station-1", first, windows, evaluateBatchRows)
+
+	now := first.Add(time.Duration(windows) * time.Hour)
+	if _, err := evaluateDuePredictions(ctx, db, "diesel", now); err != nil {
+		t.Fatalf("evaluateDuePredictions: %v", err)
+	}
+	var settled int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM price_predictions WHERE evaluated_at IS NOT NULL`).Scan(&settled); err != nil {
+		t.Fatalf("count evaluated: %v", err)
+	}
+	// At least the limit, because the batch that reaches it still finishes the
+	// window it is standing in — a window is never left half settled — and well
+	// short of the fixture, because the rest waits for the next run.
+	if settled < evaluateRunRowLimit || settled >= total {
+		t.Fatalf("settled %d of %d rows, want at least the run's limit of %d and not all of it",
+			settled, total, evaluateRunRowLimit)
+	}
+	if _, ok, err := oldestPendingEvaluation(ctx, db, "diesel", now); err != nil || !ok {
+		t.Fatalf("oldestPendingEvaluation = ok %v, err %v; want the rest still pending", ok, err)
 	}
 }
 
