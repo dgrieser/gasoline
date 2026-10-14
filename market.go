@@ -50,6 +50,17 @@ const (
 	// request per futures series; the free plan's daily quota does not cover a
 	// long backfill, OilPriceAPI's trial does.
 	marketBackfillMaxDays = 90
+	// marketBackfillRequestGap spaces backfill requests. OilPriceAPI allows 60
+	// requests per rolling minute on every plan; a backfill sent back to back
+	// ran into it after about 60 and lost the most recent days.
+	marketBackfillRequestGap = 1100 * time.Millisecond
+	// marketRateLimitAttempts is how often one request is tried when the API
+	// answers 429; between tries the client waits what the API asks for
+	// (marketRetryAfterDefault when it does not say), at most
+	// marketRetryAfterMax.
+	marketRateLimitAttempts = 3
+	marketRetryAfterDefault = 5 * time.Second
+	marketRetryAfterMax     = 60 * time.Second
 
 	// marketPriceMaxAge is how old the last futures observation before a
 	// moment may be and still stand for the price at that moment. Futures do
@@ -192,18 +203,25 @@ func collectMarket(ctx context.Context, db *sql.DB, d dialect, endpoints marketE
 		prices = append(prices, latest...)
 		for day := backfillDays; day >= 1; day-- {
 			date := now.AddDate(0, 0, -day).Format("2006-01-02")
+			complete := true
 			for _, family := range []struct{ path, series string }{
 				{"ice-gasoil", marketSeriesGasoil},
 				{"ice-brent", marketSeriesBrent},
 			} {
+				if err := marketSleep(ctx, marketBackfillRequestGap); err != nil {
+					return result, err
+				}
 				hourly, err := fetchOilPriceIntraday(ctx, endpoints.OilPriceAPI, apiKey, family.path, family.series, date)
 				if err != nil {
 					result.Warnings = append(result.Warnings, fmt.Sprintf("backfill %s %s: %v", family.series, date, err))
+					complete = false
 					continue
 				}
 				prices = append(prices, hourly...)
 			}
-			result.Backfilled++
+			if complete {
+				result.Backfilled++
+			}
 		}
 	}
 
@@ -234,6 +252,31 @@ func collectMarket(ctx context.Context, db *sql.DB, d dialect, endpoints marketE
 	return result, err
 }
 
+// marketSleep waits d or until ctx ends. Tests replace it to run instantly.
+var marketSleep = func(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// marketHTTPError is a non-200 answer. RetryAfter is what a 429 asked for,
+// from the Retry-After header or OilPriceAPI's retry_after body field; zero
+// when it did not say.
+type marketHTTPError struct {
+	Status     int
+	RetryAfter time.Duration
+	Body       string
+}
+
+func (e *marketHTTPError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
+}
+
 func marketGet(ctx context.Context, rawURL, apiKey string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -255,20 +298,54 @@ func marketGet(ctx context.Context, rawURL, apiKey string) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		snippet := strings.TrimSpace(string(body))
-		if len(snippet) > 200 {
-			snippet = snippet[:200]
+		httpErr := &marketHTTPError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if seconds, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && seconds > 0 {
+				httpErr.RetryAfter = time.Duration(seconds) * time.Second
+			} else {
+				var hint struct {
+					RetryAfter float64 `json:"retry_after"`
+				}
+				if json.Unmarshal(body, &hint) == nil && hint.RetryAfter > 0 {
+					httpErr.RetryAfter = time.Duration(hint.RetryAfter * float64(time.Second))
+				}
+			}
 		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
+		if len(httpErr.Body) > 200 {
+			httpErr.Body = httpErr.Body[:200]
+		}
+		return nil, httpErr
 	}
 	return body, nil
+}
+
+// oilPriceGet is marketGet for OilPriceAPI: a 429 is waited out and retried,
+// up to marketRateLimitAttempts tries in all.
+func oilPriceGet(ctx context.Context, rawURL, apiKey string) ([]byte, error) {
+	for attempt := 1; ; attempt++ {
+		body, err := marketGet(ctx, rawURL, apiKey)
+		var httpErr *marketHTTPError
+		if err == nil || attempt >= marketRateLimitAttempts || !errors.As(err, &httpErr) || httpErr.Status != http.StatusTooManyRequests {
+			return body, err
+		}
+		wait := httpErr.RetryAfter
+		if wait <= 0 {
+			wait = marketRetryAfterDefault
+		}
+		if wait > marketRetryAfterMax {
+			wait = marketRetryAfterMax
+		}
+		if err := marketSleep(ctx, wait); err != nil {
+			return nil, err
+		}
+	}
 }
 
 // fetchOilPriceLatest reads the latest gasoil and Brent front-month prices in
 // one request. The observation time is the market's as_of when given.
 func fetchOilPriceLatest(ctx context.Context, baseURL, apiKey string, now time.Time) ([]marketPrice, error) {
 	query := url.Values{"by_code": {"GASOIL_FUTURES,BRENT_CRUDE_USD"}}
-	body, err := marketGet(ctx, strings.TrimRight(baseURL, "/")+"/prices/latest?"+query.Encode(), apiKey)
+	body, err := oilPriceGet(ctx, strings.TrimRight(baseURL, "/")+"/prices/latest?"+query.Encode(), apiKey)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +408,7 @@ func fetchOilPriceLatest(ctx context.Context, baseURL, apiKey string, now time.T
 // resolution: the last price in each UTC hour.
 func fetchOilPriceIntraday(ctx context.Context, baseURL, apiKey, familyPath, series, date string) ([]marketPrice, error) {
 	query := url.Values{"date": {date}}
-	body, err := marketGet(ctx, strings.TrimRight(baseURL, "/")+"/futures/"+familyPath+"/intraday?"+query.Encode(), apiKey)
+	body, err := oilPriceGet(ctx, strings.TrimRight(baseURL, "/")+"/futures/"+familyPath+"/intraday?"+query.Encode(), apiKey)
 	if err != nil {
 		return nil, err
 	}

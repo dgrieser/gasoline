@@ -75,6 +75,19 @@ func fakeMarketServer(t *testing.T, requests *[]string) *httptest.Server {
 	return server
 }
 
+// stubMarketSleep makes the collector's waits instant and records them.
+func stubMarketSleep(t *testing.T) *[]time.Duration {
+	t.Helper()
+	var waits []time.Duration
+	original := marketSleep
+	marketSleep = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+	t.Cleanup(func() { marketSleep = original })
+	return &waits
+}
+
 func testMarketEndpoints(server *httptest.Server) marketEndpoints {
 	return marketEndpoints{
 		OilPriceAPI: server.URL + "/v1",
@@ -130,6 +143,7 @@ func TestCollectMarketStoresLatestAndRates(t *testing.T) {
 func TestCollectMarketBackfillsTheFrontMonthHourly(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
+	waits := stubMarketSleep(t)
 	var requests []string
 	server := fakeMarketServer(t, &requests)
 	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
@@ -158,6 +172,71 @@ func TestCollectMarketBackfillsTheFrontMonthHourly(t *testing.T) {
 	}
 	if !sawHistory {
 		t.Fatalf("backfill did not read the ECB history: %v", requests)
+	}
+	// Every backfill request is paced, so a long backfill stays under the
+	// per-minute limit.
+	if len(*waits) != 2 || (*waits)[0] != marketBackfillRequestGap {
+		t.Fatalf("waits = %v, want one gap before each of the two backfill requests", *waits)
+	}
+}
+
+// TestCollectMarketWaitsOutTheRateLimit pins the 429 handling: the request is
+// retried after the wait the API asked for, and a day whose requests still fail
+// is reported and not counted as backfilled.
+func TestCollectMarketWaitsOutTheRateLimit(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name       string
+		limited    int // intraday requests answered 429 before the API recovers
+		backfilled int
+		warnings   int
+	}{
+		{"one 429 is waited out", 1, 1, 0},
+		{"a lasting 429 gives up and reports the day", 100, 0, 1},
+	} {
+		db := openTestDB(t)
+		waits := stubMarketSleep(t)
+		limited := tc.limited
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/prices/latest":
+				_, _ = w.Write([]byte(latestFixture))
+			case "/v1/futures/ice-gasoil/intraday":
+				if limited > 0 {
+					limited--
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":"Rate limit exceeded","error_code":"RATE_LIMIT_EXCEEDED","retry_after":4}`))
+					return
+				}
+				_, _ = w.Write([]byte(gasoilIntradayFixture))
+			case "/v1/futures/ice-brent/intraday":
+				_, _ = w.Write([]byte(brentIntradayFixture))
+			default:
+				_, _ = w.Write([]byte(ecbFixture))
+			}
+		}))
+		result, err := collectMarket(ctx, db, dialectSQLite, testMarketEndpoints(server), "test-key", now, 1)
+		server.Close()
+		if err != nil {
+			t.Fatalf("%s: collectMarket: %v", tc.name, err)
+		}
+		if result.Backfilled != tc.backfilled || len(result.Warnings) != tc.warnings {
+			t.Fatalf("%s: backfilled %d with warnings %v, want %d and %d warnings", tc.name, result.Backfilled, result.Warnings, tc.backfilled, tc.warnings)
+		}
+		var retryWaits int
+		for _, wait := range *waits {
+			if wait == 4*time.Second {
+				retryWaits++
+			}
+		}
+		wantRetryWaits := tc.limited
+		if wantRetryWaits > marketRateLimitAttempts-1 {
+			wantRetryWaits = marketRateLimitAttempts - 1
+		}
+		if retryWaits != wantRetryWaits {
+			t.Fatalf("%s: waits = %v, want %d waits of the 4 s the API asked for", tc.name, *waits, wantRetryWaits)
+		}
 	}
 }
 
