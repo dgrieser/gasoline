@@ -941,3 +941,50 @@ func queryLimit(d dialect, limit int) int64 {
 	}
 	return -1
 }
+
+// mysqlDeadlockErrorNumber is ER_LOCK_DEADLOCK. InnoDB has already rolled the
+// victim's whole transaction back and asks for it to be restarted.
+const mysqlDeadlockErrorNumber = 1213
+
+// deadlockRetryAttempts is how often a self-contained transaction is tried
+// when MySQL picks it as a deadlock victim.
+const deadlockRetryAttempts = 3
+
+// deadlockRetryBackoff is the wait before the next try, multiplied by the
+// try number. The other side is normally an update sweep, which commits within
+// seconds.
+var deadlockRetryBackoff = 500 * time.Millisecond
+
+func isMySQLDeadlock(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlDeadlockErrorNumber
+}
+
+// retryOnDeadlock runs fn, which must own one complete transaction, again when
+// MySQL rolled it back as a deadlock victim. Any other outcome is returned at
+// once.
+//
+// suggest --persist needs it: a prediction run inserts thousands of rows whose
+// station_id foreign key takes a shared lock on each referenced stations row,
+// while `update` upserts those same rows in its own order. When the two
+// overlap, InnoDB breaks the cycle by rolling one back — usually the large
+// insert — and that fuel's whole run used to be lost for the hour.
+func retryOnDeadlock(ctx context.Context, fn func() error) error {
+	var err error
+	for attempt := 1; attempt <= deadlockRetryAttempts; attempt++ {
+		if err = fn(); err == nil || !isMySQLDeadlock(err) {
+			return err
+		}
+		if attempt == deadlockRetryAttempts {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt) * deadlockRetryBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
