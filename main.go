@@ -613,8 +613,8 @@ Commands:
                 measures the admin accuracy page, "doctor dashboard" the
                 dashboard, "doctor all" both (--optimize additionally rebuilds
                 tables to reclaim space)
-  market        store the latest wholesale futures (ICE Gasoil, Brent; needs
-                OILPRICEAPI_KEY) and the ECB euro rate; "market backtest"
+  market        store the latest wholesale futures (ICE Gasoil, Brent, RBOB;
+                needs OILPRICEAPI_KEY) and the ECB euro rate; "market backtest"
                 measures how well they predict the daily noon raise
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
@@ -658,6 +658,7 @@ Examples:
   gasoline market
   gasoline market --backfill-days 45
   gasoline market backtest --fuel diesel --series gasoil
+  gasoline market backtest --fuel e5 --series rbob
   gasoline import cities DE
   gasoline clear cities`)
 }

@@ -5,7 +5,6 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +14,7 @@ import (
 const latestFixture = `{"status":"success","data":{"prices":[
 	{"price":1451.75,"formatted":"$1451.75","currency":"USD","code":"GASOIL_FUTURES_2026_11","created_at":"2026-10-14T12:32:23.377Z","type":"futures","unit":"tonne","data_status":"current","as_of":"2026-10-14T12:22:00.000Z"},
 	{"price":105.81,"formatted":"$105.81","currency":"USD","code":"BRENT_CRUDE_USD","created_at":"2026-10-14T12:31:18.802Z","type":"spot_price","unit":"barrel","data_status":"current","as_of":"2026-10-14T12:21:00.000Z"},
+	{"price":3.26,"formatted":"$3.26","currency":"USD","code":"GASOLINE_RBOB_USD","created_at":"2026-10-14T12:14:43.608Z","type":"spot_price","unit":"gallon","data_status":"current","as_of":"2026-10-14T12:26:56.000Z"},
 	{"price":99.0,"code":"WTI_USD","currency":"USD","unit":"barrel","data_status":"current"}
 ],"metadata":{"request_id":"x","timestamp":"2026-10-14T12:37:10Z","version":"v1"}}}`
 
@@ -31,6 +31,11 @@ const gasoilIntradayFixture = `{"commodity":"GASOIL_FUTURES","date":"2026-10-08"
 const brentIntradayFixture = `{"commodity":"BRENT_FUTURES","date":"2026-10-08","contracts":[
 	{"contract_month":"2026-12","contract_code":"BRENT_FUTURES_2026_12","price_data":[
 		{"timestamp":"2026-10-08T08:36:21Z","price":101.5,"currency":"USD"}]}
+]}`
+
+const rbobIntradayFixture = `{"commodity":"GASOLINE_RBOB_FUTURES","date":"2026-10-08","contracts":[
+	{"code":"RBX6","contract_month":"2026-11","contract_code":"RBOB_FUTURES_2026_11","price_data":[
+		{"timestamp":"2026-10-08T08:05:32.553Z","price":3.2666,"price_decimal":"3.2666","currency":"USD","unit":"gallon","volume":110}]}
 ]}`
 
 const ecbFixture = `<?xml version="1.0" encoding="UTF-8"?>
@@ -57,7 +62,7 @@ func fakeMarketServer(t *testing.T, requests *[]string) *httptest.Server {
 		}
 		switch {
 		case r.URL.Path == "/v1/prices/latest":
-			if got := r.URL.Query().Get("by_code"); got != "GASOIL_FUTURES,BRENT_CRUDE_USD" {
+			if got := r.URL.Query().Get("by_code"); got != "GASOIL_FUTURES,BRENT_CRUDE_USD,GASOLINE_RBOB_USD" {
 				t.Errorf("by_code = %q", got)
 			}
 			_, _ = w.Write([]byte(latestFixture))
@@ -65,6 +70,8 @@ func fakeMarketServer(t *testing.T, requests *[]string) *httptest.Server {
 			_, _ = w.Write([]byte(gasoilIntradayFixture))
 		case r.URL.Path == "/v1/futures/ice-brent/intraday":
 			_, _ = w.Write([]byte(brentIntradayFixture))
+		case r.URL.Path == "/v1/futures/rbob/intraday":
+			_, _ = w.Write([]byte(rbobIntradayFixture))
 		case r.URL.Path == "/ecb/daily.xml", r.URL.Path == "/ecb/hist.xml":
 			_, _ = w.Write([]byte(ecbFixture))
 		default:
@@ -110,9 +117,9 @@ func TestCollectMarketStoresLatestAndRates(t *testing.T) {
 	if len(result.Warnings) != 0 {
 		t.Fatalf("warnings = %v", result.Warnings)
 	}
-	// Gasoil + Brent (WTI is not ours) + two ECB days.
-	if result.Fetched != 4 || result.Stored != 4 {
-		t.Fatalf("fetched %d stored %d, want 4 and 4", result.Fetched, result.Stored)
+	// Gasoil + Brent + RBOB (WTI is not ours) + two ECB days.
+	if result.Fetched != 5 || result.Stored != 5 {
+		t.Fatalf("fetched %d stored %d, want 5 and 5", result.Fetched, result.Stored)
 	}
 	gasoil, err := loadMarketPrices(ctx, db, marketSeriesGasoil, now.Add(-time.Hour), now)
 	if err != nil {
@@ -121,6 +128,13 @@ func TestCollectMarketStoresLatestAndRates(t *testing.T) {
 	if len(gasoil) != 1 || gasoil[0].Price != 1451.75 || gasoil[0].Contract != "GASOIL_FUTURES_2026_11" ||
 		!gasoil[0].ObservedAt.Equal(time.Date(2026, 10, 14, 12, 22, 0, 0, time.UTC)) {
 		t.Fatalf("gasoil = %+v, want the as_of quote", gasoil)
+	}
+	rbob, err := loadMarketPrices(ctx, db, marketSeriesRBOB, now.Add(-time.Hour), now)
+	if err != nil {
+		t.Fatalf("loadMarketPrices: %v", err)
+	}
+	if len(rbob) != 1 || rbob[0].Price != 3.26 || rbob[0].Unit != "gallon" {
+		t.Fatalf("rbob = %+v, want the 3.26 USD per gallon quote", rbob)
 	}
 	rates, err := loadMarketPrices(ctx, db, marketSeriesEURUSD, now.AddDate(0, 0, -5), now)
 	if err != nil {
@@ -164,6 +178,13 @@ func TestCollectMarketBackfillsTheFrontMonthHourly(t *testing.T) {
 	if len(gasoil) != 2 || gasoil[0].Price != 1410.0 || gasoil[1].Price != 1420.0 || gasoil[0].Contract != "GASOIL_FUTURES_2026_10" {
 		t.Fatalf("backfilled gasoil = %+v, want hourly 1410 then 1420 from the October contract", gasoil)
 	}
+	rbob, err := loadMarketPrices(ctx, db, marketSeriesRBOB, time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 8, 23, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("loadMarketPrices: %v", err)
+	}
+	if len(rbob) != 1 || rbob[0].Price != 3.2666 || rbob[0].Contract != "RBOB_FUTURES_2026_11" || rbob[0].Unit != "gallon" {
+		t.Fatalf("backfilled rbob = %+v, want the November contract in USD per gallon", rbob)
+	}
 	var sawHistory bool
 	for _, path := range requests {
 		if path == "/ecb/hist.xml" {
@@ -175,8 +196,8 @@ func TestCollectMarketBackfillsTheFrontMonthHourly(t *testing.T) {
 	}
 	// Every backfill request is paced, so a long backfill stays under the
 	// per-minute limit.
-	if len(*waits) != 2 || (*waits)[0] != marketBackfillRequestGap {
-		t.Fatalf("waits = %v, want one gap before each of the two backfill requests", *waits)
+	if len(*waits) != len(marketFutures) || (*waits)[0] != marketBackfillRequestGap {
+		t.Fatalf("waits = %v, want one gap before each of the %d backfill requests", *waits, len(marketFutures))
 	}
 }
 
@@ -212,6 +233,8 @@ func TestCollectMarketWaitsOutTheRateLimit(t *testing.T) {
 				_, _ = w.Write([]byte(gasoilIntradayFixture))
 			case "/v1/futures/ice-brent/intraday":
 				_, _ = w.Write([]byte(brentIntradayFixture))
+			case "/v1/futures/rbob/intraday":
+				_, _ = w.Write([]byte(rbobIntradayFixture))
 			default:
 				_, _ = w.Write([]byte(ecbFixture))
 			}
@@ -333,10 +356,11 @@ func TestWholesaleMoveUsesWallClockAnchorOnDSTDays(t *testing.T) {
 	}
 }
 
-// TestMarketBacktestFindsTheWholesaleRelation runs the backtest pieces on a
-// synthetic market whose noon raise is exactly 1.19 times the gasoil move per
-// liter (VAT on top), and checks the fit recovers it and beats a flat level.
-func TestMarketBacktestFindsTheWholesaleRelation(t *testing.T) {
+// syntheticWholesaleMarket is a market whose noon raise is exactly 1.19 times
+// the gasoil move per liter (VAT on top), over six stations and 20 days from
+// Sep 1 2026 (UTC). step adds a market-wide level change by time, for a tax
+// change on top of the wholesale-driven level.
+func syntheticWholesaleMarket(step func(at time.Time) float64) (intervals []priceInterval, futures, rates []marketPrice, now time.Time) {
 	firstDay := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	const days = 20
 	rate := 1.10
@@ -353,7 +377,6 @@ func TestMarketBacktestFindsTheWholesaleRelation(t *testing.T) {
 	for i := 1; i < days; i++ {
 		levels[i] = levels[i-1] + 1.19*(gasoil[i]-gasoil[i-1])/rate/litersPerGasoilTonne
 	}
-	var intervals []priceInterval
 	for _, station := range []string{"s1", "s2", "s3", "s4", "s5", "s6"} {
 		for _, interval := range sawtoothIntervals(station, firstDay, days, func(int) float64 { return 0 }) {
 			// The level steps at noon: hours before noon belong to the
@@ -365,41 +388,104 @@ func TestMarketBacktestFindsTheWholesaleRelation(t *testing.T) {
 			if day < 0 {
 				day = 0
 			}
-			interval.Price += levels[day]
+			interval.Price += levels[day] + step(interval.Start)
 			intervals = append(intervals, interval)
 		}
 	}
-	var futures, rates []marketPrice
 	for i := 0; i < days; i++ {
 		day := firstDay.AddDate(0, 0, i)
 		futures = append(futures, marketPrice{ObservedAt: day.Add(9 * time.Hour), Price: gasoil[i]})
 		futures = append(futures, marketPrice{ObservedAt: day.Add(12 * time.Hour), Price: gasoil[i]})
 		rates = append(rates, marketPrice{ObservedAt: day, Price: rate})
 	}
-	now := firstDay.AddDate(0, 0, days)
+	return intervals, futures, rates, firstDay.AddDate(0, 0, days)
+}
 
-	anchor, jumps := marketJumps(intervals, now, time.UTC)
-	if anchor != 12 {
-		t.Fatalf("anchor = %d, want 12", anchor)
+// TestMarketBacktestFindsTheWholesaleRelation checks the backtest recovers the
+// synthetic market's 1.19 and beats a flat level.
+func TestMarketBacktestFindsTheWholesaleRelation(t *testing.T) {
+	intervals, futures, rates, now := syntheticWholesaleMarket(func(time.Time) float64 { return 0 })
+	result := marketBacktest(intervals, nil, marketSeriesGasoil, futures, rates, now, time.UTC)
+	if result.AnchorHour != 12 {
+		t.Fatalf("anchor = %d, want 12", result.AnchorHour)
 	}
-	var dayList []string
-	moves := make(map[string]float64)
-	for day := range jumps {
-		dayList = append(dayList, day)
-		if move, ok := wholesaleMoveEuroPerLiter(marketSeriesGasoil, futures, rates, day, anchor, time.UTC); ok {
-			moves[day] = move
-		}
-	}
-	sort.Strings(dayList)
-	result := fitJumpBacktest(dayList, jumps, moves)
 	if result.Days < 10 {
-		t.Fatalf("only %d days paired: jumps %v moves %v", result.Days, jumps, moves)
+		t.Fatalf("only %d days paired: %+v", result.Days, result.Rows)
 	}
 	if math.Abs(result.Slope-1.19) > 0.02 || result.R2 < 0.99 {
 		t.Fatalf("slope %.3f R² %.3f, want 1.19 and a near-perfect fit", result.Slope, result.R2)
 	}
 	if result.MAEFitCt >= result.MAEFlatCt {
 		t.Fatalf("fit MAE %.3f ct does not beat the flat level's %.3f ct", result.MAEFitCt, result.MAEFlatCt)
+	}
+	if result.EventDays != 0 {
+		t.Fatalf("left out %d days without any price event", result.EventDays)
+	}
+}
+
+// TestMarketBacktestLeavesOutPriceEventDays puts a tax cut into the synthetic
+// market at midnight, passed on only in part (13.7 of 16.7 ct), as the
+// Tankrabatt was on Oct 1 2026. Without the event the one tax day ruins the
+// fit; with it the two jumps that span the cut are left out and the wholesale
+// relation is found again.
+func TestMarketBacktestLeavesOutPriceEventDays(t *testing.T) {
+	cut := time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC)
+	intervals, futures, rates, now := syntheticWholesaleMarket(func(at time.Time) float64 {
+		if at.Before(cut) {
+			return 0
+		}
+		return -0.137
+	})
+	events := []priceEvent{{EffectiveAt: cut, Fuel: priceEventAllFuels, Delta: -0.167}}
+
+	unaware := marketBacktest(intervals, nil, marketSeriesGasoil, futures, rates, now, time.UTC)
+	if unaware.R2 > 0.5 {
+		t.Fatalf("without the event R² is %.3f; the tax day should spoil the fit", unaware.R2)
+	}
+	result := marketBacktest(intervals, events, marketSeriesGasoil, futures, rates, now, time.UTC)
+	// The cut lands inside the Sep 11 pricing day, so the jumps of Sep 11
+	// and Sep 12 both span it.
+	if result.EventDays != 2 {
+		t.Fatalf("left out %d days, want the 2 jumps around the cut", result.EventDays)
+	}
+	for _, row := range result.Rows {
+		if row.Day == "2026-09-11" || row.Day == "2026-09-12" {
+			t.Fatalf("day %s spans the cut but was fitted", row.Day)
+		}
+	}
+	if math.Abs(result.Slope-1.19) > 0.02 || result.R2 < 0.99 {
+		t.Fatalf("slope %.3f R² %.3f, want 1.19 and a near-perfect fit with the event known", result.Slope, result.R2)
+	}
+}
+
+func TestJumpSpansPriceEventBounds(t *testing.T) {
+	event := func(at time.Time) []priceEvent {
+		return []priceEvent{{EffectiveAt: at, Fuel: priceEventAllFuels, Delta: 0.167}}
+	}
+	noonJan1 := time.Date(2027, 1, 1, 12, 0, 0, 0, time.UTC)
+	// A raise at the Jan 1 noon is the Jan 1 jump itself; the Jan 2 jump
+	// compares two levels that both include it.
+	if !jumpSpansPriceEvent(event(noonJan1), "2027-01-01", 12, time.UTC) {
+		t.Fatal("the jump at the event's own noon does not span it")
+	}
+	if jumpSpansPriceEvent(event(noonJan1), "2027-01-02", 12, time.UTC) {
+		t.Fatal("the day after a noon event was left out")
+	}
+	if jumpSpansPriceEvent(event(noonJan1), "2026-12-31", 12, time.UTC) {
+		t.Fatal("the day before a noon event was left out")
+	}
+}
+
+func TestWholesaleMoveConvertsRBOBGallons(t *testing.T) {
+	day := time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC)
+	rates := []marketPrice{{ObservedAt: day.AddDate(0, 0, -1), Price: 1.0}}
+	futures := []marketPrice{
+		{ObservedAt: day.Add(-12 * time.Hour), Price: 3.20},
+		{ObservedAt: day.Add(11 * time.Hour), Price: 3.30},
+	}
+	move, ok := wholesaleMoveEuroPerLiter(marketSeriesRBOB, futures, rates, "2026-10-13", 12, time.UTC)
+	if !ok || math.Abs(move-0.10/litersPerGallon) > 1e-9 {
+		t.Fatalf("move = %v %v, want 10 US cents per gallon in euro per liter", move, ok)
 	}
 }
 

@@ -22,7 +22,9 @@ import (
 // Wholesale market data.
 //
 // Retail prices follow the wholesale market: diesel tracks ICE Low Sulphur
-// Gasoil, petrol tracks crude, both converted at the euro/dollar rate. Under the
+// Gasoil, petrol tracks crude and the gasoline crack, all converted at the
+// euro/dollar rate. OilPriceAPI carries no European gasoline benchmark
+// (Eurobob), so NYMEX RBOB stands in for it next to Brent. Under the
 // once-per-day-raise rule the day's raise lands at noon, hours after the
 // morning's futures trading, so the wholesale move since the previous noon may
 // say in advance how large the next raise will be. Whether it does, and by how
@@ -40,11 +42,13 @@ const (
 	// Series stored in market_prices.
 	marketSeriesGasoil = "gasoil" // ICE Low Sulphur Gasoil front month, USD per tonne
 	marketSeriesBrent  = "brent"  // ICE Brent front month, USD per barrel
+	marketSeriesRBOB   = "rbob"   // NYMEX RBOB gasoline front month, USD per gallon
 	marketSeriesEURUSD = "eurusd" // ECB euro reference rate, USD per EUR
 
 	// Volume conversions to euro per liter.
 	litersPerGasoilTonne = 1183.0 // at a diesel density of 0.845 kg/l
 	litersPerBarrel      = 158.987
+	litersPerGallon      = 3.785411784
 
 	// marketBackfillMaxDays bounds --backfill-days. Every day costs one
 	// request per futures series; the free plan's daily quota does not cover a
@@ -74,6 +78,32 @@ const (
 	// change makes a market jump.
 	marketJumpMinStations = 5
 )
+
+// marketFuture is one futures series: OilPriceAPI's code for its latest
+// price (a prefix; gasoil answers with the dated contract), the futures family
+// whose intraday prices backfill it, and its quote unit.
+type marketFuture struct {
+	Series string
+	Code   string
+	Family string
+	Unit   string
+	Liters float64 // liters per quoted unit
+}
+
+var marketFutures = []marketFuture{
+	{Series: marketSeriesGasoil, Code: "GASOIL_FUTURES", Family: "ice-gasoil", Unit: "tonne", Liters: litersPerGasoilTonne},
+	{Series: marketSeriesBrent, Code: "BRENT_CRUDE_USD", Family: "ice-brent", Unit: "barrel", Liters: litersPerBarrel},
+	{Series: marketSeriesRBOB, Code: "GASOLINE_RBOB_USD", Family: "rbob", Unit: "gallon", Liters: litersPerGallon},
+}
+
+func marketFutureFor(series string) (marketFuture, bool) {
+	for _, future := range marketFutures {
+		if future.Series == series {
+			return future, true
+		}
+	}
+	return marketFuture{}, false
+}
 
 // marketEndpoints are the upstream URLs; tests point them at a fake server.
 type marketEndpoints struct {
@@ -204,16 +234,13 @@ func collectMarket(ctx context.Context, db *sql.DB, d dialect, endpoints marketE
 		for day := backfillDays; day >= 1; day-- {
 			date := now.AddDate(0, 0, -day).Format("2006-01-02")
 			complete := true
-			for _, family := range []struct{ path, series string }{
-				{"ice-gasoil", marketSeriesGasoil},
-				{"ice-brent", marketSeriesBrent},
-			} {
+			for _, future := range marketFutures {
 				if err := marketSleep(ctx, marketBackfillRequestGap); err != nil {
 					return result, err
 				}
-				hourly, err := fetchOilPriceIntraday(ctx, endpoints.OilPriceAPI, apiKey, family.path, family.series, date)
+				hourly, err := fetchOilPriceIntraday(ctx, endpoints.OilPriceAPI, apiKey, future, date)
 				if err != nil {
-					result.Warnings = append(result.Warnings, fmt.Sprintf("backfill %s %s: %v", family.series, date, err))
+					result.Warnings = append(result.Warnings, fmt.Sprintf("backfill %s %s: %v", future.Series, date, err))
 					complete = false
 					continue
 				}
@@ -341,10 +368,15 @@ func oilPriceGet(ctx context.Context, rawURL, apiKey string) ([]byte, error) {
 	}
 }
 
-// fetchOilPriceLatest reads the latest gasoil and Brent front-month prices in
-// one request. The observation time is the market's as_of when given.
+// fetchOilPriceLatest reads the latest front-month price of every series in
+// marketFutures in one request. The observation time is the market's as_of
+// when given.
 func fetchOilPriceLatest(ctx context.Context, baseURL, apiKey string, now time.Time) ([]marketPrice, error) {
-	query := url.Values{"by_code": {"GASOIL_FUTURES,BRENT_CRUDE_USD"}}
+	codes := make([]string, 0, len(marketFutures))
+	for _, future := range marketFutures {
+		codes = append(codes, future.Code)
+	}
+	query := url.Values{"by_code": {strings.Join(codes, ",")}}
 	body, err := oilPriceGet(ctx, strings.TrimRight(baseURL, "/")+"/prices/latest?"+query.Encode(), apiKey)
 	if err != nil {
 		return nil, err
@@ -372,12 +404,13 @@ func fetchOilPriceLatest(ctx context.Context, baseURL, apiKey string, now time.T
 	var prices []marketPrice
 	for _, item := range payload.Data.Prices {
 		series := ""
-		switch {
-		case strings.HasPrefix(item.Code, "GASOIL_FUTURES"):
-			series = marketSeriesGasoil
-		case strings.HasPrefix(item.Code, "BRENT_CRUDE_USD"):
-			series = marketSeriesBrent
-		default:
+		for _, future := range marketFutures {
+			if strings.HasPrefix(item.Code, future.Code) {
+				series = future.Series
+				break
+			}
+		}
+		if series == "" {
 			continue
 		}
 		if item.DataStatus == "stale" || item.Price <= 0 {
@@ -406,9 +439,9 @@ func fetchOilPriceLatest(ctx context.Context, baseURL, apiKey string, now time.T
 // fetchOilPriceIntraday reads one day of 5-minute futures prices and keeps the
 // front month — the earliest contract month that traded that day — at hourly
 // resolution: the last price in each UTC hour.
-func fetchOilPriceIntraday(ctx context.Context, baseURL, apiKey, familyPath, series, date string) ([]marketPrice, error) {
+func fetchOilPriceIntraday(ctx context.Context, baseURL, apiKey string, future marketFuture, date string) ([]marketPrice, error) {
 	query := url.Values{"date": {date}}
-	body, err := oilPriceGet(ctx, strings.TrimRight(baseURL, "/")+"/futures/"+familyPath+"/intraday?"+query.Encode(), apiKey)
+	body, err := oilPriceGet(ctx, strings.TrimRight(baseURL, "/")+"/futures/"+future.Family+"/intraday?"+query.Encode(), apiKey)
 	if err != nil {
 		return nil, err
 	}
@@ -439,10 +472,6 @@ func fetchOilPriceIntraday(ctx context.Context, baseURL, apiKey, familyPath, ser
 		return nil, nil
 	}
 	contract := payload.Contracts[front]
-	unit := "tonne"
-	if series == marketSeriesBrent {
-		unit = "barrel"
-	}
 	lastPerHour := make(map[time.Time]marketPrice)
 	for _, point := range contract.PriceData {
 		at, err := time.Parse(time.RFC3339, point.Timestamp)
@@ -459,11 +488,11 @@ func fetchOilPriceIntraday(ctx context.Context, baseURL, apiKey, familyPath, ser
 			currency = "USD"
 		}
 		lastPerHour[hour] = marketPrice{
-			Series:     series,
+			Series:     future.Series,
 			Contract:   contract.ContractCode,
 			ObservedAt: at.Truncate(time.Second),
 			Price:      point.Price,
-			Unit:       unit,
+			Unit:       future.Unit,
 			Currency:   currency,
 			Source:     "oilpriceapi",
 		}
@@ -636,6 +665,53 @@ func marketJumps(intervals []priceInterval, now time.Time, location *time.Locati
 	return anchor, jumps
 }
 
+// jumpSpansPriceEvent reports whether a known price event took effect between
+// the start of the previous pricing day and the end of this one — inside the
+// two levels the day's jump compares.
+func jumpSpansPriceEvent(events []priceEvent, day string, anchor int, location *time.Location) bool {
+	date, err := time.ParseInLocation("2006-01-02", day, location)
+	if err != nil {
+		return false
+	}
+	start := time.Date(date.Year(), date.Month(), date.Day(), anchor, 0, 0, 0, location)
+	from, to := start.AddDate(0, 0, -1), start.AddDate(0, 0, 1)
+	for _, event := range events {
+		if event.EffectiveAt.After(from) && event.EffectiveAt.Before(to) {
+			return true
+		}
+	}
+	return false
+}
+
+// marketBacktest pairs each pricing day's market jump with the wholesale move
+// before it and fits the relation. The known price events of the fuel are
+// applied to the history as the forecast applies them, so the jump hour and
+// the levels see a single regime, and the jumps that span one are left out:
+// how much of a tax change the stations passed on says nothing about the
+// wholesale market, and one such day outweighs weeks of ordinary ones.
+func marketBacktest(intervals []priceInterval, events []priceEvent, series string, futures, rates []marketPrice, now time.Time, location *time.Location) backtestResult {
+	anchor, jumps := marketJumps(restateIntervalsForEvents(intervals, events, now), now, location)
+	var (
+		days      []string
+		eventDays int
+	)
+	moves := make(map[string]float64)
+	for day := range jumps {
+		if jumpSpansPriceEvent(events, day, anchor, location) {
+			eventDays++
+			continue
+		}
+		days = append(days, day)
+		if move, ok := wholesaleMoveEuroPerLiter(series, futures, rates, day, anchor, location); ok {
+			moves[day] = move
+		}
+	}
+	sort.Strings(days)
+	result := fitJumpBacktest(days, jumps, moves)
+	result.Series, result.AnchorHour, result.EventDays = series, anchor, eventDays
+	return result
+}
+
 // wholesaleMoveEuroPerLiter is the futures move from the start of the previous
 // pricing day to an hour before this one starts — what was known before the
 // raise — converted to euro per liter.
@@ -660,11 +736,11 @@ func wholesaleMoveEuroPerLiter(series string, futures, rates []marketPrice, day 
 	if !ok || rate.Price <= 0 {
 		return 0, false
 	}
-	liters := litersPerGasoilTonne
-	if series == marketSeriesBrent {
-		liters = litersPerBarrel
+	future, ok := marketFutureFor(series)
+	if !ok {
+		return 0, false
 	}
-	return (after.Price - before.Price) / rate.Price / liters, true
+	return (after.Price - before.Price) / rate.Price / future.Liters, true
 }
 
 type backtestDay struct {
@@ -686,6 +762,7 @@ type backtestResult struct {
 	MAEFlatCt   float64       `json:"mae_flat_cent"`
 	MAEMeanCt   float64       `json:"mae_mean_cent"`
 	MAEFitCt    float64       `json:"mae_fit_loo_cent"`
+	EventDays   int           `json:"price_event_days_left_out"`
 	Rows        []backtestDay `json:"rows"`
 }
 
@@ -771,7 +848,7 @@ func runMarketBacktest(args []string) error {
 	fs := flag.NewFlagSet("market backtest", flag.ContinueOnError)
 	dbf := addDBFlags(fs)
 	fuel := fs.String("fuel", "diesel", "Fuel whose noon jumps are measured: diesel, e5 or e10")
-	series := fs.String("series", marketSeriesGasoil, "Wholesale series: gasoil or brent")
+	series := fs.String("series", marketSeriesGasoil, "Wholesale series: gasoil, brent or rbob")
 	days := fs.Int("days", 30, "Pricing days to evaluate (the history must cover them)")
 	outputLong, outputShort := addOutputFlags(fs)
 	if err := fs.Parse(args); err != nil {
@@ -780,8 +857,8 @@ func runMarketBacktest(args []string) error {
 	if *fuel != "diesel" && *fuel != "e5" && *fuel != "e10" {
 		return errors.New("--fuel must be one of: diesel, e5, e10")
 	}
-	if *series != marketSeriesGasoil && *series != marketSeriesBrent {
-		return errors.New("--series must be one of: gasoil, brent")
+	if _, ok := marketFutureFor(*series); !ok {
+		return errors.New("--series must be one of: gasoil, brent, rbob")
 	}
 	if *days < 3 || *days > 90 {
 		return errors.New("--days must be between 3 and 90")
@@ -811,7 +888,10 @@ func runMarketBacktest(args []string) error {
 		return err
 	}
 	intervals := reconstructPriceIntervals(scan.forFuel(*fuel), historyStart, now)
-	anchor, jumps := marketJumps(intervals, now, time.Local)
+	allEvents, err := loadPriceEvents(ctx, db, time.Local)
+	if err != nil {
+		return err
+	}
 	futures, err := loadMarketPrices(ctx, db, *series, historyStart.AddDate(0, 0, -2), now)
 	if err != nil {
 		return err
@@ -820,22 +900,17 @@ func runMarketBacktest(args []string) error {
 	if err != nil {
 		return err
 	}
-	var dayList []string
-	moves := make(map[string]float64)
-	for day := range jumps {
-		dayList = append(dayList, day)
-		if move, ok := wholesaleMoveEuroPerLiter(*series, futures, rates, day, anchor, time.Local); ok {
-			moves[day] = move
-		}
-	}
-	sort.Strings(dayList)
-	result := fitJumpBacktest(dayList, jumps, moves)
-	result.Fuel, result.Series, result.AnchorHour = *fuel, *series, anchor
+	result := marketBacktest(intervals, priceEventsForFuel(allEvents, *fuel), *series, futures, rates, now, time.Local)
+	result.Fuel = *fuel
 
 	if output == outputJSON {
 		return writeJSON(result)
 	}
-	fmt.Fprintf(stdout, "%s noon jumps vs %s move (anchor %02d:00), %d days with both\n", result.Fuel, result.Series, anchor, result.Days)
+	fmt.Fprintf(stdout, "%s noon jumps vs %s move (anchor %02d:00), %d days with both", result.Fuel, result.Series, result.AnchorHour, result.Days)
+	if result.EventDays > 0 {
+		fmt.Fprintf(stdout, ", %d left out for price events", result.EventDays)
+	}
+	fmt.Fprintln(stdout)
 	if result.Days < 3 {
 		fmt.Fprintln(stdout, "not enough days with both a measured jump and market data; collect longer or run `gasoline market --backfill-days N`")
 		return nil

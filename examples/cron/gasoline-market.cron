@@ -1,5 +1,5 @@
-# Gasoline wholesale market collection via cron — stores the latest ICE Gasoil
-# and Brent front-month futures and the ECB euro reference rate for
+# Gasoline wholesale market collection via cron — stores the latest ICE Gasoil,
+# Brent and RBOB front-month futures and the ECB euro reference rate for
 # `gasoline market backtest`. Nothing here changes the forecasts.
 #
 # One run is one OilPriceAPI request (OILPRICEAPI_KEY in the env file), so the
