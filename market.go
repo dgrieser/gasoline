@@ -65,6 +65,11 @@ const (
 	marketRateLimitAttempts = 3
 	marketRetryAfterDefault = 5 * time.Second
 	marketRetryAfterMax     = 60 * time.Second
+	// marketHistoryPageSize is the page size of OilPriceAPI's price history,
+	// its maximum; marketHistoryMaxPages bounds one backfill's pages, enough
+	// for marketBackfillMaxDays of hourly buckets.
+	marketHistoryPageSize = 500
+	marketHistoryMaxPages = 6
 
 	// marketPriceMaxAge is how old the last futures observation before a
 	// moment may be and still stand for the price at that moment. Futures do
@@ -81,7 +86,10 @@ const (
 
 // marketFuture is one futures series: OilPriceAPI's code for its latest
 // price (a prefix; gasoil answers with the dated contract), the futures family
-// whose intraday prices backfill it, and its quote unit.
+// whose intraday prices backfill it, and its quote unit. A series without a
+// family is backfilled from the hourly averages of the price history instead:
+// OilPriceAPI's RBOB intraday prices only start on Oct 8 2026, its history of
+// the latest-price code goes back further.
 type marketFuture struct {
 	Series string
 	Code   string
@@ -93,7 +101,7 @@ type marketFuture struct {
 var marketFutures = []marketFuture{
 	{Series: marketSeriesGasoil, Code: "GASOIL_FUTURES", Family: "ice-gasoil", Unit: "tonne", Liters: litersPerGasoilTonne},
 	{Series: marketSeriesBrent, Code: "BRENT_CRUDE_USD", Family: "ice-brent", Unit: "barrel", Liters: litersPerBarrel},
-	{Series: marketSeriesRBOB, Code: "GASOLINE_RBOB_USD", Family: "rbob", Unit: "gallon", Liters: litersPerGallon},
+	{Series: marketSeriesRBOB, Code: "GASOLINE_RBOB_USD", Unit: "gallon", Liters: litersPerGallon},
 }
 
 func marketFutureFor(series string) (marketFuture, bool) {
@@ -134,7 +142,11 @@ type marketCollectResult struct {
 	Fetched    int           `json:"fetched"`
 	Latest     []marketPrice `json:"latest"`
 	Backfilled int           `json:"backfilled_days"`
-	Warnings   []string      `json:"warnings,omitempty"`
+	// BackfilledQuotes counts the backfilled observations per series, so a
+	// series whose source has no history shows as such instead of hiding in
+	// the day count.
+	BackfilledQuotes map[string]int `json:"backfilled_quotes,omitempty"`
+	Warnings         []string       `json:"warnings,omitempty"`
 }
 
 func oilPriceAPIKey() string {
@@ -207,7 +219,11 @@ func runMarket(args []string) (err error) {
 	}
 	fmt.Fprintf(stdout, "fetched %d, stored %d new observations", result.Fetched, result.Stored)
 	if result.Backfilled > 0 {
-		fmt.Fprintf(stdout, " (backfilled %d days)", result.Backfilled)
+		fmt.Fprintf(stdout, " (backfilled %d days", result.Backfilled)
+		for _, future := range marketFutures {
+			fmt.Fprintf(stdout, ", %s %d", future.Series, result.BackfilledQuotes[future.Series])
+		}
+		fmt.Fprint(stdout, " hourly quotes)")
 	}
 	fmt.Fprintln(stdout)
 	return nil
@@ -231,10 +247,16 @@ func collectMarket(ctx context.Context, db *sql.DB, d dialect, endpoints marketE
 		}
 		result.Latest = append(result.Latest, latest...)
 		prices = append(prices, latest...)
+		if backfillDays > 0 {
+			result.BackfilledQuotes = make(map[string]int)
+		}
 		for day := backfillDays; day >= 1; day-- {
 			date := now.AddDate(0, 0, -day).Format("2006-01-02")
 			complete := true
 			for _, future := range marketFutures {
+				if future.Family == "" {
+					continue
+				}
 				if err := marketSleep(ctx, marketBackfillRequestGap); err != nil {
 					return result, err
 				}
@@ -245,10 +267,26 @@ func collectMarket(ctx context.Context, db *sql.DB, d dialect, endpoints marketE
 					continue
 				}
 				prices = append(prices, hourly...)
+				result.BackfilledQuotes[future.Series] += len(hourly)
 			}
 			if complete {
 				result.Backfilled++
 			}
+		}
+		for _, future := range marketFutures {
+			if future.Family != "" || backfillDays == 0 {
+				continue
+			}
+			hourly, err := fetchOilPriceHourlyHistory(ctx, endpoints.OilPriceAPI, apiKey, future, now.AddDate(0, 0, -backfillDays), now)
+			if err != nil {
+				if ctx.Err() != nil {
+					return result, ctx.Err()
+				}
+				result.Warnings = append(result.Warnings, fmt.Sprintf("backfill %s: %v", future.Series, err))
+				continue
+			}
+			prices = append(prices, hourly...)
+			result.BackfilledQuotes[future.Series] += len(hourly)
 		}
 	}
 
@@ -500,6 +538,80 @@ func fetchOilPriceIntraday(ctx context.Context, baseURL, apiKey string, future m
 	prices := make([]marketPrice, 0, len(lastPerHour))
 	for _, price := range lastPerHour {
 		prices = append(prices, price)
+	}
+	sort.Slice(prices, func(i, j int) bool { return prices[i].ObservedAt.Before(prices[j].ObservedAt) })
+	return prices, nil
+}
+
+// fetchOilPriceHourlyHistory reads a series' hourly averages from the price
+// history, from the start of from's UTC day up to now, page by page. A bucket
+// averages the hour that starts at its timestamp, so it is stored as observed
+// at the hour's end — never earlier than it was known — and the current,
+// unfinished hour is left out.
+func fetchOilPriceHourlyHistory(ctx context.Context, baseURL, apiKey string, future marketFuture, from, now time.Time) ([]marketPrice, error) {
+	var prices []marketPrice
+	for page := 1; page <= marketHistoryMaxPages; page++ {
+		if err := marketSleep(ctx, marketBackfillRequestGap); err != nil {
+			return nil, err
+		}
+		query := url.Values{
+			"by_code":    {future.Code},
+			"interval":   {"hourly"},
+			"start_date": {from.UTC().Format("2006-01-02")},
+			"end_date":   {now.UTC().Format("2006-01-02")},
+			"per_page":   {strconv.Itoa(marketHistoryPageSize)},
+			"page":       {strconv.Itoa(page)},
+		}
+		body, err := oilPriceGet(ctx, strings.TrimRight(baseURL, "/")+"/prices/historical?"+query.Encode(), apiKey)
+		if err != nil {
+			return nil, err
+		}
+		var payload struct {
+			Status string `json:"status"`
+			Data   struct {
+				Prices []struct {
+					Price     float64 `json:"price"`
+					Code      string  `json:"code"`
+					Currency  string  `json:"currency"`
+					CreatedAt string  `json:"created_at"`
+				} `json:"prices"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return nil, fmt.Errorf("decode price history: %w", err)
+		}
+		if payload.Status != "success" {
+			return nil, fmt.Errorf("price history status %q", payload.Status)
+		}
+		for _, item := range payload.Data.Prices {
+			if item.Code != future.Code || item.Price <= 0 {
+				continue
+			}
+			start, err := time.Parse(time.RFC3339, item.CreatedAt)
+			if err != nil {
+				continue
+			}
+			end := start.UTC().Truncate(time.Hour).Add(time.Hour)
+			if end.After(now) {
+				continue
+			}
+			currency := item.Currency
+			if currency == "" {
+				currency = "USD"
+			}
+			prices = append(prices, marketPrice{
+				Series:     future.Series,
+				Contract:   item.Code,
+				ObservedAt: end,
+				Price:      item.Price,
+				Unit:       future.Unit,
+				Currency:   currency,
+				Source:     "oilpriceapi",
+			})
+		}
+		if len(payload.Data.Prices) < marketHistoryPageSize {
+			break
+		}
 	}
 	sort.Slice(prices, func(i, j int) bool { return prices[i].ObservedAt.Before(prices[j].ObservedAt) })
 	return prices, nil

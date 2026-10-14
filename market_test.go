@@ -33,10 +33,12 @@ const brentIntradayFixture = `{"commodity":"BRENT_FUTURES","date":"2026-10-08","
 		{"timestamp":"2026-10-08T08:36:21Z","price":101.5,"currency":"USD"}]}
 ]}`
 
-const rbobIntradayFixture = `{"commodity":"GASOLINE_RBOB_FUTURES","date":"2026-10-08","contracts":[
-	{"code":"RBX6","contract_month":"2026-11","contract_code":"RBOB_FUTURES_2026_11","price_data":[
-		{"timestamp":"2026-10-08T08:05:32.553Z","price":3.2666,"price_decimal":"3.2666","currency":"USD","unit":"gallon","volume":110}]}
-]}`
+// rbobHistoryFixture is a page of hourly averages; the 12:00 bucket of Oct 9
+// is the hour still running at the backfill tests' now.
+const rbobHistoryFixture = `{"status":"success","data":{"prices":[
+	{"price":3.31,"formatted":"$3.31","currency":"USD","code":"GASOLINE_RBOB_USD","created_at":"2026-10-09T12:00:00.000Z","type":"hourly_average","price_type":"spot_price","unit":"gallon","source":"aggregated","as_of":"2026-10-09T12:00:00.000Z","stale":false},
+	{"price":3.27,"formatted":"$3.27","currency":"USD","code":"GASOLINE_RBOB_USD","created_at":"2026-10-08T08:00:00.000Z","type":"hourly_average","price_type":"spot_price","unit":"gallon","source":"aggregated","as_of":"2026-10-08T08:00:00.000Z","stale":true,"data_status":"stale"}
+],"metadata":{"window":"historical","interval":"hourly","pagination":{"page":1,"per_page":500}}}}`
 
 const ecbFixture = `<?xml version="1.0" encoding="UTF-8"?>
 <gesmes:Envelope xmlns:gesmes="http://www.gesmes.org/xml/2002-08-01" xmlns="http://www.ecb.int/vocabulary/2002-08-01/eurofxref">
@@ -70,8 +72,11 @@ func fakeMarketServer(t *testing.T, requests *[]string) *httptest.Server {
 			_, _ = w.Write([]byte(gasoilIntradayFixture))
 		case r.URL.Path == "/v1/futures/ice-brent/intraday":
 			_, _ = w.Write([]byte(brentIntradayFixture))
-		case r.URL.Path == "/v1/futures/rbob/intraday":
-			_, _ = w.Write([]byte(rbobIntradayFixture))
+		case r.URL.Path == "/v1/prices/historical":
+			if got := r.URL.Query(); got.Get("by_code") != "GASOLINE_RBOB_USD" || got.Get("interval") != "hourly" {
+				t.Errorf("history query = %v", got)
+			}
+			_, _ = w.Write([]byte(rbobHistoryFixture))
 		case r.URL.Path == "/ecb/daily.xml", r.URL.Path == "/ecb/hist.xml":
 			_, _ = w.Write([]byte(ecbFixture))
 		default:
@@ -182,8 +187,14 @@ func TestCollectMarketBackfillsTheFrontMonthHourly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadMarketPrices: %v", err)
 	}
-	if len(rbob) != 1 || rbob[0].Price != 3.2666 || rbob[0].Contract != "RBOB_FUTURES_2026_11" || rbob[0].Unit != "gallon" {
-		t.Fatalf("backfilled rbob = %+v, want the November contract in USD per gallon", rbob)
+	// RBOB comes from the hourly averages: the 08:00 bucket is known at
+	// 09:00, and the hour still running at now is left out.
+	if len(rbob) != 1 || rbob[0].Price != 3.27 || rbob[0].Unit != "gallon" ||
+		!rbob[0].ObservedAt.Equal(time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)) {
+		t.Fatalf("backfilled rbob = %+v, want the 08:00 average at 09:00 in USD per gallon", rbob)
+	}
+	if got := result.BackfilledQuotes; got[marketSeriesGasoil] != 2 || got[marketSeriesBrent] != 1 || got[marketSeriesRBOB] != 1 {
+		t.Fatalf("backfilled quotes = %v, want gasoil 2, brent 1, rbob 1", got)
 	}
 	var sawHistory bool
 	for _, path := range requests {
@@ -196,8 +207,8 @@ func TestCollectMarketBackfillsTheFrontMonthHourly(t *testing.T) {
 	}
 	// Every backfill request is paced, so a long backfill stays under the
 	// per-minute limit.
-	if len(*waits) != len(marketFutures) || (*waits)[0] != marketBackfillRequestGap {
-		t.Fatalf("waits = %v, want one gap before each of the %d backfill requests", *waits, len(marketFutures))
+	if len(*waits) != 3 || (*waits)[0] != marketBackfillRequestGap {
+		t.Fatalf("waits = %v, want one gap before each of the 3 backfill requests (2 intraday, 1 history page)", *waits)
 	}
 }
 
@@ -233,8 +244,8 @@ func TestCollectMarketWaitsOutTheRateLimit(t *testing.T) {
 				_, _ = w.Write([]byte(gasoilIntradayFixture))
 			case "/v1/futures/ice-brent/intraday":
 				_, _ = w.Write([]byte(brentIntradayFixture))
-			case "/v1/futures/rbob/intraday":
-				_, _ = w.Write([]byte(rbobIntradayFixture))
+			case "/v1/prices/historical":
+				_, _ = w.Write([]byte(rbobHistoryFixture))
 			default:
 				_, _ = w.Write([]byte(ecbFixture))
 			}
@@ -260,6 +271,43 @@ func TestCollectMarketWaitsOutTheRateLimit(t *testing.T) {
 		if retryWaits != wantRetryWaits {
 			t.Fatalf("%s: waits = %v, want %d waits of the 4 s the API asked for", tc.name, *waits, wantRetryWaits)
 		}
+	}
+}
+
+// TestFetchOilPriceHourlyHistoryPages follows the history's pages until one
+// comes back short.
+func TestFetchOilPriceHourlyHistoryPages(t *testing.T) {
+	stubMarketSleep(t)
+	first := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
+	bucket := func(i int) string {
+		return `{"price":3.2,"currency":"USD","code":"GASOLINE_RBOB_USD","created_at":"` + first.Add(time.Duration(i)*time.Hour).Format(time.RFC3339) + `"}`
+	}
+	var pages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		pages = append(pages, page)
+		var items []string
+		switch page {
+		case "1":
+			for i := 0; i < marketHistoryPageSize; i++ {
+				items = append(items, bucket(i))
+			}
+		case "2":
+			items = append(items, bucket(marketHistoryPageSize), bucket(marketHistoryPageSize+1))
+		}
+		_, _ = w.Write([]byte(`{"status":"success","data":{"prices":[` + strings.Join(items, ",") + `]}}`))
+	}))
+	t.Cleanup(server.Close)
+	future, _ := marketFutureFor(marketSeriesRBOB)
+	prices, err := fetchOilPriceHourlyHistory(context.Background(), server.URL+"/v1", "test-key", future, first, first.AddDate(0, 0, 30))
+	if err != nil {
+		t.Fatalf("fetchOilPriceHourlyHistory: %v", err)
+	}
+	if len(pages) != 2 || len(prices) != marketHistoryPageSize+2 {
+		t.Fatalf("pages %v gave %d prices, want 2 pages and %d prices", pages, len(prices), marketHistoryPageSize+2)
+	}
+	if !prices[0].ObservedAt.Equal(first.Add(time.Hour)) {
+		t.Fatalf("first price observed at %v, want the end of its hour", prices[0].ObservedAt)
 	}
 }
 
