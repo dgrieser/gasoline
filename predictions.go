@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"time"
 )
@@ -51,6 +52,10 @@ const (
 	// by more than 2 ct at most one time in five.
 	predictionConfidenceHighMaxErrEuro   = 0.02
 	predictionConfidenceMediumMaxErrEuro = 0.04
+	// predictionMarketShiftMinStations is how many stations must have
+	// predicted one target hour before their median miss counts as a
+	// market-wide move and is taken out of the confidence calibration.
+	predictionMarketShiftMinStations = 5
 	// predictionSuggestionBiasMinSamples / MaxAbs gate and cap the measured
 	// selection bias of suggested windows.
 	predictionSuggestionBiasMinSamples = 30
@@ -527,11 +532,14 @@ func applyLearnedCorrections(ctx context.Context, db *sql.DB, model *forecastMod
 // model error back by adding the correction the row recorded it carried:
 // RawGap = error + applied_correction = actual − raw model prediction. The
 // gap is winsorized, the weight decays with evaluation age, and the cell
-// locates the row on the hour-lead correction grid.
+// locates the row on the hour-lead correction grid. TargetHour groups rows
+// that predicted the same market hour, which is how market-wide misses are
+// told apart from a station's own.
 type evaluatedError struct {
 	StationID    string
 	Lead         leadBucket
 	Cell         hourLeadKey
+	TargetHour   int64 // Unix hour of the target start
 	IsSuggestion bool
 	RawGap       float64
 	Weight       float64
@@ -623,6 +631,7 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 			StationID:    stationID,
 			Lead:         lead,
 			Cell:         hourLeadKey{Hour: targetLocal.Hour(), Lead: cell, Weekend: isWeekendLike(targetLocal)},
+			TargetHour:   targetStart.Unix() / 3600,
 			IsSuggestion: isSuggestion != 0,
 			RawGap:       rawGap,
 			Weight:       math.Exp(-ageDays / predictionBiasHalfLifeDays),
@@ -681,27 +690,47 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 		corrections.StationBias[stationID] = median
 	}
 
-	// 3) Empirical confidence: the p80 absolute residual per station and lead
-	// bucket, mapped onto labels. The residual is what a *new* prediction is
-	// expected to be off by — the raw gap minus the corrections that will be
-	// applied to it — so the calibration measures the corrected model.
-	// Measured accuracy replaces the sample-count heuristic, which the data
-	// showed inverted (its "low" beat its "medium").
-	confidenceResiduals := make(map[stationLeadKey][]float64)
+	// 3) Empirical confidence: the weighted p80 absolute residual per station
+	// and lead bucket, mapped onto labels. The residual is what a *new*
+	// prediction is expected to be off by — the raw gap minus the corrections
+	// that will be applied to it — so the calibration measures the corrected
+	// model. Measured accuracy replaces the sample-count heuristic, which the
+	// data showed inverted (its "low" beat its "medium").
+	//
+	// The part of the residual every station shares at that hour is removed
+	// first. A market-wide level move — a tax change, an oil-driven noon raise
+	// — misses every station by the same amount, says nothing about how well
+	// one station can be forecast, and does not change which station or hour
+	// is cheapest. Left in, a single shock day pushed nearly every cell over
+	// the threshold and hid all suggestions until it aged out of the window.
+	// The recency weight lets a shock that does slip through fade like
+	// everything else instead of counting in full for the whole window.
+	marketShift := marketResidualShift(evaluated, corrections)
+	// Two floats per row, not a priceSample: the window holds millions of
+	// rows, and a cell is widened to samples only when its quantile is taken.
+	type weightedResidual struct{ abs, weight float64 }
+	confidenceResiduals := make(map[stationLeadKey][]weightedResidual)
 	for _, row := range evaluated {
 		if row.Lead == leadBucketBeyond24h {
 			continue
 		}
 		residual := row.RawGap - corrections.HourLeadBias[row.Cell] - corrections.StationBias[row.StationID]
+		residual -= marketShift[marketHourKey{TargetHour: row.TargetHour, Lead: row.Lead}]
 		key := stationLeadKey{StationID: row.StationID, Lead: row.Lead}
-		confidenceResiduals[key] = append(confidenceResiduals[key], math.Abs(residual))
+		confidenceResiduals[key] = append(confidenceResiduals[key], weightedResidual{abs: math.Abs(residual), weight: row.Weight})
 	}
 	for key, residuals := range confidenceResiduals {
 		if len(residuals) < predictionConfidenceMinSamples {
 			continue
 		}
-		sort.Float64s(residuals)
-		p80 := residuals[(len(residuals)*8)/10]
+		samples := make([]priceSample, len(residuals))
+		for i, r := range residuals {
+			samples[i] = priceSample{Price: r.abs, Weight: r.weight}
+		}
+		p80, ok := weightedQuantile(samples, 0.8)
+		if !ok {
+			continue
+		}
 		switch {
 		case p80 <= predictionConfidenceHighMaxErrEuro:
 			corrections.ConfidenceByLead[key] = "high"
@@ -731,6 +760,45 @@ func loadLearnedCorrections(ctx context.Context, db *sql.DB, fuel string, now ti
 		}
 	}
 	return corrections, nil
+}
+
+// marketHourKey groups evaluated rows that predicted the same market hour at
+// the same lead.
+type marketHourKey struct {
+	TargetHour int64
+	Lead       leadBucket
+}
+
+// marketResidualShift measures, per target hour and lead bucket, the median
+// residual across stations — the miss the whole market shared, such as a level
+// shock nobody could forecast. Cells covering fewer than
+// predictionMarketShiftMinStations stations are left out: too few stations
+// cannot tell a market move from their own errors.
+func marketResidualShift(evaluated []evaluatedError, corrections learnedCorrections) map[marketHourKey]float64 {
+	residuals := make(map[marketHourKey][]float64)
+	// Only whether a cell reaches the floor matters, so each cell remembers
+	// at most that many distinct stations.
+	stations := make(map[marketHourKey][]string)
+	for _, row := range evaluated {
+		if row.Lead == leadBucketBeyond24h {
+			continue
+		}
+		key := marketHourKey{TargetHour: row.TargetHour, Lead: row.Lead}
+		residuals[key] = append(residuals[key], row.RawGap-corrections.HourLeadBias[row.Cell]-corrections.StationBias[row.StationID])
+		if seen := stations[key]; len(seen) < predictionMarketShiftMinStations && !slices.Contains(seen, row.StationID) {
+			stations[key] = append(seen, row.StationID)
+		}
+	}
+	shift := make(map[marketHourKey]float64)
+	for key, cell := range residuals {
+		if len(stations[key]) < predictionMarketShiftMinStations {
+			continue
+		}
+		// The lower median, as weightedMedianPrice takes it with equal weights.
+		sort.Float64s(cell)
+		shift[key] = cell[(len(cell)-1)/2]
+	}
+	return shift
 }
 
 func clampAbs(value, limit float64) float64 {

@@ -860,6 +860,134 @@ func TestLoadLearnedCorrectionsCalibratesConfidence(t *testing.T) {
 	}
 }
 
+// TestLoadLearnedCorrectionsConfidenceIgnoresMarketShock pins the market-wide
+// part of the calibration: a shock every station missed by the same amount (a
+// tax change, an oil-driven raise) must not turn precise stations "low", while a
+// station that is noisy on its own stays "low".
+func TestLoadLearnedCorrectionsConfidenceIgnoresMarketShock(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	stations := []string{"p1", "p2", "p3", "p4", "p5", "noisy"}
+	for _, station := range stations {
+		insertSuggestStation(t, db, station, station, 52.5, 13.4)
+	}
+	now := time.Date(2026, 4, 27, 15, 0, 0, 0, time.UTC)
+	runID := insertPredictionRunRow(t, db, now.AddDate(0, 0, -5))
+
+	normal := time.Date(2026, 4, 23, 0, 0, 0, 0, time.UTC)
+	shock := time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC)
+	for _, station := range stations {
+		// 30 ordinary hours: the precise stations are within a few mills, the
+		// noisy one alternates ±6 ct.
+		for i := 0; i < 30; i++ {
+			errValue := float64(i%3) * 0.001
+			if station == "noisy" {
+				errValue = 0.06
+				if i%2 == 0 {
+					errValue = -0.06
+				}
+			}
+			id := insertPredictionRow(t, db, runID, station, normal.Add(time.Duration(i)*time.Hour), 2.00, 30)
+			markPredictionEvaluated(t, db, id, errValue, now.AddDate(0, 0, -1))
+		}
+		// 10 shock hours (25% of the cell) where the whole market missed:
+		// 13 ct low for five hours, then 8 ct high — each hour's own market
+		// move must be taken out, not one figure for the day.
+		for i := 0; i < 10; i++ {
+			shockError := -0.13
+			if i >= 5 {
+				shockError = 0.08
+			}
+			id := insertPredictionRow(t, db, runID, station, shock.Add(time.Duration(i)*time.Hour), 2.00, 30)
+			markPredictionEvaluated(t, db, id, shockError, now.AddDate(0, 0, -1))
+		}
+	}
+
+	corrections, err := loadLearnedCorrections(ctx, db, "diesel", now, time.UTC)
+	if err != nil {
+		t.Fatalf("loadLearnedCorrections: %v", err)
+	}
+	for _, station := range stations[:5] {
+		key := stationLeadKey{StationID: station, Lead: leadBucket0to1h}
+		if got := corrections.ConfidenceByLead[key]; got != "high" {
+			t.Fatalf("%s confidence = %q, want high despite the market-wide shock", station, got)
+		}
+	}
+	noisyKey := stationLeadKey{StationID: "noisy", Lead: leadBucket0to1h}
+	if got := corrections.ConfidenceByLead[noisyKey]; got != "low" {
+		t.Fatalf("noisy confidence = %q, want low", got)
+	}
+}
+
+// TestLoadLearnedCorrectionsConfidenceNeedsAMarket pins the station floor: two
+// stations sharing a miss are not a market, so their shared shock stays in the
+// calibration.
+func TestLoadLearnedCorrectionsConfidenceNeedsAMarket(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	stations := []string{"a", "b"}
+	for _, station := range stations {
+		insertSuggestStation(t, db, station, station, 52.5, 13.4)
+	}
+	now := time.Date(2026, 4, 27, 15, 0, 0, 0, time.UTC)
+	runID := insertPredictionRunRow(t, db, now.AddDate(0, 0, -5))
+	normal := time.Date(2026, 4, 23, 0, 0, 0, 0, time.UTC)
+	shock := time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC)
+	for _, station := range stations {
+		for i := 0; i < 30; i++ {
+			id := insertPredictionRow(t, db, runID, station, normal.Add(time.Duration(i)*time.Hour), 2.00, 30)
+			markPredictionEvaluated(t, db, id, 0, now.AddDate(0, 0, -1))
+		}
+		for i := 0; i < 10; i++ {
+			id := insertPredictionRow(t, db, runID, station, shock.Add(time.Duration(i)*time.Hour), 2.00, 30)
+			markPredictionEvaluated(t, db, id, -0.13, now.AddDate(0, 0, -1))
+		}
+	}
+	corrections, err := loadLearnedCorrections(ctx, db, "diesel", now, time.UTC)
+	if err != nil {
+		t.Fatalf("loadLearnedCorrections: %v", err)
+	}
+	for _, station := range stations {
+		key := stationLeadKey{StationID: station, Lead: leadBucket0to1h}
+		if got := corrections.ConfidenceByLead[key]; got != "low" {
+			t.Fatalf("%s confidence = %q, want low below the market station floor", station, got)
+		}
+	}
+}
+
+func TestWeightedQuantile(t *testing.T) {
+	if _, ok := weightedQuantile(nil, 0.8); ok {
+		t.Fatal("empty samples returned ok")
+	}
+	if _, ok := weightedQuantile([]priceSample{{Price: 1, Weight: 0}}, 0.8); ok {
+		t.Fatal("zero total weight returned ok")
+	}
+	var even []priceSample
+	for i := 1; i <= 10; i++ {
+		even = append(even, priceSample{Price: float64(i), Weight: 1})
+	}
+	if got, _ := weightedQuantile(even, 0.8); got != 8 {
+		t.Fatalf("p80 of 1..10 = %v, want 8", got)
+	}
+	if got, _ := weightedQuantile(even, 0.5); got != 5 {
+		t.Fatalf("p50 of 1..10 = %v, want 5", got)
+	}
+	if got, _ := weightedQuantile(even, 1); got != 10 {
+		t.Fatalf("p100 of 1..10 = %v, want 10", got)
+	}
+	// A heavy recent small error outweighs three light old large ones.
+	mixed := []priceSample{
+		{Price: 0.10, Weight: 0.05}, {Price: 0.10, Weight: 0.05}, {Price: 0.10, Weight: 0.05},
+		{Price: 0.01, Weight: 1},
+	}
+	if got, _ := weightedQuantile(mixed, 0.8); got != 0.01 {
+		t.Fatalf("weighted p80 = %v, want 0.01", got)
+	}
+	if got, _ := weightedMedianPrice(mixed); got != 0.01 {
+		t.Fatalf("weighted median = %v, want 0.01", got)
+	}
+}
+
 func TestPersistPredictionRunStoresAppliedCorrection(t *testing.T) {
 	db := openTestDB(t)
 	now := time.Date(2026, 4, 25, 9, 30, 0, 0, time.UTC)

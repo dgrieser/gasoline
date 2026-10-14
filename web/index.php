@@ -259,6 +259,10 @@ function flashText(string $key): string
         'invalidTarget' => 'Invalid city or radius (1-42 km).',
         'invalidTargetRadius' => 'Invalid radius (1-42 km).',
         'targetExists' => 'This city is already an update target.',
+        'priceEventAdded' => 'Price event added.',
+        'priceEventRemoved' => 'Price event removed.',
+        'invalidPriceEvent' => 'Invalid price event. Enter a date and time, a fuel, and a non-zero change of at most 100 cent.',
+        'priceEventsUnavailable' => 'Price events are not available yet. Run any gasoline command once so it can create the table.',
         'stationRenamed' => 'Station renamed.',
         'renameCleared' => 'Rename removed. The original name is used again.',
         'invalidRename' => 'Select a station and enter a non-empty new name.',
@@ -1359,6 +1363,57 @@ const GASOLINE_MAX_NOTIFY_RADIUS_KM = 100;
 const GASOLINE_MAX_TARGET_RADIUS_KM = 42;
 
 /**
+ * The largest price event an admin can enter, in cent per liter. A tax change
+ * of a whole euro is not a plausible typo-free entry.
+ */
+const GASOLINE_MAX_PRICE_EVENT_CENT = 100;
+
+/**
+ * Validate one price event from the admin form (see the Go priceEvent): when the
+ * pump price moves, as local wall-clock time to the minute (what a
+ * datetime-local input posts), which fuel, the expected gross change in cent
+ * (signed, non-zero), and an optional note. Returns the row to store, with the
+ * change converted to euro, or null when anything is off.
+ *
+ * @param array<string, mixed> $input
+ * @return array{effective_at: string, fuel: string, delta_euro: float, note: string}|null
+ */
+function normalizePriceEventInput(array $input): ?array
+{
+    $effectiveAt = trim((string) ($input['effective_at'] ?? ''));
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/', $effectiveAt)) {
+        return null;
+    }
+    $parsed = DateTimeImmutable::createFromFormat('!Y-m-d\TH:i', $effectiveAt);
+    if ($parsed === false || $parsed->format('Y-m-d\TH:i') !== $effectiveAt) {
+        return null;
+    }
+    $fuel = strtolower(trim((string) ($input['fuel'] ?? '')));
+    if (!in_array($fuel, ['all', 'e5', 'e10', 'diesel'], true)) {
+        return null;
+    }
+    $deltaText = str_replace(',', '.', trim((string) ($input['delta_cent'] ?? '')));
+    if (!is_numeric($deltaText)) {
+        return null;
+    }
+    $deltaCent = round((float) $deltaText, 1);
+    if ($deltaCent == 0.0 || abs($deltaCent) > GASOLINE_MAX_PRICE_EVENT_CENT) {
+        return null;
+    }
+    $note = trim((string) ($input['note'] ?? ''));
+    // Characters, not bytes, like the VARCHAR(255) column; without mbstring.
+    if (!preg_match('/^.{0,255}$/us', $note)) {
+        return null;
+    }
+    return [
+        'effective_at' => $effectiveAt,
+        'fuel' => $fuel,
+        'delta_euro' => round($deltaCent / 100, 4),
+        'note' => $note,
+    ];
+}
+
+/**
  * What the widest target costs, mirroring Go's planSearchTiles: a
  * GASOLINE_MAX_TARGET_RADIUS_KM disk is covered by this many overlapping 25 km
  * queries. Used only to show an admin what a pace adds up to before they save
@@ -2149,6 +2204,45 @@ function handlePost(PDO $pdo, string $driver): void
             $stmt->bindValue(':id', (int) ($_POST['target_id'] ?? 0), PDO::PARAM_INT);
             $stmt->execute();
             setFlash($stmt->rowCount() > 0 ? 'success' : 'error', $stmt->rowCount() > 0 ? 'targetRemoved' : 'notFound');
+            redirectTo('?page=admin_settings');
+            // no break
+
+        case 'add_event':
+            $event = normalizePriceEventInput($_POST);
+            if ($event === null) {
+                setFlash('error', 'invalidPriceEvent');
+                redirectTo('?page=admin_settings');
+            }
+            try {
+                $stmt = $pdo->prepare('INSERT INTO price_events (effective_at, fuel, delta_euro, note, created_at) VALUES (:effective_at, :fuel, :delta, :note, :now)');
+                $stmt->bindValue(':effective_at', $event['effective_at']);
+                $stmt->bindValue(':fuel', $event['fuel']);
+                $stmt->bindValue(':delta', (string) $event['delta_euro']);
+                $stmt->bindValue(':note', $event['note']);
+                $stmt->bindValue(':now', nowUTC());
+                $stmt->execute();
+            } catch (PDOException $e) {
+                // The table is created by the Go CLI; until it has run once
+                // against this database there is nowhere to store events.
+                error_log('gasoline add_event error: ' . $e->getMessage());
+                setFlash('error', 'priceEventsUnavailable');
+                redirectTo('?page=admin_settings');
+            }
+            setFlash('success', 'priceEventAdded');
+            redirectTo('?page=admin_settings');
+            // no break
+
+        case 'delete_event':
+            try {
+                $stmt = $pdo->prepare('DELETE FROM price_events WHERE id = :id');
+                $stmt->bindValue(':id', (int) ($_POST['event_id'] ?? 0), PDO::PARAM_INT);
+                $stmt->execute();
+            } catch (PDOException $e) {
+                error_log('gasoline delete_event error: ' . $e->getMessage());
+                setFlash('error', 'priceEventsUnavailable');
+                redirectTo('?page=admin_settings');
+            }
+            setFlash($stmt->rowCount() > 0 ? 'success' : 'error', $stmt->rowCount() > 0 ? 'priceEventRemoved' : 'notFound');
             redirectTo('?page=admin_settings');
             // no break
 
@@ -5374,6 +5468,14 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
 {
     $settings = settingsAll($pdo);
     $targets = $pdo->query('SELECT id, city, radius_km FROM update_targets ORDER BY id ASC')->fetchAll();
+    // price_events is created by the Go CLI; a viewer deployed ahead of the
+    // binary shows the card without the table instead of failing the page.
+    $priceEvents = gasolineTableExists($pdo, $driver, 'price_events')
+        ? $pdo->query('SELECT id, effective_at, fuel, delta_euro, note FROM price_events ORDER BY effective_at ASC, id ASC')->fetchAll()
+        : null;
+    $nowLocal = (new DateTimeImmutable('now'))->format('Y-m-d\TH:i');
+    $fuelLabelKeys = ['all' => 'fuelAll', 'diesel' => 'fuelDiesel', 'e5' => 'fuelE5', 'e10' => 'fuelE10'];
+    $fuelLabels = ['all' => 'All', 'diesel' => 'Diesel', 'e5' => 'Super E5', 'e10' => 'Super E10'];
     $get = static fn (string $name, string $fallback = ''): string => trim((string) ($settings[$name] ?? $fallback));
     renderPageStart('Settings', $user, 'admin_settings');
     ?>
@@ -5409,6 +5511,53 @@ function renderAdminSettingsPage(PDO $pdo, string $driver, array $user): never
                 <input type="number" name="radius_km" min="1" max="<?= GASOLINE_MAX_TARGET_RADIUS_KM ?>" value="5" required>
                 <button type="submit" class="btn-primary" data-i18n="addTarget">Add</button>
             </form>
+        </div>
+
+        <div class="settings-card">
+            <h2 data-i18n="priceEvents">Price events</h2>
+            <p class="auth-note" data-i18n="priceEventsHint">Known market-wide price changes with a fixed date, such as a tax cut or its end. Enter when the pump price moves and by how much: forecasts before it add the change to every hour after it, and once it has happened the history before it is restated, so the forecast does not need days to catch up. A raise can only reach the pump at the daily 12:00 raise; a cut can land at once. Unannounced moves are detected from the prices on their own.</p>
+            <?php if ($priceEvents === null) { ?>
+            <p class="auth-note" data-i18n="priceEventsUnavailable">Price events are not available yet. Run any gasoline command once so it can create the table.</p>
+            <?php } else { ?>
+            <div class="table-scroll">
+            <table class="stack-table">
+                <thead>
+                    <tr><th data-i18n="priceEventAt">Takes effect</th><th data-i18n="priceEventFuel">Fuel</th><th data-i18n="priceEventDelta">Change (ct)</th><th data-i18n="priceEventNote">Note</th><th data-i18n="colActions">Actions</th></tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($priceEvents as $event) {
+                        $fuel = (string) $event['fuel'];
+                        $deltaCent = round((float) $event['delta_euro'] * 100, 1);
+                        $past = strcmp((string) $event['effective_at'], $nowLocal) <= 0;
+                        ?>
+                    <tr>
+                        <td class="stack-primary"><?= h(str_replace('T', ' ', (string) $event['effective_at'])) ?> <span class="auth-note" data-i18n="<?= $past ? 'priceEventInEffect' : 'priceEventUpcoming' ?>"><?= $past ? 'in effect' : 'upcoming' ?></span></td>
+                        <td data-label="Fuel" data-i18n-label="priceEventFuel"><span data-i18n="<?= h($fuelLabelKeys[$fuel] ?? 'fuelAll') ?>"><?= h($fuelLabels[$fuel] ?? $fuel) ?></span></td>
+                        <td data-label="Change (ct)" data-i18n-label="priceEventDelta"><?= h(($deltaCent > 0 ? '+' : '') . number_format($deltaCent, 1, '.', '')) ?></td>
+                        <td data-label="Note" data-i18n-label="priceEventNote"><?= h((string) $event['note']) ?></td>
+                        <td class="actions-cell"><form method="post" action="" class="table-form"><?= csrfField() ?><input type="hidden" name="action" value="delete_event"><input type="hidden" name="event_id" value="<?= (int) $event['id'] ?>"><button type="submit" class="btn-small danger" data-i18n="removeTarget">Remove</button></form></td>
+                    </tr>
+                    <?php } ?>
+                    <?php if ($priceEvents === []) { ?>
+                    <tr><td colspan="5" data-i18n="noPriceEvents">No price events entered.</td></tr>
+                    <?php } ?>
+                </tbody>
+            </table>
+            </div>
+            <form method="post" action="" class="inline-form">
+                <?= csrfField() ?>
+                <input type="hidden" name="action" value="add_event">
+                <input type="datetime-local" name="effective_at" required aria-label="Takes effect" data-i18n-aria-label="priceEventAt">
+                <select name="fuel" aria-label="Fuel" data-i18n-aria-label="priceEventFuel">
+                    <?php foreach ($fuelLabels as $value => $label) { ?>
+                    <option value="<?= h($value) ?>" data-i18n="<?= h($fuelLabelKeys[$value]) ?>"><?= h($label) ?></option>
+                    <?php } ?>
+                </select>
+                <input type="number" name="delta_cent" step="0.1" min="-<?= GASOLINE_MAX_PRICE_EVENT_CENT ?>" max="<?= GASOLINE_MAX_PRICE_EVENT_CENT ?>" required placeholder="ct" aria-label="Change (ct)" data-i18n-aria-label="priceEventDelta">
+                <input type="text" name="note" maxlength="255" placeholder="Note" data-i18n-placeholder="priceEventNote">
+                <button type="submit" class="btn-primary" data-i18n="addTarget">Add</button>
+            </form>
+            <?php } ?>
         </div>
 
         <div class="settings-card">
@@ -10256,6 +10405,19 @@ const translations = {
         invalidTarget: 'Invalid city or radius (1-42 km).',
         invalidTargetRadius: 'Invalid radius (1-42 km).',
         targetExists: 'This city is already an update target.',
+        priceEvents: 'Price events',
+        priceEventsHint: 'Known market-wide price changes with a fixed date, such as a tax cut or its end. Enter when the pump price moves and by how much: forecasts before it add the change to every hour after it, and once it has happened the history before it is restated, so the forecast does not need days to catch up. A raise can only reach the pump at the daily 12:00 raise; a cut can land at once. Unannounced moves are detected from the prices on their own.',
+        priceEventsUnavailable: 'Price events are not available yet. Run any gasoline command once so it can create the table.',
+        priceEventAt: 'Takes effect',
+        priceEventFuel: 'Fuel',
+        priceEventDelta: 'Change (ct)',
+        priceEventNote: 'Note',
+        priceEventInEffect: 'in effect',
+        priceEventUpcoming: 'upcoming',
+        noPriceEvents: 'No price events entered.',
+        priceEventAdded: 'Price event added.',
+        priceEventRemoved: 'Price event removed.',
+        invalidPriceEvent: 'Invalid price event. Enter a date and time, a fuel, and a non-zero change of at most 100 cent.',
         renameStation: 'Rename a station',
         renameStationHint: 'The new name replaces the Tankerkönig name everywhere — dashboard, CLI output, and notifications. The original name is kept and can be restored at any time.',
         stationSearchPlaceholder: 'Search by name or address...',
@@ -10629,6 +10791,19 @@ const translations = {
         invalidTarget: 'Ungültige Stadt oder ungültiger Radius (1-42 km).',
         invalidTargetRadius: 'Ungültiger Radius (1-42 km).',
         targetExists: 'Diese Stadt ist bereits ein Update-Ziel.',
+        priceEvents: 'Preisereignisse',
+        priceEventsHint: 'Bekannte marktweite Preisänderungen mit festem Datum, etwa eine Steuersenkung oder ihr Ende. Eintragen, wann sich der Zapfsäulenpreis ändert und um wie viel: Prognosen davor rechnen die Änderung auf jede Stunde danach auf, und sobald sie eingetreten ist, wird die Historie davor umgerechnet, sodass die Prognose nicht tagelang hinterherläuft. Eine Erhöhung kann erst mit der täglichen Erhöhung um 12:00 an der Zapfsäule ankommen; eine Senkung sofort. Unangekündigte Sprünge werden aus den Preisen selbst erkannt.',
+        priceEventsUnavailable: 'Preisereignisse sind noch nicht verfügbar. Einmal einen beliebigen gasoline-Befehl ausführen, damit er die Tabelle anlegt.',
+        priceEventAt: 'Gilt ab',
+        priceEventFuel: 'Kraftstoff',
+        priceEventDelta: 'Änderung (ct)',
+        priceEventNote: 'Notiz',
+        priceEventInEffect: 'in Kraft',
+        priceEventUpcoming: 'bevorstehend',
+        noPriceEvents: 'Keine Preisereignisse eingetragen.',
+        priceEventAdded: 'Preisereignis hinzugefügt.',
+        priceEventRemoved: 'Preisereignis entfernt.',
+        invalidPriceEvent: 'Ungültiges Preisereignis. Datum und Uhrzeit, Kraftstoff und eine Änderung ungleich null von höchstens 100 Cent eingeben.',
         renameStation: 'Tankstelle umbenennen',
         renameStationHint: 'Der neue Name ersetzt den Tankerkönig-Namen überall — Dashboard, CLI-Ausgabe und Benachrichtigungen. Der Originalname bleibt erhalten und kann jederzeit wiederhergestellt werden.',
         stationSearchPlaceholder: 'Nach Name oder Adresse suchen...',

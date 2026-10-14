@@ -1,0 +1,12 @@
+# Gasoline wholesale market collection via cron — stores the latest ICE Gasoil
+# and Brent front-month futures and the ECB euro reference rate for
+# `gasoline market backtest`. Nothing here changes the forecasts.
+#
+# One run is one OilPriceAPI request (OILPRICEAPI_KEY in the env file), so the
+# hourly schedule below uses 24 of the free plan's 50 requests a day. The ECB
+# rate needs no key; without OILPRICEAPI_KEY only the rate is stored.
+#
+# Cron starts with an empty environment: source the env file first (`set -a`
+# exports the storage settings and the key). Everything below is ONE physical line.
+
+7 * * * * set -a; . /etc/gasoline/gasoline.env; set +a; /usr/local/bin/gasoline market

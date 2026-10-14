@@ -400,6 +400,11 @@ type forecastModel struct {
 	// BaselineDrift is the damped market-wide day-over-day baseline move in
 	// euro per pricing day (see estimateBaselineDrift). Zero in flat markets.
 	BaselineDrift float64
+	// FutureEvents are the known price events (see priceEvent) that take
+	// effect after NowLocal; a target after one carries its delta. Events
+	// already in effect are folded into the history instead (see
+	// restateIntervalsForEvents).
+	FutureEvents []priceEvent
 	// HourLeadBias holds market-wide learned corrections for the parts of the
 	// daily price curve the shape model systematically misses, keyed by local
 	// target hour, lead bucket and day class (see loadLearnedCorrections).
@@ -574,6 +579,8 @@ func run(args []string) error {
 		return runMergeStations(args[1:])
 	case "doctor":
 		return runDoctor(args[1:])
+	case "market":
+		return runMarket(args[1:])
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "gasoline %s (commit %s, built %s)\n", version, commit, date)
 		return nil
@@ -606,6 +613,9 @@ Commands:
                 measures the admin accuracy page, "doctor dashboard" the
                 dashboard, "doctor all" both (--optimize additionally rebuilds
                 tables to reclaim space)
+  market        store the latest wholesale futures (ICE Gasoil, Brent; needs
+                OILPRICEAPI_KEY) and the ECB euro rate; "market backtest"
+                measures how well they predict the daily noon raise
   import cities import GeoNames populated places for a 2-letter country code
   clear cities  clear all cached cities
   version       print build version information
@@ -645,6 +655,9 @@ Examples:
   gasoline doctor dashboard
   gasoline doctor dashboard --city berlin --radius 10 --range 30d --explain
   gasoline doctor all -o json
+  gasoline market
+  gasoline market --backfill-days 45
+  gasoline market backtest --fuel diesel --series gasoil
   gasoline import cities DE
   gasoline clear cities`)
 }
@@ -2390,8 +2403,8 @@ func buildFuelForecast(ctx context.Context, db *sql.DB, scan snapshotScan, opts 
 	if len(intervals) == 0 {
 		return forecastModel{}, nil, errors.New("not enough historical open-price data for suggestions")
 	}
-	model := buildForecastModel(intervals, opts.Now, opts.Location)
-	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, opts.Now, opts.Location); err != nil {
+	model, err := buildCorrectedForecastModel(ctx, db, intervals, opts.Fuel, opts.Now, opts.Location)
+	if err != nil {
 		return forecastModel{}, nil, err
 	}
 	return model, snapshots, nil
@@ -2450,8 +2463,8 @@ func checkGasFromScan(ctx context.Context, db *sql.DB, scan snapshotScan, opts c
 		return nil, errors.New("not enough historical open-price data for checks")
 	}
 
-	model := buildForecastModel(intervals, opts.Now, opts.Location)
-	if err := applyLearnedCorrections(ctx, db, &model, opts.Fuel, opts.Now, opts.Location); err != nil {
+	model, err := buildCorrectedForecastModel(ctx, db, intervals, opts.Fuel, opts.Now, opts.Location)
+	if err != nil {
 		return nil, err
 	}
 	checks := generatePriceChecks(model, snapshots, opts.Fuel, opts.Now, opts.Location, opts.PredictDays, opts.Limit)
@@ -3448,6 +3461,12 @@ func scoreForecast(model forecastModel, stationID string, target time.Time) (for
 			predicted += model.BaselineDrift * float64(pricingDaysAhead(model.NowLocal, target, model.JumpAnchorHour))
 		}
 	}
+	if !model.NowLocal.IsZero() {
+		// A known event between now and the target moves its level by the
+		// event's delta. It belongs to the model, not to the learned
+		// correction: learning must see it as part of the raw forecast.
+		predicted += eventShiftBetween(model.FutureEvents, model.NowLocal, target)
+	}
 	learnedCorrection := station.BiasCorrection
 	predicted += station.BiasCorrection
 
@@ -3497,6 +3516,12 @@ func pricingDaysAhead(nowLocal, target time.Time, anchorHour int) int {
 }
 
 func weightedMedianPrice(samples []priceSample) (float64, bool) {
+	return weightedQuantile(samples, 0.5)
+}
+
+// weightedQuantile returns the smallest sample price whose cumulative weight
+// reaches q of the total weight (q in [0, 1]).
+func weightedQuantile(samples []priceSample, q float64) (float64, bool) {
 	if len(samples) == 0 {
 		return 0, false
 	}
@@ -3516,7 +3541,7 @@ func weightedMedianPrice(samples []priceSample) (float64, bool) {
 	var cumulative float64
 	for _, sample := range ordered {
 		cumulative += sample.Weight
-		if cumulative >= totalWeight/2 {
+		if cumulative >= totalWeight*q {
 			return sample.Price, true
 		}
 	}
