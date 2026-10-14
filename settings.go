@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -294,6 +295,62 @@ func loadUpdateTargets(ctx context.Context, q settingsQuerier) ([]updateTarget, 
 		targets = append(targets, t)
 	}
 	return targets, rows.Err()
+}
+
+// priceEvent is a known market-wide retail price move with a fixed time — a
+// tax or levy change such as the 2026 Tankrabatt — entered by an admin ahead of
+// time. EffectiveAt is when the pump price moves, which is not always when the
+// law changes: under the once-per-day-raise rule a raise can only land at the
+// noon jump, while a cut can land at once. Delta is the expected gross retail
+// move in euro per liter, signed.
+type priceEvent struct {
+	ID          int64
+	EffectiveAt time.Time
+	Fuel        string
+	Delta       float64
+	Note        string
+}
+
+// priceEventLayout is how effective_at is stored: local wall-clock time to the
+// minute, the way the admin page edits it.
+const priceEventLayout = "2006-01-02T15:04"
+
+// priceEventAllFuels marks an event that moves every fuel.
+const priceEventAllFuels = "all"
+
+// loadPriceEvents reads the price event calendar, ordered by effective time.
+// effective_at is local wall-clock time and is placed in location. A row that
+// does not parse is skipped with a warning rather than failing the run: the
+// admin page validates what it stores, and one bad row must not stop every
+// forecast.
+func loadPriceEvents(ctx context.Context, q settingsQuerier, location *time.Location) ([]priceEvent, error) {
+	if location == nil {
+		location = time.Local
+	}
+	rows, err := q.QueryContext(ctx, `SELECT id, effective_at, fuel, delta_euro, note FROM price_events ORDER BY effective_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []priceEvent
+	for rows.Next() {
+		var (
+			event         priceEvent
+			effectiveText string
+		)
+		if err := rows.Scan(&event.ID, &effectiveText, &event.Fuel, &event.Delta, &event.Note); err != nil {
+			return nil, err
+		}
+		effectiveAt, err := time.ParseInLocation(priceEventLayout, strings.TrimSpace(effectiveText), location)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping price event %d: effective_at %q is not YYYY-MM-DDTHH:MM\n", event.ID, effectiveText)
+			continue
+		}
+		event.EffectiveAt = effectiveAt
+		event.Fuel = strings.ToLower(strings.TrimSpace(event.Fuel))
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 func getNotificationState(ctx context.Context, db *sql.DB, name string) (string, bool, error) {

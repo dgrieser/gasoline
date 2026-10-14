@@ -47,7 +47,7 @@ $viewer = file_get_contents(__DIR__ . '/web/index.php');
 // The filter functions read the page's own limits, so the constants come from
 // the page too rather than being restated here where they could drift.
 foreach (['DASHBOARD_RADIUS_OPTIONS', 'DASHBOARD_RANGE_DAYS', 'DASHBOARD_FUELS',
-    'DASHBOARD_STATION_LIMIT'] as $name) {
+    'DASHBOARD_STATION_LIMIT', 'GASOLINE_MAX_PRICE_EVENT_CENT'] as $name) {
     if (!preg_match('/^const ' . $name . ' = .*?;$/ms', $viewer, $match)) {
         fwrite(STDERR, "web/index.php no longer defines {$name}\n");
         exit(2);
@@ -62,7 +62,7 @@ foreach (['raisedNinePrice', 'raisedNinePriceSql', 'loadNearbyPrices', 'geocodeL
     'gasolineCommandStatsRowFilter', 'gasolineCommandStatsRows',
     'gasolineCommandStatsTiles', 'gasolineTableExists', 'gasolineIsIntInRange',
     'gasolineLeadBucketLabels', 'gasolineLeadBucketSql',
-    'gasolineBreakdownTables'] as $name) {
+    'gasolineBreakdownTables', 'normalizePriceEventInput'] as $name) {
     eval(extractFunction($viewer, $name));
 }
 
@@ -975,6 +975,31 @@ foreach ([
     check($what . ' is the one save_settings validates against',
         str_contains($viewerSource, $fragment), true);
 }
+
+/* ── Price events ─────────────────────────────────────────────────── */
+
+// What the admin form stores is what Go's loadPriceEvents parses: local
+// wall-clock time to the minute, a fuel Go matches, and the change in euro.
+check('a datetime-local value, a fuel and a cent change are stored in euro',
+    normalizePriceEventInput(['effective_at' => '2027-01-01T12:00', 'fuel' => 'all', 'delta_cent' => '16.7', 'note' => ' Tankrabatt ends ']),
+    ['effective_at' => '2027-01-01T12:00', 'fuel' => 'all', 'delta_euro' => 0.167, 'note' => 'Tankrabatt ends']);
+check('a cut is negative, a comma decimal is accepted, the fuel is folded',
+    normalizePriceEventInput(['effective_at' => '2026-10-01T00:00', 'fuel' => 'Diesel', 'delta_cent' => '-16,7']),
+    ['effective_at' => '2026-10-01T00:00', 'fuel' => 'diesel', 'delta_euro' => -0.167, 'note' => '']);
+check('seconds are not part of the format',
+    normalizePriceEventInput(['effective_at' => '2027-01-01T12:00:00', 'fuel' => 'all', 'delta_cent' => '5']), null);
+check('an impossible date is refused',
+    normalizePriceEventInput(['effective_at' => '2027-02-30T12:00', 'fuel' => 'all', 'delta_cent' => '5']), null);
+check('an unknown fuel is refused',
+    normalizePriceEventInput(['effective_at' => '2027-01-01T12:00', 'fuel' => 'lpg', 'delta_cent' => '5']), null);
+check('a zero change is refused',
+    normalizePriceEventInput(['effective_at' => '2027-01-01T12:00', 'fuel' => 'all', 'delta_cent' => '0.04']), null);
+check('a change past the bound is refused',
+    normalizePriceEventInput(['effective_at' => '2027-01-01T12:00', 'fuel' => 'all', 'delta_cent' => '100.1']), null);
+check('a change that is not a number is refused',
+    normalizePriceEventInput(['effective_at' => '2027-01-01T12:00', 'fuel' => 'all', 'delta_cent' => 'lots']), null);
+check('a note longer than the column is refused',
+    normalizePriceEventInput(['effective_at' => '2027-01-01T12:00', 'fuel' => 'all', 'delta_cent' => '5', 'note' => str_repeat('x', 256)]), null);
 
 if ($failures > 0) {
     printf("web_picker_test: %d failed\n", $failures);

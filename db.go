@@ -452,6 +452,26 @@ func schemaStatements(d dialect) []string {
 				radius_km DOUBLE NOT NULL DEFAULT 5,
 				created_at VARCHAR(64) NOT NULL
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS price_events (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				effective_at VARCHAR(16) NOT NULL,
+				fuel VARCHAR(16) NOT NULL DEFAULT 'all',
+				delta_euro DOUBLE NOT NULL,
+				note VARCHAR(255) NOT NULL DEFAULT '',
+				created_at VARCHAR(64) NOT NULL
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+			`CREATE TABLE IF NOT EXISTS market_prices (
+				id BIGINT PRIMARY KEY AUTO_INCREMENT,
+				series VARCHAR(32) NOT NULL,
+				contract VARCHAR(64) NOT NULL DEFAULT '',
+				observed_at VARCHAR(64) NOT NULL,
+				price DOUBLE NOT NULL,
+				unit VARCHAR(16) NOT NULL DEFAULT '',
+				currency VARCHAR(8) NOT NULL DEFAULT '',
+				source VARCHAR(32) NOT NULL DEFAULT '',
+				fetched_at VARCHAR(64) NOT NULL,
+				UNIQUE KEY idx_market_prices_series_observed (series, observed_at)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
 			`CREATE TABLE IF NOT EXISTS notification_state (
 				name VARCHAR(191) PRIMARY KEY,
 				value TEXT NOT NULL,
@@ -678,6 +698,26 @@ func schemaStatements(d dialect) []string {
 			city TEXT NOT NULL UNIQUE,
 			radius_km REAL NOT NULL DEFAULT 5,
 			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS price_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			effective_at TEXT NOT NULL,
+			fuel TEXT NOT NULL DEFAULT 'all',
+			delta_euro REAL NOT NULL,
+			note TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS market_prices (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			series TEXT NOT NULL,
+			contract TEXT NOT NULL DEFAULT '',
+			observed_at TEXT NOT NULL,
+			price REAL NOT NULL,
+			unit TEXT NOT NULL DEFAULT '',
+			currency TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT '',
+			fetched_at TEXT NOT NULL,
+			UNIQUE (series, observed_at)
 		)`,
 		`CREATE TABLE IF NOT EXISTS notification_state (
 			name TEXT PRIMARY KEY,
