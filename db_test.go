@@ -806,3 +806,42 @@ func TestViewerPersistentLoginUsesTheSchemaColumns(t *testing.T) {
 		t.Error("web/index.php no longer revokes a user's persistent logins on password change or deletion")
 	}
 }
+
+func TestRetryOnDeadlockRetriesOnlyDeadlocks(t *testing.T) {
+	original := deadlockRetryBackoff
+	deadlockRetryBackoff = time.Millisecond
+	t.Cleanup(func() { deadlockRetryBackoff = original })
+	ctx := context.Background()
+	deadlock := fmt.Errorf("persist: %w", &mysql.MySQLError{Number: mysqlDeadlockErrorNumber, Message: "Deadlock found when trying to get lock; try restarting transaction"})
+
+	calls := 0
+	err := retryOnDeadlock(ctx, func() error {
+		calls++
+		if calls < 3 {
+			return deadlock
+		}
+		return nil
+	})
+	if err != nil || calls != 3 {
+		t.Fatalf("err %v after %d calls, want success on the third", err, calls)
+	}
+
+	calls = 0
+	err = retryOnDeadlock(ctx, func() error {
+		calls++
+		return deadlock
+	})
+	if !isMySQLDeadlock(err) || calls != deadlockRetryAttempts {
+		t.Fatalf("err %v after %d calls, want the deadlock after %d tries", err, calls, deadlockRetryAttempts)
+	}
+
+	calls = 0
+	other := &mysql.MySQLError{Number: 1062, Message: "Duplicate entry"}
+	err = retryOnDeadlock(ctx, func() error {
+		calls++
+		return other
+	})
+	if err != other || calls != 1 {
+		t.Fatalf("err %v after %d calls, want any other error returned at once", err, calls)
+	}
+}

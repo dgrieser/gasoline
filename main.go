@@ -2299,12 +2299,24 @@ func suggestOneFuel(ctx context.Context, db *sql.DB, scan snapshotScan, opts sug
 	if !persist {
 		return computation.Suggestions, persistCounts{}, nil
 	}
-	runID, stored, err := persistPredictionRun(ctx, db, computation, opts)
-	if err != nil {
+	// Each persist step is one transaction that a concurrent update sweep can
+	// deadlock (see retryOnDeadlock), so each is retried on its own: a
+	// decisions retry must not store the run a second time.
+	var runID int64
+	var stored int
+	if err := retryOnDeadlock(ctx, func() error {
+		var err error
+		runID, stored, err = persistPredictionRun(ctx, db, computation, opts)
+		return err
+	}); err != nil {
 		return nil, persistCounts{}, err
 	}
-	decisions, err := persistCheckDecisions(ctx, db, computation, opts, runID)
-	if err != nil {
+	var decisions int
+	if err := retryOnDeadlock(ctx, func() error {
+		var err error
+		decisions, err = persistCheckDecisions(ctx, db, computation, opts, runID)
+		return err
+	}); err != nil {
 		return nil, persistCounts{}, err
 	}
 	counts := persistCounts{Predictions: stored, Decisions: decisions}
