@@ -2554,9 +2554,15 @@ func (s snapshotScan) forFuel(fuel string) []suggestSnapshot {
 func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Time) (snapshotScan, error) {
 	scan := snapshotScan{Stations: map[string]suggestionStationRow{}}
 	historyStartText := historyStart.Format(time.RFC3339)
-	rows, err := db.QueryContext(ctx, `
-		SELECT
-			s.id,
+	freshSince := now.Add(-stationFreshness).Format(time.RFC3339)
+	// The window and each station's last snapshot before it are two halves
+	// of a UNION ALL rather than one OR: with the OR, MySQL could not range
+	// the window on (station_id, recorded_at) and ran the "last before"
+	// subquery once per snapshot of the station's whole history: about 13
+	// minutes for a 42-day scan over 1.5M snapshots. Each half now walks the
+	// index once, and the last-before half's MAX is a loose index scan.
+	const columns = `
+			s.id AS station_id,
 			COALESCE(s.name_override, s.name),
 			COALESCE(s.brand, ''),
 			COALESCE(s.street, ''),
@@ -2567,31 +2573,40 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 			s.lng,
 			s.first_seen_at,
 			s.last_seen_at,
-			ps.recorded_at,
+			ps.recorded_at AS recorded_at,
 			ps.is_open,
 			ps.city_name,
 			ps.diesel,
 			ps.e5,
-			ps.e10
-		FROM stations s
-		JOIN price_snapshots ps ON ps.station_id = s.id
-		WHERE (
-				ps.recorded_at >= ?
-				OR ps.recorded_at = (
-					SELECT MAX(prior.recorded_at)
-					FROM price_snapshots prior
-					WHERE prior.station_id = s.id
-						AND prior.recorded_at < ?
-				)
-			)
-			AND EXISTS (
+			ps.e10,
+			ps.id AS snapshot_id`
+	const fed = `
+			EXISTS (
 				SELECT 1
 				FROM price_snapshots fresh
 				WHERE fresh.station_id = s.id
 					AND fresh.recorded_at >= ?
-			)
-		ORDER BY s.id ASC, ps.recorded_at ASC, ps.id ASC
-	`, historyStartText, historyStartText, now.Add(-stationFreshness).Format(time.RFC3339))
+			)`
+	rows, err := db.QueryContext(ctx, `
+		SELECT`+columns+`
+		FROM stations s
+		JOIN price_snapshots ps ON ps.station_id = s.id
+		WHERE ps.recorded_at >= ?
+			AND`+fed+`
+		UNION ALL
+		SELECT`+columns+`
+		FROM stations s
+		JOIN (
+			SELECT station_id, MAX(recorded_at) AS recorded_at
+			FROM price_snapshots
+			WHERE recorded_at < ?
+			GROUP BY station_id
+		) before_window ON before_window.station_id = s.id
+		JOIN price_snapshots ps ON ps.station_id = before_window.station_id
+			AND ps.recorded_at = before_window.recorded_at
+		WHERE`+fed+`
+		ORDER BY station_id ASC, recorded_at ASC, snapshot_id ASC
+	`, historyStartText, freshSince, historyStartText, freshSince)
 	if err != nil {
 		return snapshotScan{}, err
 	}
@@ -2602,6 +2617,7 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 			stationID, stationName, brand, street, houseNumber, place string
 			firstSeenAt, lastSeenAt, recordedAtText, cityName         string
 			postCode                                                  int
+			snapshotID                                                int64
 			lat, lng                                                  float64
 			isOpen                                                    bool
 			diesel, e5, e10                                           sql.NullFloat64
@@ -2624,6 +2640,7 @@ func loadSnapshotScan(ctx context.Context, db *sql.DB, historyStart, now time.Ti
 			&diesel,
 			&e5,
 			&e10,
+			&snapshotID,
 		); err != nil {
 			return snapshotScan{}, err
 		}
