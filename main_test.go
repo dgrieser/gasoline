@@ -3700,6 +3700,42 @@ func TestLoadSnapshotScanDropsStationsThatStoppedBeingFed(t *testing.T) {
 	}
 }
 
+// TestLoadSnapshotScanCarriesTheLastPriceBeforeTheWindow pins what the scan
+// returns besides the window itself: per station the newest snapshot before
+// it, which says what the price was when the window opened, and nothing older.
+func TestLoadSnapshotScanCarriesTheLastPriceBeforeTheWindow(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC)
+	windowStart := now.AddDate(0, 0, -10)
+
+	insertSuggestCity(t, db, cachedCity{QueryName: "Berlin", Name: "Berlin", DisplayName: "Berlin", Lat: 52.517389, Lng: 13.395131})
+	insertSuggestStation(t, db, "old", "Long History", 52.517389, 13.395131)
+	insertSuggestStation(t, db, "new", "Window Only", 52.517389, 13.395131)
+	for i, price := range []float64{1.70, 1.75, 1.80} {
+		insertSuggestSnapshot(t, db, "old", "Berlin", windowStart.Add(-time.Duration(3-i)*24*time.Hour), price, true)
+	}
+	insertSuggestSnapshot(t, db, "old", "Berlin", windowStart, 1.85, true)
+	insertSuggestSnapshot(t, db, "old", "Berlin", now.Add(-time.Hour), 1.90, true)
+	insertSuggestSnapshot(t, db, "new", "Berlin", now.Add(-2*time.Hour), 2.00, true)
+	insertSuggestSnapshot(t, db, "new", "Berlin", now.Add(-time.Hour), 2.01, true)
+
+	scan, err := loadSnapshotScan(ctx, db, windowStart, now)
+	if err != nil {
+		t.Fatalf("loadSnapshotScan: %v", err)
+	}
+	var got []string
+	for _, row := range scan.Rows {
+		got = append(got, fmt.Sprintf("%s %.2f", row.StationID, row.Diesel.Float64))
+	}
+	// Ordered by station, then time; "old" keeps only its 1.80 from before
+	// the window, and a snapshot right at the window start belongs to it.
+	want := []string{"new 2.00", "new 2.01", "old 1.80", "old 1.85", "old 1.90"}
+	if strings.Join(got, ", ") != strings.Join(want, ", ") {
+		t.Fatalf("scan rows = %v, want %v", got, want)
+	}
+}
+
 func TestLoadSnapshotScanAttributesStationsToTheirOwningCity(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
